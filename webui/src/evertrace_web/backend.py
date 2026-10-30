@@ -144,6 +144,9 @@ class Backend:
     async def detail(self, reference, frontier, revision):
         return await self._request({"kind": "detail", "surface": "explorer", "object_ref": reference, "expected_frontier": frontier, "expected_revision_ref": revision})
 
+    async def revisions(self, reference, frontier, revision, after=None):
+        return await self._request({"kind": "related", "relation": "object_revisions", "source_stable_key": reference, "expected_source_revision_ref": revision, "expected_frontier": frontier, "after": after, "limit": 32})
+
     async def content(self, reference, frontier, revision, representation, after=None):
         if representation not in ("text", "semantic_json"):
             raise BackendError("invalid_input")
@@ -210,7 +213,7 @@ class Backend:
                     return health
                 response = await call({"human_governance": {"operation": "read", "request": read}})
                 result = response["human_governance"]
-                if result.get("kind") not in ("snapshot", "memory_page", "scope_directory", "content", "conflict"):
+                if result.get("kind") not in ("snapshot", "memory_page", "revision_page", "scope_directory", "content", "conflict"):
                     raise BackendError("invalid_read_response")
                 return result
             finally:

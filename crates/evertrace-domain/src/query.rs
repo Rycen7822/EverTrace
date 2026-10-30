@@ -707,6 +707,37 @@ impl MemoryBrowseCursor {
     }
 }
 
+/// Opaque continuation for one exact source's same-object revision list.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct ObjectRevisionsCursor {
+    pub frontier: u64,
+    pub source_key: String,
+    pub source_revision: String,
+    pub source_event_seq: u64,
+    pub row_id: String,
+}
+
+impl ObjectRevisionsCursor {
+    pub fn validate_for(
+        &self,
+        source_key: &str,
+        source_revision: &str,
+        frontier: u64,
+    ) -> Result<(), QueryError> {
+        if self.source_key != source_key
+            || self.source_revision != source_revision
+            || self.frontier != frontier
+            || self.row_id.is_empty()
+            || self.row_id.len() > 512
+            || self.row_id.chars().any(char::is_control)
+        {
+            return Err(QueryError::Invalid);
+        }
+        Ok(())
+    }
+}
+
 /// Request-local body representation; never a CAS path or generic RPC selector.
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "snake_case")]

@@ -3,14 +3,14 @@ let fragment = location.hash.slice(1);
 let bootstrap = /^bootstrap=[0-9a-f]{64}$/.test(fragment) ? fragment.slice(10) : null;
 fragment = null;
 let poller = null;
-const state = { csrf: null, active: false, route: 'memories', query: {selection: {kind: 'all'}, include_global: false, kind: 'all', order: 'recorded_newest', epistemic_status: null, authority: null, atom_lifecycle: null}, after: null, frontier: null, next: null, selected: null, content: null, controller: null };
+const state = { csrf: null, active: false, route: 'memories', query: {selection: {kind: 'all'}, include_global: false, kind: 'all', order: 'recorded_newest', epistemic_status: null, authority: null, atom_lifecycle: null}, after: null, frontier: null, next: null, selected: null, content: null, revisions: null, controller: null };
 const directory = {query: {parent: null, name: ''}, after: null, frontier: null, next: null, controller: null};
 history.replaceState(null, '', '#memories');
 const channel = new BroadcastChannel('evertrace-web-session');
 function clear() { $('memory-items').replaceChildren(); $('detail-body').replaceChildren(); $('detail-ref').textContent = ''; $('system-status').replaceChildren(); $('page-count').textContent = ''; $('next-page').disabled = true; }
 function cancel() { state.controller?.abort(); state.controller = null; }
 function notice(text) { $('notice').textContent = text; }
-function closed(text, broadcast = false) { cancel(); clear(); clearInterval(poller); poller = null; state.csrf = null; state.active = false; state.query = {...state.query, selection: {kind: 'all'}, include_global: false}; updateScopeControls(); clearDirectory(); if ($('scope-dialog').open) $('scope-dialog').close(); state.selected = null; state.content = null; state.after = null; state.frontier = null; state.next = null; $('reader').hidden = true; $('system-panel').hidden = true; notice(text); if (broadcast) channel.postMessage('closed'); }
+function closed(text, broadcast = false) { cancel(); clear(); clearInterval(poller); poller = null; state.csrf = null; state.active = false; state.query = {...state.query, selection: {kind: 'all'}, include_global: false}; updateScopeControls(); clearDirectory(); if ($('scope-dialog').open) $('scope-dialog').close(); state.selected = null; state.content = null; state.revisions = null; state.after = null; state.frontier = null; state.next = null; $('reader').hidden = true; $('system-panel').hidden = true; notice(text); if (broadcast) channel.postMessage('closed'); }
 channel.onmessage = () => closed('网页会话已结束；请重新运行 evertrace --web。');
 async function api(path, body, signal) {
   const headers = { 'X-EverTrace-Web': '1' };
@@ -29,6 +29,28 @@ async function detail(item, frontier, controller, scroll = 0) {
   if (result.conflict) { $('detail-body').textContent = '记录已变化，请重新选择；没有改用当前版本。'; return; }
   fragmentInto($('detail-body'), result.html); $('detail-ref').textContent = item.revision || item.key; $('detail-body').scrollTop = scroll;
 }
+async function readRevisions(item, after, frontier, controller, scroll = 0) {
+  const result = await api('read', {kind: 'revisions', reference: item.key, revision: item.revision, frontier, after}, controller.signal);
+  if (state.controller !== controller || document.hidden) return;
+  if (result.conflict) {
+    state.revisions = {after: null, frontier: null, next: null}; $('detail-ref').textContent = '';
+    fragmentInto($('detail-body'), '<p>历史水位有更新；没有拼接两次结果。</p><button class="button" type="button" data-revisions-open>从头读取历史</button>'); return;
+  }
+  fragmentInto($('detail-body'), result.html); $('detail-ref').textContent = item.revision;
+  $('detail-body').scrollTop = scroll;
+  state.revisions = {after, frontier: result.frontier, next: result.next_cursor};
+  $('detail-body').querySelector('[data-revisions-next]').disabled = !result.next_cursor;
+}
+async function openRevisions(after = null) {
+  const item = state.selected; if (!item?.revision || !state.active || document.hidden) return;
+  const frontier = after ? state.revisions?.frontier : state.frontier;
+  if (frontier === null || frontier === undefined) return;
+  cancel(); const controller = new AbortController(); state.controller = controller;
+  state.content = null; state.revisions = {after, frontier, next: null}; $('detail-body').replaceChildren(); $('detail-ref').textContent = '';
+  try { await readRevisions(item, after, frontier, controller); }
+  catch { if (state.controller === controller && !controller.signal.aborted) { clear(); notice('历史暂时不可读取，旧内容已清除。'); } }
+  finally { if (state.controller === controller) state.controller = null; }
+}
 async function readContent(item, representation, after, controller, scroll = 0) {
   const result = await api('read', {kind: 'content', reference: item.key, revision: item.revision, frontier: state.frontier, representation, after}, controller.signal);
   if (state.controller !== controller || document.hidden) return;
@@ -44,13 +66,13 @@ async function readContent(item, representation, after, controller, scroll = 0) 
 async function openContent(representation, after = null) {
   const item = state.selected; if (!item?.revision || !state.active || document.hidden) return;
   cancel(); const controller = new AbortController(); state.controller = controller;
-  state.content = {representation, after}; $('detail-body').replaceChildren(); $('detail-ref').textContent = '';
+  state.revisions = null; state.content = {representation, after}; $('detail-body').replaceChildren(); $('detail-ref').textContent = '';
   try { await readContent(item, representation, after, controller); }
   catch { if (state.controller === controller && !controller.signal.aborted) { clear(); state.content = null; notice('分段读取失败，旧正文和区间已清除。'); } }
   finally { if (state.controller === controller) state.controller = null; }
 }
 async function select(item) {
-  state.content = null;
+  state.content = null; state.revisions = null;
   cancel(); const controller = new AbortController(); state.controller = controller; state.selected = item; $('detail-ref').textContent = ''; $('detail-body').textContent = '正在读取…';
   try { await detail(item, state.frontier, controller); } catch { if (state.controller === controller && !controller.signal.aborted) { clear(); notice('读取失败，旧内容已清除。'); } }
   finally { if (state.controller === controller) state.controller = null; }
@@ -70,21 +92,22 @@ async function refresh() {
     if (state.controller !== controller || document.hidden) return;
     const listScroll = $('memory-items').scrollTop, detailScroll = $('detail-body').scrollTop;
     clear();
-    if (page.conflict) { state.after = null; state.frontier = null; state.next = null; state.selected = null; state.content = null; notice('分页水位已变化；请刷新读取当前列表。'); return; }
+    if (page.conflict) { state.after = null; state.frontier = null; state.next = null; state.selected = null; state.content = null; state.revisions = null; notice('分页水位已变化；请刷新读取当前列表。'); return; }
     state.frontier = page.frontier; state.next = page.next_cursor;
     fragmentInto($('memory-items'), page.html); $('memory-items').scrollTop = listScroll;
     $('page-count').textContent = !page.scope_available ? '范围不可用 · 计数未知' : '本页 ' + page.count + ' · ' + (page.counts_complete ? '' : '已判定范围 ≥ ') + '筛选 ' + page.matching_count + ' / 当前条目 ' + page.total_count;
     $('next-page').disabled = !page.next_cursor;
     notice(!page.scope_available ? '所选身份不存在、已移除或当前不可用，未改查全部范围。' : page.degraded ? '只读数据有降级；不是完整成功。' : '按录入顺序浏览所选关联范围；计数不是可读正文数，也不表示方法可执行。' + (page.unresolved_scope_count !== '0' ? ' 另有 ' + page.unresolved_scope_count + ' 条元数据归属尚未判定。' : '') + ' 搜索和网页修改尚未接入。');
-    if (state.selected && [...$('memory-items').children].some(row => row.dataset.key === state.selected.key)) {
-      if (state.content) await readContent(state.selected, state.content.representation, state.content.after, controller, detailScroll);
+    if (state.selected && [...$('memory-items').children].some(row => row.dataset.object === state.selected.object && row.dataset.kind === state.selected.kind)) {
+      if (state.revisions) await readRevisions(state.selected, state.revisions.after, state.revisions.after ? state.revisions.frontier : page.frontier, controller, detailScroll);
+      else if (state.content) await readContent(state.selected, state.content.representation, state.content.after, controller, detailScroll);
       else await detail(state.selected, page.frontier, controller, detailScroll);
-    } else { state.selected = null; state.content = null; $('detail-body').textContent = '选择一条记忆查看正文。'; }
+    } else { state.selected = null; state.content = null; state.revisions = null; $('detail-body').textContent = '选择一条记忆查看正文。'; }
   } catch { if (state.controller === controller && !controller.signal.aborted) { clear(); $('connection-status').textContent = '读取不可用'; notice('daemon 或读取暂不可用，旧内容已清除。'); } }
   finally { if (state.controller === controller) state.controller = null; }
 }
 function route(name) {
-  cancel(); clear(); state.route = name; state.after = null; state.frontier = null; state.selected = null; state.content = null;
+  cancel(); clear(); state.route = name; state.after = null; state.frontier = null; state.selected = null; state.content = null; state.revisions = null;
   history.replaceState(null, '', '#' + name);
   for (const button of document.querySelectorAll('[data-route]')) button.classList.toggle('active', button.dataset.route === name);
   $('reader').hidden = !state.active || name !== 'memories'; $('system-panel').hidden = !state.active || name !== 'system';
@@ -95,12 +118,16 @@ function route(name) {
   refresh();
 }
 $('detail-body').onclick = event => {
-  const button = event.target.closest('[data-content-open], [data-content-nav]');
+  const button = event.target.closest('[data-content-open], [data-content-nav], [data-revisions-open], [data-revisions-next], [data-detail-open], [data-revision-key]');
   if (!button || button.disabled) return;
-  if (button.dataset.contentOpen) openContent(button.dataset.contentOpen);
+  if (button.hasAttribute('data-revisions-open')) openRevisions();
+  else if (button.hasAttribute('data-revisions-next')) { if (state.revisions?.next) openRevisions(state.revisions.next); }
+  else if (button.hasAttribute('data-detail-open')) select(state.selected);
+  else if (button.dataset.revisionKey) select({...state.selected, key: button.dataset.revisionKey, revision: button.dataset.revision});
+  else if (button.dataset.contentOpen) openContent(button.dataset.contentOpen);
   else if (state.content) openContent(state.content.representation, button.dataset.contentNav === 'first' ? null : state.content[button.dataset.contentNav]);
 };
-$('memory-items').onclick = event => { const row = event.target.closest('.memory-item'); if (row) select({ key: row.dataset.key, revision: row.dataset.revision }); };
+$('memory-items').onclick = event => { const row = event.target.closest('.memory-item'); if (row) select({ key: row.dataset.key, revision: row.dataset.revision, object: row.dataset.object, kind: row.dataset.kind }); };
 for (const button of document.querySelectorAll('[data-route]')) button.onclick = () => route(button.dataset.route);
 function clearDirectory() {
   directory.controller?.abort(); directory.controller = null;
@@ -157,7 +184,7 @@ $('scope-items').onclick = event => {
 for (const button of document.querySelectorAll('[data-scope-fixed]')) button.onclick = () => chooseScope({kind: button.dataset.scopeFixed});
 $('include-global').onchange = () => changeQuery();
 function changeQuery() {
-  cancel(); clear(); state.after = null; state.frontier = null; state.selected = null; state.content = null; state.next = null;
+  cancel(); clear(); state.after = null; state.frontier = null; state.selected = null; state.content = null; state.revisions = null; state.next = null;
   const atomAxes = ['all', 'facts_and_constraints'].includes($('reading-kind').value);
   for (const id of ['epistemic-filter', 'authority-filter', 'lifecycle-filter']) { $(id).disabled = !atomAxes; if (!atomAxes) $(id).value = ''; }
   state.query = {selection: state.query.selection, include_global: $('include-global').checked, kind: $('reading-kind').value, order: $('browse-order').value, epistemic_status: $('epistemic-filter').value || null, authority: $('authority-filter').value || null, atom_lifecycle: $('lifecycle-filter').value || null};
@@ -165,8 +192,8 @@ function changeQuery() {
 }
 for (const id of ['reading-kind', 'browse-order', 'epistemic-filter', 'authority-filter', 'lifecycle-filter']) $(id).onchange = changeQuery;
 $('refresh').onclick = refresh;
-$('first-page').onclick = () => { cancel(); clear(); state.after = null; state.frontier = null; state.selected = null; state.content = null; refresh(); };
-$('next-page').onclick = () => { if (state.next) { cancel(); clear(); state.after = state.next; state.selected = null; state.content = null; refresh(); } };
+$('first-page').onclick = () => { cancel(); clear(); state.after = null; state.frontier = null; state.selected = null; state.content = null; state.revisions = null; refresh(); };
+$('next-page').onclick = () => { if (state.next) { cancel(); clear(); state.after = state.next; state.selected = null; state.content = null; state.revisions = null; refresh(); } };
 $('logout').onclick = async () => { try { await api('logout', {}); } finally { closed('网页会话已结束。', true); } };
 document.addEventListener('visibilitychange', () => { if (document.hidden) { cancel(); clear(); clearDirectory(); if ($('scope-dialog').open) $('scope-dialog').close(); } else if (state.active) refresh(); });
 window.addEventListener('pagehide', () => closed('网页会话已离开。'));

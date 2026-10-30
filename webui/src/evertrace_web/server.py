@@ -180,6 +180,15 @@ class App:
                 else:
                     content = result["content"]
                     data = {"html": self.templates.get_template("content.html").render(content=content), "text": content["text"], "state": content["state"], "previous_cursor": content["previous_cursor"], "next_cursor": content["next_cursor"], "frontier": str(content["frontier"]), **{key: str(content[key]) if content[key] is not None else None for key in ("total_bytes", "range_start", "range_end")}}
+            elif payload.get("kind") == "revisions" and set(payload) == {"kind", "reference", "frontier", "revision", "after"}:
+                frontier = parse_frontier(payload["frontier"])
+                if not valid_ref(payload["reference"]) or not valid_ref(payload["revision"]) or not valid_ref(payload["after"], optional=True):
+                    return JSONResponse({"error": "invalid_read"}, 400)
+                result = await self.backend.revisions(payload["reference"], frontier, payload["revision"], payload["after"])
+                if result["kind"] == "conflict":
+                    data = {"conflict": True}
+                else:
+                    data = {"html": self.templates.get_template("revisions.html").render(items=result["items"], source_revision=payload["revision"], status=result["status"]), "frontier": str(result["frontier"]), "next_cursor": result["next_cursor"]}
             elif payload.get("kind") == "detail" and set(payload) == {"kind", "reference", "frontier", "revision"}:
                 frontier = parse_frontier(payload["frontier"])
                 if not valid_ref(payload["reference"]) or not valid_ref(payload["revision"], optional=True):

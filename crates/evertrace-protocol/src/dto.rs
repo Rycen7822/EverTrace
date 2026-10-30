@@ -935,6 +935,16 @@ pub enum HumanGovernanceResponse {
         counts_complete: bool,
         unresolved_scope_count: u64,
     },
+    RevisionPage {
+        diagnostics: Option<Box<HumanDiagnostics>>,
+        frontier: u64,
+        status: HumanSnapshotStatus,
+        degraded_reasons: Vec<HumanDegradedReason>,
+        items: Vec<HumanSnapshotItem>,
+        next_cursor: Option<String>,
+        source_key: String,
+        source_revision: String,
+    },
     Export {
         result: HumanExportResult,
     },
@@ -1390,6 +1400,58 @@ impl HumanGovernanceResponse {
                                             && last.source_event_seq == cursor.source_event_seq
                                     })
                             })
+                    })
+            }
+            Self::RevisionPage {
+                diagnostics,
+                frontier,
+                status,
+                degraded_reasons,
+                items,
+                next_cursor,
+                source_key,
+                source_revision,
+            } => {
+                use evertrace_domain::query::ObjectRevisionsCursor;
+                let rank = |item: &HumanSnapshotItem| {
+                    (u64::MAX - item.source_event_seq, item.stable_key.clone())
+                };
+                valid_ref(source_key)
+                    && valid_ref(source_revision)
+                    && valid_human_page(diagnostics, status, degraded_reasons, items, next_cursor)
+                    && items.iter().all(|item| {
+                        item.row_class == HumanRowClass::Object
+                            && item.object_ref.is_some()
+                            && matches!(
+                                item.object_kind.as_str(),
+                                "atom_revision"
+                                    | "procedure_revision"
+                                    | "core_membership"
+                                    | "revision_proposal_revision"
+                                    | "semantic_digest"
+                            )
+                            && items.first().is_none_or(|first| {
+                                first.object_ref == item.object_ref
+                                    && first.object_kind == item.object_kind
+                            })
+                    })
+                    && items.windows(2).all(|pair| rank(&pair[0]) < rank(&pair[1]))
+                    && items
+                        .iter()
+                        .map(|item| &item.stable_key)
+                        .collect::<std::collections::BTreeSet<_>>()
+                        .len()
+                        == items.len()
+                    && next_cursor.as_ref().is_none_or(|raw| {
+                        serde_json::from_str::<ObjectRevisionsCursor>(raw).is_ok_and(|cursor| {
+                            cursor
+                                .validate_for(source_key, source_revision, *frontier)
+                                .is_ok()
+                                && items.last().is_some_and(|last| {
+                                    last.stable_key == cursor.row_id
+                                        && last.source_event_seq == cursor.source_event_seq
+                                })
+                        })
                     })
             }
             Self::Snapshot {

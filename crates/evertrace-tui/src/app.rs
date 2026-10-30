@@ -487,6 +487,7 @@ impl App {
                     (
                         _,
                         HumanGovernanceResponse::Action { .. }
+                        | HumanGovernanceResponse::RevisionPage { .. }
                         | HumanGovernanceResponse::MemoryPage { .. }
                         | HumanGovernanceResponse::Content { .. }
                         | HumanGovernanceResponse::ScopeDirectory { .. }
@@ -519,6 +520,7 @@ impl App {
                         reason: Some("optimistic_conflict".into()),
                     },
                     HumanGovernanceResponse::Snapshot { .. }
+                    | HumanGovernanceResponse::RevisionPage { .. }
                     | HumanGovernanceResponse::MemoryPage { .. }
                     | HumanGovernanceResponse::Content { .. }
                     | HumanGovernanceResponse::ScopeDirectory { .. } => return UiCommand::None,

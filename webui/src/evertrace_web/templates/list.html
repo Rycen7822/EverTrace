@@ -2,7 +2,7 @@
 {% set origins = {'stored_value': '已有内容摘录', 'type_fallback': '类型提示', 'digest_deterministic': '确定性汇总', 'digest_llm_enriched': '模型整理', 'digest_rejected_generation': '生成结果未通过检查'} %}
 {% for item in items %}
 {% set preview = item.get('reading_preview') %}
-<button class="memory-item" data-key="{{ item.stable_key }}" data-revision="{{ item.revision_ref or '' }}" data-kind="{{ item.object_kind }}">
+<button class="memory-item" data-key="{{ item.stable_key }}" data-revision="{{ item.revision_ref or '' }}" data-kind="{{ item.object_kind }}" data-object="{{ item.object_ref or '' }}">
   <div class="item-topline"><span class="type-pill" title="{{ item.object_kind }}">{{ kinds.get(item.object_kind, item.object_kind) }}</span>{% if item.epistemic %}<span class="badge">真值：{{ item.epistemic }}</span>{% endif %}{% if item.proposal %}<span class="badge">提案：{{ item.proposal.status }}</span>{% endif %}</div>
   <h3>{% if preview and preview.state == 'ready' and preview.title %}{{ preview.title }}{% else %}{{ kinds.get(item.object_kind, item.object_kind) }} · {{ (item.revision_ref or item.object_ref or item.stable_key)[:12] }}{% endif %}</h3>
   {% if preview and preview.state == 'ready' %}

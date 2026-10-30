@@ -1,0 +1,15 @@
+<section aria-label="修订历史">
+  <h2>此对象的修订历史</h2>
+  <p class="muted">按录入顺序从新到旧。这里只列当前保留的修订元数据；正文逐版复验权限，不按状态或序号猜测哪一版是 current。</p>
+  {% if status != 'ready' %}<p>读取有降级；此页不代表完整成功。</p>{% endif %}
+  <button class="button" type="button" data-detail-open>返回所选修订正文</button>
+  {% for item in items %}
+  <button class="memory-item revision-item" type="button" data-revision-key="{{ item.stable_key }}" data-revision="{{ item.revision_ref }}">
+    <h3>{{ item.revision_ref }}</h3>
+    {% if item.revision_ref == source_revision %}<span class="badge">打开历史时所选的修订</span>{% endif %}
+    <p>录入序号 {{ item.source_event_seq }} · {{ item.object_kind }}</p>
+    <p class="reading-origin">生命周期：{{ item.lifecycle or '未提供' }} · 真值：{{ item.epistemic or '不适用' }} · 权威：{{ item.authority or '未提供' }} · 发布：{{ item.publication_state or '不适用' }} · 支持：{{ item.support_state or '未提供' }}</p>
+  </button>
+  {% else %}<p>这一页没有可列出的修订；没有用当前版本补位。</p>{% endfor %}
+  <div class="chunk-controls"><button class="button" type="button" data-revisions-open>从头读取历史</button><button class="button" type="button" data-revisions-next>下一页修订</button></div>
+</section>

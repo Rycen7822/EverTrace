@@ -2,6 +2,7 @@ mod content;
 mod diagnostics;
 pub use content::HumanContentChunk;
 mod export;
+mod history;
 mod presentation;
 mod reading;
 mod scopes;
@@ -1698,10 +1699,20 @@ impl HumanGovernanceService {
         )
         .await
         .map_err(|_| HumanGovernanceError::InvalidInput)?;
-        let semantic_view = SemanticCurrentView::from_snapshot(&snapshot)
+        let semantic_view = (request.relation != HumanRelationKind::ObjectRevisions)
+            .then(|| SemanticCurrentView::from_snapshot(&snapshot))
+            .transpose()
             .map_err(|_| HumanGovernanceError::Store)?;
         let refs = match request.relation {
-            HumanRelationKind::ObjectSources | HumanRelationKind::ObjectRevisions => {
+            HumanRelationKind::ObjectRevisions => {
+                if source.current_revision_id.as_deref()
+                    != Some(request.expected_source_revision_ref)
+                {
+                    return Ok(Err((snapshot.frontier, source.current_revision_id.clone())));
+                }
+                return Ok(Ok(history::page(&snapshot, source, request)?));
+            }
+            HumanRelationKind::ObjectSources => {
                 if source.current_revision_id.as_deref()
                     != Some(request.expected_source_revision_ref)
                 {
@@ -1713,25 +1724,14 @@ impl HumanGovernanceService {
                 ) {
                     return Err(HumanGovernanceError::InvalidInput);
                 }
-                if request.relation == HumanRelationKind::ObjectRevisions {
-                    snapshot
-                        .data_rows()
-                        .filter(|row| {
-                            row.object_id == source.object_id
-                                && row.object_kind == source.object_kind
-                        })
-                        .filter_map(|row| row.current_revision_id.clone())
-                        .collect()
-                } else {
-                    let payload: JournalPayload = serde_json::from_str(
-                        source
-                            .payload_json
-                            .as_deref()
-                            .ok_or(HumanGovernanceError::Store)?,
-                    )
-                    .map_err(|_| HumanGovernanceError::Store)?;
-                    export::dependencies_for(source, &payload)
-                }
+                let payload: JournalPayload = serde_json::from_str(
+                    source
+                        .payload_json
+                        .as_deref()
+                        .ok_or(HumanGovernanceError::Store)?,
+                )
+                .map_err(|_| HumanGovernanceError::Store)?;
+                export::dependencies_for(source, &payload)
             }
             HumanRelationKind::ProposalEvidence => {
                 let proposal_id = source
@@ -1740,6 +1740,8 @@ impl HumanGovernanceService {
                     .and_then(|value| value.parse::<RevisionProposalId>().ok())
                     .ok_or(HumanGovernanceError::InvalidInput)?;
                 let current = semantic_view
+                    .as_ref()
+                    .ok_or(HumanGovernanceError::Store)?
                     .proposals
                     .get(&proposal_id)
                     .ok_or(HumanGovernanceError::InvalidInput)?;
@@ -1804,7 +1806,7 @@ impl HumanGovernanceService {
                     summary(
                         &snapshot,
                         row,
-                        Some(&semantic_view),
+                        semantic_view.as_ref(),
                         usage_view.as_ref(),
                         None,
                         HumanSurface::Explorer,

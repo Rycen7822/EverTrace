@@ -1,5 +1,6 @@
 <section class="detail" data-content-state="{{ content.state }}">
 <h2>原修订分段读取</h2>
+<button class="button" type="button" data-detail-open>返回所选修订详情</button>
 {% if content.state == "ready" %}
 <p class="state">UTF-8 字节区间 [{{ content.range_start }}, {{ content.range_end }}) / {{ content.total_bytes }}；仅显示本段，不自动加载全文。</p>
 <div class="chunk-controls"><button class="button" type="button" data-content-nav="first"{% if content.range_start == 0 %} disabled{% endif %}>回到开头</button><button class="button" type="button" data-content-nav="previous"{% if not content.previous_cursor %} disabled{% endif %}>上一段</button><button class="button" type="button" data-content-nav="next"{% if not content.next_cursor %} disabled{% endif %}>下一段</button></div>

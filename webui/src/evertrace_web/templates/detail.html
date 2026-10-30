@@ -12,4 +12,5 @@
 <details><summary>完整语义结构与条件</summary><pre>{{ content|pretty }}</pre></details>
 {% endif %}
 {% if detail and detail.state in ('ready', 'too_large') %}<div class="chunk-controls">{% if item.object_kind == 'atom_revision' %}<button class="button" type="button" data-content-open="text">分段读取完整正文</button>{% endif %}<button class="button" type="button" data-content-open="semantic_json">分段读取完整语义结构</button></div>{% endif %}
+{% if item.object_kind in ('atom_revision', 'procedure_revision', 'core_membership', 'revision_proposal_revision', 'semantic_digest') %}<button class="button" type="button" data-revisions-open>查看此对象的修订历史</button>{% endif %}
 {% endif %}
