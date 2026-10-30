@@ -328,6 +328,7 @@ pub enum HumanObjectFamily {
 #[serde(rename_all = "snake_case")]
 pub enum HumanItemCategory {
     Proposal,
+    ProposalRevision,
     Support,
     NegativeReview,
     SegmentationCorrection,
@@ -2052,6 +2053,10 @@ fn category_matches(item: &HumanSnapshotItem) -> bool {
     match item.category {
         Category::Proposal => {
             item.item_kind == HumanItemKind::RevisionProposal
+                && item.object_kind == "revision_proposal_revision"
+        }
+        Category::ProposalRevision => {
+            item.item_kind == HumanItemKind::Generic
                 && item.object_kind == "revision_proposal_revision"
         }
         Category::Support => matches!(

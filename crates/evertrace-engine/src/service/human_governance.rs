@@ -203,6 +203,7 @@ pub enum HumanObjectFamily {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum HumanItemCategory {
     Proposal,
+    ProposalRevision,
     Support,
     NegativeReview,
     SegmentationCorrection,
@@ -4186,7 +4187,8 @@ fn inbox_page(
             .map_err(|_| HumanGovernanceError::Store)?;
             match payload {
                 JournalPayload::RevisionProposalRecorded(proposal) => {
-                    item.proposal = Some(proposal_summary(&proposal))
+                    item.category = HumanItemCategory::Proposal;
+                    item.proposal = Some(proposal_summary(&proposal));
                 }
                 JournalPayload::ProcedureNegativeReviewRecorded(review) => {
                     let facts = context
@@ -4247,6 +4249,7 @@ fn memories_page(
                     let JournalPayload::RevisionProposalRecorded(value) = payload else {
                         return Err(HumanGovernanceError::Store);
                     };
+                    result.category = HumanItemCategory::Proposal;
                     result.proposal = Some(proposal_summary(&value));
                 }
             }
@@ -5104,6 +5107,13 @@ fn summary(
         source_context: None,
         semantic_detail: None,
         proposal_base: None,
+        // Typed proposal summaries and metadata-only revisions have distinct
+        // wire categories; eligibility remains a separate domain decision.
+        category: if proposal.is_some() {
+            HumanItemCategory::Proposal
+        } else {
+            human_item_category(surface, row)
+        },
         evidence_detail,
         work_detail,
         proposal,
@@ -5847,7 +5857,7 @@ fn human_item_category(surface: HumanSurface, row: &ObjectRow) -> HumanItemCateg
     let kind = row.object_kind.as_deref().unwrap_or_default();
     match surface {
         HumanSurface::Inbox => match kind {
-            "revision_proposal_revision" => HumanItemCategory::Proposal,
+            "revision_proposal_revision" => HumanItemCategory::ProposalRevision,
             "global_support_contract" | "global_support_validation" => HumanItemCategory::Support,
             "procedure_negative_evidence" | "procedure_negative_review" => {
                 HumanItemCategory::NegativeReview
@@ -5877,7 +5887,7 @@ fn human_item_category(surface: HumanSurface, row: &ObjectRow) -> HumanItemCateg
                 HumanObjectFamily::Work => HumanItemCategory::Work,
                 HumanObjectFamily::Atom => HumanItemCategory::Semantic,
                 HumanObjectFamily::Procedure => HumanItemCategory::Procedure,
-                HumanObjectFamily::RevisionProposal => HumanItemCategory::Proposal,
+                HumanObjectFamily::RevisionProposal => HumanItemCategory::ProposalRevision,
                 HumanObjectFamily::Runtime => HumanItemCategory::Runtime,
                 HumanObjectFamily::Projection => HumanItemCategory::Projection,
             },

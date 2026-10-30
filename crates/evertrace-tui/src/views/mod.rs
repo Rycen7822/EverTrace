@@ -1803,6 +1803,7 @@ fn category_label(category: evertrace_protocol::dto::HumanItemCategory) -> &'sta
     use evertrace_protocol::dto::HumanItemCategory as Category;
     match category {
         Category::Proposal => "proposal",
+        Category::ProposalRevision => "proposal revision",
         Category::Support => "support/revalidation",
         Category::NegativeReview => "negative review",
         Category::SegmentationCorrection => "segmentation correction",
