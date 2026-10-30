@@ -64,7 +64,7 @@ cp -n docs/examples/evertrace.local.toml "$HOME/.evertrace/config.toml"
 
 ### Web 架构迁移
 
-网页正从 Rust 内嵌实现迁移为独立 Python 呈现/服务组件，领域后端和单 writer 仍归 Rust。Python、模板和静态资源修改不应要求 Cargo；只有显式 `--web` 才启动 Python。未启动时核心 CLI/TUI/MCP/daemon 不应加载 Web 资源或建立 worker、会话、轮询，Web 组件缺失也不影响核心运行。**切换和未启动内存验收尚未完成**，详见[架构边界](docs/architecture.md)；已验证的显式组件组装见[开发说明](docs/development.md#独立-web-工程迁移中--independent-web-component-migration)，打开 Web 不自动安装依赖。
+网页正从 Rust 内嵌实现迁移为独立 Python 呈现/服务组件，领域后端和单 writer 仍归 Rust。Python、模板和静态资源修改不应要求 Cargo；只有显式 `--web` 才启动 Python。未启动时核心 CLI/TUI/MCP/daemon 不应加载 Web 资源或建立 worker、会话、轮询，Web 组件缺失也不影响核心运行。当前基础只读竖切已验证 CLI/隔离装配、会话期限/多标签/真实隐藏/重连和短窗口三态回收；**完整功能与最终资源验收仍未完成**，详见[架构边界](docs/architecture.md)；已验证的显式组件组装见[开发说明](docs/development.md#独立-web-工程迁移中--independent-web-component-migration)，打开 Web 不自动安装依赖。
 
 不要以 root 身份运行安装命令。安装会修改受管宿主配置，并可能启用用户服务；它是单独的一步，不包含在上述命令中。
 

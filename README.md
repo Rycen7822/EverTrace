@@ -66,7 +66,7 @@ In a second terminal, run `./target/debug/evertrace --config "$HOME/.evertrace/c
 
 ### Web architecture migration
 
-Web is being separated from the embedded Rust implementation into an independent Python presentation/service component. Rust retains the business backend and single writer. Templates/static assets and Python Web edits must not require Cargo; only explicit `--web` starts Python. Without Web, core CLI/TUI/MCP/daemon must not preload Web resources or start its worker/sessions/pollers, and must work with the Web component absent. Cutover and inactive-memory acceptance are **not complete**; see [architecture](docs/architecture.md). See [development assembly](docs/development.md#独立-web-工程迁移中--independent-web-component-migration) for the verified explicit optional-component build; opening Web never installs dependencies.
+Web is being separated from the embedded Rust implementation into an independent Python presentation/service component. Rust retains the business backend and single writer. Templates/static assets and Python Web edits must not require Cargo; only explicit `--web` starts Python. Without Web, core CLI/TUI/MCP/daemon must not preload Web resources or start its worker/sessions/pollers, and must work with the Web component absent. The current basic read-only slice has CLI/isolated-assembly, shared-session/expiry/visibility/reconnect and short-window three-state reclamation evidence. **Full functionality and final resource acceptance remain incomplete**; see [architecture](docs/architecture.md). See [development assembly](docs/development.md#独立-web-工程迁移中--independent-web-component-migration) for the verified explicit optional-component build; opening Web never installs dependencies.
 
 ### Installation package
 

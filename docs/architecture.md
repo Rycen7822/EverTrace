@@ -52,9 +52,9 @@ Background models share the Engine's `SemanticProvider`: explicit Chat Completio
 
 The embedded Rust Web implementation and uncommitted G3 extensions have been rolled back. Product code retains the accepted flag-based CLI checkpoint, and now dispatches explicit `--web` to the matching isolated Python component. An independent Python package now has a basic read-only slice over the protected UDS, with verified CLI exec/assembly but unfinished complete migration; Rust retains business, configuration, authorization and the single writer. Templates/static assets and Python Web edits must not require Cargo. A target path, working backend interface or specification update is not a completed cutover.
 
-`--web` 仅按需启动版本匹配的 Python Web 组件，不自动安装依赖或启用服务。未启动时核心入口不导入 Web、不读页面/字体、不建立 Web worker/listener/session/timer/cache/poller；Web 组件缺失不影响普通 CLI、TUI、MCP、Hook 或 daemon。最小启动器和共享人类业务协议保留在 Rust，不等于加载 Web 运行时。迁移后仍须实测进程、PSS/RSS、CPU与退出回收；不能从文件大小推算内存收益。
+`--web` 仅按需启动版本匹配的 Python Web 组件，不自动安装依赖或启用服务。未启动时核心入口不导入 Web、不读页面/字体、不建立 Web worker/listener/session/timer/cache/poller；Web 组件缺失不影响普通 CLI、TUI、MCP、Hook 或 daemon。最小启动器和共享人类业务协议保留在 Rust，不等于加载 Web 运行时。当前基础只读竖切已有短窗口进程/PSS/RSS/CPU与退出回收证据，仍须随完整功能重做同量验收；不能从文件大小推算内存收益。
 
-Only explicit `--web` starts the version-matched Python component, without implicit installation or a service. With Web absent/inactive, core modes must not import/preload it or create Web resources. Minimal Rust launch dispatch and shared human protocol are not a Web runtime. Process/PSS/RSS/CPU and post-exit reclamation still require measurement.
+Only explicit `--web` starts the version-matched Python component, without implicit installation or a service. With Web absent/inactive, core modes must not import/preload it or create Web resources. Minimal Rust launch dispatch and shared human protocol are not a Web runtime. The basic read-only slice has short-window process/PSS/RSS/CPU/reclamation evidence; repeat full equal-work qualification as the remaining features are connected.
 
 ## 持久化与身份 / Persistence and identity
 
