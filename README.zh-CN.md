@@ -60,7 +60,7 @@ cp -n docs/examples/evertrace.local.toml "$HOME/.evertrace/config.toml"
 ./target/debug/evertrace --config "$HOME/.evertrace/config.toml" --daemon
 ```
 
-另开终端执行 `./target/debug/evertrace --config "$HOME/.evertrace/config.toml" --doctor` 或 `--tui`。旧 Rust Web 与其未提交扩展已回撤，当前构建**尚无可用的 `--web` 入口**。此前的记忆/来源/修订和筛选计数验收只属历史，不代表当前能力；独立 Python Web 将按新计划重建，原一次性链接、会话、只读与安全义务保留。核心工作流仍按[宿主接入和第一条记忆验证](docs/getting-started.md)操作。
+另开终端执行 `./target/debug/evertrace --config "$HOME/.evertrace/config.toml" --doctor` 或 `--tui`。旧 Rust Web 与其未提交扩展已回撤，当前构建**尚无可用的 `--web` 入口**。此前的记忆/来源/修订和筛选计数验收只属历史，不代表当前能力；独立 Python 包已验证记忆/详情/状态的基础只读竖切，正式 CLI 启动与生命周期验收仍待完成，原一次性链接、会话、只读与安全义务保留。核心工作流仍按[宿主接入和第一条记忆验证](docs/getting-started.md)操作。
 
 ### Web 架构迁移
 

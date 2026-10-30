@@ -1,0 +1,18 @@
+[project]
+name = "evertrace-web"
+version = "0.0.0"
+description = "On-demand local presentation client for the EverTrace daemon"
+requires-python = ">=3.12"
+dependencies = [
+  "starlette==1.3.1",
+  "uvicorn==0.51.0",
+  "jinja2==3.1.6",
+  "orjson==3.12.0",
+]
+
+[project.scripts]
+evertrace-web = "evertrace_web.__main__:main"
+
+[build-system]
+requires = ["uv_build>=0.9.28,<0.10.0"]
+build-backend = "uv_build"

@@ -48,9 +48,9 @@ Background models share the Engine's `SemanticProvider`: explicit Chat Completio
 
 ## Web 呈现边界（迁移中） / Web presentation boundary (migration)
 
-旧 `crates/evertrace-web/` 的 Rust HTTP/静态资源内嵌实现及未提交 G3 扩展已按用户确认回撤；当前产品代码保留 `cf4736a` 的正式 CLI，但尚无可运行的 `--web`。目标是独立 `webui/` Python 工程，经受保护 UDS 调用原 Rust daemon；页面控制、模板、会话和窄 IPC 适配归 Python，领域规则、配置权威、数据权限与唯一 writer 留在 Rust。HTML/CSS/字体和必要 JavaScript 独立维护，修改 Web 不要求 Cargo。不把规划路径、接口通过或规范更新当成迁移交付。
+旧 `crates/evertrace-web/` 的 Rust HTTP/静态资源内嵌实现及未提交 G3 扩展已按用户确认回撤；当前产品代码保留 `cf4736a` 的正式 CLI，但尚无可运行的 `--web`。独立 `webui/` Python 包已建立基础只读竖切（非正式 CLI 交付），经受保护 UDS 调用原 Rust daemon；页面控制、模板、会话和窄 IPC 适配归 Python，领域规则、配置权威、数据权限与唯一 writer 留在 Rust。HTML/CSS/字体和必要 JavaScript 独立维护，修改 Web 不要求 Cargo。不把规划路径、接口通过或规范更新当成迁移交付。
 
-The embedded Rust Web implementation and uncommitted G3 extensions have been rolled back. Product code retains the accepted flag-based CLI checkpoint, but `--web` is not implemented yet. The target is an independent Python presentation/service component over the protected UDS; Rust retains business, configuration, authorization and the single writer. Templates/static assets and Python Web edits must not require Cargo. A target path, working backend interface or specification update is not a completed cutover.
+The embedded Rust Web implementation and uncommitted G3 extensions have been rolled back. Product code retains the accepted flag-based CLI checkpoint, but `--web` is not implemented yet. An independent Python package now has a basic read-only slice over the protected UDS, not a completed formal CLI delivery; Rust retains business, configuration, authorization and the single writer. Templates/static assets and Python Web edits must not require Cargo. A target path, working backend interface or specification update is not a completed cutover.
 
 `--web` 将仅按需启动版本匹配的 Python Web 组件，不自动安装依赖或启用服务。未启动时核心入口不导入 Web、不读页面/字体、不建立 Web worker/listener/session/timer/cache/poller；Web 组件缺失不影响普通 CLI、TUI、MCP、Hook 或 daemon。最小启动器和共享人类业务协议保留在 Rust，不等于加载 Web 运行时。迁移后仍须实测进程、PSS/RSS、CPU与退出回收；不能从文件大小推算内存收益。
 

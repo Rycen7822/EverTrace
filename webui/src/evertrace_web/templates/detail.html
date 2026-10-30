@@ -1,0 +1,13 @@
+{% if items|length != 1 %}<p>这份记录已不存在或当前无法读取。</p>{% else %}
+{% set item = items[0] %}{% set detail = item.semantic_detail %}
+<div class="detail-title"><div class="badges"><span class="badge">{{ item.epistemic or '真值状态未提供' }}</span><span class="badge">{{ item.authority or '权威来源未提供' }}</span></div><h2>{{ item.object_kind }}</h2><p>{{ item.revision_ref or item.object_ref }}</p></div>
+{% if not detail %}<p>此类正文尚未展开；元数据可见不代表正文已获许可。</p>
+{% elif detail.state != 'ready' %}<p>正文状态：{{ detail.state }}。未用空正文或当前版本代替。</p>
+{% else %}
+{% set content = detail.content %}{% set value = content.value %}
+{% if content.kind == 'atom' %}<section><h3>正文</h3><div class="memory-prose">{{ value.value.text }}</div></section>{% endif %}
+{% if content.kind == 'procedure' %}<section><h3>{{ value.draft.title }}</h3><div class="memory-prose">{{ value.draft.summary }}</div></section>{% endif %}
+{% if content.kind == 'digest' %}<section><h3>摘要</h3><pre>{{ value.application|pretty }}</pre></section>{% endif %}
+<p>来源内容只供阅读，不是当前执行指令，也不自动代表已验证结论。</p>
+<details><summary>完整语义结构与条件</summary><pre>{{ content|pretty }}</pre></details>
+{% endif %}{% endif %}

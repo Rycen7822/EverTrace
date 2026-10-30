@@ -14,13 +14,13 @@ Read the deciding caller, implementation and consumer before editing behavior. S
 
 ## 独立 Web 工程（迁移中） / Independent Web component (migration)
 
-Web 目标工程为 `webui/`：Python 3.12+ 负责 HTTP/session、页面控制/模板与窄 UDS 适配，HTML/CSS/字体和必要 JavaScript 外置。Rust 核心保留领域、配置、协议和单 writer；Python 不直开数据库/CAS，不加载 Engine/Store FFI。旧 Rust Web 与 G3 未提交实现已回撤，保留已验收 CLI；独立 Python Web 尚未建立，不把规划路径或历史日志当成当前可运行包。
+独立 Web 工程为 `webui/`：Python 3.12+ 负责 HTTP/session、页面控制/模板与窄 UDS 适配，HTML/CSS/字体和必要 JavaScript 外置。Rust 核心保留领域、配置、协议和单 writer；Python 不直开数据库/CAS，不加载 Engine/Store FFI。旧 Rust Web 与 G3 未提交实现已回撤，保留已验收 CLI；Python 包已建立并以真实 daemon/浏览器验证基础记忆/详情/状态竖切；正式 `--web`、隔离组装及完整生命周期/资源验收仍未完成，不把历史 G3 日志当成当前能力。
 
-The target `webui/` component owns Python HTTP/session/presentation and a narrow UDS client, with separate templates/static assets. Rust retains business, config, protocol and writer authority; no Python database/CAS access or Engine/Store FFI. The Rust Web implementation and uncommitted G3 work have been rolled back; Python Web does not exist yet. Historical acceptance logs are not current capabilities.
+The independent `webui/` component owns Python HTTP/session/presentation and a narrow UDS client, with separate templates/static assets. Rust retains business, config, protocol and writer authority; no Python database/CAS access or Engine/Store FFI. The Rust Web implementation and uncommitted G3 work have been rolled back; the new package has a real daemon/browser-verified basic read-only slice. Formal CLI launch, isolated assembly and complete lifecycle/resource acceptance remain unfinished; historical G3 logs are not current capabilities.
 
-Web 修改不应要求 Cargo。精确 uv/entry/lock 命令在实际组件存在且通过验证后记录；仓库 Python/uv/pytest 都在 Conda `test` 中运行，产品不依赖 Conda。仅显式 `--web` 启动一个前台 worker，无 reload/watch/preload；普通 Rust 入口不探测/导入 Web。覆盖未启动、等量真实工作、退出回收的进程与 PSS/RSS/CPU，不按二进制大小猜内存。
+Web 修改不应要求 Cargo。开发态 wheel 已验证：`conda run -n test uv build --project webui --wheel --out-dir .work/ui/cli-webui-integration/pyweb-dist`；依赖由 `webui/uv.lock` 锁定并以 `uv export --locked` 供安装命令消费。这不是正式安装或启动说明；同包 entry/隔离组装仍待闭合。仓库 Python/uv/pytest 都在 Conda `test` 中运行，产品不依赖 Conda。仅显式 `--web` 启动一个前台 worker，无 reload/watch/preload；普通 Rust 入口不探测/导入 Web。覆盖未启动、等量真实工作、退出回收的进程与 PSS/RSS/CPU，不按二进制大小猜内存。
 
-Web edits must not require Cargo. Exact uv/entry/lock commands follow implementation verification; repository Python/uv/pytest use Conda `test`, not a product Conda requirement. Production starts one worker only on explicit `--web`, without reload/watch/preload; ordinary modes never probe/import Web. Measure processes/PSS/RSS/CPU before, during equal work and after exit.
+Web edits must not require Cargo. The development wheel build above is verified; `uv export --locked` consumes the dependency lock for installation. It is not a formal install/launch recipe: same-package entry assembly remains unfinished. Repository Python/uv/pytest use Conda `test`, not a product Conda requirement. Production starts one worker only on explicit `--web`, without reload/watch/preload; ordinary modes never probe/import Web. Measure processes/PSS/RSS/CPU before, during equal work and after exit.
 
 临时互通、浏览器与内存探针留在 `.work/`，不复制进永久 suite。迁移时保留原检查所保护的安全/恢复义务，不为临时探针保留旧 Web fallback；永久测试只保护已接受且值得长期维护的行为。
 

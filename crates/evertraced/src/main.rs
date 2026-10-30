@@ -1165,6 +1165,8 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
                                 }
                             }
                         };
+                        // Keep the shared human DTO contract authoritative for every client.
+                        if !response.validate() { return Err(ErrorCode::Internal); }
                         if mcp_bindings.take_inventory_wakeup() {
                             let next = (*session_import_wakeup.borrow()).wrapping_add(1);
                             session_import_wakeup.send_replace(next);
