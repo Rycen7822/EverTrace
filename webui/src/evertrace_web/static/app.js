@@ -3,14 +3,14 @@ let fragment = location.hash.slice(1);
 let bootstrap = /^bootstrap=[0-9a-f]{64}$/.test(fragment) ? fragment.slice(10) : null;
 fragment = null;
 let poller = null;
-const state = { csrf: null, active: false, route: 'memories', query: {selection: {kind: 'all'}, include_global: false, kind: 'all', order: 'recorded_newest', epistemic_status: null, authority: null, atom_lifecycle: null}, after: null, frontier: null, next: null, selected: null, content: null, revisions: null, links: null, comparison: null, compareBase: null, controller: null };
+const state = { csrf: null, active: false, route: 'memories', query: {selection: {kind: 'all'}, include_global: false, kind: 'all', order: 'recorded_newest', epistemic_status: null, authority: null, atom_lifecycle: null, time_range: null}, after: null, frontier: null, next: null, selected: null, content: null, revisions: null, links: null, comparison: null, compareBase: null, controller: null };
 const directory = {query: {parent: null, name: ''}, after: null, frontier: null, next: null, controller: null};
 history.replaceState(null, '', '#memories');
 const channel = new BroadcastChannel('evertrace-web-session');
-function clear() { $('memory-items').replaceChildren(); $('detail-body').replaceChildren(); $('detail-ref').textContent = ''; $('system-status').replaceChildren(); $('page-count').textContent = ''; $('next-page').disabled = true; }
+function clear() { $('time-applied').textContent = ''; $('memory-items').replaceChildren(); $('detail-body').replaceChildren(); $('detail-ref').textContent = ''; $('system-status').replaceChildren(); $('page-count').textContent = ''; $('next-page').disabled = true; }
 function cancel() { state.controller?.abort(); state.controller = null; }
 function notice(text) { $('notice').textContent = text; }
-function closed(text, broadcast = false) { cancel(); clear(); state.comparison = null; state.compareBase = null; state.links = null; clearInterval(poller); poller = null; state.csrf = null; state.active = false; state.query = {...state.query, selection: {kind: 'all'}, include_global: false}; updateScopeControls(); clearDirectory(); if ($('scope-dialog').open) $('scope-dialog').close(); state.selected = null; state.content = null; state.revisions = null; state.after = null; state.frontier = null; state.next = null; $('reader').hidden = true; $('system-panel').hidden = true; notice(text); if (broadcast) channel.postMessage('closed'); }
+function closed(text, broadcast = false) { cancel(); clear(); state.comparison = null; state.compareBase = null; state.links = null; clearInterval(poller); poller = null; state.csrf = null; state.active = false; state.query = {...state.query, selection: {kind: 'all'}, include_global: false, time_range: null}; $('time-from').value = ''; $('time-until').value = ''; $('time-from').setCustomValidity(''); $('time-until').setCustomValidity(''); $('time-basis').value = 'recorded'; updateScopeControls(); clearDirectory(); if ($('scope-dialog').open) $('scope-dialog').close(); state.selected = null; state.content = null; state.revisions = null; state.after = null; state.frontier = null; state.next = null; $('reader').hidden = true; $('system-panel').hidden = true; notice(text); if (broadcast) channel.postMessage('closed'); }
 channel.onmessage = () => closed('网页会话已结束；请重新运行 evertrace --web。');
 async function api(path, body, signal) {
   const headers = { 'X-EverTrace-Web': '1' };
@@ -180,6 +180,7 @@ async function refresh() {
     if (page.conflict) { state.after = null; state.frontier = null; state.next = null; state.selected = null; state.content = null; state.revisions = null; notice('分页水位已变化；请刷新读取当前列表。'); return; }
     state.frontier = page.frontier; state.next = page.next_cursor;
     fragmentInto($('memory-items'), page.html); $('memory-items').scrollTop = listScroll;
+    showTimeRange(page.query.time_range);
     $('page-count').textContent = !page.scope_available ? '范围不可用 · 计数未知' : '本页 ' + page.count + ' · ' + (page.counts_complete ? '' : '已判定范围 ≥ ') + '筛选 ' + page.matching_count + ' / 当前条目 ' + page.total_count;
     $('next-page').disabled = !page.next_cursor;
     notice(!page.scope_available ? '所选身份不存在、已移除或当前不可用，未改查全部范围。' : page.degraded ? '只读数据有降级；不是完整成功。' : '按录入顺序浏览所选关联范围；计数不是可读正文数，也不表示方法可执行。' + (page.unresolved_scope_count !== '0' ? ' 另有 ' + page.unresolved_scope_count + ' 条元数据归属尚未判定。' : '') + ' 搜索和网页修改尚未接入。');
@@ -284,9 +285,40 @@ function changeQuery() {
   cancel(); clear(); state.comparison = null; state.compareBase = null; state.after = null; state.frontier = null; state.selected = null; state.content = null; state.revisions = null; state.next = null;
   const atomAxes = ['all', 'facts_and_constraints'].includes($('reading-kind').value);
   for (const id of ['epistemic-filter', 'authority-filter', 'lifecycle-filter']) { $(id).disabled = !atomAxes; if (!atomAxes) $(id).value = ''; }
-  state.query = {selection: state.query.selection, include_global: $('include-global').checked, kind: $('reading-kind').value, order: $('browse-order').value, epistemic_status: $('epistemic-filter').value || null, authority: $('authority-filter').value || null, atom_lifecycle: $('lifecycle-filter').value || null};
+  state.query = {selection: state.query.selection, include_global: $('include-global').checked, kind: $('reading-kind').value, order: $('browse-order').value, epistemic_status: $('epistemic-filter').value || null, authority: $('authority-filter').value || null, atom_lifecycle: $('lifecycle-filter').value || null, time_range: state.query.time_range};
   refresh();
 }
+function displayTime(value) {
+  if (value === null) return '不限';
+  const us = BigInt(value); let ms = us / 1000n;
+  if (us < 0n && us % 1000n !== 0n) ms -= 1n;
+  if (ms < -8640000000000000n || ms > 8640000000000000n) return value + ' µs';
+  return new Date(Number(ms)).toLocaleString(undefined, {hour12: false}) + (us % 1000n ? ' (' + value + ' µs)' : '');
+}
+function showTimeRange(range) {
+  $('time-applied').textContent = range ? '已应用' + (range.basis === 'recorded' ? '原生录入时间' : '原生事件时间') + '：[' + displayTime(range.from_us) + '，' + displayTime(range.until_us) + ')；不是来源消息或生成时间。' : '未设时间窗；排序仍按原生录入顺序。';
+}
+function timeInput(id) {
+  const value = $(id).value;
+  if (!value) return null;
+  const ms = new Date(value).getTime();
+  if (!Number.isSafeInteger(ms)) throw new Error('invalid time');
+  const us = BigInt(ms) * 1000n;
+  if (us < -(2n ** 63n) || us >= 2n ** 63n) throw new Error('invalid time');
+  return us.toString();
+}
+for (const id of ['time-from', 'time-until']) $(id).oninput = () => { $('time-from').setCustomValidity(''); $('time-until').setCustomValidity(''); };
+$('time-filter').onsubmit = event => {
+  event.preventDefault();
+  try {
+    const from = timeInput('time-from'), until = timeInput('time-until');
+    if (from === null && until === null) { $('time-from').setCustomValidity('请至少填写一个时间边界。'); $('time-from').reportValidity(); return; }
+    if (from !== null && until !== null && BigInt(from) >= BigInt(until)) { $('time-until').setCustomValidity('终点必须晚于起点。'); $('time-until').reportValidity(); return; }
+    state.query.time_range = {basis: $('time-basis').value, from_us: from, until_us: until};
+    changeQuery();
+  } catch { $('time-from').setCustomValidity('无法无损转换这个时间，请重新填写。'); $('time-from').reportValidity(); }
+};
+$('time-clear').onclick = () => { $('time-from').value = ''; $('time-until').value = ''; $('time-from').setCustomValidity(''); $('time-until').setCustomValidity(''); state.query.time_range = null; changeQuery(); };
 for (const id of ['reading-kind', 'browse-order', 'epistemic-filter', 'authority-filter', 'lifecycle-filter']) $(id).onchange = changeQuery;
 $('refresh').onclick = refresh;
 $('first-page').onclick = () => { cancel(); clear(); state.after = null; state.frontier = null; state.selected = null; state.content = null; state.revisions = null; refresh(); };

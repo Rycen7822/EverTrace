@@ -41,6 +41,27 @@ def normalize_scope(value, boundary=False):
     return {"kind": kind, field: value[field]}
 
 
+def signed_microseconds(value):
+    if value is None:
+        return None
+    if isinstance(value, str):
+        digits = value[1:] if value.startswith("-") else value
+        if not digits or not digits.isascii() or not digits.isdecimal() or len(value) > 20:
+            raise BackendError("invalid_input")
+        value = int(value)
+    if type(value) is not int or not -(2**63) <= value < 2**63:
+        raise BackendError("invalid_input")
+    return value
+
+
+def normalize_time_range(value):
+    if value is None:
+        return None
+    if not isinstance(value, dict) or set(value) != {"basis", "from_us", "until_us"} or value["basis"] not in ("event", "recorded"):
+        raise BackendError("invalid_input")
+    return {"basis": value["basis"], "from_us": signed_microseconds(value["from_us"]), "until_us": signed_microseconds(value["until_us"])}
+
+
 MAX_FRAME = 1_048_576
 
 
@@ -121,12 +142,13 @@ class Backend:
         }
         if query is None:
             query = {}
-        if not isinstance(query, dict) or set(query) - (wire_values.keys() | {"selection", "include_global"}) or any(value not in wire_values[key] for key, value in query.items() if key in wire_values):
+        if not isinstance(query, dict) or set(query) - (wire_values.keys() | {"selection", "include_global", "time_range"}) or any(value not in wire_values[key] for key, value in query.items() if key in wire_values):
             raise BackendError("invalid_input")
         include_global = query.get("include_global", False)
         if type(include_global) is not bool:
             raise BackendError("invalid_input")
-        normalized = {"selection": normalize_scope(query.get("selection", {"kind": "all"})), "include_global": include_global, **{key: query.get(key, values[0]) for key, values in wire_values.items()}}
+        # Native canonical frames follow the declared field order, including null range.
+        normalized = {"selection": normalize_scope(query.get("selection", {"kind": "all"})), "include_global": include_global, **{key: query.get(key, values[0]) for key, values in wire_values.items()}, "time_range": normalize_time_range(query.get("time_range"))}
         return await self._request({"kind": "browse_memories", "query": normalized, "expected_frontier": expected_frontier, "after": after, "limit": 32})
 
     async def scopes(self, query=None, after=None, expected_frontier=None):

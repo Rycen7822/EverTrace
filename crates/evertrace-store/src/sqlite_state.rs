@@ -47,6 +47,9 @@ static NEXT_INCARNATION: AtomicU64 = AtomicU64::new(1);
 /// A cloneable physical-state handle. All SQLite writes execute through this
 /// one connection; readers use separate short-lived read-only connections.
 pub(crate) type SqliteHandle = Arc<Mutex<SqliteState>>;
+/// Point lookup of (occurred_at_us, ingested_at_us), owned by the physical
+/// journal reader and borrowed only for the validated memory request.
+pub(crate) type JournalTimeReader<'a> = dyn FnMut(u64) -> Result<(i64, i64), StoreError> + 'a;
 
 /// One real table carrying the existing `JournalRow` fields verbatim. `seq`
 /// is a fixed 8-byte big-endian BLOB so SQL ordering and ranges preserve the
@@ -509,6 +512,31 @@ impl SqliteState {
 
     pub(crate) fn rows(&self) -> Result<Vec<JournalRow>, StoreError> {
         self.with_connection(read_all_rows)
+    }
+
+    /// One prepared seq-primary-key reader for request-local memory filtering.
+    /// The caller stays within validated_current_read's pre/post stamp. Neither
+    /// event payloads nor a persistent/header cache are constructed here.
+    pub(crate) fn with_memory_journal_times<T>(
+        &self,
+        read: impl FnOnce(&mut JournalTimeReader<'_>) -> Result<T, StoreError>,
+    ) -> Result<T, StoreError> {
+        self.with_connection(|connection| {
+            let mut statement = connection
+                .prepare("SELECT occurred_at_us, ingested_at_us FROM journal_events WHERE seq=?1")
+                .map_err(|_| StoreError::StoreCorrupt)?;
+            let deadline = std::time::Instant::now() + Duration::from_secs(2);
+            read(&mut |seq| {
+                if std::time::Instant::now() >= deadline {
+                    return Err(StoreError::Projection);
+                }
+                statement
+                    .query_row(params![seq.to_be_bytes().as_slice()], |row| {
+                        Ok((row.get(0)?, row.get(1)?))
+                    })
+                    .map_err(|_| StoreError::StoreCorrupt)
+            })
+        })
     }
 
     pub(crate) fn committed_rows(

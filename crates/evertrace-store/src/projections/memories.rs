@@ -325,6 +325,7 @@ impl JournalAdmissionState {
         after: Option<&MemoryBrowseCursor>,
         limit: usize,
         has_failed_job: bool,
+        mut journal_times: Option<&mut crate::sqlite_state::JournalTimeReader<'_>>,
     ) -> Result<MemoryBrowseContext, StoreError> {
         query.validate().map_err(|_| StoreError::InvalidInput)?;
         if after.is_some_and(|cursor| cursor.validate_for(query).is_err())
@@ -447,6 +448,15 @@ impl JournalAdmissionState {
             total_count += 1;
             if !candidate.matches_query(query) {
                 continue;
+            }
+            if let Some(range) = &query.time_range {
+                let (occurred, ingested) =
+                    journal_times.as_mut().ok_or(StoreError::StoreCorrupt)?(
+                        candidate.source_event_seq(),
+                    )?;
+                if !range.contains(occurred, ingested) {
+                    continue;
+                }
             }
             matching_count += 1;
             let position = rank(candidate.source_event_seq(), candidate.row_id());

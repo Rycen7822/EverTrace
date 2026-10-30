@@ -669,6 +669,43 @@ pub enum MemoryBrowseOrder {
     RecordedOldest,
 }
 
+/// Time on the canonical native event, not a source message timestamp or
+/// the generated revision's created_at_us.
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum MemoryTimeBasis {
+    Event,
+    Recorded,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct MemoryTimeRange {
+    pub basis: MemoryTimeBasis,
+    pub from_us: Option<i64>,
+    pub until_us: Option<i64>,
+}
+
+impl MemoryTimeRange {
+    pub fn validate(&self) -> Result<(), QueryError> {
+        if (self.from_us.is_none() && self.until_us.is_none())
+            || matches!((self.from_us, self.until_us), (Some(from), Some(until)) if from >= until)
+        {
+            Err(QueryError::Invalid)
+        } else {
+            Ok(())
+        }
+    }
+    pub fn contains(&self, occurred_at_us: i64, ingested_at_us: i64) -> bool {
+        let value = match self.basis {
+            MemoryTimeBasis::Event => occurred_at_us,
+            MemoryTimeBasis::Recorded => ingested_at_us,
+        };
+        self.from_us.is_none_or(|from| value >= from)
+            && self.until_us.is_none_or(|until| value < until)
+    }
+}
+
 #[derive(Clone, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct MemoryBrowseQuery {
@@ -679,10 +716,15 @@ pub struct MemoryBrowseQuery {
     pub epistemic_status: Option<crate::semantic::EpistemicStatus>,
     pub authority: Option<crate::semantic::AtomAuthority>,
     pub atom_lifecycle: Option<crate::semantic::AtomLifecycleStatus>,
+    #[serde(default)]
+    pub time_range: Option<MemoryTimeRange>,
 }
 
 impl MemoryBrowseQuery {
     pub fn validate(&self) -> Result<(), QueryError> {
+        if let Some(range) = &self.time_range {
+            range.validate()?;
+        }
         if self.include_global && self.selection.boundary().is_none() {
             return Err(QueryError::Invalid);
         }

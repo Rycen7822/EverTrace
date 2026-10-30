@@ -275,6 +275,11 @@ kbd{font:inherit;font-size:11px;font-weight:500;line-height:1.4;color:var(--mute
 .memory-items{flex:1;min-height:0;padding:7px;overflow-y:auto}
 .browse-filters{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:6px;padding:0 12px 10px}
 .browse-filters select{width:100%;min-width:0;padding:5px 7px;border:1px solid var(--line);border-radius:6px;background:var(--surface,#fff);color:inherit;font:inherit;font-size:12px}
+.time-filter{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:6px;padding:0 12px 10px}
+.time-filter label{display:grid;min-width:0;gap:3px;font-size:11px;color:var(--muted)}
+.time-filter input,.time-filter select{width:100%;min-width:0;box-sizing:border-box;padding:4px;border:1px solid var(--line);border-radius:6px;background:var(--surface,#fff);color:var(--text);font:inherit;font-size:12px}
+.time-actions{display:flex;align-items:end;flex-wrap:wrap;gap:8px}
+.time-filter p{grid-column:1/-1;margin:0;font-size:11px;overflow-wrap:anywhere}
 .browser-list-head .tab-count{white-space:normal;overflow-wrap:anywhere}
 .memory-item{padding:15px 13px;width:100%;text-align:left;border:1px solid transparent;border-radius:6px;margin-bottom:3px;position:relative}
 .memory-item:hover{border-color:var(--line)}

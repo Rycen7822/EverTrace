@@ -1446,7 +1446,19 @@ impl JournalWriter {
         limit: usize,
     ) -> Result<crate::projections::MemoryBrowseContext, StoreError> {
         self.validated_current_read(|state, stamp| {
-            state.memory_browse_context(query, after, limit, stamp.has_failed_job)
+            if query.time_range.is_some() {
+                self.lock_sqlite()?.with_memory_journal_times(|times| {
+                    state.memory_browse_context(
+                        query,
+                        after,
+                        limit,
+                        stamp.has_failed_job,
+                        Some(times),
+                    )
+                })
+            } else {
+                state.memory_browse_context(query, after, limit, stamp.has_failed_job, None)
+            }
         })
         .await
     }
