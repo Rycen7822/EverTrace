@@ -34,9 +34,9 @@ conda run --no-capture-output -n test python -B webui/assemble.py \
 
 Initial optional assembly above requires matching native binaries and an explicit Python 3.12+ base. Use `--editable` for source development. Existing environments are not overwritten; this is not authorization to install/reconfigure a live user package. The base Python remains an explicit runtime prerequisite, not a Conda or self-contained/relocatable-Python claim. Runtime uses only the package's fixed isolated interpreter/managed entry, without shell, PATH search or dependency installation.
 
-当前资格范围：真实 CLI/wheel/editable 装配和浏览器读链、bootstrap/空闲/绝对期限（私有故障时钟，不是墙钟跑八小时）、多标签退出、真实私有 X11 隐藏暂停、daemon 断连清空和兼容重启恢复已验证。三态资源仅覆盖 35 条记录、6,668 字符详情与六秒采样窗口；分别计入 Rust、Python、浏览器，退出无 owned Web 进程/listener，不能推算旧实现收益或冒完整功能/长时负载验收。来源撤权及后续 G3–G7 仍需相应真实行为证明。
+当前资格范围：真实 CLI/wheel/editable 装配和浏览器读链、bootstrap/空闲/绝对期限（私有故障时钟，不是墙钟跑八小时）、多标签退出、真实私有 X11 隐藏暂停、daemon 断连清空和兼容重启恢复已验证。三态资源仅覆盖 35 条记录、6,668 字符详情与六秒采样窗口；分别计入 Rust、Python、浏览器，退出无 owned Web 进程/listener，不能推算旧实现收益或冒完整功能/长时负载验收。当前来源权限也已沿实际目录/捕获/导入/writer、原生 Hook、CLI 与浏览器验证：无当前观测先拒绝、获得观测后可读、撤权立即拒绝并清旧正文、显式恢复后同固定修订重新可读。后续 G3–G7 仍需相应真实行为证明。
 
-Qualification is scoped: current read-only fixtures and short resource windows, not an eight-hour soak, a Rust-versus-Python benchmark or complete feature acceptance. Source permission revocation and the remaining product workflows require their own real-consumer evidence.
+Qualification is scoped: current read-only fixtures and short resource windows, not an eight-hour soak, a Rust-versus-Python benchmark or complete feature acceptance. The current source-linked memory path also has native Hook/CLI/browser evidence for fail-closed absent observation, revocation and explicit restoration of the same immutable revision. Remaining product workflows still require their own real-consumer evidence.
 
 临时互通、浏览器与内存探针留在 `.work/`，不复制进永久 suite。迁移时保留原检查所保护的安全/恢复义务，不为临时探针保留旧 Web fallback；永久测试只保护已接受且值得长期维护的行为。
 
