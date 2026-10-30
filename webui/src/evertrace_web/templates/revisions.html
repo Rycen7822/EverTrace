@@ -1,5 +1,6 @@
 <section aria-label="修订历史">
   <h2>此对象的修订历史</h2>
+  <button class="button" type="button" data-nav-back hidden>返回上一条记录</button>
   <p class="muted">按录入顺序从新到旧。这里只列当前保留的修订元数据；正文逐版复验权限，不按状态或序号猜测哪一版是 current。</p>
   {% if status != 'ready' %}<p>读取有降级；此页不代表完整成功。</p>{% endif %}
   <button class="button" type="button" data-detail-open>返回所选修订正文</button>

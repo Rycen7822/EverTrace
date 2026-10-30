@@ -11,8 +11,8 @@ use std::{
 const MAX_SELECTIONS: usize = 64;
 const MAX_DEPENDENCIES: usize = 4096;
 const MAX_METADATA_BYTES: u64 = 64 * 1024 * 1024;
-const MAX_ENCODED_BYTES: u64 = 64 * 1024 * 1024;
-const MAX_DECODED_BYTES: u64 = 128 * 1024 * 1024;
+pub(super) const MAX_ENCODED_BYTES: u64 = 64 * 1024 * 1024;
+pub(super) const MAX_DECODED_BYTES: u64 = 128 * 1024 * 1024;
 const MAX_OUTPUT_BYTES: u64 = 160 * 1024 * 1024;
 const EXPORT_DEADLINE: Duration = Duration::from_secs(30);
 
@@ -957,6 +957,53 @@ impl Drop for Stage {
     }
 }
 
+pub(super) fn validate_source_archive(
+    receipt: &evertrace_domain::evidence::SourceReceipt,
+    observation: &evertrace_domain::evidence::SourceObservation,
+    bytes: &[u8],
+) -> ExportResult<()> {
+    if receipt.protected_length != bytes.len() as u64 {
+        return Err(Failure::Corrupt);
+    }
+    if receipt
+        .protected_presentation
+        .as_ref()
+        .is_some_and(|presentation| match presentation {
+            evertrace_domain::evidence::ProtectedPresentation::Inline { text } => {
+                text.as_bytes() != bytes
+            }
+            evertrace_domain::evidence::ProtectedPresentation::Preview { text } => {
+                !bytes.starts_with(text.as_bytes())
+            }
+            evertrace_domain::evidence::ProtectedPresentation::Unavailable { .. } => false,
+        })
+    {
+        return Err(Failure::Corrupt);
+    }
+    let secret = receipt
+        .protected_secret_digest
+        .as_deref()
+        .map(parse_hex)
+        .transpose()?;
+    if observation.source_observation_id != receipt.source_observation_id
+        || observation.source_receipt_ref != receipt.source_receipt_id
+        || observation.payload_fingerprint
+            != hex(
+                &payload_fingerprint(receipt.canonicalization_revision, bytes, secret)
+                    .map_err(|_| Failure::Corrupt)?,
+            )
+        || (receipt.archive_mode == SourceArchiveMode::Redacted
+            && bytes
+                .windows(b"[REDACTED]".len())
+                .filter(|span| *span == b"[REDACTED]")
+                .count()
+                < receipt.redaction_spans.len())
+    {
+        return Err(Failure::Corrupt);
+    }
+    Ok(())
+}
+
 fn stage(
     data: &Path,
     cas: &Path,
@@ -1026,22 +1073,6 @@ fn stage(
             decoded_remaining = decoded_remaining
                 .checked_sub(bytes.len() as u64)
                 .ok_or(Failure::Limit)?;
-            if receipt.protected_length != bytes.len() as u64 {
-                return Err(Failure::Corrupt);
-            }
-            if receipt.protected_presentation.as_ref().is_some_and(
-                |presentation| match presentation {
-                    evertrace_domain::evidence::ProtectedPresentation::Inline { text } => {
-                        text.as_bytes() != bytes
-                    }
-                    evertrace_domain::evidence::ProtectedPresentation::Preview { text } => {
-                        !bytes.starts_with(text.as_bytes())
-                    }
-                    evertrace_domain::evidence::ProtectedPresentation::Unavailable { .. } => false,
-                },
-            ) {
-                return Err(Failure::Corrupt);
-            }
             let other = snapshot
                 .row(&format!(
                     "object:evidence:source_observation:{}",
@@ -1051,26 +1082,7 @@ fn stage(
             let JournalPayload::SourceObservationRecorded(observation) = decode(other)? else {
                 return Err(Failure::Corrupt);
             };
-            let secret = receipt
-                .protected_secret_digest
-                .as_deref()
-                .map(parse_hex)
-                .transpose()?;
-            if observation.source_receipt_ref != receipt.source_receipt_id
-                || observation.payload_fingerprint
-                    != hex(
-                        &payload_fingerprint(receipt.canonicalization_revision, &bytes, secret)
-                            .map_err(|_| Failure::Corrupt)?,
-                    )
-                || (receipt.archive_mode == SourceArchiveMode::Redacted
-                    && bytes
-                        .windows(b"[REDACTED]".len())
-                        .filter(|span| *span == b"[REDACTED]")
-                        .count()
-                        < receipt.redaction_spans.len())
-            {
-                return Err(Failure::Corrupt);
-            }
+            validate_source_archive(&receipt, &observation, &bytes)?;
             match std::str::from_utf8(&bytes) {
                 Ok(text)
                     if !text

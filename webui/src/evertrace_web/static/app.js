@@ -3,14 +3,14 @@ let fragment = location.hash.slice(1);
 let bootstrap = /^bootstrap=[0-9a-f]{64}$/.test(fragment) ? fragment.slice(10) : null;
 fragment = null;
 let poller = null;
-const state = { csrf: null, active: false, route: 'memories', query: {selection: {kind: 'all'}, include_global: false, kind: 'all', order: 'recorded_newest', epistemic_status: null, authority: null, atom_lifecycle: null}, after: null, frontier: null, next: null, selected: null, content: null, revisions: null, controller: null };
+const state = { csrf: null, active: false, route: 'memories', query: {selection: {kind: 'all'}, include_global: false, kind: 'all', order: 'recorded_newest', epistemic_status: null, authority: null, atom_lifecycle: null}, after: null, frontier: null, next: null, selected: null, content: null, revisions: null, links: null, controller: null };
 const directory = {query: {parent: null, name: ''}, after: null, frontier: null, next: null, controller: null};
 history.replaceState(null, '', '#memories');
 const channel = new BroadcastChannel('evertrace-web-session');
 function clear() { $('memory-items').replaceChildren(); $('detail-body').replaceChildren(); $('detail-ref').textContent = ''; $('system-status').replaceChildren(); $('page-count').textContent = ''; $('next-page').disabled = true; }
 function cancel() { state.controller?.abort(); state.controller = null; }
 function notice(text) { $('notice').textContent = text; }
-function closed(text, broadcast = false) { cancel(); clear(); clearInterval(poller); poller = null; state.csrf = null; state.active = false; state.query = {...state.query, selection: {kind: 'all'}, include_global: false}; updateScopeControls(); clearDirectory(); if ($('scope-dialog').open) $('scope-dialog').close(); state.selected = null; state.content = null; state.revisions = null; state.after = null; state.frontier = null; state.next = null; $('reader').hidden = true; $('system-panel').hidden = true; notice(text); if (broadcast) channel.postMessage('closed'); }
+function closed(text, broadcast = false) { cancel(); clear(); state.links = null; clearInterval(poller); poller = null; state.csrf = null; state.active = false; state.query = {...state.query, selection: {kind: 'all'}, include_global: false}; updateScopeControls(); clearDirectory(); if ($('scope-dialog').open) $('scope-dialog').close(); state.selected = null; state.content = null; state.revisions = null; state.after = null; state.frontier = null; state.next = null; $('reader').hidden = true; $('system-panel').hidden = true; notice(text); if (broadcast) channel.postMessage('closed'); }
 channel.onmessage = () => closed('网页会话已结束；请重新运行 evertrace --web。');
 async function api(path, body, signal) {
   const headers = { 'X-EverTrace-Web': '1' };
@@ -23,20 +23,55 @@ async function api(path, body, signal) {
   return response.json();
 }
 function fragmentInto(target, html) { const template = document.createElement('template'); template.innerHTML = html; target.replaceChildren(template.content); }
+function navigationControls() { for (const button of $('detail-body').querySelectorAll('[data-nav-back]')) button.hidden = !state.selected?.path?.length; }
 async function detail(item, frontier, controller, scroll = 0) {
   const result = await api('read', { kind: 'detail', reference: item.key, frontier, revision: item.revision || null }, controller.signal);
   if (state.controller !== controller || document.hidden) return;
   if (result.conflict) { $('detail-body').textContent = '记录已变化，请重新选择；没有改用当前版本。'; return; }
-  fragmentInto($('detail-body'), result.html); $('detail-ref').textContent = item.revision || item.key; $('detail-body').scrollTop = scroll;
+  fragmentInto($('detail-body'), result.html);
+  const source = $('detail-body').querySelector('.source-presentation'); if (source) source.textContent = result.source_preview || '';
+  navigationControls(); $('detail-ref').textContent = item.revision || item.key; $('detail-body').scrollTop = scroll;
+}
+async function readSources(item, after, frontier, controller, scroll = 0) {
+  const result = await api('read', {kind: 'sources', reference: item.key, revision: item.revision, frontier, after}, controller.signal);
+  if (state.controller !== controller || document.hidden) return;
+  if (result.conflict) {
+    state.links = {after: null, frontier: null, next: null}; $('detail-ref').textContent = '';
+    fragmentInto($('detail-body'), '<p>关联水位有更新；没有拼接旧页。</p><button class="button" type="button" data-sources-open>从头读取关联</button><button class="button" type="button" data-nav-back hidden>返回上一条记录</button>'); navigationControls(); return;
+  }
+  fragmentInto($('detail-body'), result.html); navigationControls(); $('detail-ref').textContent = item.revision; $('detail-body').scrollTop = scroll;
+  state.links = {after, frontier: result.frontier, next: result.next_cursor};
+  $('detail-body').querySelector('[data-sources-next]').disabled = !result.next_cursor;
+}
+async function openSources(after = null) {
+  const item = state.selected; if (!item?.revision || !state.active || document.hidden) return;
+  const frontier = after ? state.links?.frontier : state.frontier;
+  if (frontier === null || frontier === undefined) return;
+  cancel(); const controller = new AbortController(); state.controller = controller;
+  state.content = null; state.revisions = null; state.links = {after, frontier, next: null}; $('detail-body').replaceChildren(); $('detail-ref').textContent = '';
+  try { await readSources(item, after, frontier, controller); }
+  catch { if (state.controller === controller && !controller.signal.aborted) { clear(); notice('来源关联暂不可读取，旧内容已清除。'); } }
+  finally { if (state.controller === controller) state.controller = null; }
+}
+function followSource(button) {
+  const current = state.selected; if (!current) return;
+  const path = current.path || [];
+  if (path.length >= 16) { notice('关联路径已到上限，请先返回上一条记录。'); return; }
+  const parent = {item: {key: current.key, revision: current.revision, object: current.object, kind: current.kind}, scroll: $('detail-body').scrollTop, links: state.links ? {after: state.links.after, frontier: state.links.frontier} : null};
+  select({key: button.dataset.linkKey, revision: button.dataset.revision, object: button.dataset.object, kind: button.dataset.kind, path: [...path, parent]});
+}
+function returnSource() {
+  const path = state.selected?.path || []; const previous = path.at(-1); if (!previous) return;
+  select({...previous.item, path: path.slice(0, -1)}, previous);
 }
 async function readRevisions(item, after, frontier, controller, scroll = 0) {
   const result = await api('read', {kind: 'revisions', reference: item.key, revision: item.revision, frontier, after}, controller.signal);
   if (state.controller !== controller || document.hidden) return;
   if (result.conflict) {
     state.revisions = {after: null, frontier: null, next: null}; $('detail-ref').textContent = '';
-    fragmentInto($('detail-body'), '<p>历史水位有更新；没有拼接两次结果。</p><button class="button" type="button" data-revisions-open>从头读取历史</button>'); return;
+    fragmentInto($('detail-body'), '<p>历史水位有更新；没有拼接两次结果。</p><button class="button" type="button" data-revisions-open>从头读取历史</button><button class="button" type="button" data-nav-back hidden>返回上一条记录</button>'); navigationControls(); return;
   }
-  fragmentInto($('detail-body'), result.html); $('detail-ref').textContent = item.revision;
+  fragmentInto($('detail-body'), result.html); navigationControls(); $('detail-ref').textContent = item.revision;
   $('detail-body').scrollTop = scroll;
   state.revisions = {after, frontier: result.frontier, next: result.next_cursor};
   $('detail-body').querySelector('[data-revisions-next]').disabled = !result.next_cursor;
@@ -46,7 +81,7 @@ async function openRevisions(after = null) {
   const frontier = after ? state.revisions?.frontier : state.frontier;
   if (frontier === null || frontier === undefined) return;
   cancel(); const controller = new AbortController(); state.controller = controller;
-  state.content = null; state.revisions = {after, frontier, next: null}; $('detail-body').replaceChildren(); $('detail-ref').textContent = '';
+  state.links = null; state.content = null; state.revisions = {after, frontier, next: null}; $('detail-body').replaceChildren(); $('detail-ref').textContent = '';
   try { await readRevisions(item, after, frontier, controller); }
   catch { if (state.controller === controller && !controller.signal.aborted) { clear(); notice('历史暂时不可读取，旧内容已清除。'); } }
   finally { if (state.controller === controller) state.controller = null; }
@@ -54,8 +89,8 @@ async function openRevisions(after = null) {
 async function readContent(item, representation, after, controller, scroll = 0) {
   const result = await api('read', {kind: 'content', reference: item.key, revision: item.revision, frontier: state.frontier, representation, after}, controller.signal);
   if (state.controller !== controller || document.hidden) return;
-  if (result.conflict) { state.content = null; $('detail-ref').textContent = ''; $('detail-body').textContent = '读取水位不可用；没有换用当前修订。'; return; }
-  fragmentInto($('detail-body'), result.html);
+  if (result.conflict) { state.content = null; $('detail-ref').textContent = ''; fragmentInto($('detail-body'), '<p>读取水位不可用；没有换用当前修订。</p><button class="button" type="button" data-nav-back hidden>返回上一条记录</button>'); navigationControls(); return; }
+  fragmentInto($('detail-body'), result.html); navigationControls();
   const body = $('detail-body').querySelector('.chunk-text'); if (body) body.textContent = result.text;
   $('detail-body').scrollTop = scroll;
   // Retain only the requested identity/cursor for fresh authorization checks;
@@ -66,15 +101,18 @@ async function readContent(item, representation, after, controller, scroll = 0) 
 async function openContent(representation, after = null) {
   const item = state.selected; if (!item?.revision || !state.active || document.hidden) return;
   cancel(); const controller = new AbortController(); state.controller = controller;
-  state.revisions = null; state.content = {representation, after}; $('detail-body').replaceChildren(); $('detail-ref').textContent = '';
+  state.links = null; state.revisions = null; state.content = {representation, after}; $('detail-body').replaceChildren(); $('detail-ref').textContent = '';
   try { await readContent(item, representation, after, controller); }
   catch { if (state.controller === controller && !controller.signal.aborted) { clear(); state.content = null; notice('分段读取失败，旧正文和区间已清除。'); } }
   finally { if (state.controller === controller) state.controller = null; }
 }
-async function select(item) {
-  state.content = null; state.revisions = null;
+async function select(item, restore = null) {
+  state.content = null; state.revisions = null; state.links = restore?.links || null;
   cancel(); const controller = new AbortController(); state.controller = controller; state.selected = item; $('detail-ref').textContent = ''; $('detail-body').textContent = '正在读取…';
-  try { await detail(item, state.frontier, controller); } catch { if (state.controller === controller && !controller.signal.aborted) { clear(); notice('读取失败，旧内容已清除。'); } }
+  try {
+    if (restore?.links) await readSources(item, restore.links.after, restore.links.after ? restore.links.frontier : state.frontier, controller, restore.scroll);
+    else await detail(item, state.frontier, controller, restore?.scroll || 0);
+  } catch { if (state.controller === controller && !controller.signal.aborted) { clear(); notice('读取失败，旧内容已清除。'); } }
   finally { if (state.controller === controller) state.controller = null; }
 }
 async function refresh() {
@@ -98,16 +136,18 @@ async function refresh() {
     $('page-count').textContent = !page.scope_available ? '范围不可用 · 计数未知' : '本页 ' + page.count + ' · ' + (page.counts_complete ? '' : '已判定范围 ≥ ') + '筛选 ' + page.matching_count + ' / 当前条目 ' + page.total_count;
     $('next-page').disabled = !page.next_cursor;
     notice(!page.scope_available ? '所选身份不存在、已移除或当前不可用，未改查全部范围。' : page.degraded ? '只读数据有降级；不是完整成功。' : '按录入顺序浏览所选关联范围；计数不是可读正文数，也不表示方法可执行。' + (page.unresolved_scope_count !== '0' ? ' 另有 ' + page.unresolved_scope_count + ' 条元数据归属尚未判定。' : '') + ' 搜索和网页修改尚未接入。');
-    if (state.selected && [...$('memory-items').children].some(row => row.dataset.object === state.selected.object && row.dataset.kind === state.selected.kind)) {
-      if (state.revisions) await readRevisions(state.selected, state.revisions.after, state.revisions.after ? state.revisions.frontier : page.frontier, controller, detailScroll);
+    const anchor = state.selected?.path?.[0]?.item || state.selected;
+    if (anchor && [...$('memory-items').children].some(row => row.dataset.object === anchor.object && row.dataset.kind === anchor.kind)) {
+      if (state.links) await readSources(state.selected, state.links.after, state.links.after ? state.links.frontier : page.frontier, controller, detailScroll);
+      else if (state.revisions) await readRevisions(state.selected, state.revisions.after, state.revisions.after ? state.revisions.frontier : page.frontier, controller, detailScroll);
       else if (state.content) await readContent(state.selected, state.content.representation, state.content.after, controller, detailScroll);
       else await detail(state.selected, page.frontier, controller, detailScroll);
-    } else { state.selected = null; state.content = null; state.revisions = null; $('detail-body').textContent = '选择一条记忆查看正文。'; }
+    } else { state.selected = null; state.content = null; state.revisions = null; state.links = null; $('detail-body').textContent = '选择一条记忆查看正文。'; }
   } catch { if (state.controller === controller && !controller.signal.aborted) { clear(); $('connection-status').textContent = '读取不可用'; notice('daemon 或读取暂不可用，旧内容已清除。'); } }
   finally { if (state.controller === controller) state.controller = null; }
 }
 function route(name) {
-  cancel(); clear(); state.route = name; state.after = null; state.frontier = null; state.selected = null; state.content = null; state.revisions = null;
+  cancel(); clear(); state.links = null; state.route = name; state.after = null; state.frontier = null; state.selected = null; state.content = null; state.revisions = null;
   history.replaceState(null, '', '#' + name);
   for (const button of document.querySelectorAll('[data-route]')) button.classList.toggle('active', button.dataset.route === name);
   $('reader').hidden = !state.active || name !== 'memories'; $('system-panel').hidden = !state.active || name !== 'system';
@@ -118,9 +158,13 @@ function route(name) {
   refresh();
 }
 $('detail-body').onclick = event => {
-  const button = event.target.closest('[data-content-open], [data-content-nav], [data-revisions-open], [data-revisions-next], [data-detail-open], [data-revision-key]');
+  const button = event.target.closest('[data-content-open], [data-content-nav], [data-revisions-open], [data-revisions-next], [data-detail-open], [data-revision-key], [data-sources-open], [data-sources-next], [data-link-key], [data-nav-back]');
   if (!button || button.disabled) return;
-  if (button.hasAttribute('data-revisions-open')) openRevisions();
+  if (button.hasAttribute('data-sources-open')) openSources();
+  else if (button.hasAttribute('data-sources-next')) { if (state.links?.next) openSources(state.links.next); }
+  else if (button.hasAttribute('data-nav-back')) returnSource();
+  else if (button.dataset.linkKey) followSource(button);
+  else if (button.hasAttribute('data-revisions-open')) openRevisions();
   else if (button.hasAttribute('data-revisions-next')) { if (state.revisions?.next) openRevisions(state.revisions.next); }
   else if (button.hasAttribute('data-detail-open')) select(state.selected);
   else if (button.dataset.revisionKey) select({...state.selected, key: button.dataset.revisionKey, revision: button.dataset.revision});

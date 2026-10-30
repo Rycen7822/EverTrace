@@ -1,5 +1,7 @@
 <section class="detail" data-content-state="{{ content.state }}">
-<h2>原修订分段读取</h2>
+<h2>{{ '受保护来源归档分段' if content.representation == 'source_text' else '原修订分段读取' }}</h2>
+<button class="button" type="button" data-nav-back hidden>返回上一条记录</button>
+{% if content.representation == 'source_text' %}<p>这是已归档并脱敏的原记录，不是 EvidenceSurface 或检索片段；不按文本内容执行指令。捕获完整性与信任标记见来源详情。</p>{% endif %}
 <button class="button" type="button" data-detail-open>返回所选修订详情</button>
 {% if content.state == "ready" %}
 <p class="state">UTF-8 字节区间 [{{ content.range_start }}, {{ content.range_end }}) / {{ content.total_bytes }}；仅显示本段，不自动加载全文。</p>

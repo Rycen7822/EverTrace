@@ -1,7 +1,8 @@
+<button class="button" type="button" data-nav-back hidden>返回上一条记录</button>
 {% if items|length != 1 %}<p>这份记录已不存在或当前无法读取。</p>{% else %}
-{% set item = items[0] %}{% set detail = item.semantic_detail %}
+{% set item = items[0] %}{% set detail = item.get('semantic_detail') %}{% set evidence = item.get('evidence_detail') %}{% set source_context = item.get('source_context') %}
 <div class="detail-title"><div class="badges"><span class="badge">{{ item.epistemic or '真值状态未提供' }}</span><span class="badge">{{ item.authority or '权威来源未提供' }}</span></div><h2>{{ item.object_kind }}</h2><p>{{ item.revision_ref or item.object_ref }}</p></div>
-{% if not detail %}<p>此类正文尚未展开；元数据可见不代表正文已获许可。</p>{% if item.object_kind == 'revision_proposal_revision' %}<button class="button" type="button" data-content-open="semantic_json">按当前权限读取完整提案结构</button>{% endif %}
+{% if not detail %}{% if item.object_kind not in ('source_receipt','source_observation') %}<p>此类正文尚未展开；元数据可见不代表正文已获许可。</p>{% endif %}{% if item.object_kind == 'revision_proposal_revision' %}<button class="button" type="button" data-content-open="semantic_json">按当前权限读取完整提案结构</button>{% endif %}
 {% elif detail.state != 'ready' %}<p>正文状态：{{ detail.state }}。{% if detail.state == 'too_large' %}语义结构共 {{ detail.original_bytes }} 字节，可按下方按钮分段读取。{% else %}未用空正文或当前版本代替。{% endif %}</p>
 {% else %}
 {% set content = detail.content %}{% set value = content.value %}
@@ -12,5 +13,16 @@
 <details><summary>完整语义结构与条件</summary><pre>{{ content|pretty }}</pre></details>
 {% endif %}
 {% if detail and detail.state in ('ready', 'too_large') %}<div class="chunk-controls">{% if item.object_kind == 'atom_revision' %}<button class="button" type="button" data-content-open="text">分段读取完整正文</button>{% endif %}<button class="button" type="button" data-content-open="semantic_json">分段读取完整语义结构</button></div>{% endif %}
+{% if evidence %}
+<section class="source-reading"><h2>受保护来源记录</h2>
+<p>来源：{{ evidence.source_kind }} · 角色：{{ evidence.source_role }} · 信任：{{ evidence.content_trust }} · 观察：{{ evidence.observation_role }}</p>
+<p>捕获完整性：{{ evidence.capture_completeness }} · 归档保护后长度：{{ evidence.protected_length }} 字节。来源文本 instruction_authority=none，不视为操作指令。</p>
+{% if source_context %}<p>目录：{{ source_context.directory or '未提供' }} · 会话：{{ source_context.session }}</p><p>来源事件时间（微秒）：{{ source_context.event_time_us }} · 记录时间（微秒）：{{ source_context.recorded_at_us }}</p>{% endif %}
+{% set presentation = evidence.protected_presentation %}
+{% if presentation and presentation.kind in ('inline','preview') %}<p>{{ '完整受保护文本呈现' if presentation.kind == 'inline' else '有界预览；不是完整归档' }}</p><pre class="memory-prose source-presentation"></pre>{% elif presentation %}<p>没有可读文本呈现（{{ presentation.kind }}）；不补空正文。</p>{% else %}<p>此记录没有保存文本呈现字段；不将缺字段视为空正文。</p>{% endif %}
+<button class="button" type="button" data-content-open="source_text">分段读取受保护归档</button>
+</section>
+{% elif item.object_kind in ('source_receipt','source_observation') %}<p>来源正文当前不可读或缺失。没有返回旧预览、目录提示或归档字节。</p>{% endif %}
+{% if item.object_kind in ('atom_revision', 'procedure_revision', 'core_membership', 'revision_proposal_revision', 'semantic_digest','source_receipt','source_observation') %}<button class="button" type="button" data-sources-open>查看来源与直接关联</button>{% endif %}
 {% if item.object_kind in ('atom_revision', 'procedure_revision', 'core_membership', 'revision_proposal_revision', 'semantic_digest') %}<button class="button" type="button" data-revisions-open>查看此对象的修订历史</button>{% endif %}
 {% endif %}

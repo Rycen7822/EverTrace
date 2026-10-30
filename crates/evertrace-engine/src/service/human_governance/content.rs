@@ -6,7 +6,7 @@ use evertrace_domain::query::{
 use evertrace_store::JournalPayload;
 
 use super::{
-    HumanContentState, HumanGovernanceError, HumanGovernanceService, HumanSemanticContent,
+    HumanContentState, HumanGovernanceError, HumanGovernanceService, HumanSemanticContent, export,
     presentation,
 };
 
@@ -26,6 +26,95 @@ pub struct HumanContentChunk {
 }
 
 impl HumanGovernanceService {
+    async fn source_text(
+        &self,
+        snapshot: &evertrace_store::projections::ProjectionSnapshot,
+        row: &evertrace_store::objects::ObjectRow,
+    ) -> Result<String, HumanContentState> {
+        use evertrace_domain::evidence::ProtectedPresentation;
+        let decode = |row: &evertrace_store::objects::ObjectRow| {
+            let payload: JournalPayload = serde_json::from_str(
+                row.payload_json
+                    .as_deref()
+                    .ok_or(HumanContentState::Unavailable)?,
+            )
+            .map_err(|_| HumanContentState::Unavailable)?;
+            payload
+                .validate()
+                .map_err(|_| HumanContentState::Unavailable)?;
+            Ok::<_, HumanContentState>(payload)
+        };
+        // Keep the selected exact observation, rather than replacing it with
+        // another observation reached through a possibly inconsistent receipt.
+        let (receipt, observation) = match decode(row)? {
+            JournalPayload::SourceReceiptRecorded(value) => {
+                let observation = snapshot
+                    .row(&format!(
+                        "object:evidence:source_observation:{}",
+                        value.source_observation_id
+                    ))
+                    .ok_or(HumanContentState::Unavailable)?;
+                let JournalPayload::SourceObservationRecorded(observation) = decode(observation)?
+                else {
+                    return Err(HumanContentState::Unavailable);
+                };
+                (value, observation)
+            }
+            JournalPayload::SourceObservationRecorded(value) => {
+                let receipt = snapshot
+                    .row(&format!(
+                        "object:evidence:source_receipt:{}",
+                        value.source_receipt_ref
+                    ))
+                    .ok_or(HumanContentState::Unavailable)?;
+                let JournalPayload::SourceReceiptRecorded(receipt) = decode(receipt)? else {
+                    return Err(HumanContentState::Unavailable);
+                };
+                (receipt, value)
+            }
+            _ => return Err(HumanContentState::Unsupported),
+        };
+        if matches!(
+            receipt.protected_presentation,
+            Some(ProtectedPresentation::Unavailable { .. })
+        ) {
+            return Err(HumanContentState::Unsupported);
+        }
+        let cas_dir = self
+            .runtime_snapshot
+            .as_ref()
+            .ok_or(HumanContentState::Unavailable)?
+            .cas_dir
+            .clone();
+        let deadline = std::time::Instant::now() + presentation::READ_DEADLINE;
+        // The existing native envelope reader verifies the entire archive. The
+        // bounded reply does not claim streaming decode/constant-RSS CAS access.
+        tokio::task::spawn_blocking(move || {
+            export::check_deadline(deadline).map_err(|_| HumanContentState::Unavailable)?;
+            let cas = evertrace_capture::CasStore::open_existing(cas_dir)
+                .map_err(|_| HumanContentState::Unavailable)?;
+            let digest = evertrace_capture::CasStore::parse_digest(&receipt.cas_ref)
+                .map_err(|_| HumanContentState::Unavailable)?;
+            let (bytes, _) = cas
+                .read_bounded(
+                    &digest,
+                    export::MAX_ENCODED_BYTES,
+                    export::MAX_DECODED_BYTES,
+                )
+                .map_err(|_| HumanContentState::Unavailable)?;
+            export::validate_source_archive(&receipt, &observation, &bytes)
+                .map_err(|_| HumanContentState::Unavailable)?;
+            export::check_deadline(deadline).map_err(|_| HumanContentState::Unavailable)?;
+            let text = String::from_utf8(bytes).map_err(|_| HumanContentState::Unsupported)?;
+            if text.contains('\0') {
+                return Err(HumanContentState::Unsupported);
+            }
+            Ok(text)
+        })
+        .await
+        .map_err(|_| HumanContentState::Unavailable)?
+    }
+
     pub async fn content(
         &self,
         object_ref: &str,
@@ -100,6 +189,8 @@ impl HumanGovernanceService {
                     | "core_membership"
                     | "semantic_digest"
                     | "revision_proposal_revision"
+                    | "source_receipt"
+                    | "source_observation"
             )
         ) {
             result.state = HumanContentState::Unsupported;
@@ -116,8 +207,24 @@ impl HumanGovernanceService {
             result.state = presentation::access_state(error);
             return Ok(Ok(result));
         }
-        // The semantic value is exact, never a journal envelope or a CAS path.
-        let text = if row.object_kind.as_deref() == Some("revision_proposal_revision") {
+        // Source text is the complete native-verified protected archive, never
+        // a stored preview, an EvidenceSurface or a Python-supplied CAS path.
+        let text = if matches!(
+            row.object_kind.as_deref(),
+            Some("source_receipt" | "source_observation")
+        ) {
+            if representation != HumanContentRepresentation::SourceText {
+                result.state = HumanContentState::Unsupported;
+                return Ok(Ok(result));
+            }
+            match self.source_text(&snapshot, row).await {
+                Ok(text) => text,
+                Err(state) => {
+                    result.state = state;
+                    return Ok(Ok(result));
+                }
+            }
+        } else if row.object_kind.as_deref() == Some("revision_proposal_revision") {
             let payload: JournalPayload = serde_json::from_str(
                 row.payload_json
                     .as_deref()
@@ -127,7 +234,7 @@ impl HumanGovernanceService {
             let JournalPayload::RevisionProposalRecorded(value) = payload else {
                 return Err(HumanGovernanceError::Store);
             };
-            if representation == HumanContentRepresentation::Text {
+            if representation != HumanContentRepresentation::SemanticJson {
                 result.state = HumanContentState::Unsupported;
                 return Ok(Ok(result));
             }

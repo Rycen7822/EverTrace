@@ -1597,6 +1597,7 @@ fn map_human_page(page: evertrace_engine::HumanPage) -> HumanGovernanceResponse 
                 evertrace_engine::HumanDegradedReason::CurrentJobFailed => {
                     HumanDegradedReason::CurrentJobFailed
                 }
+                evertrace_engine::HumanDegradedReason::RelatedReferencesUnavailable => HumanDegradedReason::RelatedReferencesUnavailable,
             })
             .collect(),
         items: page

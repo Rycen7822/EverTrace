@@ -315,6 +315,7 @@ pub enum HumanSnapshotStatus {
 #[serde(rename_all = "snake_case")]
 pub enum HumanDegradedReason {
     CurrentJobFailed,
+    RelatedReferencesUnavailable,
 }
 
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]

@@ -180,6 +180,15 @@ class App:
                 else:
                     content = result["content"]
                     data = {"html": self.templates.get_template("content.html").render(content=content), "text": content["text"], "state": content["state"], "previous_cursor": content["previous_cursor"], "next_cursor": content["next_cursor"], "frontier": str(content["frontier"]), **{key: str(content[key]) if content[key] is not None else None for key in ("total_bytes", "range_start", "range_end")}}
+            elif payload.get("kind") == "sources" and set(payload) == {"kind", "reference", "frontier", "revision", "after"}:
+                frontier = parse_frontier(payload["frontier"])
+                if not valid_ref(payload["reference"]) or not valid_ref(payload["revision"]) or not valid_ref(payload["after"], optional=True):
+                    return JSONResponse({"error": "invalid_read"}, 400)
+                result = await self.backend.sources(payload["reference"], frontier, payload["revision"], payload["after"])
+                if result["kind"] == "conflict":
+                    data = {"conflict": True}
+                else:
+                    data = {"html": self.templates.get_template("sources.html").render(items=result["items"], status=result["status"], reasons=result["degraded_reasons"]), "frontier": str(result["frontier"]), "next_cursor": result["next_cursor"], "degraded_reasons": result["degraded_reasons"]}
             elif payload.get("kind") == "revisions" and set(payload) == {"kind", "reference", "frontier", "revision", "after"}:
                 frontier = parse_frontier(payload["frontier"])
                 if not valid_ref(payload["reference"]) or not valid_ref(payload["revision"]) or not valid_ref(payload["after"], optional=True):
@@ -197,7 +206,11 @@ class App:
                 if result["kind"] == "conflict":
                     data = {"conflict": True}
                 else:
-                    data = {"html": self.templates.get_template("detail.html").render(items=result["items"])}
+                    item = result["items"][0] if len(result["items"]) == 1 else None
+                    evidence = item.get("evidence_detail") if item else None
+                    presentation = evidence.get("protected_presentation") if evidence else None
+                    preview = presentation.get("text") if presentation and presentation.get("kind") in ("inline", "preview") else None
+                    data = {"html": self.templates.get_template("detail.html").render(items=result["items"]), "source_preview": preview}
             else:
                 return JSONResponse({"error": "read_unavailable"}, status_code=400)
         except BackendError as error:

@@ -686,6 +686,7 @@ pub enum HumanSnapshotStatus {
 #[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
 pub enum HumanDegradedReason {
     CurrentJobFailed,
+    RelatedReferencesUnavailable,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -1720,7 +1721,15 @@ impl HumanGovernanceService {
                 }
                 if !matches!(
                     source.object_kind.as_deref(),
-                    Some("atom_revision" | "procedure_revision" | "core_membership")
+                    Some(
+                        "atom_revision"
+                            | "procedure_revision"
+                            | "core_membership"
+                            | "semantic_digest"
+                            | "revision_proposal_revision"
+                            | "source_receipt"
+                            | "source_observation"
+                    )
                 ) {
                     return Err(HumanGovernanceError::InvalidInput);
                 }
@@ -1786,15 +1795,69 @@ impl HumanGovernanceService {
                 support_dependency_refs(&validation, &contract)
             }
         };
-        let rows = related_rows(&snapshot, refs, request.after, usize::from(request.limit))?;
-        let (selected, next_cursor) = rows;
+        let source_cursor = if request.relation == HumanRelationKind::ObjectSources {
+            request
+                .after
+                .map(|raw| {
+                    let value: evertrace_domain::query::SourceLinksCursor =
+                        serde_json::from_str(raw)
+                            .map_err(|_| HumanGovernanceError::InvalidInput)?;
+                    value
+                        .validate_for(
+                            request.source_stable_key,
+                            request.expected_source_revision_ref,
+                            request.expected_frontier,
+                        )
+                        .map_err(|_| HumanGovernanceError::InvalidInput)?;
+                    Ok::<_, HumanGovernanceError>(value)
+                })
+                .transpose()?
+        } else {
+            None
+        };
+        let after = source_cursor
+            .as_ref()
+            .map(|value| value.after_key.as_str())
+            .or(request.after);
+        let ((selected, next_cursor), unresolved_sources) =
+            if request.relation == HumanRelationKind::ObjectSources {
+                let (resolved, unavailable) = resolve_source_links(&snapshot, refs)?;
+                (
+                    related_page(resolved, after, usize::from(request.limit))?,
+                    unavailable,
+                )
+            } else {
+                (
+                    related_rows(&snapshot, refs, after, usize::from(request.limit))?,
+                    false,
+                )
+            };
+        let next_cursor = if request.relation == HumanRelationKind::ObjectSources {
+            next_cursor
+                .map(|after_key| {
+                    serde_json::to_string(&evertrace_domain::query::SourceLinksCursor {
+                        frontier: snapshot.frontier,
+                        source_key: request.source_stable_key.into(),
+                        source_revision: request.expected_source_revision_ref.into(),
+                        after_key,
+                    })
+                    .map_err(|_| HumanGovernanceError::Store)
+                })
+                .transpose()?
+        } else {
+            next_cursor
+        };
         let usage_view = selected
             .iter()
             .any(|row| row.object_kind.as_deref() == Some("procedure_negative_review"))
             .then(|| ProcedureUsageCurrentView::from_snapshot(&snapshot))
             .transpose()
             .map_err(|_| HumanGovernanceError::Store)?;
-        let (status, degraded_reasons) = snapshot_status(&snapshot)?;
+        let (mut status, mut degraded_reasons) = snapshot_status(&snapshot)?;
+        if unresolved_sources {
+            status = HumanSnapshotStatus::Degraded;
+            degraded_reasons.push(HumanDegradedReason::RelatedReferencesUnavailable);
+        }
         Ok(Ok(HumanPage {
             diagnostics: None,
             frontier: snapshot.frontier,
@@ -4877,6 +4940,17 @@ fn related_rows<'a>(
             resolved.insert(row.row_id.clone(), row);
         }
     }
+    related_page(resolved, after, limit)
+}
+
+fn related_page<'a>(
+    resolved: BTreeMap<String, &'a ObjectRow>,
+    after: Option<&str>,
+    limit: usize,
+) -> Result<(Vec<&'a ObjectRow>, Option<String>), HumanGovernanceError> {
+    if after.is_some_and(|key| !resolved.contains_key(key)) {
+        return Err(HumanGovernanceError::InvalidInput);
+    }
     let mut selected = resolved
         .into_values()
         .filter(|row| after.is_none_or(|cursor| row.row_id.as_str() > cursor))
@@ -4886,6 +4960,44 @@ fn related_rows<'a>(
         (selected.len() > limit).then(|| selected[limit.saturating_sub(1)].row_id.clone());
     selected.truncate(limit);
     Ok((selected, next_cursor))
+}
+
+// Exact object revisions are authoritative; a derived projection sharing the
+// revision alias is not a second possible original source. Multiple objects
+// remain ambiguous, and unresolved references are reported rather than empty.
+fn resolve_source_links(
+    snapshot: &ProjectionSnapshot,
+    refs: BTreeSet<String>,
+) -> Result<(BTreeMap<String, &ObjectRow>, bool), HumanGovernanceError> {
+    let index = export::presentation_index(
+        snapshot,
+        std::time::Instant::now() + presentation::READ_DEADLINE,
+    )
+    .map_err(|_| HumanGovernanceError::Store)?;
+    let mut resolved = BTreeMap::new();
+    let mut unavailable = false;
+    for reference in refs {
+        let Some(rows) = index.get(reference.as_str()) else {
+            unavailable = true;
+            continue;
+        };
+        let objects = rows
+            .iter()
+            .copied()
+            .filter(|row| row.row_class == Some(ObjectRowClass::Object))
+            .collect::<Vec<_>>();
+        let candidates = if objects.is_empty() {
+            rows.as_slice()
+        } else {
+            objects.as_slice()
+        };
+        if candidates.len() == 1 {
+            resolved.insert(candidates[0].row_id.clone(), candidates[0]);
+        } else {
+            unavailable = true;
+        }
+    }
+    Ok((resolved, unavailable))
 }
 
 fn support_dependency_refs(

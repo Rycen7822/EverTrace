@@ -144,11 +144,14 @@ class Backend:
     async def detail(self, reference, frontier, revision):
         return await self._request({"kind": "detail", "surface": "explorer", "object_ref": reference, "expected_frontier": frontier, "expected_revision_ref": revision})
 
+    async def sources(self, reference, frontier, revision, after=None):
+        return await self._request({"kind": "related", "relation": "object_sources", "source_stable_key": reference, "expected_source_revision_ref": revision, "expected_frontier": frontier, "after": after, "limit": 32})
+
     async def revisions(self, reference, frontier, revision, after=None):
         return await self._request({"kind": "related", "relation": "object_revisions", "source_stable_key": reference, "expected_source_revision_ref": revision, "expected_frontier": frontier, "after": after, "limit": 32})
 
     async def content(self, reference, frontier, revision, representation, after=None):
-        if representation not in ("text", "semantic_json"):
+        if representation not in ("text", "semantic_json", "source_text"):
             raise BackendError("invalid_input")
         return await self._request({"kind": "content", "object_ref": reference, "expected_revision_ref": revision, "expected_frontier": frontier, "representation": representation, "after": after, "limit": 8192})
 
