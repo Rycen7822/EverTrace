@@ -4,4 +4,4 @@
   <h3>{{ item.object_kind }} · {{ (item.revision_ref or item.object_ref or item.stable_key)[:12] }}</h3>
   <p>{{ item.scope_ref or '范围未提供；正文权限在展开时验证' }}</p>
 </button>
-{% else %}<div class="empty">当前没有记忆记录。</div>{% endfor %}
+{% else %}<div class="empty">{{ empty_message }}</div>{% endfor %}

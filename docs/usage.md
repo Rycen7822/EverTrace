@@ -14,7 +14,7 @@ Summaries require supported records with body permission. Record existence, queu
 
 ## 本机网页 / Local WebUI
 
-**当前状态：旧 Rust Web 已回撤；正式 `--web` exec、显式隔离组件装配及基础只读记忆/详情/分页/状态已通过真实 daemon/浏览器验证。先按开发说明装配匹配组件。来源/历史/比较/筛选/计数和完整功能/生命周期/资源验收仍未闭合，旧日志不作为新版本完成证明。**
+**当前状态：旧 Rust Web 已回撤；正式 `--web` exec、显式隔离组件装配及基础只读记忆/详情/分页/状态已通过真实 daemon/浏览器验证。先按开发说明装配匹配组件。当前版本元数据的后端种类/Atom 状态筛选、录入顺序和 query/frontier 绑定分页计数也已验证；来源页/历史/比较、完整范围/搜索/长正文和最终功能/资源验收仍未闭合，旧日志不作为新版本完成证明。**
 
 **Current status: Rust Web was rolled back. Formal CLI exec, explicit isolated assembly and basic Python memory/detail/paging/status have real daemon/browser evidence. Assemble the matching optional component first. Source/history/comparison/filter/count and complete functionality/lifecycle/resource acceptance remain unfinished; old logs are not new acceptance.**
 
@@ -30,11 +30,11 @@ evertrace --config /absolute/config.toml --web
 evertrace --config /absolute/config.toml --web --port 4173
 ```
 
-打开终端打印的 `http://127.0.0.1:PORT/#bootstrap=...` 链接。它是两分钟内有效的一次性登录凭据，请勿分享或写进日志。服务只监听本机；不自动启动 daemon，不安装宿主接线。Ctrl-C 关闭前台 Web 服务，不停止 daemon。旧 Rust 实现已回撤，独立 Python 基础只读包已建立，正式启动器已用 Unix exec 对接；Web 修改不需 Cargo、未启动时不加载 Web 运行时是目标和待验收项，不是已完成声明。
+打开终端打印的 `http://127.0.0.1:PORT/#bootstrap=...` 链接。它是两分钟内有效的一次性登录凭据，请勿分享或写进日志。服务只监听本机；不自动启动 daemon，不安装宿主接线。Ctrl-C 关闭前台 Web 服务，不停止 daemon。旧 Rust 实现已回撤，独立 Python 基础只读包已建立，正式启动器已用 Unix exec 对接；Python/模板/资源修改不需 Cargo；基础启动链已验证无 `--web` 时不访问 Python/页面资源，缺失组件不影响核心入口。该基础证据不替代完整功能接入后的最终资源复验。
 
 Open the printed loopback URL. Its fragment is a single-use login credential valid for two minutes: do not share or log it. The service listens locally only, never starts a daemon or installs host wiring, and Ctrl-C closes Web without stopping the daemon. The old Rust implementation has been rolled back; an independent Python read-only package exists, its formal launcher now uses Unix exec; no-Cargo Web edits and no dormant Web runtime remain migration targets, not completed claims.
 
-回撤前的网页曾接入真实记忆列表、正文、分页、来源关联、修订历史、同对象固定修订比较和连接状态；新 Python 包现已验证基础列表/语义正文/分页与状态，其余来源、历史、比较和筛选计数仍须重建与验证，不能以原日志冒当前能力。后续来源阅读须打开精确记录并返回；比较须包含逐字段差异，不把历史版本换成当前版本。长正文分块尚未接入：语义正文超限时明确提示，来源预览不冒充全文。搜索、完整范围选择及其余业务页面尚未闭合；原后端筛选/计数/keyset 实现也已撤销，需要按 Program 重建并通过新的浏览器验收。未接入的页面不会显示样例。正文按文本显示，网页会话不将记忆存入 localStorage、IndexedDB 或离线缓存。会话空闲 15 分钟或满 8 小时后失效；可用侧栏按钮提前结束。这里是本机 HTTP，不提供 TLS，也不防护同一 OS 用户下的恶意进程。
+当前 Python 网页默认只列每个对象的当前元数据版本，不混入历史修订；支持后端种类筛选、Atom 真值/权威/生命周期三个独立轴和录入顺序分页。总数与筛选数由原生后端计算，表示当前元数据记录，不是可读正文数量；缺正文权限时不能据此推断正文可用。回撤前的来源关联、历史与比较证据仍只属历史，新来源页、历史/比较读面尚未闭合。后续来源阅读须打开精确记录并返回；比较须包含逐字段差异，不把历史版本换成当前版本。长正文分块尚未接入：语义正文超限时明确提示，来源预览不冒充全文。搜索、完整范围选择及其余业务页面尚未闭合；新 current-only 筛选/计数/keyset 已通过真实 daemon/浏览器验收；按范围、来源和时间段过滤仍未接入，不把录入顺序当作事件发生时间。未接入的页面不会显示样例。正文按文本显示，网页会话不将记忆存入 localStorage、IndexedDB 或离线缓存。会话空闲 15 分钟或满 8 小时后失效；可用侧栏按钮提前结束。这里是本机 HTTP，不提供 TLS，也不防护同一 OS 用户下的恶意进程。
 
 The rolled-back WebUI previously provided memory lists/details, source references, revision history, exact comparison and connection status. The new Python package has verified basic list/semantic detail/paging/status; source/history/comparison/filter/count behavior remains to be rebuilt and accepted, not inferred from old logs. The future source/comparison routes must open exact records, allow returning and show field differences without substituting current heads. Chunked full-text reads are not connected: oversized semantic content is explicit, and source previews are not presented as complete text. Search, complete scope selection and other business pages remain unfinished. The former filtering/count/keyset implementation has also been rolled back and must be rebuilt and accepted under the Program; unconnected pages do not fall back to samples. Content is rendered as text without browser database/offline persistence. Sessions expire after 15 idle minutes or eight hours total, or explicitly through the sidebar. This is local HTTP, not TLS or protection against a malicious process running as the same OS user.
 

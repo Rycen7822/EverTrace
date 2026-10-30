@@ -650,6 +650,14 @@ pub struct HumanRepositoryPurgePreview {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
+pub struct HumanMemoryBrowsePage {
+    pub page: HumanPage,
+    pub query: evertrace_domain::query::MemoryBrowseQuery,
+    pub total_count: u64,
+    pub matching_count: u64,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub struct HumanPage {
     pub diagnostics: Option<HumanDiagnostics>,
     pub frontier: u64,
@@ -1209,6 +1217,54 @@ impl HumanGovernanceService {
     ) -> Result<Result<HumanPage, u64>, HumanGovernanceError> {
         self.list_selected(surface, expected_frontier, after, limit, None)
             .await
+    }
+
+    pub async fn browse_memories(
+        &self,
+        query: evertrace_domain::query::MemoryBrowseQuery,
+        expected_frontier: Option<u64>,
+        after: Option<&str>,
+        limit: u16,
+    ) -> Result<Result<HumanMemoryBrowsePage, u64>, HumanGovernanceError> {
+        query
+            .validate()
+            .map_err(|_| HumanGovernanceError::InvalidInput)?;
+        if limit == 0 || limit > MAX_PAGE {
+            return Err(HumanGovernanceError::InvalidInput);
+        }
+        let cursor = after
+            .map(|raw| {
+                if raw.len() > 2048 {
+                    return Err(HumanGovernanceError::InvalidInput);
+                }
+                let value: evertrace_domain::query::MemoryBrowseCursor =
+                    serde_json::from_str(raw).map_err(|_| HumanGovernanceError::InvalidInput)?;
+                value
+                    .validate_for(&query)
+                    .map_err(|_| HumanGovernanceError::InvalidInput)?;
+                Ok(value)
+            })
+            .transpose()?;
+        if cursor
+            .as_ref()
+            .is_some_and(|cursor| expected_frontier != Some(cursor.frontier))
+        {
+            return Err(HumanGovernanceError::InvalidInput);
+        }
+        let context = self
+            .writer
+            .memory_browse_context(&query, cursor.as_ref(), usize::from(limit))
+            .await
+            .map_err(|_| HumanGovernanceError::Store)?;
+        if expected_frontier.is_some_and(|frontier| frontier != context.page.frontier) {
+            return Ok(Err(context.page.frontier));
+        }
+        Ok(Ok(HumanMemoryBrowsePage {
+            page: memories_page(context.page)?,
+            query,
+            total_count: context.total_count,
+            matching_count: context.matching_count,
+        }))
     }
 
     pub async fn list_selected(

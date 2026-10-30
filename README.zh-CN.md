@@ -60,11 +60,11 @@ cp -n docs/examples/evertrace.local.toml "$HOME/.evertrace/config.toml"
 ./target/debug/evertrace --config "$HOME/.evertrace/config.toml" --daemon
 ```
 
-另开终端执行 `./target/debug/evertrace --config "$HOME/.evertrace/config.toml" --doctor` 或 `--tui`。旧 Rust Web 与其未提交扩展已回撤，当前 `--web` 已可在显式装配匹配组件后启动独立 Python 服务。此前的记忆/来源/修订和筛选计数验收只属历史，不代表当前能力；独立 Python 包已验证记忆/详情/状态的基础只读竖切，正式 CLI exec/隔离组装已验证，完整生命周期与资源验收仍待完成，原一次性链接、会话、只读与安全义务保留。核心工作流仍按[宿主接入和第一条记忆验证](docs/getting-started.md)操作。
+另开终端执行 `./target/debug/evertrace --config "$HOME/.evertrace/config.toml" --doctor` 或 `--tui`。旧 Rust Web 与其未提交扩展已回撤，当前 `--web` 已可在显式装配匹配组件后启动独立 Python 服务。旧来源/历史/比较的验收只属历史，不代表当前能力。Python 包已验证当前版本元数据浏览、后端种类/Atom 独立状态轴筛选、录入顺序分页及计数、语义正文与连接状态；计数不等于可读正文数量。正式 CLI exec/隔离组装和基础生命周期已验证；来源页、固定修订历史/比较、完整范围/搜索/长正文及最终资源验收仍待完成，原一次性链接、会话、只读与安全义务保留。核心工作流仍按[宿主接入和第一条记忆验证](docs/getting-started.md)操作。
 
 ### Web 架构迁移
 
-网页正从 Rust 内嵌实现迁移为独立 Python 呈现/服务组件，领域后端和单 writer 仍归 Rust。Python、模板和静态资源修改不应要求 Cargo；只有显式 `--web` 才启动 Python。未启动时核心 CLI/TUI/MCP/daemon 不应加载 Web 资源或建立 worker、会话、轮询，Web 组件缺失也不影响核心运行。当前基础只读竖切已验证 CLI/隔离装配、会话期限/多标签/真实隐藏/重连和短窗口三态回收；**完整功能与最终资源验收仍未完成**，详见[架构边界](docs/architecture.md)；已验证的显式组件组装见[开发说明](docs/development.md#独立-web-工程迁移中--independent-web-component-migration)，打开 Web 不自动安装依赖。
+网页已采用独立、可选的 Python 呈现/服务组件，不内嵌 Rust HTTP 或页面资源，领域后端和单 writer 仍归 Rust。Python、模板和静态资源修改不应要求 Cargo；只有显式 `--web` 才启动 Python。未启动时核心 CLI/TUI/MCP/daemon 不应加载 Web 资源或建立 worker、会话、轮询，Web 组件缺失也不影响核心运行。当前基础只读竖切已验证 CLI/隔离装配、会话期限/多标签/真实隐藏/重连和短窗口三态回收；**完整功能与最终资源验收仍未完成**，详见[架构边界](docs/architecture.md)；已验证的显式组件组装见[开发说明](docs/development.md#独立-web-工程迁移中--independent-web-component-migration)，打开 Web 不自动安装依赖。
 
 不要以 root 身份运行安装命令。安装会修改受管宿主配置，并可能启用用户服务；它是单独的一步，不包含在上述命令中。
 

@@ -78,6 +78,12 @@ enum WriterRequest {
         limit: usize,
         reply: oneshot::Sender<Result<evertrace_store::MemoriesCurrentContext, WriterActorError>>,
     },
+    MemoryBrowse {
+        query: evertrace_domain::query::MemoryBrowseQuery,
+        after: Option<evertrace_domain::query::MemoryBrowseCursor>,
+        limit: usize,
+        reply: oneshot::Sender<Result<evertrace_store::MemoryBrowseContext, WriterActorError>>,
+    },
     CaptureCurrent {
         after: Option<String>,
         exact: Option<String>,
@@ -579,6 +585,25 @@ impl WriterHandle {
         self.sender
             .send(WriterRequest::MemoriesCurrent {
                 after,
+                limit,
+                reply,
+            })
+            .await
+            .map_err(|_| WriterActorError::Stopped)?;
+        response.await.map_err(|_| WriterActorError::Stopped)?
+    }
+
+    pub(crate) async fn memory_browse_context(
+        &self,
+        query: &evertrace_domain::query::MemoryBrowseQuery,
+        after: Option<&evertrace_domain::query::MemoryBrowseCursor>,
+        limit: usize,
+    ) -> Result<evertrace_store::MemoryBrowseContext, WriterActorError> {
+        let (reply, response) = oneshot::channel();
+        self.sender
+            .send(WriterRequest::MemoryBrowse {
+                query: query.clone(),
+                after: after.cloned(),
                 limit,
                 reply,
             })
@@ -1222,6 +1247,27 @@ async fn run_writer(
                         .as_ref()
                         .ok_or(WriterActorError::Stopped)?
                         .memories_current_context(after.as_deref(), limit)
+                        .await
+                        .map_err(map_store_error);
+                    let fatal = result.is_err();
+                    let _ = reply.send(result);
+                    if fatal {
+                        return Err(WriterActorError::Store);
+                    }
+                }
+                WriterRequest::MemoryBrowse {
+                    query,
+                    after,
+                    limit,
+                    reply,
+                } => {
+                    if reply.is_closed() {
+                        continue;
+                    }
+                    let result = writer
+                        .as_ref()
+                        .ok_or(WriterActorError::Stopped)?
+                        .memory_browse_context(&query, after.as_ref(), limit)
                         .await
                         .map_err(map_store_error);
                     let fatal = result.is_err();

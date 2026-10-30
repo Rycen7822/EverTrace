@@ -487,6 +487,7 @@ impl App {
                     (
                         _,
                         HumanGovernanceResponse::Action { .. }
+                        | HumanGovernanceResponse::MemoryPage { .. }
                         | HumanGovernanceResponse::Export { .. },
                     ) => UiCommand::None,
                     (HumanReadLocator::Page { .. } | HumanReadLocator::View { .. }, _) => {
@@ -515,7 +516,8 @@ impl App {
                         audit_event_ref: None,
                         reason: Some("optimistic_conflict".into()),
                     },
-                    HumanGovernanceResponse::Snapshot { .. } => return UiCommand::None,
+                    HumanGovernanceResponse::Snapshot { .. }
+                    | HumanGovernanceResponse::MemoryPage { .. } => return UiCommand::None,
                 };
                 if result.reason.as_deref() != Some("local_busy") {
                     self.state.write_queued = false;

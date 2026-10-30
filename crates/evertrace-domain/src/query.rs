@@ -508,6 +508,75 @@ pub struct SearchResult {
     pub budget: RetrievalBudget,
 }
 
+/// Metadata browsing is not an alternative text-retrieval pipeline.
+#[derive(Clone, Copy, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum MemoryReadingKind {
+    #[default]
+    All,
+    Summaries,
+    FactsAndConstraints,
+    Methods,
+    References,
+}
+
+/// This is journal recording order, not a claim about event timestamps.
+#[derive(Clone, Copy, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum MemoryBrowseOrder {
+    #[default]
+    RecordedNewest,
+    RecordedOldest,
+}
+
+#[derive(Clone, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct MemoryBrowseQuery {
+    pub kind: MemoryReadingKind,
+    pub order: MemoryBrowseOrder,
+    pub epistemic_status: Option<crate::semantic::EpistemicStatus>,
+    pub authority: Option<crate::semantic::AtomAuthority>,
+    pub atom_lifecycle: Option<crate::semantic::AtomLifecycleStatus>,
+}
+
+impl MemoryBrowseQuery {
+    pub fn validate(&self) -> Result<(), QueryError> {
+        if !matches!(
+            self.kind,
+            MemoryReadingKind::All | MemoryReadingKind::FactsAndConstraints
+        ) && (self.epistemic_status.is_some()
+            || self.authority.is_some()
+            || self.atom_lifecycle.is_some())
+        {
+            return Err(QueryError::Invalid);
+        }
+        Ok(())
+    }
+}
+
+/// Opaque to HTTP clients; the complete query binds every continuation.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct MemoryBrowseCursor {
+    pub frontier: u64,
+    pub query: MemoryBrowseQuery,
+    pub source_event_seq: u64,
+    pub row_id: String,
+}
+
+impl MemoryBrowseCursor {
+    pub fn validate_for(&self, query: &MemoryBrowseQuery) -> Result<(), QueryError> {
+        if self.query != *query
+            || self.row_id.is_empty()
+            || self.row_id.len() > 512
+            || self.row_id.chars().any(char::is_control)
+        {
+            return Err(QueryError::Invalid);
+        }
+        Ok(())
+    }
+}
+
 #[derive(Clone, Copy, Debug, Error, Eq, PartialEq)]
 pub enum QueryError {
     #[error("query contract is invalid")]

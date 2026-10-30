@@ -111,6 +111,11 @@ async fn send_human(
     let kind = match &request {
         HumanGovernanceRequest::Export { .. } => PendingKind::Export,
         HumanGovernanceRequest::Read { request } => match request {
+            HumanReadRequest::BrowseMemories { .. } => {
+                return Err(evertrace_protocol::error::ProtocolError::Wire(
+                    evertrace_protocol::error::ErrorCode::InvalidInput,
+                ));
+            }
             HumanReadRequest::List { surface, after, .. } => PendingKind::HumanRead(
                 *surface,
                 after

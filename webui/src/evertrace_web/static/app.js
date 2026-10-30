@@ -3,7 +3,7 @@ let fragment = location.hash.slice(1);
 let bootstrap = /^bootstrap=[0-9a-f]{64}$/.test(fragment) ? fragment.slice(10) : null;
 fragment = null;
 let poller = null;
-const state = { csrf: null, active: false, route: 'memories', after: null, frontier: null, next: null, selected: null, controller: null };
+const state = { csrf: null, active: false, route: 'memories', query: {kind: 'all', order: 'recorded_newest', epistemic_status: null, authority: null, atom_lifecycle: null}, after: null, frontier: null, next: null, selected: null, controller: null };
 history.replaceState(null, '', '#memories');
 const channel = new BroadcastChannel('evertrace-web-session');
 function clear() { $('memory-items').replaceChildren(); $('detail-body').replaceChildren(); $('detail-ref').textContent = ''; $('system-status').replaceChildren(); $('page-count').textContent = ''; $('next-page').disabled = true; }
@@ -42,16 +42,16 @@ async function refresh() {
     $('connection-status').textContent = 'daemon 已连接';
     if (state.route === 'system') { $('system-status').textContent = JSON.stringify(health, null, 2); return; }
     if (state.route !== 'memories') return;
-    const page = await api('read', { kind: 'list', after: state.after, expected_frontier: state.after ? state.frontier : null }, controller.signal);
+    const page = await api('read', { kind: 'list', query: state.query, after: state.after, expected_frontier: state.after ? state.frontier : null }, controller.signal);
     if (state.controller !== controller || document.hidden) return;
     const listScroll = $('memory-items').scrollTop, detailScroll = $('detail-body').scrollTop;
     clear();
-    if (page.conflict) { state.after = null; state.frontier = null; state.selected = null; notice('分页水位已变化；请刷新读取当前列表。'); return; }
+    if (page.conflict) { state.after = null; state.frontier = null; state.next = null; state.selected = null; notice('分页水位已变化；请刷新读取当前列表。'); return; }
     state.frontier = page.frontier; state.next = page.next_cursor;
     fragmentInto($('memory-items'), page.html); $('memory-items').scrollTop = listScroll;
-    $('page-count').textContent = '本页 ' + page.count + ' 条';
+    $('page-count').textContent = '本页 ' + page.count + ' · 筛选 ' + page.matching_count + ' / 当前条目 ' + page.total_count;
     $('next-page').disabled = !page.next_cursor;
-    notice(page.degraded ? '只读数据有降级；不是完整成功。' : '只读连接已建立；筛选、搜索及网页修改尚未接入。');
+    notice(page.degraded ? '只读数据有降级；不是完整成功。' : '按录入顺序浏览当前条目；计数不等于可读正文数量。搜索、范围及网页修改尚未接入。');
     if (state.selected && [...$('memory-items').children].some(row => row.dataset.key === state.selected.key)) await detail(state.selected, page.frontier, controller, detailScroll);
     else { state.selected = null; $('detail-body').textContent = '选择一条记忆查看正文。'; }
   } catch { if (state.controller === controller && !controller.signal.aborted) { clear(); $('connection-status').textContent = '读取不可用'; notice('daemon 或读取暂不可用，旧内容已清除。'); } }
@@ -70,6 +70,14 @@ function route(name) {
 }
 $('memory-items').onclick = event => { const row = event.target.closest('.memory-item'); if (row) select({ key: row.dataset.key, revision: row.dataset.revision }); };
 for (const button of document.querySelectorAll('[data-route]')) button.onclick = () => route(button.dataset.route);
+function changeQuery() {
+  cancel(); clear(); state.after = null; state.frontier = null; state.selected = null; state.next = null;
+  const atomAxes = ['all', 'facts_and_constraints'].includes($('reading-kind').value);
+  for (const id of ['epistemic-filter', 'authority-filter', 'lifecycle-filter']) { $(id).disabled = !atomAxes; if (!atomAxes) $(id).value = ''; }
+  state.query = {kind: $('reading-kind').value, order: $('browse-order').value, epistemic_status: $('epistemic-filter').value || null, authority: $('authority-filter').value || null, atom_lifecycle: $('lifecycle-filter').value || null};
+  refresh();
+}
+for (const id of ['reading-kind', 'browse-order', 'epistemic-filter', 'authority-filter', 'lifecycle-filter']) $(id).onchange = changeQuery;
 $('refresh').onclick = refresh;
 $('first-page').onclick = () => { cancel(); clear(); state.after = null; state.frontier = null; state.selected = null; refresh(); };
 $('next-page').onclick = () => { if (state.next) { cancel(); clear(); state.after = state.next; state.selected = null; refresh(); } };

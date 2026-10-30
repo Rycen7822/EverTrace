@@ -102,6 +102,12 @@ pub enum HumanRelationKind {
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
 pub enum HumanReadRequest {
+    BrowseMemories {
+        query: evertrace_domain::query::MemoryBrowseQuery,
+        expected_frontier: Option<u64>,
+        after: Option<String>,
+        limit: u16,
+    },
     List {
         surface: HumanSurface,
         #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -892,6 +898,18 @@ pub struct HumanActionResult {
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
 pub enum HumanGovernanceResponse {
+    MemoryPage {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        diagnostics: Option<Box<HumanDiagnostics>>,
+        frontier: u64,
+        status: HumanSnapshotStatus,
+        degraded_reasons: Vec<HumanDegradedReason>,
+        items: Vec<HumanSnapshotItem>,
+        next_cursor: Option<String>,
+        query: evertrace_domain::query::MemoryBrowseQuery,
+        total_count: u64,
+        matching_count: u64,
+    },
     Export {
         result: HumanExportResult,
     },
@@ -933,6 +951,18 @@ impl HumanGovernanceRequest {
 impl HumanReadRequest {
     fn validate(&self) -> bool {
         match self {
+            Self::BrowseMemories {
+                query,
+                expected_frontier,
+                after,
+                limit,
+            } => {
+                query.validate().is_ok()
+                    && (1..=HUMAN_PAGE_LIMIT).contains(limit)
+                    && after
+                        .as_ref()
+                        .is_none_or(|value| value.len() <= 2048 && expected_frontier.is_some())
+            }
             Self::List {
                 surface,
                 system_selection,
@@ -1169,6 +1199,50 @@ impl HumanGovernanceResponse {
                         HumanExportStatus::Published | HumanExportStatus::PublicationUncertain
                     ) || result.path.is_some())
             }
+            Self::MemoryPage {
+                diagnostics,
+                frontier,
+                status,
+                degraded_reasons,
+                items,
+                next_cursor,
+                query,
+                total_count,
+                matching_count,
+            } => {
+                use evertrace_domain::query::{MemoryBrowseCursor, MemoryBrowseOrder};
+                let rank = |item: &HumanSnapshotItem| {
+                    (
+                        match query.order {
+                            MemoryBrowseOrder::RecordedNewest => u64::MAX - item.source_event_seq,
+                            MemoryBrowseOrder::RecordedOldest => item.source_event_seq,
+                        },
+                        item.stable_key.clone(),
+                    )
+                };
+                query.validate().is_ok()
+                    && matching_count <= total_count
+                    && items.len() as u64 <= *matching_count
+                    && valid_human_page(diagnostics, status, degraded_reasons, items, next_cursor)
+                    && items.windows(2).all(|pair| rank(&pair[0]) < rank(&pair[1]))
+                    && items
+                        .iter()
+                        .map(|item| &item.stable_key)
+                        .collect::<std::collections::BTreeSet<_>>()
+                        .len()
+                        == items.len()
+                    && next_cursor.as_ref().is_none_or(|raw| {
+                        raw.len() <= 2048
+                            && serde_json::from_str::<MemoryBrowseCursor>(raw).is_ok_and(|cursor| {
+                                cursor.validate_for(query).is_ok()
+                                    && cursor.frontier == *frontier
+                                    && items.last().is_some_and(|last| {
+                                        last.stable_key == cursor.row_id
+                                            && last.source_event_seq == cursor.source_event_seq
+                                    })
+                            })
+                    })
+            }
             Self::Snapshot {
                 diagnostics,
                 status,
@@ -1177,17 +1251,10 @@ impl HumanGovernanceResponse {
                 next_cursor,
                 ..
             } => {
-                ((matches!(status, HumanSnapshotStatus::Ready) && degraded_reasons.is_empty())
-                    || (matches!(status, HumanSnapshotStatus::Degraded)
-                        && !degraded_reasons.is_empty()))
-                    && degraded_reasons.windows(2).all(|pair| pair[0] < pair[1])
-                    && items.len() <= usize::from(HUMAN_PAGE_LIMIT)
+                valid_human_page(diagnostics, status, degraded_reasons, items, next_cursor)
                     && items
                         .windows(2)
                         .all(|pair| pair[0].stable_key < pair[1].stable_key)
-                    && items.iter().all(HumanSnapshotItem::validate)
-                    && next_cursor.as_deref().is_none_or(valid_ref)
-                    && diagnostics.as_ref().is_none_or(|value| value.validate())
             }
             Self::Action { result } => result.validate(),
             Self::Conflict {
@@ -2046,6 +2113,22 @@ fn family_matches_class(row_class: HumanRowClass, family: HumanObjectFamily) -> 
         HumanRowClass::Runtime => family == HumanObjectFamily::Runtime,
         HumanRowClass::Projection => family == HumanObjectFamily::Projection,
     }
+}
+
+fn valid_human_page(
+    diagnostics: &Option<Box<HumanDiagnostics>>,
+    status: &HumanSnapshotStatus,
+    reasons: &[HumanDegradedReason],
+    items: &[HumanSnapshotItem],
+    next: &Option<String>,
+) -> bool {
+    ((matches!(status, HumanSnapshotStatus::Ready) && reasons.is_empty())
+        || (matches!(status, HumanSnapshotStatus::Degraded) && !reasons.is_empty()))
+        && reasons.windows(2).all(|pair| pair[0] < pair[1])
+        && items.len() <= usize::from(HUMAN_PAGE_LIMIT)
+        && items.iter().all(HumanSnapshotItem::validate)
+        && next.as_deref().is_none_or(valid_ref)
+        && diagnostics.as_ref().is_none_or(|value| value.validate())
 }
 
 fn category_matches(item: &HumanSnapshotItem) -> bool {

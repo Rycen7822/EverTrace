@@ -148,20 +148,21 @@ class App:
             if path == "/api/status":
                 result = await self.backend.health()
                 data = {"mode": result["mode"], "config_hash": result["effective_config_hash"]}
-            elif payload.get("kind") == "list" and not (set(payload) - {"kind", "after", "expected_frontier"}):
+            elif payload.get("kind") == "list" and not (set(payload) - {"kind", "query", "after", "expected_frontier"}):
                 after = payload.get("after")
-                frontier = payload.get("expected_frontier")
-                if not valid_ref(after, optional=True) or not valid_frontier(frontier, optional=True):
+                frontier = parse_frontier(payload.get("expected_frontier"), optional=True)
+                if not valid_ref(after, optional=True):
                     return JSONResponse({"error": "invalid_read"}, status_code=400)
-                result = await self.backend.memories(after, frontier)
+                result = await self.backend.memories(after, frontier, payload.get("query"))
                 if result["kind"] == "conflict":
                     data = {"conflict": True}
                 else:
-                    data = {"html": self.templates.get_template("list.html").render(items=result["items"]), "frontier": result["frontier"], "next_cursor": result["next_cursor"], "count": len(result["items"]), "degraded": result["status"] != "ready"}
+                    data = {"html": self.templates.get_template("list.html").render(items=result["items"], empty_message="这些条件下没有条目；可以清除筛选。" if result["total_count"] else "当前没有记忆记录。"), "frontier": str(result["frontier"]), "next_cursor": result["next_cursor"], "count": len(result["items"]), "degraded": result["status"] != "ready", "query": result["query"], "total_count": str(result["total_count"]), "matching_count": str(result["matching_count"])}
             elif payload.get("kind") == "detail" and set(payload) == {"kind", "reference", "frontier", "revision"}:
-                if not valid_ref(payload["reference"]) or not valid_ref(payload["revision"], optional=True) or not valid_frontier(payload["frontier"]):
+                frontier = parse_frontier(payload["frontier"])
+                if not valid_ref(payload["reference"]) or not valid_ref(payload["revision"], optional=True):
                     return JSONResponse({"error": "invalid_read"}, status_code=400)
-                result = await self.backend.detail(payload["reference"], payload["frontier"], payload["revision"])
+                result = await self.backend.detail(payload["reference"], frontier, payload["revision"])
                 if result["kind"] == "conflict":
                     data = {"conflict": True}
                 else:
@@ -180,8 +181,15 @@ def valid_ref(value, optional=False):
     return optional and value is None or isinstance(value, str) and 0 < len(value) <= 4096 and not any(ord(char) < 32 for char in value)
 
 
-def valid_frontier(value, optional=False):
-    return optional and value is None or type(value) is int and 0 <= value < 2**64
+def parse_frontier(value, optional=False):
+    if optional and value is None:
+        return None
+    # Browser-visible 64-bit sequence values use decimal strings, never float.
+    if isinstance(value, str) and value.isascii() and value.isdecimal() and len(value) <= 20:
+        value = int(value)
+    if type(value) is not int or not 0 <= value < 2**64:
+        raise ValueError("invalid frontier")
+    return value
 
 
 async def serve(context, port):

@@ -863,6 +863,36 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
                                 }
                             }
                             HumanGovernanceRequest::Read { request } => match request {
+                                HumanReadRequest::BrowseMemories {
+                                    query,
+                                    expected_frontier,
+                                    after,
+                                    limit,
+                                } => {
+                                    match human_governance
+                                        .browse_memories(query, expected_frontier, after.as_deref(), limit)
+                                        .await
+                                        .map_err(map_human_error)?
+                                    {
+                                        Ok(value) => {
+                                            let HumanGovernanceResponse::Snapshot {
+                                                diagnostics, frontier, status, degraded_reasons, items, next_cursor,
+                                            } = map_human_page(value.page) else {
+                                                return Err(ErrorCode::Internal);
+                                            };
+                                            HumanGovernanceResponse::MemoryPage {
+                                                diagnostics, frontier, status, degraded_reasons, items, next_cursor,
+                                                query: value.query,
+                                                total_count: value.total_count,
+                                                matching_count: value.matching_count,
+                                            }
+                                        }
+                                        Err(frontier) => HumanGovernanceResponse::Conflict {
+                                            current_frontier: frontier,
+                                            current_revision_ref: None,
+                                        },
+                                    }
+                                }
                                 HumanReadRequest::List {
                                     surface,
                                     system_selection,

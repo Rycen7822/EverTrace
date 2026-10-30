@@ -83,9 +83,23 @@ class Backend:
     async def health(self):
         return await self._request(None)
 
-    async def memories(self, after=None, expected_frontier=None):
-        # Declaration order/defaults are the existing Rust wire contract.
-        return await self._request({"kind": "list", "surface": "explorer", "explorer_selection": "memories", "expected_frontier": expected_frontier, "after": after, "limit": 32})
+    async def memories(self, after=None, expected_frontier=None, query=None):
+        # Closed wire spellings/defaults, not policy: Rust owns axis combinations,
+        # visibility, filtering and counts. Reject malformed enum JSON here rather
+        # than misreporting the native codec's connection close as daemon loss.
+        wire_values = {
+            "kind": ("all", "summaries", "facts_and_constraints", "methods", "references"),
+            "order": ("recorded_newest", "recorded_oldest"),
+            "epistemic_status": (None, "not_applicable", "unverified", "supported", "disputed", "refuted"),
+            "authority": (None, "user_explicit", "project_policy", "objective_evidence", "agent_inferred", "imported_claim"),
+            "atom_lifecycle": (None, "active", "superseded", "deprecated"),
+        }
+        if query is None:
+            query = {}
+        if not isinstance(query, dict) or set(query) - wire_values.keys() or any(value not in wire_values[key] for key, value in query.items()):
+            raise BackendError("invalid_input")
+        normalized = {key: query.get(key, values[0]) for key, values in wire_values.items()}
+        return await self._request({"kind": "browse_memories", "query": normalized, "expected_frontier": expected_frontier, "after": after, "limit": 32})
 
     async def detail(self, reference, frontier, revision):
         return await self._request({"kind": "detail", "surface": "explorer", "object_ref": reference, "expected_frontier": frontier, "expected_revision_ref": revision})
@@ -151,7 +165,7 @@ class Backend:
                     return health
                 response = await call({"human_governance": {"operation": "read", "request": read}})
                 result = response["human_governance"]
-                if result.get("kind") not in ("snapshot", "conflict"):
+                if result.get("kind") not in ("snapshot", "memory_page", "conflict"):
                     raise BackendError("invalid_read_response")
                 return result
             finally:

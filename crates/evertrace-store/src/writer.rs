@@ -1426,6 +1426,18 @@ impl JournalWriter {
         .await
     }
 
+    pub async fn memory_browse_context(
+        &self,
+        query: &evertrace_domain::query::MemoryBrowseQuery,
+        after: Option<&evertrace_domain::query::MemoryBrowseCursor>,
+        limit: usize,
+    ) -> Result<crate::projections::MemoryBrowseContext, StoreError> {
+        self.validated_current_read(|state, stamp| {
+            state.memory_browse_context(query, after, limit, stamp.has_failed_job)
+        })
+        .await
+    }
+
     pub async fn capture_current_context(
         &self,
         after: Option<&str>,
