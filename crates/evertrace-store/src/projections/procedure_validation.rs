@@ -384,7 +384,7 @@ impl JournalAdmissionState {
                     procedure.draft.scope,
                     evertrace_domain::procedure::ProcedureScope::Global
                 ) || self
-                    .s23
+                    .scenario_core
                     .successor_support_states()
                     .get(&usage.procedure_revision_id.to_string())
                     .is_some_and(|state| *state == "valid");

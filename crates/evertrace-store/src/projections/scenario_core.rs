@@ -1,3 +1,4 @@
+//! Canonical Scenario, Core membership and global-support projections.
 use std::collections::{BTreeMap, BTreeSet};
 
 use evertrace_domain::{
@@ -20,7 +21,7 @@ use crate::{
 pub(super) const CORE_PROJECTION_KIND: &str = "l3_core_projection";
 
 #[derive(Clone, Default)]
-pub(super) struct S23State {
+pub(super) struct ScenarioCoreState {
     scenarios: BTreeMap<ScenarioId, (Scenario, u64)>,
     scenario_revisions: BTreeMap<RevisionId, (Scenario, u64)>,
     memberships: BTreeMap<CoreMembershipId, (CoreMembership, u64)>,
@@ -30,7 +31,7 @@ pub(super) struct S23State {
     current_validations: BTreeMap<RevisionId, (GlobalSupportValidationEvent, u64)>,
 }
 
-impl S23State {
+impl ScenarioCoreState {
     pub(super) fn validation_entries(
         &self,
     ) -> impl Iterator<Item = (&GlobalSupportValidationEvent, u64)> {
@@ -338,8 +339,13 @@ impl S23State {
             .filter(move |value| value.core_membership_id == membership_id)
     }
 
-    pub(super) fn membership_revision(&self, id: RevisionId) -> Option<&CoreMembership> {
-        self.membership_revisions.get(&id).map(|(value, _)| value)
+    pub(super) fn membership_revision_entry(
+        &self,
+        id: RevisionId,
+    ) -> Option<(&CoreMembership, u64)> {
+        self.membership_revisions
+            .get(&id)
+            .map(|(value, seq)| (value, *seq))
     }
 
     pub(super) fn all_membership_revisions(&self) -> impl Iterator<Item = &CoreMembership> {
@@ -1382,7 +1388,7 @@ mod tests {
             validator_revision: 1,
             created_at_us: 1,
         };
-        let mut state = S23State::default();
+        let mut state = ScenarioCoreState::default();
         state
             .apply(
                 JournalPayload::GlobalSupportContractRecorded(Box::new(contract)),
@@ -1498,7 +1504,7 @@ mod tests {
             applicability_contract_hash: [2; 32],
             created_at_us: 1,
         };
-        let mut state = S23State::default();
+        let mut state = ScenarioCoreState::default();
         state
             .apply(
                 JournalPayload::GlobalSupportContractRecorded(Box::new(contract)),
@@ -1592,7 +1598,7 @@ mod tests {
         };
         let assert_rebuild_rejects =
             |contract: GlobalSuccessorSupportContract, validation: GlobalSupportValidationEvent| {
-                let mut restored = S23State::default();
+                let mut restored = ScenarioCoreState::default();
                 assert!(
                     restored
                         .restore(
@@ -1664,7 +1670,7 @@ mod tests {
         let successor_ref = RevisionId::new_v7().to_string();
         let valid_contract_id = RevisionId::new_v7();
         let invalid_contract_id = RevisionId::new_v7();
-        let mut state = S23State::default();
+        let mut state = ScenarioCoreState::default();
         state.contracts.insert(
             valid_contract_id,
             (support_contract(valid_contract_id, &successor_ref), 1),

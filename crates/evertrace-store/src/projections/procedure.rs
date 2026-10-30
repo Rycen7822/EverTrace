@@ -1590,7 +1590,7 @@ impl ProcedureState {
     pub(super) fn rows(
         &self,
         generation: u64,
-        support: &super::s23::S23State,
+        support: &super::scenario_core::ScenarioCoreState,
     ) -> Result<Vec<ObjectRow>, StoreError> {
         let mut rows = Vec::new();
         let support_states = support.successor_support_states();

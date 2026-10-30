@@ -1067,19 +1067,12 @@ fn row_product_deleted(
     let Some(payload) = journal_payload(row)? else {
         return Ok(false);
     };
+    if let Some(memory) =
+        crate::projections::MemoriesCandidate::from_payload(&payload, row.source_event_seq)
+    {
+        return Ok(memory.product_deleted(revision_ids, atom_ids, procedure_ids, membership_ids));
+    }
     Ok(match payload {
-        JournalPayload::AtomRecorded(value) => atom_ids.contains(&value.atom_id),
-        JournalPayload::RevisionProposalRecorded(value) => {
-            crate::projections::proposal_targets_deleted(
-                &value,
-                atom_ids,
-                procedure_ids,
-                membership_ids,
-            )
-        }
-        JournalPayload::ProcedureRevisionRecorded(value) => {
-            procedure_ids.contains(&value.procedure_id)
-        }
         JournalPayload::ProcedureStateRecorded(value) => {
             revision_ids.contains(&value.procedure_revision_id)
         }
@@ -1091,10 +1084,6 @@ fn row_product_deleted(
         }
         JournalPayload::ProcedureNegativeReviewRecorded(value) => {
             negative_ids.contains(&value.negative_evidence_id)
-        }
-        JournalPayload::CoreMembershipRecorded(value) => {
-            membership_ids.contains(&value.core_membership_id)
-                || revision_ids.contains(&value.atom_revision_id)
         }
         JournalPayload::GlobalSupportContractRecorded(value) => owned_support_runtime
             .contracts
@@ -1116,13 +1105,6 @@ fn row_product_deleted(
                     || need.recall_plan.applicable_procedure_revision
                         .is_some_and(|id| revision_ids.contains(&id))
         ),
-        JournalPayload::SemanticDigestRecorded(value) => {
-            value.selected_direct_refs.iter().any(|reference| {
-                reference
-                    .parse::<RevisionId>()
-                    .is_ok_and(|id| revision_ids.contains(&id))
-            })
-        }
         JournalPayload::SemanticDerivationRunRecorded(value) => {
             value.selected_direct_refs.iter().any(|reference| {
                 reference

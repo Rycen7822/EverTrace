@@ -15,9 +15,9 @@ use evertrace_domain::{
         ExecutionLaneId, ExperimentRunId, HostOccurrenceId, IntegrationEventId, JobId,
         OperationBurstId, OperationId, ProcedureId, ProcedureNegativeEvidenceId, ProcedureUsageId,
         RecoveryApplicationId, RecoveryBundleId, RecoveryCaptureRequestId, RepositoryId,
-        ResultEvidenceId, RevisionProposalId, ScopeEffectId, SemanticDigestId, SourceObservationId,
-        SourceReceiptId, TaskId, WorkArtifactId, WorkBindingRevisionId, WorkEpisodeId,
-        WorkstreamId, WorktreeId, WorktreeSnapshotId, WorktreeTransitionId,
+        ResultEvidenceId, RevisionProposalId, ScopeEffectId, SourceObservationId, SourceReceiptId,
+        TaskId, WorkArtifactId, WorkBindingRevisionId, WorkEpisodeId, WorkstreamId, WorktreeId,
+        WorktreeSnapshotId, WorktreeTransitionId,
     },
     procedure::{ProcedureRevision, ProcedureScope, ProcedureUsageRevision},
     purge::{
@@ -75,7 +75,7 @@ mod recall_ledger;
 #[path = "recall_projection.rs"]
 mod recall_projection;
 mod recovery;
-mod s23;
+mod scenario_core;
 mod segmentation;
 mod semantic;
 pub(crate) mod synthesis;
@@ -101,7 +101,7 @@ pub const RECALL_TRIGGER_INDEX_KIND: &str = recall_projection::RECALL_TRIGGER_IN
 
 /// Physical reconcile family names, one owner for the storage and reducer
 /// sides of the partial objects upsert.
-pub(crate) const CORE_INDEX_KIND: &str = s23::CORE_PROJECTION_KIND;
+pub(crate) const CORE_INDEX_KIND: &str = scenario_core::CORE_PROJECTION_KIND;
 pub(crate) const WIKI_INDEX_KIND: &str = synthesis::WIKI_PROJECTION_KIND;
 
 pub fn recall_trigger_contract(
@@ -117,7 +117,7 @@ pub fn recall_need(
 }
 
 pub(crate) fn l3_core_projection(row: &ObjectRow) -> Result<bool, StoreError> {
-    s23::S23State::restore_projection(row)
+    scenario_core::ScenarioCoreState::restore_projection(row)
 }
 
 pub(crate) fn wiki_projection(
@@ -363,7 +363,7 @@ impl ProjectionSnapshot {
         for row in self.data_rows() {
             if recall_projection::contract(row)?.is_some()
                 || crate::session_import::restore_current(row)?.is_some()
-                || s23::S23State::restore_projection(row)?
+                || scenario_core::ScenarioCoreState::restore_projection(row)?
                 || procedure_effect::restore(row)?.is_some()
                 || recall_ledger::need(row)?.is_some()
             {
@@ -2572,7 +2572,7 @@ struct ReducerState {
     proposals: BTreeMap<RevisionProposalId, (RevisionProposal, u64)>,
     proposal_revisions: BTreeMap<evertrace_domain::revision::RevisionId, (RevisionProposal, u64)>,
     recall_ledger: recall_ledger::RecallLedgerState,
-    s23: s23::S23State,
+    scenario_core: scenario_core::ScenarioCoreState,
     procedure: procedure::ProcedureState,
     synthesis: synthesis::SynthesisState,
     deletions: Box<ObjectDeletionState>,
@@ -2697,7 +2697,7 @@ pub(crate) struct JournalAdmissionState {
     proposals: BTreeMap<RevisionProposalId, (RevisionProposal, u64)>,
     proposal_revisions: BTreeMap<evertrace_domain::revision::RevisionId, (RevisionProposal, u64)>,
     recall_ledger: recall_ledger::RecallLedgerState,
-    s23: s23::S23State,
+    scenario_core: scenario_core::ScenarioCoreState,
     procedure: procedure::ProcedureState,
     synthesis: synthesis::SynthesisState,
     jobs: BTreeMap<evertrace_domain::ids::JobId, DurableJob>,
@@ -2739,12 +2739,15 @@ pub struct MemoriesCurrentContext {
     pub next_cursor: Option<String>,
 }
 
-enum MemoriesCandidate {
-    Atom(RevisionId),
-    Membership(RevisionId),
-    Procedure(RevisionId),
-    Proposal(RevisionId),
-    Digest(SemanticDigestId),
+/// Request-local borrowed memories, shared by current browsing and history.
+/// Neither a second metadata schema nor an incomplete projection snapshot.
+#[derive(Clone, Copy)]
+pub(crate) enum MemoriesCandidate<'a> {
+    Atom(&'a Atom, u64),
+    Membership(&'a CoreMembership, u64),
+    Procedure(&'a ProcedureRevision, u64),
+    Proposal(&'a RevisionProposal, u64),
+    Digest(&'a evertrace_domain::semantic::SemanticDigest, u64),
 }
 pub(crate) struct ProductDeletionIds {
     pub(crate) revision_ids: BTreeSet<RevisionId>,
@@ -3483,7 +3486,7 @@ struct ObjectDeletionPreviewInputs<'a> {
     atom_revisions: &'a BTreeMap<RevisionId, (Atom, u64)>,
     proposals: &'a BTreeMap<RevisionProposalId, (RevisionProposal, u64)>,
     procedure: &'a procedure::ProcedureState,
-    s23: &'a s23::S23State,
+    scenario_core: &'a scenario_core::ScenarioCoreState,
     synthesis: &'a synthesis::SynthesisState,
     deletions: &'a ObjectDeletionState,
 }
@@ -3523,7 +3526,7 @@ struct RepositoryScopePreviewInputs<'a> {
     recall_ledger: &'a recall_ledger::RecallLedgerState,
     synthesis: &'a synthesis::SynthesisState,
     procedure: &'a procedure::ProcedureState,
-    s23: &'a s23::S23State,
+    scenario_core: &'a scenario_core::ScenarioCoreState,
     scope_purges: &'a crate::purge::ScopePurgeState,
 }
 
@@ -4253,7 +4256,7 @@ impl ReducerState {
             atom_revisions: &self.atom_revisions,
             proposals: &self.proposals,
             procedure: &self.procedure,
-            s23: &self.s23,
+            scenario_core: &self.scenario_core,
             synthesis: &self.synthesis,
             deletions: &self.deletions,
         }
@@ -4294,7 +4297,7 @@ impl ReducerState {
             recall_ledger: &self.recall_ledger,
             synthesis: &self.synthesis,
             procedure: &self.procedure,
-            s23: &self.s23,
+            scenario_core: &self.scenario_core,
             scope_purges: &self.scope_purges,
         }
     }
@@ -4992,7 +4995,9 @@ impl JournalAdmissionState {
             .values()
             .cloned()
             .collect::<Vec<_>>();
-        let mut rows = self.procedure.rows(PROJECTION_GENERATION, &self.s23)?;
+        let mut rows = self
+            .procedure
+            .rows(PROJECTION_GENERATION, &self.scenario_core)?;
         for (value, seq) in self.proposal_revisions.values() {
             rows.push(semantic_proposal_row(
                 value,
@@ -5184,7 +5189,7 @@ impl JournalAdmissionState {
                     *seq,
                 )?;
                 row.support_state = self
-                    .s23
+                    .scenario_core
                     .atom_support_state(value.revision_id)
                     .map(str::to_owned);
                 rows.push(row);
@@ -5212,14 +5217,16 @@ impl JournalAdmissionState {
             // suppressed after its CoreMembership/contract inputs establish
             // the owned-support closure; selecting it first would hide those
             // inputs from `filter_product_rows`.
-            let mut derived = self.s23.rows(&self.atom_revisions, PROJECTION_GENERATION)?;
+            let mut derived = self
+                .scenario_core
+                .rows(&self.atom_revisions, PROJECTION_GENERATION)?;
             derived.extend(self.synthesis.clone().rows()?);
             derived.extend(synthesis::wiki_rows(
                 &self.atoms,
                 &self.proposals,
                 &self.episodes,
                 &self.synthesis,
-                &self.s23,
+                &self.scenario_core,
             )?);
             for row in filter_product_rows(
                 derived,
@@ -5332,7 +5339,7 @@ impl JournalAdmissionState {
             .values()
             .map(|(v, s)| (InboxCandidate::Proposal(v), *s))
             .chain(
-                self.s23
+                self.scenario_core
                     .validation_entries()
                     .map(|(v, s)| (InboxCandidate::Support(v), s)),
             )
@@ -5494,7 +5501,7 @@ impl JournalAdmissionState {
                 seq,
             ),
             InboxCandidate::Support(v) => self
-                .s23
+                .scenario_core
                 .validation_row(v.validation_revision_id, PROJECTION_GENERATION),
             InboxCandidate::Negative(v) => self
                 .procedure
@@ -5728,7 +5735,7 @@ impl JournalAdmissionState {
             contracts: if ids.revision_ids.is_empty() {
                 BTreeSet::new()
             } else {
-                self.s23
+                self.scenario_core
                     .deletion_owned_contracts(&ids.revision_ids, &ids.membership_ids)
             },
             proposals: proposal_ids_for_deletion(
@@ -5816,38 +5823,17 @@ impl JournalAdmissionState {
         if limit == 0 || limit > 64 {
             return Err(StoreError::InvalidInput);
         }
-        let mut revision_ids = BTreeSet::new();
-        let mut atom_ids = BTreeSet::new();
-        let mut procedure_ids = BTreeSet::new();
-        let mut membership_ids = BTreeSet::new();
-        for event in self.deletions.events() {
-            revision_ids.extend(event.exact_revision_ids.iter().copied());
-            match event.target {
-                ObjectDeletionTarget::Atom { atom_id } => {
-                    atom_ids.insert(atom_id);
-                }
-                ObjectDeletionTarget::Procedure { procedure_id } => {
-                    procedure_ids.insert(procedure_id);
-                }
-                ObjectDeletionTarget::CoreMembership { core_membership_id } => {
-                    membership_ids.insert(core_membership_id);
-                }
-            }
-        }
-        let removed_contracts = if revision_ids.is_empty() {
-            BTreeSet::new()
-        } else {
-            self.s23
-                .deletion_owned_contracts(&revision_ids, &membership_ids)
-        };
+        let deleted = product_deletion_ids(&self.deletions);
+        let removed_contracts = self
+            .scenario_core
+            .deletion_owned_contracts(&deleted.revision_ids, &deleted.membership_ids);
         let mut items = Vec::with_capacity(limit + 1);
         let mut cursor = after.map(str::to_owned);
         while items.len() <= limit {
-            // Retain only the next bounded group of identities. No candidate
-            // payload is cloned or serialized while enumerating history.
             let capacity = limit + 1 - items.len();
             let mut candidates = BTreeMap::new();
-            let mut offer = |key: String, candidate| {
+            let mut offer = |candidate| {
+                let key = MemoriesCandidate::row_id(candidate);
                 if cursor.as_deref().is_some_and(|after| key.as_str() <= after) {
                     return;
                 }
@@ -5856,108 +5842,51 @@ impl JournalAdmissionState {
                     candidates.pop_last();
                 }
             };
-            for id in self.atom_revisions.keys() {
-                offer(
-                    format!("object:atom:atom_revision:{id}"),
-                    MemoriesCandidate::Atom(*id),
-                );
+            for (value, seq) in self.atom_revisions.values() {
+                offer(MemoriesCandidate::Atom(value, *seq));
             }
-            for value in self.s23.all_membership_revisions() {
-                offer(
-                    format!(
-                        "object:atom:core_membership:{}",
-                        value.membership_revision_id
-                    ),
-                    MemoriesCandidate::Membership(value.membership_revision_id),
-                );
+            for value in self.scenario_core.all_membership_revisions() {
+                let (_, seq) = self
+                    .scenario_core
+                    .membership_revision_entry(value.membership_revision_id)
+                    .ok_or(StoreError::StoreCorrupt)?;
+                offer(MemoriesCandidate::Membership(value, seq));
             }
             for value in self.procedure.all_revisions() {
-                offer(
-                    format!(
-                        "object:procedure:{}:{}",
-                        value.procedure_id, value.revision_id
-                    ),
-                    MemoriesCandidate::Procedure(value.revision_id),
-                );
+                let (_, seq) = self
+                    .procedure
+                    .revision_entry(value.revision_id)
+                    .ok_or(StoreError::StoreCorrupt)?;
+                offer(MemoriesCandidate::Procedure(value, seq));
             }
-            for id in self.proposal_revisions.keys() {
-                offer(
-                    format!("object:revision_proposal:revision_proposal_revision:{id}"),
-                    MemoriesCandidate::Proposal(*id),
-                );
+            for (value, seq) in self.proposal_revisions.values() {
+                offer(MemoriesCandidate::Proposal(value, *seq));
             }
-            for id in self.synthesis.digests.keys() {
-                offer(
-                    format!("object:work:semantic_digest:{id}"),
-                    MemoriesCandidate::Digest(*id),
-                );
+            for (value, seq) in self.synthesis.digests.values() {
+                offer(MemoriesCandidate::Digest(value, *seq));
             }
             if candidates.is_empty() {
                 break;
             }
             for (key, candidate) in candidates {
                 cursor = Some(key);
-                let row = match candidate {
-                    MemoriesCandidate::Atom(id) => {
-                        let (value, seq) = self
-                            .atom_revisions
-                            .get(&id)
-                            .ok_or(StoreError::StoreCorrupt)?;
-                        let mut row = semantic_atom_row(
-                            value,
-                            &JournalPayload::AtomRecorded(Box::new(value.clone())),
-                            *seq,
-                        )?;
-                        row.support_state = self
-                            .s23
-                            .atom_support_state_excluding(id, &removed_contracts)
-                            .map(str::to_owned);
-                        row
-                    }
-                    MemoriesCandidate::Membership(id) => {
-                        self.s23.membership_row(id, PROJECTION_GENERATION)?
-                    }
-                    MemoriesCandidate::Procedure(id) => self.procedure.revision_row(
-                        id,
-                        PROJECTION_GENERATION,
-                        self.s23
-                            .successor_support_state_excluding(id, &removed_contracts),
-                    )?,
-                    MemoriesCandidate::Proposal(id) => {
-                        let (value, seq) = self
-                            .proposal_revisions
-                            .get(&id)
-                            .ok_or(StoreError::StoreCorrupt)?;
-                        // Full projection closes deletion over the logical
-                        // proposal before rendering any of its revisions.
-                        if !revision_ids.is_empty()
-                            && self.proposal_revisions.values().any(|(candidate, _)| {
-                                candidate.proposal_id == value.proposal_id
-                                    && proposal_targets_deleted(
-                                        candidate,
-                                        &atom_ids,
-                                        &procedure_ids,
-                                        &membership_ids,
-                                    )
-                            })
-                        {
-                            continue;
-                        }
-                        semantic_proposal_row(
-                            value,
-                            &JournalPayload::RevisionProposalRecorded(Box::new(value.clone())),
-                            *seq,
-                        )?
-                    }
-                    MemoriesCandidate::Digest(id) => {
-                        let (value, seq) = self
-                            .synthesis
-                            .digests
-                            .get(&id)
-                            .ok_or(StoreError::StoreCorrupt)?;
-                        synthesis::digest_row(id, value.clone(), *seq)?
-                    }
-                };
+                // Deletion closes over the whole logical proposal, including
+                // accepted creates whose earlier revisions had no target.
+                if let MemoriesCandidate::Proposal(value, _) = candidate
+                    && !deleted.revision_ids.is_empty()
+                    && self.proposal_revisions.values().any(|(previous, _)| {
+                        previous.proposal_id == value.proposal_id
+                            && proposal_targets_deleted(
+                                previous,
+                                &deleted.atom_ids,
+                                &deleted.procedure_ids,
+                                &deleted.membership_ids,
+                            )
+                    })
+                {
+                    continue;
+                }
+                let row = self.memory_candidate_row(candidate, &removed_contracts)?;
                 items.extend(filter_product_rows(
                     vec![row],
                     &self.deletions,
@@ -5968,19 +5897,11 @@ impl JournalAdmissionState {
         }
         let next_cursor = (items.len() > limit).then(|| items[limit - 1].row_id.clone());
         items.truncate(limit);
-        // Deletion closure removes complete proposal identities, including
-        // accepted creates whose older revisions had no direct target. The
-        // repository closure likewise records logical proposal IDs. A retained
-        // chain therefore has the same current revision as validated admission.
         let current_proposal_revisions = items
             .iter()
             .filter(|row| row.object_kind.as_deref() == Some("revision_proposal_revision"))
             .filter_map(|row| row.object_id.as_deref()?.parse::<RevisionProposalId>().ok())
-            .filter_map(|id| {
-                self.proposals
-                    .get(&id)
-                    .map(|(value, _)| value.proposal_revision_id)
-            })
+            .filter_map(|id| self.proposals.get(&id).map(|(v, _)| v.proposal_revision_id))
             .collect();
         Ok(MemoriesCurrentContext {
             frontier: self.frontier,
@@ -6791,7 +6712,7 @@ impl JournalAdmissionState {
             atom_revisions: &self.atom_revisions,
             proposals: &self.proposals,
             procedure: &self.procedure,
-            s23: &self.s23,
+            scenario_core: &self.scenario_core,
             synthesis: &self.synthesis,
             deletions: &self.deletions,
         }
@@ -6832,7 +6753,7 @@ impl JournalAdmissionState {
             recall_ledger: &self.recall_ledger,
             synthesis: &self.synthesis,
             procedure: &self.procedure,
-            s23: &self.s23,
+            scenario_core: &self.scenario_core,
             scope_purges: &self.scope_purges,
         }
     }
@@ -7052,7 +6973,7 @@ fn derive_object_deletion_preview_from_inputs(
         }
         ObjectDeletionTarget::CoreMembership { core_membership_id } => {
             let current = inputs
-                .s23
+                .scenario_core
                 .current_membership(core_membership_id)
                 .ok_or(StoreError::InvalidInput)?;
             let proposal = exact_accepted_proposal_for_target(
@@ -7062,7 +6983,7 @@ fn derive_object_deletion_preview_from_inputs(
             )?;
             (
                 inputs
-                    .s23
+                    .scenario_core
                     .memberships_for_deletion(core_membership_id)
                     .map(|membership| {
                         Ok(ObjectDeletionRevisionFact {
@@ -7092,7 +7013,7 @@ fn derive_object_deletion_preview_from_inputs(
         .map(|fact| fact.revision_id)
         .collect::<BTreeSet<_>>();
     let support_impacts = inputs
-        .s23
+        .scenario_core
         .deletion_support_impacts(target, &target_revisions)?;
     let procedure_impacts = inputs
         .procedure
@@ -7357,8 +7278,9 @@ fn derive_repository_scope_purge_preview(
             .contains(&revision.procedure_id)
             .then_some(revision.revision_id)
     }));
-    let (mut membership_ids, membership_revisions) =
-        inputs.s23.repository_membership_revision_ids(repository_id);
+    let (mut membership_ids, membership_revisions) = inputs
+        .scenario_core
+        .repository_membership_revision_ids(repository_id);
     target_revision_ids.extend(membership_revisions);
 
     let target_workstreams = inputs
@@ -7785,7 +7707,7 @@ fn derive_repository_scope_purge_preview(
         .cloned()
         .collect::<Vec<_>>();
     let downstream_support_impacts = inputs
-        .s23
+        .scenario_core
         .scope_purge_support_impacts(&target_revision_ids, &membership_ids)?;
     let dependent_procedure_impacts = inputs
         .procedure
@@ -8123,7 +8045,7 @@ fn extend_repository_semantic_closure(
             reverse.entry(dependency).or_default().insert(entity);
         }
     }
-    for membership in inputs.s23.all_membership_revisions() {
+    for membership in inputs.scenario_core.all_membership_revisions() {
         membership_revisions
             .entry(membership.core_membership_id)
             .or_default()
@@ -8658,7 +8580,7 @@ impl RepositoryClosureKeys {
                     .is_some_and(|id| self.worktree_ids.contains(&id)));
         }
         match row.object_kind.as_deref() {
-            Some(s23::CORE_PROJECTION_KIND) => {
+            Some(scenario_core::CORE_PROJECTION_KIND) => {
                 let value: evertrace_domain::semantic::L3CoreProjection = serde_json::from_str(
                     row.payload_json
                         .as_deref()
@@ -8919,35 +8841,7 @@ impl RepositoryClosureKeys {
                         .any(|id| self.source_observation_ids.contains(id))
             }
             JournalPayload::AtomRecorded(value) => {
-                self.atom_ids.contains(&value.atom_id)
-                    || self.revision_ids.contains(&value.revision_id)
-                    || atom_scope_repository(&value.scope, repository_id, &self.task_ids)
-                    || value
-                        .source_observation_refs
-                        .iter()
-                        .any(|id| self.source_observation_ids.contains(id))
-                    || value.evidence_refs.iter().any(|reference| {
-                        typed_text_references_target(
-                            reference,
-                            &self.source_observation_ids,
-                            &self.source_receipt_ids,
-                            &self.revision_ids,
-                        )
-                    })
-                    || value
-                        .parent_revision_id
-                        .iter()
-                        .chain(&value.value.critical_revision_refs)
-                        .chain(&value.supersedes_revision_refs)
-                        .chain(&value.supports_revision_refs)
-                        .chain(&value.contradicts_revision_refs)
-                        .any(|id| self.revision_ids.contains(id))
-                    || value
-                        .accepted_proposal_id
-                        .is_some_and(|id| self.proposal_ids.contains(&id))
-                    || value
-                        .accepted_proposal_revision_id
-                        .is_some_and(|id| self.proposal_revision_ids.contains(&id))
+                self.references_memory(MemoriesCandidate::Atom(value, 0))
             }
             JournalPayload::RevisionProposalRecorded(value) => self.references_proposal(value),
             JournalPayload::ProcedureRevisionRecorded(value) => self.references_procedure(value),
@@ -8986,18 +8880,7 @@ impl RepositoryClosureKeys {
                         .any(|id| self.atom_ids.contains(id))
             }
             JournalPayload::CoreMembershipRecorded(value) => {
-                self.membership_ids.contains(&value.core_membership_id)
-                    || self.revision_ids.contains(&value.membership_revision_id)
-                    || self.revision_ids.contains(&value.atom_revision_id)
-                    || self.revision_ids.contains(&value.support_contract_ref)
-                    || value
-                        .authorization_revision_refs
-                        .iter()
-                        .any(|id| self.revision_ids.contains(id))
-                    || value
-                        .supersedes_membership_revision_id
-                        .is_some_and(|id| self.revision_ids.contains(&id))
-                    || self.revision_ids.contains(&value.created_by_acceptance_ref)
+                self.references_memory(MemoriesCandidate::Membership(value, 0))
             }
             JournalPayload::GlobalSupportContractRecorded(value) => {
                 value
@@ -9498,7 +9381,7 @@ impl JournalAdmissionState {
                         (atom.lifecycle_status
                             == evertrace_domain::semantic::AtomLifecycleStatus::Active
                             && atom.kind.is_normative()
-                            && self.s23.atom_support_eligible(atom.revision_id)
+                            && self.scenario_core.atom_support_eligible(atom.revision_id)
                             && recall_scope_matches(&atom.scope, episode))
                         .then_some(RecallCurrentAtom {
                             atom: atom.clone(),
@@ -9769,7 +9652,7 @@ impl JournalAdmissionState {
             &self.atoms,
             &self.proposals,
             &self.procedure,
-            &self.s23,
+            &self.scenario_core,
             command.events().iter().map(|event| {
                 (
                     &event.payload,
@@ -9812,7 +9695,7 @@ impl JournalAdmissionState {
                     proposals: &self.proposals,
                     atoms: &self.atoms,
                     procedures: &self.procedure,
-                    s23: &self.s23,
+                    scenario_core: &self.scenario_core,
                     refs: &synthesis_refs,
                     proposal_evidence_refs: &proposal_evidence_refs,
                     source_receipts: &self.source_receipts,
@@ -9997,7 +9880,7 @@ impl JournalAdmissionState {
             &self.atoms,
             &self.proposals,
             &self.procedure,
-            &self.s23,
+            &self.scenario_core,
             rows.iter()
                 .zip(parsed.iter())
                 .map(|(row, (payload, _, _))| {
@@ -10035,7 +9918,7 @@ impl JournalAdmissionState {
                 proposals: &self.proposals,
                 atoms: &self.atoms,
                 procedures: &self.procedure,
-                s23: &self.s23,
+                scenario_core: &self.scenario_core,
                 refs: &synthesis_refs,
                 proposal_evidence_refs: &proposal_evidence_refs,
                 source_receipts: &self.source_receipts,
@@ -10154,7 +10037,7 @@ impl JournalAdmissionState {
                     .iter()
                     .map(|(payload, _, _, _)| *payload)
                     .collect::<Vec<_>>();
-                self.s23.validate_deletion_support_fanout(
+                self.scenario_core.validate_deletion_support_fanout(
                     &preview.downstream_support_impacts,
                     occurred_at_us,
                     effective_config_hash,
@@ -10324,7 +10207,7 @@ impl JournalAdmissionState {
                     .iter()
                     .map(|(payload, _, _, _)| *payload)
                     .collect::<Vec<_>>();
-                self.s23.validate_deletion_support_fanout(
+                self.scenario_core.validate_deletion_support_fanout(
                     &preview.downstream_support_impacts,
                     occurred_at_us,
                     config_hash,
@@ -11152,7 +11035,7 @@ impl JournalAdmissionState {
             | JournalPayload::CoreMembershipRecorded(_)
             | JournalPayload::GlobalSupportContractRecorded(_)
             | JournalPayload::GlobalSupportValidationRecorded(_)) => {
-                self.s23.apply(payload, seq)?;
+                self.scenario_core.apply(payload, seq)?;
             }
             payload @ (JournalPayload::SemanticDigestRecorded(_)
             | JournalPayload::SemanticDerivationRunRecorded(_)) => {
@@ -11350,7 +11233,7 @@ impl JournalAdmissionState {
             results: &self.result_evidence,
             artifacts: &self.work_artifacts,
             procedure: &self.procedure,
-            s23: &self.s23,
+            scenario_core: &self.scenario_core,
             semantic_digests: self.synthesis.digests(),
             deletions: &self.deletions,
         })?;
@@ -12173,7 +12056,7 @@ fn apply_event(
         | JournalPayload::CoreMembershipRecorded(_)
         | JournalPayload::GlobalSupportContractRecorded(_)
         | JournalPayload::GlobalSupportValidationRecorded(_)) => {
-            state.s23.apply(payload, row.seq)?;
+            state.scenario_core.apply(payload, row.seq)?;
         }
         payload @ (JournalPayload::SemanticDigestRecorded(_)
         | JournalPayload::SemanticDerivationRunRecorded(_)) => {
@@ -13848,7 +13731,7 @@ impl ReducerState {
         semantic::rebuild_atoms(&mut self.atoms, &self.atom_revisions)?;
         semantic::rebuild_proposals(&mut self.proposals, &self.proposal_revisions)?;
         self.procedure.rebuild()?;
-        self.s23.rebuild()?;
+        self.scenario_core.rebuild()?;
         self.synthesis.rebuild(
             &self.episodes,
             &self.episode_revisions,
@@ -13907,7 +13790,7 @@ impl ReducerState {
                 }
                 continue;
             }
-            if s23::S23State::restore_projection(row)? {
+            if scenario_core::ScenarioCoreState::restore_projection(row)? {
                 continue;
             }
             if synthesis::restore_wiki_projection(row)?.is_some() {
@@ -14874,7 +14757,7 @@ impl ReducerState {
             | JournalPayload::CoreMembershipRecorded(_)
             | JournalPayload::GlobalSupportContractRecorded(_)
             | JournalPayload::GlobalSupportValidationRecorded(_)) => {
-                self.s23.restore(payload, row.source_event_seq)?;
+                self.scenario_core.restore(payload, row.source_event_seq)?;
                 false
             }
             payload @ (JournalPayload::SemanticDigestRecorded(_)
@@ -14977,7 +14860,7 @@ impl ReducerState {
             .collect::<Vec<_>>();
         let mut rows = Vec::new();
         rows.extend(recall_projection::rows(&self.atoms, |atom| {
-            self.s23.atom_support_eligible(atom.revision_id)
+            self.scenario_core.atom_support_eligible(atom.revision_id)
         })?);
         rows.extend(self.recall_ledger.clone().rows(PROJECTION_GENERATION)?);
         rows.extend(
@@ -14991,9 +14874,12 @@ impl ReducerState {
             &self.proposals,
             &self.episodes,
             &self.synthesis,
-            &self.s23,
+            &self.scenario_core,
         )?);
-        rows.extend(self.procedure.rows(PROJECTION_GENERATION, &self.s23)?);
+        rows.extend(
+            self.procedure
+                .rows(PROJECTION_GENERATION, &self.scenario_core)?,
+        );
         rows.extend(self.procedure.effect_rows(
             &self.episode_revisions,
             &self.worktree_snapshots,
@@ -15002,7 +14888,10 @@ impl ReducerState {
             &self.artifact_revisions,
             PROJECTION_GENERATION,
         )?);
-        rows.extend(self.s23.rows(&self.atom_revisions, PROJECTION_GENERATION)?);
+        rows.extend(
+            self.scenario_core
+                .rows(&self.atom_revisions, PROJECTION_GENERATION)?,
+        );
         rows.extend(self.synthesis.rows()?);
         let mut payload_blocks = crate::objects::RowPayloadBlockBuilder::default();
         let mut payload_scratch = Vec::new();
@@ -15455,7 +15344,7 @@ impl ReducerState {
                 seq,
             )?;
             row.support_state = self
-                .s23
+                .scenario_core
                 .atom_support_state(value.revision_id)
                 .map(str::to_owned);
             rows.push(row);
@@ -15500,7 +15389,7 @@ impl ReducerState {
         });
         self.procedure.forget(&procedure_ids, &revision_ids);
         let owned_support_contracts = self
-            .s23
+            .scenario_core
             .deletion_owned_contracts(&revision_ids, &membership_ids);
         let owned_outbox_ids = self
             .outbox
@@ -15525,7 +15414,7 @@ impl ReducerState {
         self.outbox.retain(|id, _| !owned_outbox_ids.contains(id));
         self.jobs
             .retain(|_, (job, _)| !owned_outbox_ids.contains(&job.idempotency_key));
-        self.s23.forget(&revision_ids, &membership_ids);
+        self.scenario_core.forget(&revision_ids, &membership_ids);
 
         self.proposals
             .retain(|id, _| !deleted_proposal_ids.contains(id));
@@ -15553,7 +15442,7 @@ impl ReducerState {
             &self.host_occurrences,
             &self.operations,
         )?;
-        self.s23.validate(
+        self.scenario_core.validate(
             &self.atom_revisions,
             &self.proposal_revisions,
             &self.procedure,
@@ -15756,7 +15645,7 @@ impl ReducerState {
             results: &self.result_evidence,
             artifacts: &self.work_artifacts,
             procedure: &self.procedure,
-            s23: &self.s23,
+            scenario_core: &self.scenario_core,
             semantic_digests: self.synthesis.digests(),
             deletions: &self.deletions,
         })?;
@@ -15831,7 +15720,7 @@ impl ReducerState {
             proposals: self.proposals.clone(),
             proposal_revisions: self.proposal_revisions.clone(),
             recall_ledger: self.recall_ledger.clone(),
-            s23: self.s23.clone(),
+            scenario_core: self.scenario_core.clone(),
             procedure: self.procedure.clone(),
             synthesis: self.synthesis.clone(),
             deletions: self.deletions.clone(),
@@ -17303,7 +17192,8 @@ fn incremental_changed_rows(
                 || reconcile_recall
                     && row.object_kind.as_deref()
                         == Some(recall_projection::RECALL_TRIGGER_INDEX_KIND)
-                || reconcile_core && row.object_kind.as_deref() == Some(s23::CORE_PROJECTION_KIND)
+                || reconcile_core
+                    && row.object_kind.as_deref() == Some(scenario_core::CORE_PROJECTION_KIND)
                 || reconcile_wiki
                     && row.object_kind.as_deref() == Some(synthesis::WIKI_PROJECTION_KIND)
                 || reconcile_procedure_effect

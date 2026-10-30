@@ -1,3 +1,4 @@
+//! Scenario updates and Core/global-support proposal commands.
 use std::collections::{BTreeMap, BTreeSet};
 
 use evertrace_domain::{
@@ -39,7 +40,7 @@ use super::{
     },
 };
 
-const S23_ALGORITHM: &str = "s23-scenario-core-v1";
+const SCENARIO_CORE_ALGORITHM: &str = "s23-scenario-core-v1";
 
 #[derive(Clone, Debug)]
 pub(crate) struct SupportReplacementSelection {
@@ -540,7 +541,7 @@ pub(crate) fn global_support_payloads(
     let dirty = DirtyTarget {
         target_kind: DirtyTargetKind::RuntimeJob,
         target_id: support_contract_ref.to_string(),
-        algorithm_revision: S23_ALGORITHM.into(),
+        algorithm_revision: SCENARIO_CORE_ALGORITHM.into(),
         source_watermark: 1,
     };
     Ok(vec![
@@ -1068,7 +1069,7 @@ pub fn accept_core_membership(
     let dirty = DirtyTarget {
         target_kind: DirtyTargetKind::RuntimeJob,
         target_id: support_contract_ref.to_string(),
-        algorithm_revision: S23_ALGORITHM.into(),
+        algorithm_revision: SCENARIO_CORE_ALGORITHM.into(),
         source_watermark: 1,
     };
     payloads.extend(vec![
@@ -1131,7 +1132,7 @@ pub fn mark_support_pending(
     let dirty = DirtyTarget {
         target_kind: DirtyTargetKind::RuntimeJob,
         target_id: current.support_contract_ref.to_string(),
-        algorithm_revision: S23_ALGORITHM.into(),
+        algorithm_revision: SCENARIO_CORE_ALGORITHM.into(),
         source_watermark: generation,
     };
     let job = DurableJob {
@@ -1141,7 +1142,7 @@ pub fn mark_support_pending(
         target_watermark: generation,
         target_generation: generation,
         kind: "support_closure".into(),
-        algorithm_revision: S23_ALGORITHM.into(),
+        algorithm_revision: SCENARIO_CORE_ALGORITHM.into(),
         model_id: None,
         priority: 0,
         state: JobStatus::Queued,
@@ -1171,7 +1172,7 @@ pub fn mark_support_pending(
 }
 
 fn draft(at: i64, config: [u8; 32], payload: JournalPayload) -> JournalEventDraft {
-    JournalEventDraft::runtime(at, config, S23_ALGORITHM, payload)
+    JournalEventDraft::runtime(at, config, SCENARIO_CORE_ALGORITHM, payload)
 }
 
 fn digest_revisions(tag: &str, values: &[RevisionId]) -> Result<[u8; 32], SemanticServiceError> {

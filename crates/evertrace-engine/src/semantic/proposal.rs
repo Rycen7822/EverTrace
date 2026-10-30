@@ -682,7 +682,7 @@ impl RevisionProposalService {
         context: ProposalCommandContext,
         proposal_id: RevisionProposalId,
         acceptance_context: AtomAcceptanceContext,
-        support: &super::s23::SupportAtomAcceptance,
+        support: &super::scenario_core::SupportAtomAcceptance,
     ) -> Result<AcceptedProposalCommand, SemanticServiceError> {
         self.accept_inner(
             view,
@@ -719,7 +719,7 @@ impl RevisionProposalService {
         proposal_id: RevisionProposalId,
         acceptance_context: AtomAcceptanceContext,
         original: &RevisionProposal,
-        support: &super::s23::SupportAtomAcceptance,
+        support: &super::scenario_core::SupportAtomAcceptance,
     ) -> Result<AcceptedProposalCommand, SemanticServiceError> {
         self.accept_inner(
             view,
@@ -738,7 +738,7 @@ impl RevisionProposalService {
         proposal_id: RevisionProposalId,
         acceptance_context: AtomAcceptanceContext,
         edit_original: Option<&RevisionProposal>,
-        support: Option<&super::s23::SupportAtomAcceptance>,
+        support: Option<&super::scenario_core::SupportAtomAcceptance>,
     ) -> Result<AcceptedProposalCommand, SemanticServiceError> {
         let current = view
             .proposals
@@ -894,7 +894,7 @@ impl RevisionProposalService {
             match support {
                 Some(support) => {
                     if current.operation == ProposalOperation::Replace {
-                        payloads.extend(super::s23::global_atom_support_payloads(
+                        payloads.extend(super::scenario_core::global_atom_support_payloads(
                             view,
                             &atom,
                             &accepted,
@@ -903,13 +903,13 @@ impl RevisionProposalService {
                     } else if current.operation != ProposalOperation::Deprecate {
                         return Err(SemanticServiceError::UnsupportedTarget);
                     }
-                    payloads.extend(super::s23::support_successor_fanout_payloads(
+                    payloads.extend(super::scenario_core::support_successor_fanout_payloads(
                         support,
                         context.effective_config_hash,
                         context.occurred_at_us,
                     )?);
                 }
-                None => payloads.extend(super::s23::global_atom_support_payloads(
+                None => payloads.extend(super::scenario_core::global_atom_support_payloads(
                     view,
                     &atom,
                     &accepted,

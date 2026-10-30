@@ -36,7 +36,7 @@ pub(super) struct SynthesisAdmissionView<'a> {
     >,
     pub(super) atoms: &'a BTreeMap<evertrace_domain::ids::AtomId, (Atom, u64)>,
     pub(super) procedures: &'a super::procedure::ProcedureState,
-    pub(super) s23: &'a super::s23::S23State,
+    pub(super) scenario_core: &'a super::scenario_core::ScenarioCoreState,
     pub(super) refs: &'a std::collections::BTreeSet<String>,
     pub(super) proposal_evidence_refs: &'a std::collections::BTreeSet<String>,
     pub(super) source_receipts: &'a SourceReceiptFacts,
@@ -51,7 +51,7 @@ pub(super) fn wiki_rows(
     >,
     episodes: &BTreeMap<evertrace_domain::ids::WorkEpisodeId, (WorkEpisode, u64)>,
     synthesis: &SynthesisState,
-    support: &super::s23::S23State,
+    support: &super::scenario_core::ScenarioCoreState,
 ) -> Result<Vec<ObjectRow>, StoreError> {
     let active_atom_revisions = atoms
         .values()
@@ -596,7 +596,7 @@ impl SynthesisState {
                             ..
                         } => {
                             let scenario = view
-                                .s23
+                                .scenario_core
                                 .current_scenario(*scenario_revision_id)
                                 .ok_or(StoreError::StoreCorrupt)?;
                             if scenario.scope.task_id != *task_id
@@ -1170,7 +1170,7 @@ mod tests {
             &proposals,
             &BTreeMap::new(),
             &SynthesisState::default(),
-            &super::super::s23::S23State::default(),
+            &super::super::scenario_core::ScenarioCoreState::default(),
         )
         .unwrap();
         assert_eq!(rows.len(), 1);
@@ -1229,7 +1229,7 @@ mod tests {
             &proposals,
             &BTreeMap::new(),
             &SynthesisState::default(),
-            &super::super::s23::S23State::default(),
+            &super::super::scenario_core::ScenarioCoreState::default(),
         )
         .unwrap();
         let projection = restore_wiki_projection(&rows[0]).unwrap().unwrap();

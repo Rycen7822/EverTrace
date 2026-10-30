@@ -327,193 +327,174 @@ impl JournalAdmissionState {
         has_failed_job: bool,
     ) -> Result<MemoryBrowseContext, StoreError> {
         query.validate().map_err(|_| StoreError::InvalidInput)?;
-        if after.is_some_and(|cursor| cursor.validate_for(query).is_err()) {
-            return Err(StoreError::InvalidInput);
-        }
-        if limit == 0 || limit > 64 {
+        if after.is_some_and(|cursor| cursor.validate_for(query).is_err())
+            || !(1..=64).contains(&limit)
+        {
             return Err(StoreError::InvalidInput);
         }
         let scope = self.memory_scope_context(query.selection)?;
-        let ProductDeletionIds {
-            revision_ids: revisions,
-            atom_ids: atoms,
-            procedure_ids: procedures,
-            membership_ids: memberships,
-        } = product_deletion_ids(&self.deletions);
-        let contracts = self.s23.deletion_owned_contracts(&revisions, &memberships);
-        // No corpus clone or Web index: consume one current record at a time
-        // and retain only the selected limit+1. Historical reads stay separate.
-        let rows = self
+        let deleted = product_deletion_ids(&self.deletions);
+        let contracts = self
+            .scenario_core
+            .deletion_owned_contracts(&deleted.revision_ids, &deleted.membership_ids);
+        let purged_repositories = self
+            .scope_purges
+            .events()
+            .map(|event| event.target.repository_id())
+            .collect::<BTreeSet<_>>();
+        // Borrow current typed records. Full canonical rows are formed only
+        // after visibility, scope, filters, counts and keyset selection.
+        let candidates = self
             .atoms
             .values()
-            .filter(|(value, _)| {
-                !atoms.contains(&value.atom_id) && !revisions.contains(&value.revision_id)
-            })
-            .map(|(value, seq)| {
-                let mut row = semantic_atom_row(
-                    value,
-                    &JournalPayload::AtomRecorded(Box::new(value.clone())),
-                    *seq,
-                )?;
-                row.support_state = self
-                    .s23
-                    .atom_support_state_excluding(value.revision_id, &contracts)
-                    .map(str::to_owned);
-                Ok(row)
-            })
+            .map(|(v, seq)| Ok(MemoriesCandidate::Atom(v, *seq)))
             .chain(
-                self.s23
+                self.scenario_core
                     .all_membership_revisions()
-                    .filter(|value| {
-                        !revisions.contains(&value.membership_revision_id)
-                            && !memberships.contains(&value.core_membership_id)
-                            && self
-                                .s23
-                                .current_membership(value.core_membership_id)
-                                .is_some_and(|current| {
-                                    current.membership_revision_id == value.membership_revision_id
-                                })
+                    .filter(|v| {
+                        self.scenario_core
+                            .current_membership(v.core_membership_id)
+                            .is_some_and(|current| {
+                                current.membership_revision_id == v.membership_revision_id
+                            })
                     })
-                    .map(|value| {
-                        self.s23
-                            .membership_row(value.membership_revision_id, PROJECTION_GENERATION)
+                    .map(|v| {
+                        self.scenario_core
+                            .membership_revision_entry(v.membership_revision_id)
+                            .map(|(_, seq)| MemoriesCandidate::Membership(v, seq))
+                            .ok_or(StoreError::StoreCorrupt)
                     }),
             )
             .chain(
                 self.procedure
                     .all_revisions()
-                    .filter(|value| {
-                        !revisions.contains(&value.revision_id)
-                            && self.procedure.is_current_revision_id(value.revision_id)
-                    })
-                    .map(|value| {
-                        self.procedure.revision_row(
-                            value.revision_id,
-                            PROJECTION_GENERATION,
-                            self.s23
-                                .successor_support_state_excluding(value.revision_id, &contracts),
-                        )
+                    .filter(|v| self.procedure.is_current_revision_id(v.revision_id))
+                    .map(|v| {
+                        self.procedure
+                            .revision_entry(v.revision_id)
+                            .map(|(_, seq)| MemoriesCandidate::Procedure(v, seq))
+                            .ok_or(StoreError::StoreCorrupt)
                     }),
             )
             .chain(
                 self.proposals
                     .values()
-                    .filter(|(value, _)| {
-                        !revisions.contains(&value.proposal_revision_id)
-                            && !value
-                                .base_revision_id
-                                .is_some_and(|id| revisions.contains(&id))
-                            && !proposal_targets_deleted(value, &atoms, &procedures, &memberships)
-                            && (revisions.is_empty()
-                                || !self.proposal_revisions.values().any(|(candidate, _)| {
-                                    candidate.proposal_id == value.proposal_id
+                    .filter(|(v, _)| {
+                        !v.base_revision_id
+                            .is_some_and(|id| deleted.revision_ids.contains(&id))
+                            && (deleted.revision_ids.is_empty()
+                                || !self.proposal_revisions.values().any(|(previous, _)| {
+                                    previous.proposal_id == v.proposal_id
                                         && proposal_targets_deleted(
-                                            candidate,
-                                            &atoms,
-                                            &procedures,
-                                            &memberships,
+                                            previous,
+                                            &deleted.atom_ids,
+                                            &deleted.procedure_ids,
+                                            &deleted.membership_ids,
                                         )
                                 }))
                     })
-                    .map(|(value, seq)| {
-                        semantic_proposal_row(
-                            value,
-                            &JournalPayload::RevisionProposalRecorded(Box::new(value.clone())),
-                            *seq,
-                        )
-                    }),
+                    .map(|(v, seq)| Ok(MemoriesCandidate::Proposal(v, *seq))),
             )
-            .chain(self.synthesis.digests().values().map(|(value, seq)| {
-                synthesis::digest_row(value.semantic_digest_id, value.clone(), *seq)
-            }));
-        let rank = |seq: u64, key: &str| {
+            .chain(
+                self.synthesis
+                    .digests()
+                    .values()
+                    .map(|(v, seq)| Ok(MemoriesCandidate::Digest(v, *seq))),
+            );
+        let rank = |seq: u64, key: String| {
             (
                 match query.order {
                     MemoryBrowseOrder::RecordedNewest => u64::MAX - seq,
                     MemoryBrowseOrder::RecordedOldest => seq,
                 },
-                key.to_owned(),
+                key,
             )
         };
-        let after_rank = after.map(|value| rank(value.source_event_seq, &value.row_id));
+        let after_rank = after.map(|v| rank(v.source_event_seq, v.row_id.clone()));
         let mut selected = BTreeMap::new();
         let (mut total_count, mut matching_count, mut unresolved_scope_count) =
             (0_u64, 0_u64, 0_u64);
-        for row in rows {
-            for row in filter_product_rows(
-                vec![row?],
-                &self.deletions,
-                &self.scope_purges,
-                self.repository_closures.values(),
-            )? {
-                let ownership = self.memory_record_scope(&row)?;
-                if ownership.is_none() {
-                    unresolved_scope_count += 1;
-                }
-                if !scope.available
-                    || !scope.includes(query.selection, query.include_global, ownership.as_deref())
-                {
-                    continue;
-                }
-                total_count += 1;
-                let kind = match row.object_kind.as_deref() {
-                    Some("semantic_digest") => MemoryReadingKind::Summaries,
-                    Some("atom_revision" | "core_membership") => {
-                        MemoryReadingKind::FactsAndConstraints
-                    }
-                    Some("procedure_revision") => MemoryReadingKind::Methods,
-                    Some("revision_proposal_revision") => MemoryReadingKind::References,
-                    _ => return Err(StoreError::StoreCorrupt),
-                };
-                if (query.kind != MemoryReadingKind::All && query.kind != kind)
-                    || query
-                        .epistemic_status
-                        .is_some_and(|value| row.epistemic.as_deref() != Some(value.as_str()))
-                    || query
-                        .authority
-                        .is_some_and(|value| row.authority.as_deref() != Some(value.as_str()))
-                    || query
-                        .atom_lifecycle
-                        .is_some_and(|value| row.lifecycle.as_deref() != Some(value.as_str()))
-                {
-                    continue;
-                }
-                matching_count += 1;
-                let position = rank(row.source_event_seq, &row.row_id);
-                if after_rank.as_ref().is_some_and(|after| position <= *after) {
-                    continue;
-                }
-                selected.insert(position, row);
-                if selected.len() > limit + 1 {
-                    selected.pop_last();
-                }
+        for candidate in candidates {
+            let candidate = candidate?;
+            if candidate.product_deleted(
+                &deleted.revision_ids,
+                &deleted.atom_ids,
+                &deleted.procedure_ids,
+                &deleted.membership_ids,
+            ) {
+                continue;
+            }
+            if !purged_repositories.is_empty()
+                && (candidate
+                    .repository_id()
+                    .is_some_and(|id| purged_repositories.contains(&id))
+                    || self
+                        .repository_closures
+                        .values()
+                        .any(|closure| closure.references_memory(candidate)))
+            {
+                continue;
+            }
+            let ownership = self.memory_record_scope(candidate);
+            if ownership.is_none() {
+                unresolved_scope_count += 1;
+            }
+            if !scope.available
+                || !scope.includes(query.selection, query.include_global, ownership.as_deref())
+            {
+                continue;
+            }
+            total_count += 1;
+            if !candidate.matches_query(query) {
+                continue;
+            }
+            matching_count += 1;
+            let position = rank(candidate.source_event_seq(), candidate.row_id());
+            if after_rank.as_ref().is_some_and(|after| position <= *after) {
+                continue;
+            }
+            selected.insert(position, candidate);
+            if selected.len() > limit + 1 {
+                selected.pop_last();
             }
         }
-        let mut items = selected.into_values().collect::<Vec<_>>();
-        let next_cursor = if items.len() > limit {
-            let last = &items[limit - 1];
+        let mut selected = selected.into_iter().collect::<Vec<_>>();
+        let next_cursor = if selected.len() > limit {
+            let (position, last) = &selected[limit - 1];
             Some(
                 serde_json::to_string(&MemoryBrowseCursor {
                     frontier: self.frontier,
                     query: query.clone(),
-                    source_event_seq: last.source_event_seq,
-                    row_id: last.row_id.clone(),
+                    source_event_seq: last.source_event_seq(),
+                    row_id: position.1.clone(),
                 })
                 .map_err(|_| StoreError::StoreCorrupt)?,
             )
         } else {
             None
         };
-        items.truncate(limit);
+        selected.truncate(limit);
+        let expected_count = selected.len();
+        let items = selected
+            .into_iter()
+            .map(|(_, candidate)| self.memory_candidate_row(candidate, &contracts))
+            .collect::<Result<Vec<_>, _>>()?;
+        // Keep the existing canonical selected-row check as well. A divergence
+        // is corruption, not a silently shorter page with overstated counts.
+        let items = filter_product_rows(
+            items,
+            &self.deletions,
+            &self.scope_purges,
+            self.repository_closures.values(),
+        )?;
+        if items.len() != expected_count {
+            return Err(StoreError::StoreCorrupt);
+        }
         let current_proposal_revisions = items
             .iter()
             .filter(|row| row.object_kind.as_deref() == Some("revision_proposal_revision"))
             .filter_map(|row| row.object_id.as_deref()?.parse::<RevisionProposalId>().ok())
-            .filter_map(|id| {
-                self.proposals
-                    .get(&id)
-                    .map(|(value, _)| value.proposal_revision_id)
-            })
+            .filter_map(|id| self.proposals.get(&id).map(|(v, _)| v.proposal_revision_id))
             .collect();
         Ok(MemoryBrowseContext {
             page: MemoriesCurrentContext {
@@ -532,6 +513,49 @@ impl JournalAdmissionState {
                     || unresolved_scope_count == 0),
             unresolved_scope_count,
         })
+    }
+
+    pub(super) fn memory_candidate_row(
+        &self,
+        candidate: MemoriesCandidate<'_>,
+        contracts: &BTreeSet<RevisionId>,
+    ) -> Result<ObjectRow, StoreError> {
+        let row = match candidate {
+            MemoriesCandidate::Atom(value, seq) => {
+                let mut row = semantic_atom_row(
+                    value,
+                    &JournalPayload::AtomRecorded(Box::new(value.clone())),
+                    seq,
+                )?;
+                row.support_state = self
+                    .scenario_core
+                    .atom_support_state_excluding(value.revision_id, contracts)
+                    .map(str::to_owned);
+                row
+            }
+            MemoriesCandidate::Membership(value, _) => self
+                .scenario_core
+                .membership_row(value.membership_revision_id, PROJECTION_GENERATION)?,
+            MemoriesCandidate::Procedure(value, _) => self.procedure.revision_row(
+                value.revision_id,
+                PROJECTION_GENERATION,
+                self.scenario_core
+                    .successor_support_state_excluding(value.revision_id, contracts),
+            )?,
+            MemoriesCandidate::Proposal(value, seq) => semantic_proposal_row(
+                value,
+                &JournalPayload::RevisionProposalRecorded(Box::new(value.clone())),
+                seq,
+            )?,
+            MemoriesCandidate::Digest(value, seq) => {
+                synthesis::digest_row(value.semantic_digest_id, value.clone(), seq)?
+            }
+        };
+        if row.row_id != candidate.row_id() || row.source_event_seq != candidate.source_event_seq()
+        {
+            return Err(StoreError::StoreCorrupt);
+        }
+        Ok(row)
     }
 
     fn memory_scope_context(
@@ -665,58 +689,16 @@ impl JournalAdmissionState {
     // In particular, proposals with no base are not silently classified global.
     fn memory_record_scope(
         &self,
-        row: &ObjectRow,
-    ) -> Result<Option<Vec<evertrace_domain::semantic::AtomScope>>, StoreError> {
-        use evertrace_domain::{
-            ids::SemanticDigestId,
-            semantic::{
-                AtomProposalPayload as A, CoreMembershipProposalPayload as C, ProposalPayload as P,
-            },
+        candidate: MemoriesCandidate<'_>,
+    ) -> Option<Vec<evertrace_domain::semantic::AtomScope>> {
+        use evertrace_domain::semantic::{
+            AtomProposalPayload as A, CoreMembershipProposalPayload as C, ProposalPayload as P,
         };
-        let revision = || {
-            row.current_revision_id
-                .as_deref()
-                .ok_or(StoreError::StoreCorrupt)?
-                .parse::<RevisionId>()
-                .map_err(|_| StoreError::StoreCorrupt)
-        };
-        let scopes = match row.object_kind.as_deref() {
-            Some("atom_revision") => vec![
-                self.atom_revisions
-                    .get(&revision()?)
-                    .ok_or(StoreError::StoreCorrupt)?
-                    .0
-                    .scope
-                    .clone(),
-            ],
-            Some("core_membership") => vec![core_scope(
-                &self
-                    .s23
-                    .membership_revision(revision()?)
-                    .ok_or(StoreError::StoreCorrupt)?
-                    .scope_identity,
-            )],
-            Some("procedure_revision") => vec![procedure_scope(
-                &self
-                    .procedure
-                    .revision(revision()?)
-                    .ok_or(StoreError::StoreCorrupt)?
-                    .draft
-                    .scope,
-            )],
-            Some("semantic_digest") => {
-                let id = row
-                    .object_id
-                    .as_deref()
-                    .ok_or(StoreError::StoreCorrupt)?
-                    .parse::<SemanticDigestId>()
-                    .map_err(|_| StoreError::StoreCorrupt)?;
-                let digest = &self
-                    .synthesis
-                    .digests()
-                    .get(&id)
-                    .ok_or(StoreError::StoreCorrupt)?
-                    .0;
+        let scopes = match candidate {
+            MemoriesCandidate::Atom(value, _) => vec![value.scope.clone()],
+            MemoriesCandidate::Membership(value, _) => vec![core_scope(&value.scope_identity)],
+            MemoriesCandidate::Procedure(value, _) => vec![procedure_scope(&value.draft.scope)],
+            MemoriesCandidate::Digest(digest, _) => {
                 if let Some(task_id) = digest.task_id {
                     vec![evertrace_domain::semantic::AtomScope::Task { task_id }]
                 } else if let (Some(repository_id), Some(worktree_id)) =
@@ -734,44 +716,216 @@ impl JournalAdmissionState {
                     Vec::new()
                 }
             }
-            Some("revision_proposal_revision") => {
-                let proposal = &self
-                    .proposal_revisions
-                    .get(&revision()?)
-                    .ok_or(StoreError::StoreCorrupt)?
-                    .0;
-                match &proposal.payload {
-                    P::Atom(value) => match value.as_ref() {
-                        A::Create { draft }
-                        | A::Replace { draft }
-                        | A::Merge { draft, .. }
-                        | A::Reclassify { draft } => vec![draft.scope.clone()],
-                        A::Split { drafts } => {
-                            drafts.iter().map(|draft| draft.scope.clone()).collect()
-                        }
-                        A::Deprecate { .. } => {
-                            let Some((atom, _)) = proposal
-                                .base_revision_id
-                                .and_then(|id| self.atom_revisions.get(&id))
-                            else {
-                                return Ok(None);
-                            };
-                            vec![atom.scope.clone()]
-                        }
-                    },
-                    P::Procedure(value) => vec![procedure_scope(&value.draft().scope)],
-                    P::CoreMembership(value) => match value.as_ref() {
-                        C::Create { scope_identity, .. }
-                        | C::ResolveConflict { scope_identity, .. } => {
-                            vec![core_scope(scope_identity)]
-                        }
-                    },
-                    P::ReservedTarget { .. } => return Ok(None),
-                }
-            }
-            _ => return Err(StoreError::StoreCorrupt),
+            MemoriesCandidate::Proposal(proposal, _) => match &proposal.payload {
+                P::Atom(value) => match value.as_ref() {
+                    A::Create { draft }
+                    | A::Replace { draft }
+                    | A::Merge { draft, .. }
+                    | A::Reclassify { draft } => vec![draft.scope.clone()],
+                    A::Split { drafts } => drafts.iter().map(|draft| draft.scope.clone()).collect(),
+                    A::Deprecate { .. } => {
+                        let (atom, _) = proposal
+                            .base_revision_id
+                            .and_then(|id| self.atom_revisions.get(&id))?;
+                        vec![atom.scope.clone()]
+                    }
+                },
+                P::Procedure(value) => vec![procedure_scope(&value.draft().scope)],
+                P::CoreMembership(value) => match value.as_ref() {
+                    C::Create { scope_identity, .. }
+                    | C::ResolveConflict { scope_identity, .. } => {
+                        vec![core_scope(scope_identity)]
+                    }
+                },
+                P::ReservedTarget { .. } => return None,
+            },
         };
-        Ok(Some(scopes))
+        Some(scopes)
+    }
+}
+
+impl<'a> MemoriesCandidate<'a> {
+    pub(crate) fn from_payload(payload: &'a JournalPayload, seq: u64) -> Option<Self> {
+        Some(match payload {
+            JournalPayload::AtomRecorded(v) => Self::Atom(v, seq),
+            JournalPayload::CoreMembershipRecorded(v) => Self::Membership(v, seq),
+            JournalPayload::ProcedureRevisionRecorded(v) => Self::Procedure(v, seq),
+            JournalPayload::RevisionProposalRecorded(v) => Self::Proposal(v, seq),
+            JournalPayload::SemanticDigestRecorded(v) => Self::Digest(v, seq),
+            _ => return None,
+        })
+    }
+
+    pub(super) fn source_event_seq(self) -> u64 {
+        match self {
+            Self::Atom(_, seq)
+            | Self::Membership(_, seq)
+            | Self::Procedure(_, seq)
+            | Self::Proposal(_, seq)
+            | Self::Digest(_, seq) => seq,
+        }
+    }
+
+    pub(super) fn row_id(self) -> String {
+        match self {
+            Self::Atom(v, _) => format!("object:atom:atom_revision:{}", v.revision_id),
+            Self::Membership(v, _) => {
+                format!("object:atom:core_membership:{}", v.membership_revision_id)
+            }
+            Self::Procedure(v, _) => {
+                format!("object:procedure:{}:{}", v.procedure_id, v.revision_id)
+            }
+            Self::Proposal(v, _) => format!(
+                "object:revision_proposal:revision_proposal_revision:{}",
+                v.proposal_revision_id
+            ),
+            Self::Digest(v, _) => format!("object:work:semantic_digest:{}", v.semantic_digest_id),
+        }
+    }
+
+    fn repository_id(self) -> Option<RepositoryId> {
+        match self {
+            Self::Atom(v, _) => v.scope.repository_id(),
+            Self::Membership(v, _) => core_scope(&v.scope_identity).repository_id(),
+            Self::Procedure(v, _) => procedure_scope(&v.draft.scope).repository_id(),
+            Self::Digest(v, _) => v.repository_id,
+            // Proposal projection columns do not define its owning scope.
+            Self::Proposal(_, _) => None,
+        }
+    }
+
+    fn matches_query(self, query: &MemoryBrowseQuery) -> bool {
+        let (kind, epistemic, authority, lifecycle) = match self {
+            Self::Atom(v, _) => (
+                MemoryReadingKind::FactsAndConstraints,
+                Some(v.epistemic_status.as_str()),
+                Some(v.authority.as_str()),
+                Some(v.lifecycle_status.as_str()),
+            ),
+            Self::Membership(v, _) => (
+                MemoryReadingKind::FactsAndConstraints,
+                None,
+                None,
+                Some(if v.active { "active" } else { "inactive" }),
+            ),
+            Self::Procedure(_, _) => (MemoryReadingKind::Methods, None, None, Some("active")),
+            Self::Proposal(v, _) => (
+                MemoryReadingKind::References,
+                Some("not_applicable"),
+                Some("none"),
+                Some(v.status.as_str()),
+            ),
+            Self::Digest(v, _) => (
+                MemoryReadingKind::Summaries,
+                Some("derived"),
+                Some(if v.source_target.is_some() {
+                    "agent_inferred"
+                } else {
+                    "none"
+                }),
+                Some("immutable"),
+            ),
+        };
+        (query.kind == MemoryReadingKind::All || query.kind == kind)
+            && query
+                .epistemic_status
+                .is_none_or(|v| epistemic == Some(v.as_str()))
+            && query
+                .authority
+                .is_none_or(|v| authority == Some(v.as_str()))
+            && query
+                .atom_lifecycle
+                .is_none_or(|v| lifecycle == Some(v.as_str()))
+    }
+
+    // The same five-family product deletion predicate is used by the canonical
+    // row filter and by metadata selection before counts/paging.
+    pub(crate) fn product_deleted(
+        self,
+        revisions: &BTreeSet<RevisionId>,
+        atoms: &BTreeSet<AtomId>,
+        procedures: &BTreeSet<evertrace_domain::ids::ProcedureId>,
+        memberships: &BTreeSet<evertrace_domain::ids::CoreMembershipId>,
+    ) -> bool {
+        match self {
+            Self::Atom(v, _) => revisions.contains(&v.revision_id) || atoms.contains(&v.atom_id),
+            Self::Membership(v, _) => {
+                revisions.contains(&v.membership_revision_id)
+                    || memberships.contains(&v.core_membership_id)
+                    || revisions.contains(&v.atom_revision_id)
+            }
+            Self::Procedure(v, _) => {
+                revisions.contains(&v.revision_id) || procedures.contains(&v.procedure_id)
+            }
+            Self::Proposal(v, _) => {
+                revisions.contains(&v.proposal_revision_id)
+                    || proposal_targets_deleted(v, atoms, procedures, memberships)
+            }
+            Self::Digest(v, _) => v.selected_direct_refs.iter().any(|r| {
+                r.parse::<RevisionId>()
+                    .is_ok_and(|id| revisions.contains(&id))
+            }),
+        }
+    }
+}
+
+impl RepositoryClosureKeys {
+    // Borrowing entry for the existing repository product predicate. The
+    // JournalPayload path delegates here too; this is not a second policy.
+    pub(super) fn references_memory(&self, candidate: MemoriesCandidate<'_>) -> bool {
+        let Some(repository_id) = self.repository_id else {
+            return false;
+        };
+        match candidate {
+            MemoriesCandidate::Atom(value, _) => {
+                self.atom_ids.contains(&value.atom_id)
+                    || self.revision_ids.contains(&value.revision_id)
+                    || atom_scope_repository(&value.scope, repository_id, &self.task_ids)
+                    || value
+                        .source_observation_refs
+                        .iter()
+                        .any(|id| self.source_observation_ids.contains(id))
+                    || value.evidence_refs.iter().any(|reference| {
+                        typed_text_references_target(
+                            reference,
+                            &self.source_observation_ids,
+                            &self.source_receipt_ids,
+                            &self.revision_ids,
+                        )
+                    })
+                    || value
+                        .parent_revision_id
+                        .iter()
+                        .chain(&value.value.critical_revision_refs)
+                        .chain(&value.supersedes_revision_refs)
+                        .chain(&value.supports_revision_refs)
+                        .chain(&value.contradicts_revision_refs)
+                        .any(|id| self.revision_ids.contains(id))
+                    || value
+                        .accepted_proposal_id
+                        .is_some_and(|id| self.proposal_ids.contains(&id))
+                    || value
+                        .accepted_proposal_revision_id
+                        .is_some_and(|id| self.proposal_revision_ids.contains(&id))
+            }
+            MemoriesCandidate::Membership(value, _) => {
+                self.membership_ids.contains(&value.core_membership_id)
+                    || self.revision_ids.contains(&value.membership_revision_id)
+                    || self.revision_ids.contains(&value.atom_revision_id)
+                    || self.revision_ids.contains(&value.support_contract_ref)
+                    || value
+                        .authorization_revision_refs
+                        .iter()
+                        .any(|id| self.revision_ids.contains(id))
+                    || value
+                        .supersedes_membership_revision_id
+                        .is_some_and(|id| self.revision_ids.contains(&id))
+                    || self.revision_ids.contains(&value.created_by_acceptance_ref)
+            }
+            MemoriesCandidate::Procedure(value, _) => self.references_procedure(value),
+            MemoriesCandidate::Proposal(value, _) => self.references_proposal(value),
+            MemoriesCandidate::Digest(value, _) => self.references_digest(value),
+        }
     }
 }
 

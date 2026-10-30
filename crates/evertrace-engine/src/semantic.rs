@@ -3,7 +3,7 @@ use thiserror::Error;
 mod emission;
 mod proposal;
 mod resolver;
-mod s23;
+mod scenario_core;
 
 pub use emission::{
     AtomAuthorityBasis, AtomEmissionDecision, AtomEmissionGate, AtomMaterialization,
@@ -23,11 +23,11 @@ pub use resolver::{
     DescriptiveResolutionState, NormativeInstructionResolver, NormativeResolution,
     NormativeResolutionState, ResolverContext,
 };
-pub use s23::{
+pub use scenario_core::{
     AcceptedCoreMembershipCommand, CoreGovernanceDecision, CoreMembershipAcceptanceContext,
     ScenarioCompiler, accept_core_membership, mark_support_pending, submit_core_conflict_proposal,
 };
-pub(crate) use s23::{
+pub(crate) use scenario_core::{
     SupportAtomAcceptance, SupportDeprecateLookup, SupportReplacementLookup,
     compose_support_deprecate, compose_support_replacement, global_support_payloads,
     select_support_atom_acceptance, select_support_deprecate, select_support_replacement,

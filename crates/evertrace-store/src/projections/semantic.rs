@@ -327,7 +327,7 @@ pub(crate) struct SemanticRelationInputs<'a> {
     pub results: &'a BTreeMap<ResultEvidenceId, (evertrace_domain::semantic::ResultEvidence, u64)>,
     pub artifacts: &'a BTreeMap<WorkArtifactId, (WorkArtifact, u64)>,
     pub procedure: &'a super::procedure::ProcedureState,
-    pub s23: &'a super::s23::S23State,
+    pub scenario_core: &'a super::scenario_core::ScenarioCoreState,
     pub semantic_digests:
         &'a BTreeMap<SemanticDigestId, (evertrace_domain::semantic::SemanticDigest, u64)>,
     pub deletions: &'a ObjectDeletionState,
@@ -347,7 +347,7 @@ pub(crate) fn validate_command_boundary<'a>(
     current_atoms: &BTreeMap<AtomId, (Atom, u64)>,
     current_proposals: &BTreeMap<RevisionProposalId, (RevisionProposal, u64)>,
     current_procedures: &super::procedure::ProcedureState,
-    current_support: &super::s23::S23State,
+    current_support: &super::scenario_core::ScenarioCoreState,
     events: impl IntoIterator<Item = (&'a JournalPayload, i64, [u8; 32])>,
     error: StoreError,
 ) -> Result<BTreeSet<RevisionProposalId>, StoreError> {
@@ -492,7 +492,7 @@ pub(crate) fn validate_command_boundary<'a>(
 fn validate_support_proposal_boundaries(
     current_atoms: &BTreeMap<AtomId, (Atom, u64)>,
     current_procedures: &super::procedure::ProcedureState,
-    current_support: &super::s23::S23State,
+    current_support: &super::scenario_core::ScenarioCoreState,
     payloads: &[&JournalPayload],
     error: StoreError,
 ) -> Result<(), StoreError> {
@@ -581,7 +581,7 @@ fn validate_support_proposal_boundaries(
 
 fn support_validation_ref(
     proposal: &RevisionProposal,
-    support: &super::s23::S23State,
+    support: &super::scenario_core::ScenarioCoreState,
     error: StoreError,
 ) -> Result<Option<RevisionId>, StoreError> {
     let evidence = proposal
@@ -1116,7 +1116,7 @@ fn validate_atom_relations(
     {
         if !input.atom_revisions.contains_key(revision)
             && (!input.deleted_revision_ids.contains(revision)
-                || input.s23.atom_support_eligible(atom.revision_id))
+                || input.scenario_core.atom_support_eligible(atom.revision_id))
         {
             return Err(StoreError::StoreCorrupt);
         }
@@ -1281,7 +1281,11 @@ fn support_acceptance_evidence_exists(
     let Ok(validation_revision_id) = evidence_ref.parse::<RevisionId>() else {
         return Ok(false);
     };
-    if input.s23.validation(validation_revision_id).is_none() {
+    if input
+        .scenario_core
+        .validation(validation_revision_id)
+        .is_none()
+    {
         return Ok(false);
     }
     if atom.parent_revision_id.is_some_and(|parent_revision_id| {
@@ -1318,7 +1322,7 @@ fn support_acceptance_evidence_exists(
         return Ok(false);
     }
     Ok(
-        support_validation_ref(proposal, input.s23, StoreError::StoreCorrupt)?
+        support_validation_ref(proposal, input.scenario_core, StoreError::StoreCorrupt)?
             == Some(validation_revision_id),
     )
 }
@@ -1328,10 +1332,10 @@ fn validate_proposal_relations(
     input: &SemanticRelationInputs<'_>,
 ) -> Result<(), StoreError> {
     let support_validation_ref =
-        support_validation_ref(proposal, input.s23, StoreError::StoreCorrupt)?;
+        support_validation_ref(proposal, input.scenario_core, StoreError::StoreCorrupt)?;
     if let Some(validation_revision_id) = support_validation_ref {
         let validation = input
-            .s23
+            .scenario_core
             .validation(validation_revision_id)
             .ok_or(StoreError::StoreCorrupt)?;
         if validation.state == GlobalSupportState::Valid {
