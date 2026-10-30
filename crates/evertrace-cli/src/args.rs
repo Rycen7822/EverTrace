@@ -44,6 +44,9 @@ pub enum Command {
         host_locator: Option<(PathBuf, PathBuf)>,
     },
     Tui,
+    Web {
+        port: u16,
+    },
     AdminSession {
         action: AdminSessionAction,
         session_id: String,
@@ -97,6 +100,7 @@ const ADMIN_REQUIRED: &str = "--admin requires a valid session or repository act
 const BACKUP_REQUIRED: &str = "--backup requires create or verify BACKUP_JOB_ID";
 const HOST_REQUIRED: &str =
     "--install requires an absolute Host executable path; run --uninstall to remove wiring";
+const WEB_PORT_REQUIRED: &str = "--web --port requires a decimal port from 0 to 65535";
 const MCP_LOCATOR_REQUIRED: &str = "--mcp host observation requires --host-executable ABSOLUTE_HOST_EXECUTABLE --host-config ABSOLUTE_CONFIG_PATH";
 
 impl Args {
@@ -120,6 +124,17 @@ impl Args {
                 maintenance: trailing_flag(&mut values, "--maintenance")?,
             },
             b"--tui" => Command::Tui,
+            b"--web" => Command::Web {
+                port: match values.next() {
+                    None => 0,
+                    Some(flag) if flag == "--port" => values
+                        .next()
+                        .and_then(|value| value.into_string().ok())
+                        .and_then(|value| value.parse().ok())
+                        .ok_or(ParseError::Rejected(WEB_PORT_REQUIRED))?,
+                    _ => return Err(ParseError::Usage),
+                },
+            },
             b"--config-check" => Command::ConfigCheck,
             b"--config-show" => Command::ConfigShowEffective,
             b"--config-reload" => Command::ConfigReload {
@@ -192,7 +207,7 @@ impl Args {
                 ));
             }
             b"help" | b"doctor" | b"install" | b"uninstall" | b"upgrade" | b"backup"
-            | b"restore" | b"export" | b"mcp" | b"tui" | b"admin" => {
+            | b"restore" | b"export" | b"mcp" | b"tui" | b"web" | b"admin" => {
                 return Err(ParseError::Retired(
                     mode.to_str().ok_or(ParseError::Usage)?.into(),
                 ));
@@ -368,6 +383,9 @@ Modes:
       Run the evertraced of this installation package in the foreground. This
       process is replaced by that program and keeps its signals and exit status.
   --tui
+  --web [--port PORT]
+      Run the optional same-package Python Web component in the foreground.
+      Default: 127.0.0.1 with an ephemeral port. No daemon or dependency installation.
   --doctor [--refresh-host HOST_EXECUTABLE]
   --config-check
   --config-show

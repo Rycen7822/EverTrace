@@ -1,5 +1,6 @@
 mod admin;
 mod backup;
+mod companion;
 mod config;
 mod daemon;
 mod doctor;
@@ -8,6 +9,7 @@ mod install;
 mod mcp;
 mod restore;
 mod tui;
+mod web;
 
 use std::error::Error;
 
@@ -42,6 +44,7 @@ pub async fn run(args: Args) -> Result<(), Box<dyn Error>> {
         Command::Restore { backup } => restore::run(args.config, backup).await,
         Command::Mcp { host_locator } => mcp::run(args.config, host_locator).await,
         Command::Tui => tui::run(args.config).await,
+        Command::Web { port } => web::run(args.config, port).await,
         Command::AdminSession { action, session_id } => {
             admin::run(args.config, action, session_id).await
         }

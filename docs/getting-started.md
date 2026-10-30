@@ -8,9 +8,9 @@
 
 The current implementation targets Linux: Unix domain sockets and Linux-specific filesystem safety are part of the design. In WSL2 use the Linux filesystem and check user-service availability. Native Windows/macOS support is not claimed here. Run as your normal user; do not place the data root on cloud-sync/network storage or share it between writers.
 
-源码编译需要 Git、Rust 1.97.1、C/C++ 编译工具、`cmake`、`pkg-config`、`protoc`。Lance 的构建脚本需要 Protocol Buffers 编译器；只安装 Rust 不够。Debian/Ubuntu 中对应的常见包名为 `git build-essential cmake pkg-config protobuf-compiler`；按自己的发行版安装。运行已编译的非 Web 核心程序不需要 Conda/Python。旧 Rust Web 已回撤，当前尚无 `--web`；独立 `webui/` Python 包已有开发态只读竖切，但正式入口/隔离打包及生命周期验收尚未完成。迁移后仅 `--web` 按需使用隔离 Python 环境，不把 Python 变成核心入口依赖，不自动安装 Web 依赖。
+源码编译需要 Git、Rust 1.97.1、C/C++ 编译工具、`cmake`、`pkg-config`、`protoc`。Lance 的构建脚本需要 Protocol Buffers 编译器；只安装 Rust 不够。Debian/Ubuntu 中对应的常见包名为 `git build-essential cmake pkg-config protobuf-compiler`；按自己的发行版安装。运行已编译的非 Web 核心程序不需要 Conda/Python。旧 Rust Web 已回撤，`--web` 已接入按需 exec；独立 `webui/` Python 包已有开发态只读竖切，且正式入口/隔离组装已验证，完整生命周期/资源验收仍未完成。仅 `--web` 按需使用隔离 Python 环境，不把 Python 变成核心入口依赖，不自动安装 Web 依赖。
 
-A source build needs Git, Rust 1.97.1, a C/C++ toolchain, `cmake`, `pkg-config` and `protoc`. Lance build scripts require the Protocol Buffers compiler. Common Debian/Ubuntu package names are `git build-essential cmake pkg-config protobuf-compiler`; install the equivalents for your distribution. Non-Web core binaries do not require Conda/Python. The old Rust Web has been rolled back; the current build has no `--web` implementation, and the independent Python package has only a development read-only slice; formal launch, isolated assembly and lifecycle acceptance remain unfinished. Only `--web` will start its isolated Python runtime, without making Python a core-mode dependency or silently installing Web dependencies.
+A source build needs Git, Rust 1.97.1, a C/C++ toolchain, `cmake`, `pkg-config` and `protoc`. Lance build scripts require the Protocol Buffers compiler. Common Debian/Ubuntu package names are `git build-essential cmake pkg-config protobuf-compiler`; install the equivalents for your distribution. Non-Web core binaries do not require Conda/Python. The old Rust Web has been rolled back; the new `--web` exec launcher and independent Python read-only component have verified isolated assembly; full lifecycle/resource acceptance remains unfinished. Only `--web` will start its isolated Python runtime, without making Python a core-mode dependency or silently installing Web dependencies.
 
 ```sh
 git --version
@@ -77,17 +77,17 @@ daemon 启动会创建本地运行数据。这一步没有接入宿主，空数�
 
 Starting the daemon creates local runtime data. Host integration has not happened yet: an empty instance and `host_canary=not_run` are expected. `q` closes the TUI, not the daemon; Ctrl-C in the daemon terminal requests shutdown. Never start a second writer on the same data directory.
 
-下面仅列出新计划的 Web 目标入口：旧 Rust Web 已回撤，当前命令尚不可用，不作为本节已验证操作。
+Web 是可选组件，须先显式完成[同包隔离组装](development.md#独立-web-工程迁移中--independent-web-component-migration)，再运行以下入口。仅 Cargo build 不会安装 Python Web；缺组件会明确失败，不影响非 Web 模式。
 
-The following is the planned Web entry, not a working step in the rolled-back current build:
+Explicitly assemble the optional same-package Python component before this entry. Cargo build alone does not install it; missing Web does not affect core modes:
 
 ```sh
 ./target/debug/evertrace --config "$HOME/.evertrace/config.toml" --web
 ```
 
-使用打印的一次性本机链接，不要分享该凭据。此版本网页只读接入记忆列表、正文、来源关联、修订历史、同对象固定修订比较和连接状态；搜索、范围筛选、长正文分块及其余页面仍未接入；没有后台模型也能读取已有记忆。入口、安全边界和会话期限见[使用方法](usage.md#本机网页--local-webui)。
+使用打印的一次性本机链接，不要分享该凭据。此版本 Python 网页只读接入基础记忆列表、语义正文、分页和连接状态；来源关联、修订历史、固定修订比较、搜索/筛选/计数、长正文分块及其余页面仍待重建；没有后台模型也能读取已有记忆。入口、安全边界和会话期限见[使用方法](usage.md#本机网页--local-webui)。
 
-Use the printed one-time local link and keep it private. The read-only WebUI exposes memory lists/details, source references, revision history, exact same-object revision comparison and connection status. Search, scope filters, chunked full-text reads and other pages remain unconnected. Existing memory can be read with LLM processing off. See [Usage](usage.md#本机网页--local-webui) for access and session limits.
+Use the printed one-time local link and keep it private. The Python WebUI exposes basic read-only memory lists/semantic details/paging/status. Source/history/exact comparison, search/filter/count, chunked full text and other pages remain to be rebuilt. Existing memory can be read with LLM processing off. See [Usage](usage.md#本机网页--local-webui) for access and session limits.
 
 ## 5. 启用后台模型 / Enable background model processing
 

@@ -14,13 +14,25 @@ Read the deciding caller, implementation and consumer before editing behavior. S
 
 ## 独立 Web 工程（迁移中） / Independent Web component (migration)
 
-独立 Web 工程为 `webui/`：Python 3.12+ 负责 HTTP/session、页面控制/模板与窄 UDS 适配，HTML/CSS/字体和必要 JavaScript 外置。Rust 核心保留领域、配置、协议和单 writer；Python 不直开数据库/CAS，不加载 Engine/Store FFI。旧 Rust Web 与 G3 未提交实现已回撤，保留已验收 CLI；Python 包已建立并以真实 daemon/浏览器验证基础记忆/详情/状态竖切；正式 `--web`、隔离组装及完整生命周期/资源验收仍未完成，不把历史 G3 日志当成当前能力。
+独立 Web 工程为 `webui/`：Python 3.12+ 负责 HTTP/session、页面控制/模板与窄 UDS 适配，HTML/CSS/字体和必要 JavaScript 外置。Rust 核心保留领域、配置、协议和单 writer；Python 不直开数据库/CAS，不加载 Engine/Store FFI。旧 Rust Web 与 G3 未提交实现已回撤，保留已验收 CLI；Python 包已建立并以真实 daemon/浏览器验证基础记忆/详情/状态竖切；正式 `--web` exec 与 wheel/editable 隔离组装已验证，完整生命周期/资源验收仍未完成，不把历史 G3 日志当成当前能力。
 
-The independent `webui/` component owns Python HTTP/session/presentation and a narrow UDS client, with separate templates/static assets. Rust retains business, config, protocol and writer authority; no Python database/CAS access or Engine/Store FFI. The Rust Web implementation and uncommitted G3 work have been rolled back; the new package has a real daemon/browser-verified basic read-only slice. Formal CLI launch, isolated assembly and complete lifecycle/resource acceptance remain unfinished; historical G3 logs are not current capabilities.
+The independent `webui/` component owns Python HTTP/session/presentation and a narrow UDS client, with separate templates/static assets. Rust retains business, config, protocol and writer authority; no Python database/CAS access or Engine/Store FFI. The Rust Web implementation and uncommitted G3 work have been rolled back; the new package has a real daemon/browser-verified basic read-only slice. Formal CLI exec and wheel/editable isolated assembly are verified; complete lifecycle/resource acceptance remains unfinished; historical G3 logs are not current capabilities.
 
-Web 修改不应要求 Cargo。开发态 wheel 已验证：`conda run -n test uv build --project webui --wheel --out-dir .work/ui/cli-webui-integration/pyweb-dist`；依赖由 `webui/uv.lock` 锁定并以 `uv export --locked` 供安装命令消费。这不是正式安装或启动说明；同包 entry/隔离组装仍待闭合。仓库 Python/uv/pytest 都在 Conda `test` 中运行，产品不依赖 Conda。仅显式 `--web` 启动一个前台 worker，无 reload/watch/preload；普通 Rust 入口不探测/导入 Web。覆盖未启动、等量真实工作、退出回收的进程与 PSS/RSS/CPU，不按二进制大小猜内存。
+Web 修改不应要求 Cargo。开发态 wheel 已验证：`conda run -n test uv build --project webui --wheel --out-dir .work/ui/cli-webui-integration/pyweb-dist`；依赖由 `webui/uv.lock` 锁定并以 `uv export --locked` 供安装命令消费。组件须用下面的显式组装步骤准备，不能把 wheel 构建当作安装或完整迁移验收。仓库 Python/uv/pytest 都在 Conda `test` 中运行，产品不依赖 Conda。仅显式 `--web` 启动一个前台 worker，无 reload/watch/preload；普通 Rust 入口不探测/导入 Web。覆盖未启动、等量真实工作、退出回收的进程与 PSS/RSS/CPU，不按二进制大小猜内存。
 
-Web edits must not require Cargo. The development wheel build above is verified; `uv export --locked` consumes the dependency lock for installation. It is not a formal install/launch recipe: same-package entry assembly remains unfinished. Repository Python/uv/pytest use Conda `test`, not a product Conda requirement. Production starts one worker only on explicit `--web`, without reload/watch/preload; ordinary modes never probe/import Web. Measure processes/PSS/RSS/CPU before, during equal work and after exit.
+Web edits must not require Cargo. The development wheel build above is verified; `uv export --locked` consumes the dependency lock for installation. Prepare the same-package isolated component explicitly as below; wheel build alone is not installation or complete migration acceptance. Repository Python/uv/pytest use Conda `test`, not a product Conda requirement. Production starts one worker only on explicit `--web`, without reload/watch/preload; ordinary modes never probe/import Web. Measure processes/PSS/RSS/CPU before, during equal work and after exit.
+
+可选组件初次组装（路径为占位参数，目标包需已有同版本 `bin/evertrace` 与 `bin/evertraced`）：
+
+```sh
+conda run --no-capture-output -n test python -B webui/assemble.py \
+  --bin-dir /absolute/package/bin --python /absolute/python3.12 \
+  --wheel /absolute/evertrace_web-0.0.0-py3-none-any.whl
+```
+
+开发时用 `--editable` 替代 `--wheel ...`，指向本仓 `webui/` 源码。已存在的组件拒绝覆盖，不应对运行中或真实用户包直接重装；正式用户安装仍是单独授权步骤。环境位于 `<package>/webui/`，Rust 仅在 `--web` 用该环境的 `bin/python -I bin/evertrace-web`，不执行 shell，不查 PATH；pipe 传已解析上下文后 exec，改源码/模板后单独重启 Web。指定的基础 Python 3.12+ 必须继续存在；这不是跨机器自包含 Python 分发包。只有显式组装调用 uv/锁定依赖安装，核心/Host 安装与运行入口不调用本工具。
+
+Initial optional assembly above requires matching native binaries and an explicit Python 3.12+ base. Use `--editable` for source development. Existing environments are not overwritten; this is not authorization to install/reconfigure a live user package. The base Python remains an explicit runtime prerequisite, not a Conda or self-contained/relocatable-Python claim. Runtime uses only the package's fixed isolated interpreter/managed entry, without shell, PATH search or dependency installation.
 
 临时互通、浏览器与内存探针留在 `.work/`，不复制进永久 suite。迁移时保留原检查所保护的安全/恢复义务，不为临时探针保留旧 Web fallback；永久测试只保护已接受且值得长期维护的行为。
 

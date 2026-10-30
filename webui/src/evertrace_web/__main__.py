@@ -13,6 +13,8 @@ def main():
     parser.add_argument("--startup-stdin", action="store_true")
     parser.add_argument("--port", type=int, default=0)
     args = parser.parse_args()
+    if sys.version_info < (3, 12):
+        parser.error("Python 3.12 or later is required for the optional Web component")
     build = version("evertrace-web")
     if args.version:
         print(f"evertrace-web {build}")
