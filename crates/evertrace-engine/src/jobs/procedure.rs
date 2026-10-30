@@ -377,12 +377,32 @@ fn input(
     })
 }
 
+// A manual same-body acceptance records another audited proposal but does not
+// create a Procedure revision. Its base is the accepted target itself; only
+// revision-creating acceptances anchor subsequent reviews of that revision.
+fn accepted_procedure_origin(
+    proposal: &RevisionProposal,
+) -> Option<(evertrace_domain::ids::ProcedureId, RevisionId)> {
+    let acceptance = proposal.acceptance.as_ref()?;
+    let evertrace_domain::semantic::AcceptedProposalTarget::Procedure {
+        procedure_id,
+        procedure_revision_id,
+        ..
+    } = acceptance.accepted_target
+    else {
+        return None;
+    };
+    (proposal.base_revision_id != Some(procedure_revision_id))
+        .then_some((procedure_id, procedure_revision_id))
+}
+
 fn accepted<'a>(
     view: &'a SemanticCurrentView,
     procedure: &evertrace_domain::procedure::ProcedureRevision,
 ) -> Result<&'a RevisionProposal, SemanticServiceError> {
-    let mut matching = view.proposals.values().filter(|proposal| proposal.acceptance.as_ref().is_some_and(|acceptance| matches!(acceptance.accepted_target,
-        evertrace_domain::semantic::AcceptedProposalTarget::Procedure { procedure_id, procedure_revision_id, .. } if procedure_id == procedure.procedure_id && procedure_revision_id == procedure.revision_id)));
+    let mut matching = view.proposals.values().filter(|proposal| {
+        accepted_procedure_origin(proposal) == Some((procedure.procedure_id, procedure.revision_id))
+    });
     let proposal = matching.next().ok_or(StoreError::StoreCorrupt)?;
     if matching.next().is_some() {
         return Err(StoreError::StoreCorrupt.into());
@@ -537,11 +557,7 @@ pub(crate) fn jobs(
         .collect::<Vec<_>>();
     let mut accepted_proposals = BTreeMap::new();
     for proposal in view.proposals.values() {
-        if let Some(acceptance) = &proposal.acceptance
-            && let evertrace_domain::semantic::AcceptedProposalTarget::Procedure {
-                procedure_revision_id,
-                ..
-            } = acceptance.accepted_target
+        if let Some((_, procedure_revision_id)) = accepted_procedure_origin(proposal)
             && accepted_proposals
                 .insert(procedure_revision_id, proposal)
                 .is_some()

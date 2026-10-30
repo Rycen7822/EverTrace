@@ -5137,13 +5137,12 @@ fn support_context(
 {
     let mut contracts = Vec::new();
     let mut validations = Vec::new();
-    for row in snapshot.other_data_rows() {
-        if evertrace_store::session_import::restore_current(row)
-            .map_err(|_| BackgroundSchedulerError::Store)?
-            .is_some()
-        {
-            continue;
-        }
+    for row in snapshot.other_data_rows().filter(|row| {
+        matches!(
+            row.object_kind.as_deref(),
+            Some("global_support_contract" | "global_support_validation")
+        )
+    }) {
         let Some(json) = row.payload_json.as_deref() else {
             return Err(BackgroundSchedulerError::Store);
         };

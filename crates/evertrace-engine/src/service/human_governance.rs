@@ -5938,22 +5938,25 @@ fn human_item_category(surface: HumanSurface, row: &ObjectRow) -> HumanItemCateg
             "recovery_capture_request_revision"
             | "recovery_bundle"
             | "recovery_application_revision" => HumanItemCategory::RecoveryEvidence,
-            _ => match human_object_family(row) {
-                HumanObjectFamily::Evidence => HumanItemCategory::Evidence,
-                HumanObjectFamily::Work => HumanItemCategory::Work,
-                HumanObjectFamily::Atom => HumanItemCategory::Semantic,
-                HumanObjectFamily::Procedure => HumanItemCategory::Procedure,
-                HumanObjectFamily::RevisionProposal => HumanItemCategory::ProposalRevision,
-                HumanObjectFamily::Runtime => HumanItemCategory::Runtime,
-                HumanObjectFamily::Projection => HumanItemCategory::Projection,
-            },
+            _ => human_family_category(row),
         },
         HumanSurface::System => match kind {
             "session_import_current" => HumanItemCategory::SessionImport,
             "semantic_derivation_run" => HumanItemCategory::SemanticDerivation,
-            _ if row.row_class == Some(ObjectRowClass::Runtime) => HumanItemCategory::Runtime,
-            _ => HumanItemCategory::Projection,
+            _ => human_family_category(row),
         },
+    }
+}
+
+fn human_family_category(row: &ObjectRow) -> HumanItemCategory {
+    match human_object_family(row) {
+        HumanObjectFamily::Evidence => HumanItemCategory::Evidence,
+        HumanObjectFamily::Work => HumanItemCategory::Work,
+        HumanObjectFamily::Atom => HumanItemCategory::Semantic,
+        HumanObjectFamily::Procedure => HumanItemCategory::Procedure,
+        HumanObjectFamily::RevisionProposal => HumanItemCategory::ProposalRevision,
+        HumanObjectFamily::Runtime => HumanItemCategory::Runtime,
+        HumanObjectFamily::Projection => HumanItemCategory::Projection,
     }
 }
 
