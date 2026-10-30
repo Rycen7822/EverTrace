@@ -24,7 +24,7 @@ use evertrace_domain::{
 
 use crate::{
     command::{JournalPayload, ObjectFamily, StoreError},
-    objects::ObjectRow,
+    objects::{ObjectRow, ObjectRowClass},
 };
 
 use super::{
@@ -78,6 +78,12 @@ impl RecoveryCurrentView {
             .iter()
             .filter(|row| row.row_kind == crate::objects::ObjectRowKind::Data)
         {
+            row.validate()?;
+            // Compiled projections have owner-specific payloads, not journal
+            // envelopes. Their owning projection validator checks the content.
+            if row.row_class == Some(ObjectRowClass::Projection) {
+                continue;
+            }
             if crate::session_import::restore_current(row)?.is_some() {
                 continue;
             }

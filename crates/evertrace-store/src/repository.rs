@@ -15,7 +15,7 @@ use evertrace_domain::{
 
 use crate::{
     command::{JournalEventDraft, JournalPayload, StoreError},
-    objects::{ObjectRow, ObjectRowKind},
+    objects::{ObjectRow, ObjectRowClass, ObjectRowKind},
     projections::ProjectionSnapshot,
     relations::{RepositoryRelationRow, build_repository_relation_rows},
 };
@@ -55,6 +55,12 @@ impl RepositoryCurrentView {
             .iter()
             .filter(|row| row.row_kind == ObjectRowKind::Data)
         {
+            row.validate()?;
+            // A mixed current view also contains compiler materializations,
+            // whose payloads are not JournalPayload envelopes.
+            if row.row_class == Some(ObjectRowClass::Projection) {
+                continue;
+            }
             if crate::session_import::restore_current(row)?.is_some() {
                 continue;
             }
