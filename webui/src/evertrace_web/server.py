@@ -158,6 +158,16 @@ class App:
                     data = {"conflict": True}
                 else:
                     data = {"html": self.templates.get_template("list.html").render(items=result["items"], empty_message="这些条件下没有条目；可以清除筛选。" if result["total_count"] else "当前没有记忆记录。"), "frontier": str(result["frontier"]), "next_cursor": result["next_cursor"], "count": len(result["items"]), "degraded": result["status"] != "ready", "query": result["query"], "total_count": str(result["total_count"]), "matching_count": str(result["matching_count"])}
+            elif payload.get("kind") == "content" and set(payload) == {"kind", "reference", "frontier", "revision", "representation", "after"}:
+                frontier = parse_frontier(payload["frontier"])
+                if not valid_ref(payload["reference"]) or not valid_ref(payload["revision"]) or not valid_ref(payload["after"], optional=True):
+                    return JSONResponse({"error": "invalid_read"}, 400)
+                result = await self.backend.content(payload["reference"], frontier, payload["revision"], payload["representation"], payload["after"])
+                if result["kind"] == "conflict":
+                    data = {"conflict": True}
+                else:
+                    content = result["content"]
+                    data = {"html": self.templates.get_template("content.html").render(content=content), "text": content["text"], "state": content["state"], "previous_cursor": content["previous_cursor"], "next_cursor": content["next_cursor"], "frontier": str(content["frontier"]), **{key: str(content[key]) if content[key] is not None else None for key in ("total_bytes", "range_start", "range_end")}}
             elif payload.get("kind") == "detail" and set(payload) == {"kind", "reference", "frontier", "revision"}:
                 frontier = parse_frontier(payload["frontier"])
                 if not valid_ref(payload["reference"]) or not valid_ref(payload["revision"], optional=True):

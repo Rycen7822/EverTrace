@@ -1,4 +1,6 @@
+mod content;
 mod diagnostics;
+pub use content::HumanContentChunk;
 mod export;
 mod presentation;
 pub use diagnostics::{

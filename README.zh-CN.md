@@ -60,7 +60,7 @@ cp -n docs/examples/evertrace.local.toml "$HOME/.evertrace/config.toml"
 ./target/debug/evertrace --config "$HOME/.evertrace/config.toml" --daemon
 ```
 
-另开终端执行 `./target/debug/evertrace --config "$HOME/.evertrace/config.toml" --doctor` 或 `--tui`。旧 Rust Web 与其未提交扩展已回撤，当前 `--web` 已可在显式装配匹配组件后启动独立 Python 服务。旧来源/历史/比较的验收只属历史，不代表当前能力。Python 包已验证当前版本元数据浏览、后端种类/Atom 独立状态轴筛选、录入顺序分页及计数、语义正文与连接状态；计数不等于可读正文数量。正式 CLI exec/隔离组装和基础生命周期已验证；来源页、固定修订历史/比较、完整范围/搜索/长正文及最终资源验收仍待完成，原一次性链接、会话、只读与安全义务保留。核心工作流仍按[宿主接入和第一条记忆验证](docs/getting-started.md)操作。
+另开终端执行 `./target/debug/evertrace --config "$HOME/.evertrace/config.toml" --doctor` 或 `--tui`。旧 Rust Web 与其未提交扩展已回撤，当前 `--web` 已可在显式装配匹配组件后启动独立 Python 服务。旧来源/历史/比较的验收只属历史，不代表当前能力。Python 包已验证当前版本元数据浏览、后端种类/Atom 独立状态轴筛选、录入顺序分页及计数、语义正文、每次复验权限的原修订语义值分段读取（每段至多 8 KiB）与连接状态；计数不等于可读正文数量。正式 CLI exec/隔离组装和基础生命周期已验证；来源页、固定修订历史/比较、完整范围/搜索、原始来源/制品区间及最终资源验收仍待完成，原一次性链接、会话、只读与安全义务保留。核心工作流仍按[宿主接入和第一条记忆验证](docs/getting-started.md)操作。
 
 ### Web 架构迁移
 

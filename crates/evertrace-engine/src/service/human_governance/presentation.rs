@@ -37,7 +37,7 @@ pub struct HumanSemanticDetail {
 }
 
 const MAX_CONTENT_BYTES: usize = 32 * 1024;
-const READ_DEADLINE: std::time::Duration = std::time::Duration::from_secs(3);
+pub(super) const READ_DEADLINE: std::time::Duration = std::time::Duration::from_secs(3);
 
 fn source_context_fields(
     receipt: &evertrace_domain::evidence::SourceReceipt,
@@ -483,7 +483,7 @@ impl HumanGovernanceService {
     }
 }
 
-fn access_state(error: export::Failure) -> HumanContentState {
+pub(super) fn access_state(error: export::Failure) -> HumanContentState {
     match error {
         export::Failure::Denied => HumanContentState::AccessDenied,
         _ => HumanContentState::Unavailable,
@@ -505,7 +505,9 @@ fn unavailable(
     }
 }
 
-fn present(row: &ObjectRow) -> Result<HumanSemanticDetail, HumanGovernanceError> {
+pub(super) fn semantic_value(
+    row: &ObjectRow,
+) -> Result<Option<(HumanSemanticContent, Option<String>)>, HumanGovernanceError> {
     let payload: JournalPayload = serde_json::from_str(
         row.payload_json
             .as_deref()
@@ -566,26 +568,31 @@ fn present(row: &ObjectRow) -> Result<HumanSemanticDetail, HumanGovernanceError>
                 revision,
             )
         }
-        _ => {
-            return Ok(unavailable(
-                row.object_id.clone(),
-                row.current_revision_id.clone(),
-                HumanContentState::Unsupported,
-            ));
-        }
+        _ => return Ok(None),
     };
     if row.object_id.as_deref() != Some(object.as_str())
         || row.current_revision_id.as_deref() != Some(revision.as_str())
     {
         return Err(HumanGovernanceError::Store);
     }
+    Ok(Some((content, preview)))
+}
+
+fn present(row: &ObjectRow) -> Result<HumanSemanticDetail, HumanGovernanceError> {
+    let Some((content, preview)) = semantic_value(row)? else {
+        return Ok(unavailable(
+            row.object_id.clone(),
+            row.current_revision_id.clone(),
+            HumanContentState::Unsupported,
+        ));
+    };
     let original_bytes = serde_json::to_vec(&content)
         .map_err(|_| HumanGovernanceError::Store)?
         .len();
     let fits = original_bytes <= MAX_CONTENT_BYTES;
     Ok(HumanSemanticDetail {
-        object_ref: Some(object),
-        revision_ref: Some(revision),
+        object_ref: row.object_id.clone(),
+        revision_ref: row.current_revision_id.clone(),
         state: if fits {
             HumanContentState::Ready
         } else {

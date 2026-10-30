@@ -863,6 +863,16 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
                                 }
                             }
                             HumanGovernanceRequest::Read { request } => match request {
+                                HumanReadRequest::Content {
+                                    object_ref, expected_revision_ref, expected_frontier, representation, after, limit,
+                                } => {
+                                    match human_governance.content(&object_ref, &expected_revision_ref, expected_frontier, representation, after.as_deref(), limit)
+                                        .await.map_err(map_human_error)?
+                                    {
+                                        Ok(content) => HumanGovernanceResponse::Content {content: Box::new(map_content_chunk(content))},
+                                        Err(frontier) => HumanGovernanceResponse::Conflict {current_frontier: frontier, current_revision_ref: None},
+                                    }
+                                }
                                 HumanReadRequest::BrowseMemories {
                                     query,
                                     expected_frontier,
@@ -1500,23 +1510,48 @@ fn map_human_surface(surface: HumanSurface) -> EngineHumanSurface {
     }
 }
 
+fn map_content_state(
+    state: evertrace_engine::HumanContentState,
+) -> evertrace_protocol::dto::HumanContentState {
+    use evertrace_protocol::dto::HumanContentState as State;
+    match state {
+        evertrace_engine::HumanContentState::Ready => State::Ready,
+        evertrace_engine::HumanContentState::TooLarge => State::TooLarge,
+        evertrace_engine::HumanContentState::AccessDenied => State::AccessDenied,
+        evertrace_engine::HumanContentState::Missing => State::Missing,
+        evertrace_engine::HumanContentState::Unsupported => State::Unsupported,
+        evertrace_engine::HumanContentState::Unavailable => State::Unavailable,
+    }
+}
+
+fn map_content_chunk(
+    content: evertrace_engine::HumanContentChunk,
+) -> evertrace_protocol::dto::HumanContentChunk {
+    evertrace_protocol::dto::HumanContentChunk {
+        frontier: content.frontier,
+        object_ref: content.object_ref,
+        revision_ref: content.revision_ref,
+        representation: content.representation,
+        state: map_content_state(content.state),
+        total_bytes: content.total_bytes,
+        range_start: content.range_start,
+        range_end: content.range_end,
+        text: content.text,
+        previous_cursor: content.previous_cursor,
+        next_cursor: content.next_cursor,
+    }
+}
+
 fn map_semantic_detail(
     detail: evertrace_engine::HumanSemanticDetail,
 ) -> evertrace_protocol::dto::HumanSemanticDetail {
-    use evertrace_protocol::dto::{HumanContentState as State, HumanSemanticContent as Content};
+    use evertrace_protocol::dto::HumanSemanticContent as Content;
     evertrace_protocol::dto::HumanSemanticDetail {
         object_ref: detail.object_ref,
         revision_ref: detail.revision_ref,
         preview: detail.preview,
         original_bytes: detail.original_bytes,
-        state: match detail.state {
-            evertrace_engine::HumanContentState::Ready => State::Ready,
-            evertrace_engine::HumanContentState::TooLarge => State::TooLarge,
-            evertrace_engine::HumanContentState::AccessDenied => State::AccessDenied,
-            evertrace_engine::HumanContentState::Missing => State::Missing,
-            evertrace_engine::HumanContentState::Unsupported => State::Unsupported,
-            evertrace_engine::HumanContentState::Unavailable => State::Unavailable,
-        },
+        state: map_content_state(detail.state),
         content: detail.content.map(|content| match content {
             evertrace_engine::HumanSemanticContent::Digest(value) => Content::Digest(value),
             evertrace_engine::HumanSemanticContent::Atom(value) => Content::Atom(value),

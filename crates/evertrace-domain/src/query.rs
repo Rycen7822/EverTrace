@@ -577,6 +577,44 @@ impl MemoryBrowseCursor {
     }
 }
 
+/// Request-local body representation; never a CAS path or generic RPC selector.
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum HumanContentRepresentation {
+    Text,
+    SemanticJson,
+}
+
+pub const HUMAN_CONTENT_LIMIT: u16 = 8192;
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct HumanContentCursor {
+    pub object_ref: String,
+    pub revision_ref: String,
+    pub representation: HumanContentRepresentation,
+    pub offset: u64,
+    pub backwards: bool,
+}
+
+impl HumanContentCursor {
+    pub fn validate_for(
+        &self,
+        object_ref: &str,
+        revision_ref: &str,
+        representation: HumanContentRepresentation,
+    ) -> Result<(), QueryError> {
+        if self.object_ref != object_ref
+            || self.revision_ref != revision_ref
+            || self.representation != representation
+            || (self.backwards && self.offset == 0)
+        {
+            return Err(QueryError::Invalid);
+        }
+        Ok(())
+    }
+}
+
 #[derive(Clone, Copy, Debug, Error, Eq, PartialEq)]
 pub enum QueryError {
     #[error("query contract is invalid")]

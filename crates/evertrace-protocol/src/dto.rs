@@ -102,6 +102,14 @@ pub enum HumanRelationKind {
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
 pub enum HumanReadRequest {
+    Content {
+        object_ref: String,
+        expected_revision_ref: String,
+        expected_frontier: u64,
+        representation: evertrace_domain::query::HumanContentRepresentation,
+        after: Option<String>,
+        limit: u16,
+    },
     BrowseMemories {
         query: evertrace_domain::query::MemoryBrowseQuery,
         expected_frontier: Option<u64>,
@@ -898,6 +906,9 @@ pub struct HumanActionResult {
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
 pub enum HumanGovernanceResponse {
+    Content {
+        content: Box<HumanContentChunk>,
+    },
     MemoryPage {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         diagnostics: Option<Box<HumanDiagnostics>>,
@@ -951,6 +962,35 @@ impl HumanGovernanceRequest {
 impl HumanReadRequest {
     fn validate(&self) -> bool {
         match self {
+            Self::Content {
+                object_ref,
+                expected_revision_ref,
+                representation,
+                after,
+                limit,
+                ..
+            } => {
+                valid_ref(object_ref)
+                    && object_ref.len() <= 512
+                    && valid_ref(expected_revision_ref)
+                    && expected_revision_ref.len() <= 512
+                    && (4..=evertrace_domain::query::HUMAN_CONTENT_LIMIT).contains(limit)
+                    && after.as_ref().is_none_or(|value| {
+                        value.len() <= 2048
+                            && serde_json::from_str::<evertrace_domain::query::HumanContentCursor>(
+                                value,
+                            )
+                            .is_ok_and(|cursor| {
+                                cursor
+                                    .validate_for(
+                                        object_ref,
+                                        expected_revision_ref,
+                                        *representation,
+                                    )
+                                    .is_ok()
+                            })
+                    })
+            }
             Self::BrowseMemories {
                 query,
                 expected_frontier,
@@ -1187,6 +1227,7 @@ impl HumanDiagnostics {
 impl HumanGovernanceResponse {
     pub fn validate(&self) -> bool {
         match self {
+            Self::Content { content } => content.validate(),
             Self::Export { result } => {
                 result.object_count <= 64
                     && result
@@ -1291,6 +1332,82 @@ pub enum HumanContentState {
 }
 
 #[derive(Clone, Debug, serde::Deserialize, Eq, PartialEq, serde::Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct HumanContentChunk {
+    pub frontier: u64,
+    pub object_ref: String,
+    pub revision_ref: String,
+    pub representation: evertrace_domain::query::HumanContentRepresentation,
+    pub state: HumanContentState,
+    pub total_bytes: Option<u64>,
+    pub range_start: Option<u64>,
+    pub range_end: Option<u64>,
+    pub text: Option<String>,
+    pub previous_cursor: Option<String>,
+    pub next_cursor: Option<String>,
+}
+
+impl HumanContentChunk {
+    fn validate(&self) -> bool {
+        use evertrace_domain::query::{HUMAN_CONTENT_LIMIT, HumanContentCursor};
+        if !valid_ref(&self.object_ref)
+            || self.object_ref.len() > 512
+            || !valid_ref(&self.revision_ref)
+            || self.revision_ref.len() > 512
+        {
+            return false;
+        }
+        if self.state != HumanContentState::Ready {
+            return self.total_bytes.is_none()
+                && self.range_start.is_none()
+                && self.range_end.is_none()
+                && self.text.is_none()
+                && self.previous_cursor.is_none()
+                && self.next_cursor.is_none();
+        }
+        let (Some(total), Some(start), Some(end), Some(text)) = (
+            self.total_bytes,
+            self.range_start,
+            self.range_end,
+            &self.text,
+        ) else {
+            return false;
+        };
+        let valid_cursor = |value: &Option<String>, offset: u64, backwards: bool| {
+            value.as_ref().is_some_and(|value| {
+                value.len() <= 2048
+                    && serde_json::from_str::<HumanContentCursor>(value).is_ok_and(|cursor| {
+                        cursor.offset == offset
+                            && cursor.backwards == backwards
+                            && cursor
+                                .validate_for(
+                                    &self.object_ref,
+                                    &self.revision_ref,
+                                    self.representation,
+                                )
+                                .is_ok()
+                    })
+            })
+        };
+        start <= end
+            && end <= total
+            && end - start == text.len() as u64
+            && text.len() <= usize::from(HUMAN_CONTENT_LIMIT)
+            && (end > start || start == total)
+            && if start == 0 {
+                self.previous_cursor.is_none()
+            } else {
+                valid_cursor(&self.previous_cursor, start, true)
+            }
+            && if end == total {
+                self.next_cursor.is_none()
+            } else {
+                valid_cursor(&self.next_cursor, end, false)
+            }
+    }
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct HumanSemanticDetail {
     pub object_ref: Option<String>,
