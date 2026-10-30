@@ -158,46 +158,9 @@ pub fn is_session_import_source(instance: &str) -> bool {
     instance.starts_with("codex-session:") || instance.starts_with("session-rollout:")
 }
 
-#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
-#[serde(rename_all = "snake_case")]
-pub enum WorkspaceResolutionKind {
-    Repository,
-    NonRepository,
-    Ambiguous,
-    Unavailable,
-}
-
-#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
-#[serde(rename_all = "snake_case")]
-pub enum MetadataState {
-    Discovered,
-    Indexed,
-    Partial,
-    Unsupported,
-    Failed,
-}
-
-#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
-#[serde(rename_all = "snake_case")]
-pub enum SessionBodyState {
-    NotImported,
-    Queued,
-    Importing,
-    Imported,
-    BlockedUntrusted,
-    BlockedUnapproved,
-    BlockedScopeUnresolved,
-    Partial,
-    Failed,
-    SourceReplaced,
-}
-
-#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
-#[serde(rename_all = "snake_case")]
-pub enum SessionAccessDecision {
-    Approved,
-    Revoked,
-}
+pub use evertrace_domain::source::{
+    MetadataState, SessionAccessDecision, SessionBodyState, WorkspaceResolutionKind,
+};
 
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "snake_case")]

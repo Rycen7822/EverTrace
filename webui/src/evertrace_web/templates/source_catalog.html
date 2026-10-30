@@ -1,0 +1,9 @@
+{% set body_labels = {'not_imported':'尚未导入','queued':'已排队','importing':'正在导入','imported':'已记录导入完成','blocked_untrusted':'信任限制','blocked_unapproved':'未获读取许可','blocked_scope_unresolved':'归属未确定','partial':'部分已处理','failed':'导入失败','source_replaced':'来源已改写'} %}
+{% for item in items %}
+<button type="button" class="memory-item source-catalog-item" data-catalog-source="{{ item.source_instance_id }}">
+  <div class="item-top"><span class="type-pill">已登记来源</span><span class="muted">{{ body_labels.get(item.body_state, item.body_state) }}</span></div>
+  <h3 class="item-title">{{ item.session_id }}</h3>
+  <p class="reading-excerpt">{{ item.source_instance_id }}</p>
+  <div class="item-meta"><span>历史归属：{{ item.workspace_resolution_kind }}</span><span>目录修订 {{ item.catalog_revision }}</span></div>
+</button>
+{% else %}<div class="empty"><h3>这些条件下没有已登记来源</h3><p>这不表示宿主没有历史会话，也不表示正文已完成扫描或导入。</p></div>{% endfor %}

@@ -108,6 +108,12 @@ pub enum HumanReadRequest {
         after: Option<String>,
         limit: u16,
     },
+    SourceCatalog {
+        query: evertrace_domain::source::SourceCatalogQuery,
+        expected_frontier: Option<u64>,
+        after: Option<String>,
+        limit: u16,
+    },
     ScopeDirectory {
         query: evertrace_domain::query::ScopeDirectoryQuery,
         expected_frontier: Option<u64>,
@@ -924,6 +930,9 @@ pub enum HumanGovernanceResponse {
     RevisionComparison {
         comparison: Box<evertrace_domain::query::HumanRevisionComparison>,
     },
+    SourceCatalog {
+        page: Box<evertrace_domain::source::SourceCatalogPage>,
+    },
     ScopeDirectory {
         page: Box<evertrace_domain::query::ScopeDirectoryPage>,
     },
@@ -1010,6 +1019,25 @@ impl HumanReadRequest {
                             raw,
                         )
                         .is_ok_and(|cursor| cursor.validate_for(query, *expected_frontier).is_ok())
+                    })
+            }
+            Self::SourceCatalog {
+                query,
+                expected_frontier,
+                after,
+                limit,
+            } => {
+                query.validate().is_ok()
+                    && (1..=HUMAN_PAGE_LIMIT).contains(limit)
+                    && after.as_ref().is_none_or(|raw| {
+                        raw.len() <= 4096
+                        && serde_json::from_str::<evertrace_domain::source::SourceCatalogCursor>(
+                            raw,
+                        )
+                        .is_ok_and(|cursor| {
+                            cursor.validate_for(query).is_ok()
+                                && *expected_frontier == Some(cursor.frontier)
+                        })
                     })
             }
             Self::ScopeDirectory {
@@ -1323,6 +1351,44 @@ impl HumanGovernanceResponse {
                                     .fields
                                     .last()
                                     .is_some_and(|last| last.path == cursor.after_path)
+                        })
+                    })
+            }
+            Self::SourceCatalog { page } => {
+                page.query.validate().is_ok()
+                    && page.entries.len() <= usize::from(HUMAN_PAGE_LIMIT)
+                    && page.entries.iter().all(|entry| {
+                        entry.validate()
+                            && page
+                                .query
+                                .session_id
+                                .as_ref()
+                                .is_none_or(|id| id == &entry.session_id)
+                            && page
+                                .query
+                                .source_instance_id
+                                .as_ref()
+                                .is_none_or(|id| id == &entry.source_instance_id)
+                            && (!page.query.unassigned_only
+                                || (entry.resolved_repository_id.is_none()
+                                    && entry.resolved_worktree_id.is_none()))
+                    })
+                    && page
+                        .entries
+                        .windows(2)
+                        .all(|pair| pair[0].key < pair[1].key)
+                    && page.next_cursor.as_ref().is_none_or(|raw| {
+                        raw.len() <= 4096
+                        && serde_json::from_str::<evertrace_domain::source::SourceCatalogCursor>(
+                            raw,
+                        )
+                        .is_ok_and(|cursor| {
+                            cursor.validate_for(&page.query).is_ok()
+                                && cursor.frontier == page.frontier
+                                && page
+                                    .entries
+                                    .last()
+                                    .is_some_and(|entry| entry.key == cursor.after_source)
                         })
                     })
             }

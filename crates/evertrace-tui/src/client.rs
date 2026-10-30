@@ -114,7 +114,8 @@ async fn send_human(
             HumanReadRequest::CompareRevisions { .. }
             | HumanReadRequest::BrowseMemories { .. }
             | HumanReadRequest::Content { .. }
-            | HumanReadRequest::ScopeDirectory { .. } => {
+            | HumanReadRequest::ScopeDirectory { .. }
+            | HumanReadRequest::SourceCatalog { .. } => {
                 return Err(evertrace_protocol::error::ProtocolError::Wire(
                     evertrace_protocol::error::ErrorCode::InvalidInput,
                 ));

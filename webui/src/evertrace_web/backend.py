@@ -151,6 +151,21 @@ class Backend:
         normalized = {"selection": normalize_scope(query.get("selection", {"kind": "all"})), "include_global": include_global, **{key: query.get(key, values[0]) for key, values in wire_values.items()}, "time_range": normalize_time_range(query.get("time_range"))}
         return await self._request({"kind": "browse_memories", "query": normalized, "expected_frontier": expected_frontier, "after": after, "limit": 32})
 
+    async def source_catalog(self, query=None, after=None, expected_frontier=None):
+        if query is None:
+            query = {}
+        if not isinstance(query, dict) or set(query) - {"session_id", "source_instance_id", "unassigned_only"}:
+            raise BackendError("invalid_input")
+        session, source = query.get("session_id"), query.get("source_instance_id")
+        for value, maximum in ((session, 512), (source, 1024)):
+            if value is not None and (not isinstance(value, str) or not value or len(value.encode("utf-8")) > maximum or any(ord(ch) < 32 for ch in value)):
+                raise BackendError("invalid_input")
+        unassigned = query.get("unassigned_only", False)
+        if type(unassigned) is not bool:
+            raise BackendError("invalid_input")
+        normalized = {"session_id": session, "source_instance_id": source, "unassigned_only": unassigned}
+        return await self._request({"kind": "source_catalog", "query": normalized, "expected_frontier": expected_frontier, "after": after, "limit": 32})
+
     async def scopes(self, query=None, after=None, expected_frontier=None):
         if query is None:
             query = {}
@@ -247,7 +262,7 @@ class Backend:
                     return health
                 response = await call({"human_governance": {"operation": "read", "request": read}})
                 result = response["human_governance"]
-                if result.get("kind") not in ("snapshot", "memory_page", "revision_page", "scope_directory", "content", "revision_comparison", "conflict"):
+                if result.get("kind") not in ("snapshot", "memory_page", "revision_page", "scope_directory", "source_catalog", "content", "revision_comparison", "conflict"):
                     raise BackendError("invalid_read_response")
                 return result
             finally:

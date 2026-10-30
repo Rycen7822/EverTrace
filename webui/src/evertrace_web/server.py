@@ -160,6 +160,18 @@ class App:
                 else:
                     empty = "范围不存在、已移除或当前不可用；这不表示记忆数量为零。" if not result["scope_available"] else "这些条件下没有条目；可以清除筛选。" if result["total_count"] else "当前范围没有可列出的元数据记录。"
                     data = {"html": self.templates.get_template("list.html").render(items=result["items"], empty_message=empty), "frontier": str(result["frontier"]), "next_cursor": result["next_cursor"], "count": len(result["items"]), "degraded": result["status"] != "ready", "query": present_memory_query(result["query"]), "total_count": str(result["total_count"]) if result["total_count"] is not None else None, "matching_count": str(result["matching_count"]) if result["matching_count"] is not None else None, "scope_available": result["scope_available"], "counts_complete": result["counts_complete"], "unresolved_scope_count": str(result["unresolved_scope_count"])}
+            elif payload.get("kind") == "source_catalog" and not (set(payload) - {"kind", "query", "after", "expected_frontier"}):
+                frontier = parse_frontier(payload.get("expected_frontier"), optional=True)
+                after = payload.get("after")
+                if not valid_ref(after, optional=True):
+                    return JSONResponse({"error": "invalid_read"}, 400)
+                result = await self.backend.source_catalog(payload.get("query"), after, frontier)
+                if result["kind"] == "conflict":
+                    data = {"conflict": True}
+                else:
+                    page = result["page"]
+                    selected = page["entries"][0] if page["query"]["source_instance_id"] is not None and len(page["entries"]) == 1 else None
+                    data = {"html": self.templates.get_template("source_catalog.html").render(items=page["entries"]), "detail_html": self.templates.get_template("source_catalog_detail.html").render(item=selected), "query": page["query"], "frontier": str(page["frontier"]), "next_cursor": page["next_cursor"], "count": len(page["entries"])}
             elif payload.get("kind") == "scopes" and not (set(payload) - {"kind", "query", "after", "expected_frontier"}):
                 frontier = parse_frontier(payload.get("expected_frontier"), optional=True)
                 after = payload.get("after")

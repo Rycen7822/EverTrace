@@ -7,6 +7,7 @@ mod history;
 mod presentation;
 mod reading;
 mod scopes;
+mod source_catalog;
 pub use diagnostics::{
     HumanDiagnosticCheck, HumanDiagnosticState, HumanDiagnostics, HumanTableDiagnostic,
 };

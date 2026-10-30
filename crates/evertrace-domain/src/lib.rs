@@ -16,4 +16,5 @@ pub mod recall;
 pub mod repository;
 pub mod revision;
 pub mod semantic;
+pub mod source;
 pub mod work;

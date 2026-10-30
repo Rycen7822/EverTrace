@@ -78,6 +78,7 @@ mod recovery;
 mod scenario_core;
 mod segmentation;
 mod semantic;
+mod source_catalog;
 pub(crate) mod synthesis;
 pub use autoresearch::AutoresearchCurrentView;
 use autoresearch::{record_artifact, record_result, record_run};

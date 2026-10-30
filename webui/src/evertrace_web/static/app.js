@@ -4,13 +4,15 @@ let bootstrap = /^bootstrap=[0-9a-f]{64}$/.test(fragment) ? fragment.slice(10) :
 fragment = null;
 let poller = null;
 const state = { csrf: null, active: false, route: 'memories', query: {selection: {kind: 'all'}, include_global: false, kind: 'all', order: 'recorded_newest', epistemic_status: null, authority: null, atom_lifecycle: null, time_range: null}, after: null, frontier: null, next: null, selected: null, content: null, revisions: null, links: null, comparison: null, compareBase: null, controller: null };
+let restoreSourceControls = false;
+let sourceQuery = {session_id: null, source_instance_id: null, unassigned_only: false};
 const directory = {query: {parent: null, name: ''}, after: null, frontier: null, next: null, controller: null};
 history.replaceState(null, '', '#memories');
 const channel = new BroadcastChannel('evertrace-web-session');
-function clear() { $('time-applied').textContent = ''; $('memory-items').replaceChildren(); $('detail-body').replaceChildren(); $('detail-ref').textContent = ''; $('system-status').replaceChildren(); $('page-count').textContent = ''; $('next-page').disabled = true; }
+function clear() { $('source-picked').textContent = ''; $('time-applied').textContent = ''; $('memory-items').replaceChildren(); $('detail-body').replaceChildren(); $('detail-ref').textContent = ''; $('system-status').replaceChildren(); $('page-count').textContent = ''; $('next-page').disabled = true; }
 function cancel() { state.controller?.abort(); state.controller = null; }
 function notice(text) { $('notice').textContent = text; }
-function closed(text, broadcast = false) { cancel(); clear(); state.comparison = null; state.compareBase = null; state.links = null; clearInterval(poller); poller = null; state.csrf = null; state.active = false; state.query = {...state.query, selection: {kind: 'all'}, include_global: false, time_range: null}; $('time-from').value = ''; $('time-until').value = ''; $('time-from').setCustomValidity(''); $('time-until').setCustomValidity(''); $('time-basis').value = 'recorded'; updateScopeControls(); clearDirectory(); if ($('scope-dialog').open) $('scope-dialog').close(); state.selected = null; state.content = null; state.revisions = null; state.after = null; state.frontier = null; state.next = null; $('reader').hidden = true; $('system-panel').hidden = true; notice(text); if (broadcast) channel.postMessage('closed'); }
+function closed(text, broadcast = false) { restoreSourceControls = false; sourceQuery = {session_id: null, source_instance_id: null, unassigned_only: false}; $('source-session').value = ''; $('source-unassigned').checked = false; cancel(); clear(); state.comparison = null; state.compareBase = null; state.links = null; clearInterval(poller); poller = null; state.csrf = null; state.active = false; state.query = {...state.query, selection: {kind: 'all'}, include_global: false, time_range: null}; $('time-from').value = ''; $('time-until').value = ''; $('time-from').setCustomValidity(''); $('time-until').setCustomValidity(''); $('time-basis').value = 'recorded'; updateScopeControls(); clearDirectory(); if ($('scope-dialog').open) $('scope-dialog').close(); state.selected = null; state.content = null; state.revisions = null; state.after = null; state.frontier = null; state.next = null; $('reader').hidden = true; $('system-panel').hidden = true; notice(text); if (broadcast) channel.postMessage('closed'); }
 channel.onmessage = () => closed('网页会话已结束；请重新运行 evertrace --web。');
 async function api(path, body, signal) {
   const headers = { 'X-EverTrace-Web': '1' };
@@ -162,6 +164,31 @@ async function select(item, restore = null) {
   } catch { if (state.controller === controller && !controller.signal.aborted) { clear(); notice('读取失败，旧内容已清除。'); } }
   finally { if (state.controller === controller) state.controller = null; }
 }
+async function readCatalogue(controller) {
+  const page = await api('read', {kind: 'source_catalog', query: sourceQuery, after: state.after, expected_frontier: state.after ? state.frontier : null}, controller.signal);
+  if (state.controller !== controller || document.hidden || state.route !== 'sources') return;
+  const listScroll = $('memory-items').scrollTop, detailScroll = $('detail-body').scrollTop;
+  clear();
+  if (page.conflict) { state.after = null; state.frontier = null; state.next = null; notice('来源目录水位已变化；请从首页重新读取。'); return; }
+  state.frontier = page.frontier; state.next = page.next_cursor; sourceQuery = page.query;
+  if (restoreSourceControls) { $('source-session').value = page.query.session_id || ''; $('source-unassigned').checked = page.query.unassigned_only; restoreSourceControls = false; }
+  fragmentInto($('memory-items'), page.html); fragmentInto($('detail-body'), page.detail_html);
+  $('memory-items').scrollTop = listScroll; $('detail-body').scrollTop = detailScroll;
+  $('page-count').textContent = '本页 ' + page.count + ' 个已登记来源';
+  const conditions = [];
+  if (page.query.session_id) conditions.push('Session：' + page.query.session_id);
+  if (page.query.source_instance_id) conditions.push('来源：' + page.query.source_instance_id);
+  if (page.query.unassigned_only) conditions.push('仅未确定仓库/工作树');
+  $('source-picked').textContent = (conditions.join('；') || '全部已登记来源') + '；按原生来源键分页，不是时间排序。';
+  $('next-page').disabled = !page.next_cursor;
+  notice('只读已登记来源。一个 Session 可有多个独立来源；目录不表示宿主历史已全部发现，也不表示正文已获许可或全部导入。');
+}
+function changeSourceQuery(patch) {
+  cancel(); clear(); sourceQuery = {...sourceQuery, ...patch};
+  state.after = null; state.frontier = null; state.next = null; refresh();
+}
+$('source-filter').onsubmit = event => { event.preventDefault(); changeSourceQuery({session_id: $('source-session').value.trim() || null, source_instance_id: null, unassigned_only: $('source-unassigned').checked}); };
+$('source-all').onclick = () => changeSourceQuery({source_instance_id: null});
 async function refresh() {
   if (!state.active || document.hidden) return;
   if ($('scope-dialog').open) { await loadDirectory(); return; }
@@ -172,6 +199,7 @@ async function refresh() {
     if (state.controller !== controller || document.hidden) return;
     $('connection-status').textContent = 'daemon 已连接';
     if (state.route === 'system') { $('system-status').textContent = JSON.stringify(health, null, 2); return; }
+    if (state.route === 'sources') { await readCatalogue(controller); return; }
     if (state.route !== 'memories') return;
     const page = await api('read', { kind: 'list', query: state.query, after: state.after, expected_frontier: state.after ? state.frontier : null }, controller.signal);
     if (state.controller !== controller || document.hidden) return;
@@ -192,18 +220,21 @@ async function refresh() {
       else if (state.content) await readContent(state.selected, state.content.representation, state.content.after, controller, detailScroll);
       else await detail(state.selected, page.frontier, controller, detailScroll);
     } else { state.selected = null; state.content = null; state.revisions = null; state.links = null; state.comparison = null; $('detail-body').textContent = '选择一条记忆查看正文。'; }
-  } catch { if (state.controller === controller && !controller.signal.aborted) { clear(); $('connection-status').textContent = '读取不可用'; notice('daemon 或读取暂不可用，旧内容已清除。'); } }
+  } catch { if (state.controller === controller && !controller.signal.aborted) { clear(); if (state.route === 'sources') { restoreSourceControls = true; $('source-session').value = ''; $('source-unassigned').checked = false; } $('connection-status').textContent = '读取不可用'; notice('daemon 或读取暂不可用，旧内容已清除。'); } }
   finally { if (state.controller === controller) state.controller = null; }
 }
 function route(name) {
   cancel(); clear(); state.comparison = null; state.compareBase = null; state.links = null; state.route = name; state.after = null; state.frontier = null; state.selected = null; state.content = null; state.revisions = null;
   history.replaceState(null, '', '#' + name);
   for (const button of document.querySelectorAll('[data-route]')) button.classList.toggle('active', button.dataset.route === name);
-  $('reader').hidden = !state.active || name !== 'memories'; $('system-panel').hidden = !state.active || name !== 'system';
+  $('reader').hidden = !state.active || !['memories', 'sources'].includes(name); $('system-panel').hidden = !state.active || name !== 'system';
+  $('records-title').textContent = name === 'sources' ? '已登记来源' : '记忆记录';
+  $('source-filter').hidden = name !== 'sources'; $('time-filter').hidden = name !== 'memories'; document.querySelector('.browse-filters').hidden = name !== 'memories';
+  $('scope-open').hidden = name !== 'memories'; $('include-global').parentElement.hidden = name !== 'memories';
   const label = document.querySelector('[data-route="' + name + '"]')?.textContent.trim() || name;
   $('breadcrumb').textContent = label; $('page-title').textContent = label;
   $('page-description').textContent = '独立 Python Web，只读调用现有 daemon；未接入的页面不使用示例数据。';
-  notice(['memories', 'system'].includes(name) ? '正在读取…' : '该页面尚未接入真实后端。');
+  notice(['memories', 'sources', 'system'].includes(name) ? '正在读取…' : '该页面尚未接入真实后端。');
   refresh();
 }
 $('detail-body').onclick = event => {
@@ -225,7 +256,7 @@ $('detail-body').onclick = event => {
   else if (button.dataset.contentOpen) openContent(button.dataset.contentOpen);
   else if (state.content) openContent(state.content.representation, button.dataset.contentNav === 'first' ? null : state.content[button.dataset.contentNav]);
 };
-$('memory-items').onclick = event => { const row = event.target.closest('.memory-item'); if (row) select({ key: row.dataset.key, revision: row.dataset.revision, object: row.dataset.object, kind: row.dataset.kind }); };
+$('memory-items').onclick = event => { const source = event.target.closest('[data-catalog-source]'); if (source) { changeSourceQuery({source_instance_id: source.dataset.catalogSource}); return; } const row = event.target.closest('.memory-item'); if (row) select({ key: row.dataset.key, revision: row.dataset.revision, object: row.dataset.object, kind: row.dataset.kind }); };
 for (const button of document.querySelectorAll('[data-route]')) button.onclick = () => route(button.dataset.route);
 function clearDirectory() {
   directory.controller?.abort(); directory.controller = null;
@@ -324,7 +355,7 @@ $('refresh').onclick = refresh;
 $('first-page').onclick = () => { cancel(); clear(); state.after = null; state.frontier = null; state.selected = null; state.content = null; state.revisions = null; refresh(); };
 $('next-page').onclick = () => { if (state.next) { cancel(); clear(); state.after = state.next; state.selected = null; state.content = null; state.revisions = null; refresh(); } };
 $('logout').onclick = async () => { try { await api('logout', {}); } finally { closed('网页会话已结束。', true); } };
-document.addEventListener('visibilitychange', () => { if (document.hidden) { cancel(); clear(); clearDirectory(); if ($('scope-dialog').open) $('scope-dialog').close(); } else if (state.active) refresh(); });
+document.addEventListener('visibilitychange', () => { if (document.hidden) { restoreSourceControls = true; $('source-session').value = ''; $('source-unassigned').checked = false; cancel(); clear(); clearDirectory(); if ($('scope-dialog').open) $('scope-dialog').close(); } else if (state.active) refresh(); });
 window.addEventListener('pagehide', () => closed('网页会话已离开。'));
 window.addEventListener('pageshow', event => { if (event.persisted) start(); });
 async function start() {
