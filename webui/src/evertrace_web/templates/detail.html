@@ -24,5 +24,5 @@
 </section>
 {% elif item.object_kind in ('source_receipt','source_observation') %}<p>来源正文当前不可读或缺失。没有返回旧预览、目录提示或归档字节。</p>{% endif %}
 {% if item.object_kind in ('atom_revision', 'procedure_revision', 'core_membership', 'revision_proposal_revision', 'semantic_digest','source_receipt','source_observation') %}<button class="button" type="button" data-sources-open>查看来源与直接关联</button>{% endif %}
-{% if item.object_kind in ('atom_revision', 'procedure_revision', 'core_membership', 'revision_proposal_revision', 'semantic_digest') %}<button class="button" type="button" data-revisions-open>查看此对象的修订历史</button>{% endif %}
+{% if item.object_kind in ('atom_revision', 'procedure_revision', 'core_membership', 'revision_proposal_revision', 'semantic_digest') %}<button class="button" type="button" data-compare-base>设为比较左侧</button><button class="button" type="button" data-revisions-open>查看此对象的修订历史</button>{% endif %}
 {% endif %}

@@ -1,3 +1,4 @@
+mod comparison;
 mod content;
 mod diagnostics;
 pub use content::HumanContentChunk;

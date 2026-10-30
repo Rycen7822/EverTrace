@@ -144,6 +144,15 @@ class Backend:
     async def detail(self, reference, frontier, revision):
         return await self._request({"kind": "detail", "surface": "explorer", "object_ref": reference, "expected_frontier": frontier, "expected_revision_ref": revision})
 
+    async def compare(self, query, frontier, after=None):
+        if not isinstance(query, dict) or set(query) != {"left", "right"} or any(
+            not isinstance(ref, dict) or set(ref) != {"stable_key", "revision_ref"}
+            or any(not isinstance(value, str) or not value or len(value.encode("utf-8")) > 512 for value in ref.values())
+            for ref in query.values()
+        ):
+            raise BackendError("invalid_input")
+        return await self._request({"kind": "compare_revisions", "query": query, "expected_frontier": frontier, "after": after, "limit": 8})
+
     async def sources(self, reference, frontier, revision, after=None):
         return await self._request({"kind": "related", "relation": "object_sources", "source_stable_key": reference, "expected_source_revision_ref": revision, "expected_frontier": frontier, "after": after, "limit": 32})
 
@@ -216,7 +225,7 @@ class Backend:
                     return health
                 response = await call({"human_governance": {"operation": "read", "request": read}})
                 result = response["human_governance"]
-                if result.get("kind") not in ("snapshot", "memory_page", "revision_page", "scope_directory", "content", "conflict"):
+                if result.get("kind") not in ("snapshot", "memory_page", "revision_page", "scope_directory", "content", "revision_comparison", "conflict"):
                     raise BackendError("invalid_read_response")
                 return result
             finally:

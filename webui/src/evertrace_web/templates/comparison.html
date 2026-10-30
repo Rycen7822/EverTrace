@@ -1,0 +1,21 @@
+{% macro field_value(value) %}{% if value.state == 'ready' %}<pre class="memory-prose">{{ value.json|field_value }}</pre>{% elif value.state == 'absent' %}<p>此侧没有这个字段；不是 JSON null。</p>{% else %}<p>字段 JSON 共 {{ value.original_bytes }} 字节，超过对照显示上限；请按下方入口读取该侧完整语义。</p>{% endif %}{% endmacro %}
+<section aria-label="指定修订比较">
+<h2>两份指定修订的字段对照</h2>
+<p class="badges"><span class="badge">{{ {'atom':'Atom 修订','procedure':'方法修订；可读不代表可执行','core_membership':'Core membership 修订','proposal':'提案参考；不表示已生效','digest':'摘要；不是原始证据'}.get(comparison.object_kind, '未定位类型') }}</span></p>
+<button class="button" type="button" data-nav-back hidden>返回上一页</button>
+<p class="muted">左、右是所选方向，不猜时间先后，也不据此判定语义真假。列表及深层结构按整个字段比较。</p>
+<p>左侧：{{ comparison.query.left.revision_ref }} · {{ comparison.left_state }}</p>
+<p>右侧：{{ comparison.query.right.revision_ref }} · {{ comparison.right_state }}</p>
+{% if comparison.status == 'side_unavailable' %}<p>至少一侧当前无法读取；本次没有返回字段名、值、长度或差异计数，也没有换成当前版本。</p>
+{% elif comparison.status == 'budget_exhausted' %}<p>比较预算不足；本次没有返回不完整的字段差异，可重读或分别查看两侧完整语义。</p>
+{% else %}<p>变化字段 {{ comparison.changed_fields }} 项，本页 {{ comparison.fields|length }} 项。</p>
+{% for field in comparison.fields %}<article class="comparison-field">
+<h3>{{ field.path }} · {{ {'added':'新增','removed':'移除','modified':'变化'}[field.change] }}</h3>
+<p class="reading-origin">左侧</p>{{ field_value(field.left) }}<p class="reading-origin">右侧</p>{{ field_value(field.right) }}
+</article>{% else %}<p>{{ '所选修订的字段相同。' if comparison.changed_fields == 0 else '这一页没有变化字段，可从头读取对照。' }}</p>{% endfor %}{% endif %}
+<div class="chunk-controls">
+{% if comparison.left_state == 'ready' %}<button class="button" type="button" data-compare-side="left">分段读取左侧完整语义</button>{% endif %}
+{% if comparison.right_state == 'ready' %}<button class="button" type="button" data-compare-side="right">分段读取右侧完整语义</button>{% endif %}
+<button class="button" type="button" data-compare-first>从头读取对照</button><button class="button" type="button" data-compare-next>下一页变化</button>
+</div>
+</section>

@@ -102,6 +102,12 @@ pub enum HumanRelationKind {
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
 pub enum HumanReadRequest {
+    CompareRevisions {
+        query: evertrace_domain::query::RevisionCompareQuery,
+        expected_frontier: u64,
+        after: Option<String>,
+        limit: u16,
+    },
     ScopeDirectory {
         query: evertrace_domain::query::ScopeDirectoryQuery,
         expected_frontier: Option<u64>,
@@ -915,6 +921,9 @@ pub struct HumanActionResult {
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
 pub enum HumanGovernanceResponse {
+    RevisionComparison {
+        comparison: Box<evertrace_domain::query::HumanRevisionComparison>,
+    },
     ScopeDirectory {
         page: Box<evertrace_domain::query::ScopeDirectoryPage>,
     },
@@ -987,6 +996,22 @@ impl HumanGovernanceRequest {
 impl HumanReadRequest {
     fn validate(&self) -> bool {
         match self {
+            Self::CompareRevisions {
+                query,
+                expected_frontier,
+                after,
+                limit,
+            } => {
+                query.validate().is_ok()
+                    && (1..=evertrace_domain::query::HUMAN_COMPARE_LIMIT).contains(limit)
+                    && after.as_ref().is_none_or(|raw| {
+                        raw.len() <= 8192
+                        && serde_json::from_str::<evertrace_domain::query::RevisionCompareCursor>(
+                            raw,
+                        )
+                        .is_ok_and(|cursor| cursor.validate_for(query, *expected_frontier).is_ok())
+                    })
+            }
             Self::ScopeDirectory {
                 query,
                 expected_frontier,
@@ -1271,6 +1296,36 @@ impl HumanDiagnostics {
 impl HumanGovernanceResponse {
     pub fn validate(&self) -> bool {
         match self {
+            Self::RevisionComparison { comparison } => {
+                use evertrace_domain::query::{HumanComparedValue, RevisionCompareCursor};
+                comparison.validate()
+                    && comparison.fields.iter().all(|field| {
+                        [&field.left, &field.right]
+                            .into_iter()
+                            .all(|value| match value {
+                                HumanComparedValue::Ready { json } => {
+                                    serde_json::from_str::<serde_json::Value>(json).is_ok_and(
+                                        |value| {
+                                            serde_json::to_string(&value)
+                                                .is_ok_and(|canonical| canonical == *json)
+                                        },
+                                    )
+                                }
+                                _ => true,
+                            })
+                    })
+                    && comparison.next_cursor.as_ref().is_none_or(|raw| {
+                        serde_json::from_str::<RevisionCompareCursor>(raw).is_ok_and(|cursor| {
+                            cursor
+                                .validate_for(&comparison.query, comparison.frontier)
+                                .is_ok()
+                                && comparison
+                                    .fields
+                                    .last()
+                                    .is_some_and(|last| last.path == cursor.after_path)
+                        })
+                    })
+            }
             Self::ScopeDirectory { page } => {
                 use evertrace_domain::query::{ScopeDirectoryCursor, ScopeTitleState};
                 page.query.validate().is_ok()
@@ -1491,16 +1546,7 @@ pub enum HumanSemanticContent {
     CoreMembership(Box<evertrace_domain::semantic::CoreMembership>),
 }
 
-#[derive(Clone, Copy, Debug, serde::Deserialize, Eq, PartialEq, serde::Serialize)]
-#[serde(rename_all = "snake_case")]
-pub enum HumanContentState {
-    Ready,
-    TooLarge,
-    AccessDenied,
-    Missing,
-    Unsupported,
-    Unavailable,
-}
+pub use evertrace_domain::query::HumanContentState;
 
 #[derive(Clone, Debug, serde::Deserialize, Eq, PartialEq, serde::Serialize)]
 #[serde(deny_unknown_fields)]

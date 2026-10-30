@@ -14,16 +14,7 @@ pub enum HumanSemanticContent {
     CoreMembership(Box<evertrace_domain::semantic::CoreMembership>),
 }
 
-#[derive(Clone, Copy, Debug, serde::Deserialize, Eq, PartialEq, serde::Serialize)]
-#[serde(rename_all = "snake_case")]
-pub enum HumanContentState {
-    Ready,
-    TooLarge,
-    AccessDenied,
-    Missing,
-    Unsupported,
-    Unavailable,
-}
+pub use evertrace_domain::query::HumanContentState;
 
 #[derive(Clone, Debug, serde::Deserialize, Eq, PartialEq, serde::Serialize)]
 #[serde(deny_unknown_fields)]

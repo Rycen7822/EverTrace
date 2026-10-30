@@ -487,6 +487,7 @@ impl App {
                     (
                         _,
                         HumanGovernanceResponse::Action { .. }
+                        | HumanGovernanceResponse::RevisionComparison { .. }
                         | HumanGovernanceResponse::RevisionPage { .. }
                         | HumanGovernanceResponse::MemoryPage { .. }
                         | HumanGovernanceResponse::Content { .. }
@@ -520,6 +521,7 @@ impl App {
                         reason: Some("optimistic_conflict".into()),
                     },
                     HumanGovernanceResponse::Snapshot { .. }
+                    | HumanGovernanceResponse::RevisionComparison { .. }
                     | HumanGovernanceResponse::RevisionPage { .. }
                     | HumanGovernanceResponse::MemoryPage { .. }
                     | HumanGovernanceResponse::Content { .. }

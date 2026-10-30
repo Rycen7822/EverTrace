@@ -863,6 +863,12 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
                                 }
                             }
                             HumanGovernanceRequest::Read { request } => match request {
+                                HumanReadRequest::CompareRevisions {query, expected_frontier, after, limit} => {
+                                    match human_governance.compare_revisions(query, expected_frontier, after.as_deref(), limit).await.map_err(map_human_error)? {
+                                        Ok(comparison) => HumanGovernanceResponse::RevisionComparison {comparison:Box::new(comparison)},
+                                        Err(frontier) => HumanGovernanceResponse::Conflict {current_frontier:frontier,current_revision_ref:None},
+                                    }
+                                }
                                 HumanReadRequest::ScopeDirectory {query,expected_frontier,after,limit} => {
                                     match human_governance.scope_directory(query,expected_frontier,after.as_deref(),limit).await.map_err(map_human_error)? {
                                         Ok(page)=>HumanGovernanceResponse::ScopeDirectory {page:Box::new(page)},
@@ -1529,20 +1535,6 @@ fn map_human_surface(surface: HumanSurface) -> EngineHumanSurface {
     }
 }
 
-fn map_content_state(
-    state: evertrace_engine::HumanContentState,
-) -> evertrace_protocol::dto::HumanContentState {
-    use evertrace_protocol::dto::HumanContentState as State;
-    match state {
-        evertrace_engine::HumanContentState::Ready => State::Ready,
-        evertrace_engine::HumanContentState::TooLarge => State::TooLarge,
-        evertrace_engine::HumanContentState::AccessDenied => State::AccessDenied,
-        evertrace_engine::HumanContentState::Missing => State::Missing,
-        evertrace_engine::HumanContentState::Unsupported => State::Unsupported,
-        evertrace_engine::HumanContentState::Unavailable => State::Unavailable,
-    }
-}
-
 fn map_content_chunk(
     content: evertrace_engine::HumanContentChunk,
 ) -> evertrace_protocol::dto::HumanContentChunk {
@@ -1551,7 +1543,7 @@ fn map_content_chunk(
         object_ref: content.object_ref,
         revision_ref: content.revision_ref,
         representation: content.representation,
-        state: map_content_state(content.state),
+        state: content.state,
         total_bytes: content.total_bytes,
         range_start: content.range_start,
         range_end: content.range_end,
@@ -1570,7 +1562,7 @@ fn map_semantic_detail(
         revision_ref: detail.revision_ref,
         preview: detail.preview,
         original_bytes: detail.original_bytes,
-        state: map_content_state(detail.state),
+        state: detail.state,
         content: detail.content.map(|content| match content {
             evertrace_engine::HumanSemanticContent::Digest(value) => Content::Digest(value),
             evertrace_engine::HumanSemanticContent::Atom(value) => Content::Atom(value),
@@ -1604,7 +1596,7 @@ fn map_human_page(page: evertrace_engine::HumanPage) -> HumanGovernanceResponse 
             .items
             .into_iter()
             .map(|item| HumanSnapshotItem {
-                reading_preview: item.reading_preview.map(|value| evertrace_protocol::dto::HumanMemoryPreview {state:map_content_state(value.state),title:value.title,excerpt:value.excerpt,origin:value.origin,truncated:value.truncated}),
+                reading_preview: item.reading_preview.map(|value| evertrace_protocol::dto::HumanMemoryPreview {state:value.state,title:value.title,excerpt:value.excerpt,origin:value.origin,truncated:value.truncated}),
                 source_context: item.source_context.map(|value| evertrace_protocol::dto::HumanSourceContext {
                     directory: value.directory, session: value.session,
                     event_time_us: value.event_time_us, recorded_at_us: value.recorded_at_us,

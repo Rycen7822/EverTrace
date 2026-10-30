@@ -53,6 +53,7 @@ class App:
         self.session = None
         self.templates = Environment(loader=FileSystemLoader(str(ROOT / "templates")), autoescape=select_autoescape(("html",)), undefined=StrictUndefined, cache_size=8, auto_reload=False)
         self.templates.filters["pretty"] = lambda value: orjson.dumps(value, option=orjson.OPT_INDENT_2).decode()
+        self.templates.filters["field_value"] = display_field_value
 
     def authenticated(self, request, touch=False):
         current = self.session
@@ -170,6 +171,16 @@ class App:
                 else:
                     page = result["page"]
                     data = {"html": self.templates.get_template("scopes.html").render(items=page["items"]), "query": page["query"], "frontier": str(page["frontier"]), "next_cursor": page["next_cursor"], "parent_available": page["parent_available"], "complete": page["complete"], "names_complete": page["names_complete"]}
+            elif payload.get("kind") == "compare" and set(payload) == {"kind", "query", "frontier", "after"}:
+                frontier = parse_frontier(payload["frontier"])
+                if not valid_ref(payload["after"], optional=True):
+                    return JSONResponse({"error": "invalid_read"}, 400)
+                result = await self.backend.compare(payload["query"], frontier, payload["after"])
+                if result["kind"] == "conflict":
+                    data = {"conflict": True}
+                else:
+                    comparison = result["comparison"]
+                    data = {"html": self.templates.get_template("comparison.html").render(comparison=comparison), "frontier": str(comparison["frontier"]), "next_cursor": comparison["next_cursor"], "status": comparison["status"]}
             elif payload.get("kind") == "content" and set(payload) == {"kind", "reference", "frontier", "revision", "representation", "after"}:
                 frontier = parse_frontier(payload["frontier"])
                 if not valid_ref(payload["reference"]) or not valid_ref(payload["revision"]) or not valid_ref(payload["after"], optional=True):
@@ -219,6 +230,13 @@ class App:
         if self.session is not current or not self.authenticated(request):
             return JSONResponse({"error": "session_expired"}, status_code=401)
         return JSONResponse(data)
+
+
+def display_field_value(text):
+    value = _decode(text.encode("utf-8"))
+    # Preserve Native's bounded JSON presentation instead of expanding deeply
+    # nested values or re-encoding their numbers in the Web process.
+    return value if isinstance(value, str) else text
 
 
 def valid_ref(value, optional=False):
