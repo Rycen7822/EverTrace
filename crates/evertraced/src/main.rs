@@ -863,6 +863,12 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
                                 }
                             }
                             HumanGovernanceRequest::Read { request } => match request {
+                                HumanReadRequest::ScopeDirectory {query,expected_frontier,after,limit} => {
+                                    match human_governance.scope_directory(query,expected_frontier,after.as_deref(),limit).await.map_err(map_human_error)? {
+                                        Ok(page)=>HumanGovernanceResponse::ScopeDirectory {page:Box::new(page)},
+                                        Err(frontier)=>HumanGovernanceResponse::Conflict {current_frontier:frontier,current_revision_ref:None},
+                                    }
+                                }
                                 HumanReadRequest::Content {
                                     object_ref, expected_revision_ref, expected_frontier, representation, after, limit,
                                 } => {
@@ -895,6 +901,9 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
                                                 query: value.query,
                                                 total_count: value.total_count,
                                                 matching_count: value.matching_count,
+                                                scope_available: value.scope_available,
+                                                counts_complete: value.counts_complete,
+                                                unresolved_scope_count: value.unresolved_scope_count,
                                             }
                                         }
                                         Err(frontier) => HumanGovernanceResponse::Conflict {

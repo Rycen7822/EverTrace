@@ -520,7 +520,121 @@ pub enum MemoryReadingKind {
     References,
 }
 
-/// This is journal recording order, not a claim about event timestamps.
+/// Explicit human browsing scope; distinct from applicability/agent binding.
+#[derive(Clone, Copy, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
+pub enum MemoryScopeSelection {
+    #[default]
+    All,
+    Global,
+    Unassigned,
+    Task {
+        task_id: TaskId,
+    },
+    Repository {
+        repository_id: RepositoryId,
+    },
+    Worktree {
+        worktree_id: WorktreeId,
+    },
+}
+
+impl MemoryScopeSelection {
+    pub const fn boundary(self) -> Option<ScopeBoundary> {
+        match self {
+            Self::Task { task_id } => Some(ScopeBoundary::Task { task_id }),
+            Self::Repository { repository_id } => Some(ScopeBoundary::Repository { repository_id }),
+            Self::Worktree { worktree_id } => Some(ScopeBoundary::Worktree { worktree_id }),
+            _ => None,
+        }
+    }
+}
+
+#[derive(Clone, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct ScopeDirectoryQuery {
+    pub parent: Option<ScopeBoundary>,
+    pub name: String,
+}
+
+impl ScopeDirectoryQuery {
+    pub fn validate(&self) -> Result<(), QueryError> {
+        if self.name.len() > 256
+            || self.name != self.name.trim()
+            || self.name.chars().any(char::is_control)
+        {
+            return Err(QueryError::Invalid);
+        }
+        Ok(())
+    }
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct ScopeDirectoryCursor {
+    pub frontier: u64,
+    pub query: ScopeDirectoryQuery,
+    pub after_key: String,
+}
+
+impl ScopeDirectoryCursor {
+    pub fn validate_for(&self, query: &ScopeDirectoryQuery) -> Result<(), QueryError> {
+        if self.query != *query
+            || self.after_key.is_empty()
+            || self.after_key.len() > 512
+            || self.after_key.chars().any(char::is_control)
+        {
+            return Err(QueryError::Invalid);
+        }
+        Ok(())
+    }
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ScopeTitleState {
+    Metadata,
+    ContentReady,
+    AccessDenied,
+    Unavailable,
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, Eq, Ord, PartialEq, PartialOrd, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ScopeReadRestriction {
+    CurrentAccessNotEvaluated,
+    UserDisabled,
+    TrustRevoked,
+    WorktreeNotActive,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct ScopeDirectoryEntry {
+    pub stable_key: String,
+    pub selection: MemoryScopeSelection,
+    pub label: String,
+    pub title_state: ScopeTitleState,
+    pub path_hint: Option<String>,
+    pub branch_hint: Option<String>,
+    pub lifecycle: Option<String>,
+    pub restrictions: Vec<ScopeReadRestriction>,
+    pub has_children: bool,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct ScopeDirectoryPage {
+    pub frontier: u64,
+    pub query: ScopeDirectoryQuery,
+    pub parent_available: bool,
+    pub complete: bool,
+    pub names_complete: bool,
+    pub items: Vec<ScopeDirectoryEntry>,
+    pub next_cursor: Option<String>,
+}
+
+/// Journal recording order, not a claim about event timestamps.
 #[derive(Clone, Copy, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum MemoryBrowseOrder {
@@ -532,6 +646,8 @@ pub enum MemoryBrowseOrder {
 #[derive(Clone, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct MemoryBrowseQuery {
+    pub selection: MemoryScopeSelection,
+    pub include_global: bool,
     pub kind: MemoryReadingKind,
     pub order: MemoryBrowseOrder,
     pub epistemic_status: Option<crate::semantic::EpistemicStatus>,
@@ -541,6 +657,9 @@ pub struct MemoryBrowseQuery {
 
 impl MemoryBrowseQuery {
     pub fn validate(&self) -> Result<(), QueryError> {
+        if self.include_global && self.selection.boundary().is_none() {
+            return Err(QueryError::Invalid);
+        }
         if !matches!(
             self.kind,
             MemoryReadingKind::All | MemoryReadingKind::FactsAndConstraints

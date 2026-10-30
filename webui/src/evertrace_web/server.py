@@ -157,7 +157,19 @@ class App:
                 if result["kind"] == "conflict":
                     data = {"conflict": True}
                 else:
-                    data = {"html": self.templates.get_template("list.html").render(items=result["items"], empty_message="这些条件下没有条目；可以清除筛选。" if result["total_count"] else "当前没有记忆记录。"), "frontier": str(result["frontier"]), "next_cursor": result["next_cursor"], "count": len(result["items"]), "degraded": result["status"] != "ready", "query": result["query"], "total_count": str(result["total_count"]), "matching_count": str(result["matching_count"])}
+                    empty = "范围不存在、已移除或当前不可用；这不表示记忆数量为零。" if not result["scope_available"] else "这些条件下没有条目；可以清除筛选。" if result["total_count"] else "当前范围没有可列出的元数据记录。"
+                    data = {"html": self.templates.get_template("list.html").render(items=result["items"], empty_message=empty), "frontier": str(result["frontier"]), "next_cursor": result["next_cursor"], "count": len(result["items"]), "degraded": result["status"] != "ready", "query": result["query"], "total_count": str(result["total_count"]) if result["total_count"] is not None else None, "matching_count": str(result["matching_count"]) if result["matching_count"] is not None else None, "scope_available": result["scope_available"], "counts_complete": result["counts_complete"], "unresolved_scope_count": str(result["unresolved_scope_count"])}
+            elif payload.get("kind") == "scopes" and not (set(payload) - {"kind", "query", "after", "expected_frontier"}):
+                frontier = parse_frontier(payload.get("expected_frontier"), optional=True)
+                after = payload.get("after")
+                if not valid_ref(after, optional=True):
+                    return JSONResponse({"error": "invalid_read"}, 400)
+                result = await self.backend.scopes(payload.get("query"), after, frontier)
+                if result["kind"] == "conflict":
+                    data = {"conflict": True}
+                else:
+                    page = result["page"]
+                    data = {"html": self.templates.get_template("scopes.html").render(items=page["items"]), "query": page["query"], "frontier": str(page["frontier"]), "next_cursor": page["next_cursor"], "parent_available": page["parent_available"], "complete": page["complete"], "names_complete": page["names_complete"]}
             elif payload.get("kind") == "content" and set(payload) == {"kind", "reference", "frontier", "revision", "representation", "after"}:
                 frontier = parse_frontier(payload["frontier"])
                 if not valid_ref(payload["reference"]) or not valid_ref(payload["revision"]) or not valid_ref(payload["after"], optional=True):

@@ -16,6 +16,31 @@ import orjson
 
 from . import BackendError
 
+def normalize_scope(value, boundary=False):
+    # Wire shape only. Native identity, membership and permission resolution is
+    # never inferred from a path, a label or the most recent session here.
+    if not isinstance(value, dict):
+        raise BackendError("invalid_input")
+    kind = value.get("kind")
+    if not isinstance(kind, str):
+        raise BackendError("invalid_input")
+    if kind in ("all", "global", "unassigned") and not boundary and set(value) == {"kind"}:
+        return {"kind": kind}
+    field = {"task": "task_id", "repository": "repository_id", "worktree": "worktree_id"}.get(kind)
+    if field is None or set(value) != {"kind", field} or not isinstance(value[field], str):
+        raise BackendError("invalid_input")
+    family, separator, payload = value[field].partition(":")
+    if separator != ":" or family != {"task": "task", "repository": "repo", "worktree": "wt"}[kind]:
+        raise BackendError("invalid_input")
+    try:
+        parsed = uuid.UUID(payload)
+    except ValueError as error:
+        raise BackendError("invalid_input") from error
+    if str(parsed) != payload or parsed.version != 7 or parsed.variant != uuid.RFC_4122:
+        raise BackendError("invalid_input")
+    return {"kind": kind, field: value[field]}
+
+
 MAX_FRAME = 1_048_576
 
 
@@ -96,10 +121,25 @@ class Backend:
         }
         if query is None:
             query = {}
-        if not isinstance(query, dict) or set(query) - wire_values.keys() or any(value not in wire_values[key] for key, value in query.items()):
+        if not isinstance(query, dict) or set(query) - (wire_values.keys() | {"selection", "include_global"}) or any(value not in wire_values[key] for key, value in query.items() if key in wire_values):
             raise BackendError("invalid_input")
-        normalized = {key: query.get(key, values[0]) for key, values in wire_values.items()}
+        include_global = query.get("include_global", False)
+        if type(include_global) is not bool:
+            raise BackendError("invalid_input")
+        normalized = {"selection": normalize_scope(query.get("selection", {"kind": "all"})), "include_global": include_global, **{key: query.get(key, values[0]) for key, values in wire_values.items()}}
         return await self._request({"kind": "browse_memories", "query": normalized, "expected_frontier": expected_frontier, "after": after, "limit": 32})
+
+    async def scopes(self, query=None, after=None, expected_frontier=None):
+        if query is None:
+            query = {}
+        if not isinstance(query, dict) or set(query) - {"parent", "name"}:
+            raise BackendError("invalid_input")
+        name = query.get("name", "")
+        if not isinstance(name, str) or len(name.encode("utf-8")) > 256:
+            raise BackendError("invalid_input")
+        parent = query.get("parent")
+        normalized = {"parent": normalize_scope(parent, boundary=True) if parent is not None else None, "name": name}
+        return await self._request({"kind": "scope_directory", "query": normalized, "expected_frontier": expected_frontier, "after": after, "limit": 32})
 
     async def detail(self, reference, frontier, revision):
         return await self._request({"kind": "detail", "surface": "explorer", "object_ref": reference, "expected_frontier": frontier, "expected_revision_ref": revision})
@@ -170,7 +210,7 @@ class Backend:
                     return health
                 response = await call({"human_governance": {"operation": "read", "request": read}})
                 result = response["human_governance"]
-                if result.get("kind") not in ("snapshot", "memory_page", "content", "conflict"):
+                if result.get("kind") not in ("snapshot", "memory_page", "scope_directory", "content", "conflict"):
                     raise BackendError("invalid_read_response")
                 return result
             finally:

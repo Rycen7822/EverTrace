@@ -3,6 +3,7 @@ mod diagnostics;
 pub use content::HumanContentChunk;
 mod export;
 mod presentation;
+mod scopes;
 pub use diagnostics::{
     HumanDiagnosticCheck, HumanDiagnosticState, HumanDiagnostics, HumanTableDiagnostic,
 };
@@ -655,8 +656,11 @@ pub struct HumanRepositoryPurgePreview {
 pub struct HumanMemoryBrowsePage {
     pub page: HumanPage,
     pub query: evertrace_domain::query::MemoryBrowseQuery,
-    pub total_count: u64,
-    pub matching_count: u64,
+    pub total_count: Option<u64>,
+    pub matching_count: Option<u64>,
+    pub scope_available: bool,
+    pub counts_complete: bool,
+    pub unresolved_scope_count: u64,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -1266,6 +1270,9 @@ impl HumanGovernanceService {
             query,
             total_count: context.total_count,
             matching_count: context.matching_count,
+            scope_available: context.scope_available,
+            counts_complete: context.counts_complete,
+            unresolved_scope_count: context.unresolved_scope_count,
         }))
     }
 

@@ -32,7 +32,7 @@
 <div id="frame" class="app-main route-memories">
   <header class="topbar"><div class="breadcrumb"><span>本地工作区</span><span>›</span><strong id="breadcrumb">记忆</strong></div><button class="top-search" disabled title="搜索尚未接入"><svg class="icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" aria-hidden="true"><circle cx="10.5" cy="10.5" r="6.5"/><path d="m16 16 4.5 4.5"/></svg><span>搜索记忆、来源和工作（未接入）</span></button><div class="top-actions"><span class="mode-label">本机连接 · 只读</span></div></header>
   <main id="main-content" class="main-content" tabindex="-1">
-    <div class="page-heading"><div><h1 id="page-title">记忆</h1><p id="page-description">查看 daemon 中当前可读的记忆。暂未开放网页修改。</p></div><div class="page-actions"><button id="refresh" class="button">刷新</button></div></div>
+    <div class="page-heading"><div><h1 id="page-title">记忆</h1><p id="page-description">查看 daemon 中当前可读的记忆。暂未开放网页修改。</p></div><div class="page-actions"><button id="scope-open" class="button" type="button">范围：全部元数据</button><label class="muted"><input id="include-global" type="checkbox" disabled> 同时列 global</label><button id="refresh" class="button">刷新</button></div></div>
     <div id="notice" class="notice" role="status">正在验证本机网页会话…</div>
     <section id="reader" class="browser" aria-label="记忆阅读器" hidden>
       <div class="browser-list"><div class="browser-list-head"><div class="toolbar"><strong>记忆记录</strong><span class="muted">只读</span></div><div class="tabs"><span class="tab active">当前条目<span id="page-count" class="tab-count">正在读取</span></span></div><div class="browse-filters"><select id="reading-kind" aria-label="阅读种类"><option value="all">全部种类</option><option value="summaries">摘要</option><option value="facts_and_constraints">事实与约束</option><option value="methods">正式方法</option><option value="references">提案参考</option></select><select id="browse-order" aria-label="录入顺序"><option value="recorded_newest">后录入在前</option><option value="recorded_oldest">先录入在前</option></select><select id="epistemic-filter" aria-label="Atom 真值状态"><option value="">全部真值状态</option><option value="not_applicable">不适用</option><option value="unverified">未验证</option><option value="supported">有支持</option><option value="disputed">有争议</option><option value="refuted">已反驳</option></select><select id="authority-filter" aria-label="Atom 权威来源"><option value="">全部权威来源</option><option value="user_explicit">用户明确授权</option><option value="project_policy">项目策略</option><option value="objective_evidence">客观证据</option><option value="agent_inferred">Agent 推断</option><option value="imported_claim">导入声明</option></select><select id="lifecycle-filter" aria-label="Atom 生命周期"><option value="">全部 Atom 生命周期</option><option value="active">活跃</option><option value="superseded">已被替代</option><option value="deprecated">已弃用</option></select></div></div><div id="memory-items" class="memory-items"></div><div class="list-footer"><button id="first-page" class="text-button">返回首页</button><button id="next-page" class="text-button" disabled>下一页</button></div></div>
@@ -41,6 +41,15 @@
     <section id="system-panel" class="panel reading-note" hidden><h2>连接状态</h2><div id="system-status"></div></section>
   </main>
 </div>
+<dialog id="scope-dialog" class="action-dialog scope-dialog" aria-labelledby="scope-title">
+  <header><h2 id="scope-title">选择工作范围</h2><button id="scope-close" class="text-button" type="button">关闭</button></header>
+  <p class="muted">从后端记录的仓库、工作树和任务中选择。这里只切换浏览范围，不授予正文读取权限。</p>
+  <div class="scope-entry-actions"><button class="button" type="button" data-scope-fixed="all">全部元数据</button><button class="button" type="button" data-scope-fixed="global">仅 global 资产</button><button class="button" type="button" data-scope-fixed="unassigned">未归属元数据</button></div>
+  <form id="scope-search" class="scope-search"><input id="scope-name" aria-label="范围名称或已知路径" placeholder="查找名称、路径或分支" maxlength="256" autocomplete="off"><button class="button" type="submit">查找</button></form>
+  <div class="scope-entry-actions"><button id="scope-root" class="text-button" type="button">全部目录</button><span id="scope-parent" class="muted"></span></div>
+  <p id="scope-notice" class="notice" role="status"></p><div id="scope-items" class="scope-items"></div>
+  <footer><button id="scope-first" class="text-button" type="button">目录首页</button><button id="scope-next" class="text-button" type="button" disabled>目录下一页</button></footer>
+</dialog>
 <script type="module" src="/app.js"></script>
 </body>
 </html>

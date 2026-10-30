@@ -3,13 +3,14 @@ let fragment = location.hash.slice(1);
 let bootstrap = /^bootstrap=[0-9a-f]{64}$/.test(fragment) ? fragment.slice(10) : null;
 fragment = null;
 let poller = null;
-const state = { csrf: null, active: false, route: 'memories', query: {kind: 'all', order: 'recorded_newest', epistemic_status: null, authority: null, atom_lifecycle: null}, after: null, frontier: null, next: null, selected: null, content: null, controller: null };
+const state = { csrf: null, active: false, route: 'memories', query: {selection: {kind: 'all'}, include_global: false, kind: 'all', order: 'recorded_newest', epistemic_status: null, authority: null, atom_lifecycle: null}, after: null, frontier: null, next: null, selected: null, content: null, controller: null };
+const directory = {query: {parent: null, name: ''}, after: null, frontier: null, next: null, controller: null};
 history.replaceState(null, '', '#memories');
 const channel = new BroadcastChannel('evertrace-web-session');
 function clear() { $('memory-items').replaceChildren(); $('detail-body').replaceChildren(); $('detail-ref').textContent = ''; $('system-status').replaceChildren(); $('page-count').textContent = ''; $('next-page').disabled = true; }
 function cancel() { state.controller?.abort(); state.controller = null; }
 function notice(text) { $('notice').textContent = text; }
-function closed(text, broadcast = false) { cancel(); clear(); clearInterval(poller); poller = null; state.csrf = null; state.active = false; state.selected = null; state.content = null; state.after = null; state.frontier = null; state.next = null; $('reader').hidden = true; $('system-panel').hidden = true; notice(text); if (broadcast) channel.postMessage('closed'); }
+function closed(text, broadcast = false) { cancel(); clear(); clearInterval(poller); poller = null; state.csrf = null; state.active = false; state.query = {...state.query, selection: {kind: 'all'}, include_global: false}; updateScopeControls(); clearDirectory(); if ($('scope-dialog').open) $('scope-dialog').close(); state.selected = null; state.content = null; state.after = null; state.frontier = null; state.next = null; $('reader').hidden = true; $('system-panel').hidden = true; notice(text); if (broadcast) channel.postMessage('closed'); }
 channel.onmessage = () => closed('网页会话已结束；请重新运行 evertrace --web。');
 async function api(path, body, signal) {
   const headers = { 'X-EverTrace-Web': '1' };
@@ -55,7 +56,9 @@ async function select(item) {
   finally { if (state.controller === controller) state.controller = null; }
 }
 async function refresh() {
-  if (!state.active || state.controller || document.hidden) return;
+  if (!state.active || document.hidden) return;
+  if ($('scope-dialog').open) { await loadDirectory(); return; }
+  if (state.controller) return;
   const controller = new AbortController(); state.controller = controller;
   try {
     const health = await api('status', undefined, controller.signal);
@@ -70,9 +73,9 @@ async function refresh() {
     if (page.conflict) { state.after = null; state.frontier = null; state.next = null; state.selected = null; state.content = null; notice('分页水位已变化；请刷新读取当前列表。'); return; }
     state.frontier = page.frontier; state.next = page.next_cursor;
     fragmentInto($('memory-items'), page.html); $('memory-items').scrollTop = listScroll;
-    $('page-count').textContent = '本页 ' + page.count + ' · 筛选 ' + page.matching_count + ' / 当前条目 ' + page.total_count;
+    $('page-count').textContent = !page.scope_available ? '范围不可用 · 计数未知' : '本页 ' + page.count + ' · ' + (page.counts_complete ? '' : '已判定范围 ≥ ') + '筛选 ' + page.matching_count + ' / 当前条目 ' + page.total_count;
     $('next-page').disabled = !page.next_cursor;
-    notice(page.degraded ? '只读数据有降级；不是完整成功。' : '按录入顺序浏览当前条目；计数不等于可读正文数量。搜索、范围及网页修改尚未接入。');
+    notice(!page.scope_available ? '所选身份不存在、已移除或当前不可用，未改查全部范围。' : page.degraded ? '只读数据有降级；不是完整成功。' : '按录入顺序浏览所选关联范围；计数不是可读正文数，也不表示方法可执行。' + (page.unresolved_scope_count !== '0' ? ' 另有 ' + page.unresolved_scope_count + ' 条元数据归属尚未判定。' : '') + ' 搜索和网页修改尚未接入。');
     if (state.selected && [...$('memory-items').children].some(row => row.dataset.key === state.selected.key)) {
       if (state.content) await readContent(state.selected, state.content.representation, state.content.after, controller, detailScroll);
       else await detail(state.selected, page.frontier, controller, detailScroll);
@@ -99,11 +102,65 @@ $('detail-body').onclick = event => {
 };
 $('memory-items').onclick = event => { const row = event.target.closest('.memory-item'); if (row) select({ key: row.dataset.key, revision: row.dataset.revision }); };
 for (const button of document.querySelectorAll('[data-route]')) button.onclick = () => route(button.dataset.route);
+function clearDirectory() {
+  directory.controller?.abort(); directory.controller = null;
+  directory.query = {parent: null, name: ''}; directory.after = null; directory.frontier = null; directory.next = null;
+  $('scope-items').replaceChildren(); $('scope-notice').textContent = ''; $('scope-parent').textContent = ''; $('scope-name').value = ''; $('scope-next').disabled = true;
+}
+function scopeLabel(selection) {
+  const labels = {all: '全部元数据', global: '仅 global', unassigned: '未归属元数据', task: '任务', repository: '仓库', worktree: '工作树'};
+  const id = selection.task_id || selection.repository_id || selection.worktree_id;
+  return labels[selection.kind] + (id ? ' ' + id.split(':').at(-1).slice(0, 8) : '');
+}
+async function loadDirectory() {
+  if (!state.active || document.hidden || !$('scope-dialog').open || directory.controller) return;
+  const controller = new AbortController(); directory.controller = controller;
+  $('scope-items').replaceChildren(); $('scope-notice').textContent = '正在从后端复核目录…'; $('scope-next').disabled = true;
+  try {
+    const page = await api('read', {kind: 'scopes', query: directory.query, after: directory.after, expected_frontier: directory.after ? directory.frontier : null}, controller.signal);
+    if (directory.controller !== controller || document.hidden || !$('scope-dialog').open) return;
+    if (page.conflict) { directory.after = null; directory.frontier = null; directory.next = null; $('scope-notice').textContent = '目录有更新；保留原条件，请回到目录首页重新读取。'; return; }
+    directory.frontier = page.frontier; directory.next = page.next_cursor;
+    fragmentInto($('scope-items'), page.html); $('scope-next').disabled = !page.next_cursor;
+    $('scope-parent').textContent = directory.query.parent ? scopeLabel(directory.query.parent) : '全部已知身份';
+    $('scope-notice').textContent = !page.parent_available ? '父级身份不可用，未回退到全部目录。' : !page.complete ? '本次目录读取未完成；可继续下一页或重新读取。' : !page.names_complete ? '部分任务名称暂时读不到，搜索结果可能不全。' : '本页按稳定身份排列；名称与限制已重新检查，目录可见不代表正文可读。';
+  } catch { if (directory.controller === controller && !controller.signal.aborted) { $('scope-items').replaceChildren(); $('scope-notice').textContent = '目录读取不可用，旧名称和路径已清除。'; } }
+  finally { if (directory.controller === controller) directory.controller = null; }
+}
+function directoryQuery(parent, name = '') {
+  directory.controller?.abort(); directory.controller = null; directory.query = {parent, name}; directory.after = null; directory.frontier = null; directory.next = null; loadDirectory();
+}
+function updateScopeControls() {
+  const selection = state.query.selection;
+  $('include-global').checked = state.query.include_global;
+  $('include-global').disabled = !['task', 'repository', 'worktree'].includes(selection.kind);
+  $('scope-open').textContent = '范围：' + scopeLabel(selection);
+}
+function chooseScope(selection) {
+  cancel(); clear(); state.after = null; state.frontier = null; state.next = null; state.selected = null; state.content = null;
+  state.query = {...state.query, selection, include_global: false};
+  updateScopeControls();
+  $('scope-dialog').close();
+}
+$('scope-open').onclick = () => { cancel(); clear(); clearDirectory(); $('scope-dialog').showModal(); loadDirectory(); };
+$('scope-close').onclick = () => $('scope-dialog').close();
+$('scope-dialog').onclose = () => { clearDirectory(); refresh(); };
+$('scope-search').onsubmit = event => { event.preventDefault(); directoryQuery(directory.query.parent, $('scope-name').value.trim()); };
+$('scope-root').onclick = () => { $('scope-name').value = ''; directoryQuery(null); };
+$('scope-first').onclick = () => directoryQuery(directory.query.parent, directory.query.name);
+$('scope-next').onclick = () => { if (directory.next) { directory.after = directory.next; loadDirectory(); } };
+$('scope-items').onclick = event => {
+  const button = event.target.closest('[data-scope-choose], [data-scope-children]'); if (!button) return;
+  const selection = JSON.parse(button.closest('.scope-entry').dataset.selection);
+  if (button.hasAttribute('data-scope-choose')) chooseScope(selection); else { $('scope-name').value = ''; directoryQuery(selection); }
+};
+for (const button of document.querySelectorAll('[data-scope-fixed]')) button.onclick = () => chooseScope({kind: button.dataset.scopeFixed});
+$('include-global').onchange = () => changeQuery();
 function changeQuery() {
   cancel(); clear(); state.after = null; state.frontier = null; state.selected = null; state.content = null; state.next = null;
   const atomAxes = ['all', 'facts_and_constraints'].includes($('reading-kind').value);
   for (const id of ['epistemic-filter', 'authority-filter', 'lifecycle-filter']) { $(id).disabled = !atomAxes; if (!atomAxes) $(id).value = ''; }
-  state.query = {kind: $('reading-kind').value, order: $('browse-order').value, epistemic_status: $('epistemic-filter').value || null, authority: $('authority-filter').value || null, atom_lifecycle: $('lifecycle-filter').value || null};
+  state.query = {selection: state.query.selection, include_global: $('include-global').checked, kind: $('reading-kind').value, order: $('browse-order').value, epistemic_status: $('epistemic-filter').value || null, authority: $('authority-filter').value || null, atom_lifecycle: $('lifecycle-filter').value || null};
   refresh();
 }
 for (const id of ['reading-kind', 'browse-order', 'epistemic-filter', 'authority-filter', 'lifecycle-filter']) $(id).onchange = changeQuery;
@@ -111,7 +168,7 @@ $('refresh').onclick = refresh;
 $('first-page').onclick = () => { cancel(); clear(); state.after = null; state.frontier = null; state.selected = null; state.content = null; refresh(); };
 $('next-page').onclick = () => { if (state.next) { cancel(); clear(); state.after = state.next; state.selected = null; state.content = null; refresh(); } };
 $('logout').onclick = async () => { try { await api('logout', {}); } finally { closed('网页会话已结束。', true); } };
-document.addEventListener('visibilitychange', () => { if (document.hidden) { cancel(); clear(); } else if (state.active) refresh(); });
+document.addEventListener('visibilitychange', () => { if (document.hidden) { cancel(); clear(); clearDirectory(); if ($('scope-dialog').open) $('scope-dialog').close(); } else if (state.active) refresh(); });
 window.addEventListener('pagehide', () => closed('网页会话已离开。'));
 window.addEventListener('pageshow', event => { if (event.persisted) start(); });
 async function start() {

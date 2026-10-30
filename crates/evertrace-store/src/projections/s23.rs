@@ -338,6 +338,10 @@ impl S23State {
             .filter(move |value| value.core_membership_id == membership_id)
     }
 
+    pub(super) fn membership_revision(&self, id: RevisionId) -> Option<&CoreMembership> {
+        self.membership_revisions.get(&id).map(|(value, _)| value)
+    }
+
     pub(super) fn all_membership_revisions(&self) -> impl Iterator<Item = &CoreMembership> {
         self.membership_revisions
             .values()

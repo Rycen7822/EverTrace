@@ -102,6 +102,12 @@ pub enum HumanRelationKind {
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
 pub enum HumanReadRequest {
+    ScopeDirectory {
+        query: evertrace_domain::query::ScopeDirectoryQuery,
+        expected_frontier: Option<u64>,
+        after: Option<String>,
+        limit: u16,
+    },
     Content {
         object_ref: String,
         expected_revision_ref: String,
@@ -906,6 +912,9 @@ pub struct HumanActionResult {
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
 pub enum HumanGovernanceResponse {
+    ScopeDirectory {
+        page: Box<evertrace_domain::query::ScopeDirectoryPage>,
+    },
     Content {
         content: Box<HumanContentChunk>,
     },
@@ -918,8 +927,11 @@ pub enum HumanGovernanceResponse {
         items: Vec<HumanSnapshotItem>,
         next_cursor: Option<String>,
         query: evertrace_domain::query::MemoryBrowseQuery,
-        total_count: u64,
-        matching_count: u64,
+        total_count: Option<u64>,
+        matching_count: Option<u64>,
+        scope_available: bool,
+        counts_complete: bool,
+        unresolved_scope_count: u64,
     },
     Export {
         result: HumanExportResult,
@@ -962,6 +974,25 @@ impl HumanGovernanceRequest {
 impl HumanReadRequest {
     fn validate(&self) -> bool {
         match self {
+            Self::ScopeDirectory {
+                query,
+                expected_frontier,
+                after,
+                limit,
+            } => {
+                query.validate().is_ok()
+                    && (1..=HUMAN_PAGE_LIMIT).contains(limit)
+                    && after.as_ref().is_none_or(|value| {
+                        value.len() <= 2048
+                        && serde_json::from_str::<evertrace_domain::query::ScopeDirectoryCursor>(
+                            value,
+                        )
+                        .is_ok_and(|cursor| {
+                            cursor.validate_for(query).is_ok()
+                                && *expected_frontier == Some(cursor.frontier)
+                        })
+                    })
+            }
             Self::Content {
                 object_ref,
                 expected_revision_ref,
@@ -1227,6 +1258,63 @@ impl HumanDiagnostics {
 impl HumanGovernanceResponse {
     pub fn validate(&self) -> bool {
         match self {
+            Self::ScopeDirectory { page } => {
+                use evertrace_domain::query::{ScopeDirectoryCursor, ScopeTitleState};
+                page.query.validate().is_ok()
+                    && (page.parent_available
+                        || (!page.complete
+                            && !page.names_complete
+                            && page.items.is_empty()
+                            && page.next_cursor.is_none()))
+                    && page.items.len() <= usize::from(HUMAN_PAGE_LIMIT)
+                    && (!page.names_complete
+                        || page.items.iter().all(|item| {
+                            !matches!(
+                                item.title_state,
+                                ScopeTitleState::AccessDenied | ScopeTitleState::Unavailable
+                            )
+                        }))
+                    && page
+                        .items
+                        .windows(2)
+                        .all(|pair| pair[0].stable_key < pair[1].stable_key)
+                    && page.items.iter().all(|item| {
+                        valid_ref(&item.stable_key)
+                            && item.stable_key.len() <= 512
+                            && item.selection.boundary().is_some()
+                            && !item.label.trim().is_empty()
+                            && !item.label.chars().any(char::is_control)
+                            && item.label.chars().count() <= 160
+                            && item
+                                .path_hint
+                                .as_ref()
+                                .is_none_or(|value| !value.is_empty() && value.len() <= 4096)
+                            && item
+                                .branch_hint
+                                .as_ref()
+                                .is_none_or(|value| !value.is_empty() && value.len() <= 4096)
+                            && item.lifecycle.as_deref().is_none_or(valid_ref)
+                            && item.restrictions.windows(2).all(|pair| pair[0] < pair[1])
+                            && (item.title_state != ScopeTitleState::ContentReady
+                                || matches!(
+                                    item.selection,
+                                    evertrace_domain::query::MemoryScopeSelection::Task { .. }
+                                ))
+                    })
+                    && page.next_cursor.as_ref().is_none_or(|value| {
+                        value.len() <= 2048
+                            && serde_json::from_str::<ScopeDirectoryCursor>(value).is_ok_and(
+                                |cursor| {
+                                    cursor.validate_for(&page.query).is_ok()
+                                        && cursor.frontier == page.frontier
+                                        && page
+                                            .items
+                                            .last()
+                                            .is_none_or(|item| cursor.after_key >= item.stable_key)
+                                },
+                            )
+                    })
+            }
             Self::Content { content } => content.validate(),
             Self::Export { result } => {
                 result.object_count <= 64
@@ -1250,6 +1338,9 @@ impl HumanGovernanceResponse {
                 query,
                 total_count,
                 matching_count,
+                scope_available,
+                counts_complete,
+                unresolved_scope_count,
             } => {
                 use evertrace_domain::query::{MemoryBrowseCursor, MemoryBrowseOrder};
                 let rank = |item: &HumanSnapshotItem| {
@@ -1262,8 +1353,23 @@ impl HumanGovernanceResponse {
                     )
                 };
                 query.validate().is_ok()
-                    && matching_count <= total_count
-                    && items.len() as u64 <= *matching_count
+                    && if *scope_available {
+                        total_count
+                            .zip(*matching_count)
+                            .is_some_and(|(total, matching)| {
+                                matching <= total && items.len() as u64 <= matching
+                            })
+                            && (!*counts_complete
+                                || query.selection
+                                    == evertrace_domain::query::MemoryScopeSelection::All
+                                || *unresolved_scope_count == 0)
+                    } else {
+                        !*counts_complete
+                            && total_count.is_none()
+                            && matching_count.is_none()
+                            && items.is_empty()
+                            && next_cursor.is_none()
+                    }
                     && valid_human_page(diagnostics, status, degraded_reasons, items, next_cursor)
                     && items.windows(2).all(|pair| rank(&pair[0]) < rank(&pair[1]))
                     && items

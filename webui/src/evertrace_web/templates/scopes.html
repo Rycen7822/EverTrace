@@ -1,0 +1,9 @@
+{% for item in items %}
+<div class="scope-entry" data-selection='{{ item.selection|tojson }}'>
+  <div><span class="type-pill">{{ {'task': '任务', 'repository': '仓库', 'worktree': '工作树'}[item.selection.kind] }}</span><strong>{{ item.label }}</strong>{% if item.lifecycle %}<span class="chip">{{ item.lifecycle }}</span>{% endif %}</div>
+  {% if item.path_hint %}<p class="scope-path">{{ item.path_hint }}</p>{% endif %}{% if item.branch_hint %}<p class="muted">{{ item.branch_hint }}</p>{% endif %}
+  {% if item.title_state in ('access_denied', 'unavailable') %}<p class="muted">暂时读不到这个任务的名称。</p>{% endif %}
+  <p class="muted">读取限制：{% for restriction in item.restrictions %}{{ {'current_access_not_evaluated': '正文权限待检查', 'user_disabled': '仓库已停用', 'trust_revoked': '仓库信任已撤销', 'worktree_not_active': '工作树当前不活跃'}[restriction] }}{% if not loop.last %} · {% endif %}{% endfor %}</p>
+  <div class="scope-entry-actions"><button class="button" type="button" data-scope-choose>选择此范围</button>{% if item.has_children %}<button class="text-button" type="button" data-scope-children>查看下级</button>{% endif %}</div>
+</div>
+{% else %}<div class="empty">这一页没有找到匹配项。</div>{% endfor %}
