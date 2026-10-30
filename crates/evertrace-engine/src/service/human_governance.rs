@@ -3,12 +3,14 @@ mod diagnostics;
 pub use content::HumanContentChunk;
 mod export;
 mod presentation;
+mod reading;
 mod scopes;
 pub use diagnostics::{
     HumanDiagnosticCheck, HumanDiagnosticState, HumanDiagnostics, HumanTableDiagnostic,
 };
 pub use export::{HumanExportResult, HumanExportSelection, HumanExportStatus};
 pub use presentation::{HumanContentState, HumanSemanticContent, HumanSemanticDetail};
+pub use reading::HumanMemoryPreview;
 
 use std::{
     collections::{BTreeMap, BTreeSet},
@@ -233,6 +235,7 @@ pub enum HumanItemCategory {
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct HumanSummary {
+    pub reading_preview: Option<HumanMemoryPreview>,
     pub source_context: Option<HumanSourceContext>,
     pub semantic_detail: Option<HumanSemanticDetail>,
     pub proposal_base: Option<HumanSemanticDetail>,
@@ -1265,8 +1268,10 @@ impl HumanGovernanceService {
         if expected_frontier.is_some_and(|frontier| frontier != context.page.frontier) {
             return Ok(Err(context.page.frontier));
         }
+        let mut page = memories_page(context.page)?;
+        self.reading_previews(&mut page.items).await;
         Ok(Ok(HumanMemoryBrowsePage {
-            page: memories_page(context.page)?,
+            page,
             query,
             total_count: context.total_count,
             matching_count: context.matching_count,
@@ -5169,6 +5174,7 @@ fn summary(
             (None, None, None, None)
         };
     Ok(HumanSummary {
+        reading_preview: None,
         source_context: None,
         semantic_detail: None,
         proposal_base: None,
@@ -5240,6 +5246,7 @@ fn proposal_summary(value: &RevisionProposal) -> HumanProposalSummary {
 
 fn summary_fields(row: &ObjectRow, surface: HumanSurface) -> HumanSummary {
     HumanSummary {
+        reading_preview: None,
         source_context: None,
         semantic_detail: None,
         proposal_base: None,

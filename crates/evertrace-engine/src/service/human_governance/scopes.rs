@@ -1,5 +1,7 @@
 //! Request-local human directory over current typed identities; no discovery scan.
-use super::{HumanGovernanceError, HumanGovernanceService, export, presentation};
+use super::{
+    HumanGovernanceError, HumanGovernanceService, export, presentation, presentation::display_name,
+};
 use evertrace_domain::{
     query::{
         MemoryScopeSelection as Selection, ScopeBoundary, ScopeDirectoryCursor,
@@ -336,13 +338,6 @@ fn task_in(task: &Task, parent: ScopeBoundary) -> bool {
             }
             ScopeBoundary::Task { .. } => false,
         })
-}
-fn display_name(value: &str) -> String {
-    value
-        .split(|ch: char| ch.is_whitespace() || ch.is_control())
-        .filter(|part| !part.is_empty())
-        .collect::<Vec<_>>()
-        .join(" ")
 }
 fn path_label(path: &str) -> String {
     let label = display_name(

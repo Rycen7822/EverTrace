@@ -3515,6 +3515,7 @@ mod tests {
         reviewed.fingerprint = reviewed.recompute_fingerprint().unwrap();
         assert!(reviewed.validate().is_ok());
         let item = HumanSnapshotItem {
+            reading_preview: None,
             source_context: None,
             semantic_detail: None,
             proposal_base: None,
@@ -4543,6 +4544,7 @@ mod tests {
             _ => (HumanItemCategory::Work, HumanObjectFamily::Work),
         };
         HumanSnapshotItem {
+            reading_preview: None,
             source_context: None,
             semantic_detail: None,
             proposal_base: None,

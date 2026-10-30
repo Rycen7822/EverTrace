@@ -1593,6 +1593,7 @@ fn map_human_page(page: evertrace_engine::HumanPage) -> HumanGovernanceResponse 
             .items
             .into_iter()
             .map(|item| HumanSnapshotItem {
+                reading_preview: item.reading_preview.map(|value| evertrace_protocol::dto::HumanMemoryPreview {state:map_content_state(value.state),title:value.title,excerpt:value.excerpt,origin:value.origin,truncated:value.truncated}),
                 source_context: item.source_context.map(|value| evertrace_protocol::dto::HumanSourceContext {
                     directory: value.directory, session: value.session,
                     event_time_us: value.event_time_us, recorded_at_us: value.recorded_at_us,

@@ -662,6 +662,9 @@ dialog::backdrop{background:#00000066}
 .detail-body{overflow-wrap:anywhere}
 .detail-body .memory-prose,.detail-body pre{white-space:pre-wrap}
 .memory-item h3{overflow-wrap:anywhere}
+.memory-item .reading-excerpt{white-space:pre-wrap}
+.reading-origin{font-size:12px;color:var(--muted);margin:6px 0;overflow-wrap:anywhere}
+.memory-item .scope-ref{font-size:12px;overflow-wrap:anywhere}
 .detail-toolbar{flex-wrap:wrap;gap:10px}
 .detail-actions{display:flex;flex-wrap:wrap;gap:12px}
 .linked-record{border-top:1px solid var(--line);padding:16px 0;overflow-wrap:anywhere}

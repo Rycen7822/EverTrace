@@ -471,6 +471,8 @@ pub struct HumanRepositoryPurgePreview {
 #[serde(deny_unknown_fields)]
 pub struct HumanSnapshotItem {
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reading_preview: Option<HumanMemoryPreview>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub source_context: Option<HumanSourceContext>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub semantic_detail: Option<HumanSemanticDetail>,
@@ -1439,6 +1441,37 @@ pub enum HumanContentState {
 
 #[derive(Clone, Debug, serde::Deserialize, Eq, PartialEq, serde::Serialize)]
 #[serde(deny_unknown_fields)]
+pub struct HumanMemoryPreview {
+    pub state: HumanContentState,
+    pub title: Option<String>,
+    pub excerpt: Option<String>,
+    pub origin: Option<evertrace_domain::query::MemorySummaryOrigin>,
+    pub truncated: bool,
+}
+impl HumanMemoryPreview {
+    fn validate(&self) -> bool {
+        if self.state == HumanContentState::Ready {
+            self.title.as_ref().is_none_or(|value| {
+                !value.trim().is_empty()
+                    && value.len() <= 512
+                    && !value.chars().any(char::is_control)
+            }) && (self.title.is_some() || self.excerpt.is_some())
+                && self
+                    .excerpt
+                    .as_ref()
+                    .is_none_or(|value| !value.is_empty() && value.len() <= 1024)
+                && self.origin.is_some()
+        } else {
+            self.title.is_none()
+                && self.excerpt.is_none()
+                && self.origin.is_none()
+                && !self.truncated
+        }
+    }
+}
+
+#[derive(Clone, Debug, serde::Deserialize, Eq, PartialEq, serde::Serialize)]
+#[serde(deny_unknown_fields)]
 pub struct HumanContentChunk {
     pub frontier: u64,
     pub object_ref: String,
@@ -1583,6 +1616,19 @@ impl HumanSemanticDetail {
 
 impl HumanSnapshotItem {
     fn validate(&self) -> bool {
+        if !self.reading_preview.as_ref().is_none_or(|preview| {
+            preview.validate()
+                && matches!(
+                    self.object_kind.as_str(),
+                    "semantic_digest"
+                        | "atom_revision"
+                        | "procedure_revision"
+                        | "core_membership"
+                        | "revision_proposal_revision"
+                )
+        }) {
+            return false;
+        }
         self.source_context.as_ref().is_none_or(|context| {
             !context.session.is_empty()
                 && context.session.len() <= 4096
@@ -2674,6 +2720,7 @@ mod human_backup_summary_tests {
             status: HumanSnapshotStatus::Ready,
             degraded_reasons: Vec::new(),
             items: vec![HumanSnapshotItem {
+                reading_preview: None,
                 source_context: None,
                 semantic_detail: None,
                 proposal_base: None,

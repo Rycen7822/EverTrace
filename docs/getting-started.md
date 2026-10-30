@@ -85,7 +85,7 @@ Explicitly assemble the optional same-package Python component before this entry
 ./target/debug/evertrace --config "$HOME/.evertrace/config.toml" --web
 ```
 
-使用打印的一次性本机链接，不要分享该凭据。此版本 Python 网页只读接入当前版本元数据列表、原生种类/Atom 状态轴筛选、录入顺序分页/计数、原生 Task/Repository/Worktree 目录与关联范围选择（global 显式包含）、语义正文、原修订语义值分段和连接状态；计数不等于可读正文数量。分段按钮按需读取，每段至多 8 KiB 并复验当前权限。来源页、修订历史、固定修订比较、完整范围/来源/时间段过滤、搜索、原始来源/制品区间及其余页面仍待闭合；没有后台模型也能读取已有记忆。入口、安全边界和会话期限见[使用方法](usage.md#本机网页--local-webui)。
+使用打印的一次性本机链接，不要分享该凭据。此版本 Python 网页只读接入当前版本元数据列表、原生种类/Atom 状态轴筛选、录入顺序分页/计数、原生 Task/Repository/Worktree 目录与关联范围选择（global 显式包含）、经过权限检查的已有标题/短摘录与生成来源标记、语义正文、原修订语义值分段和连接状态；计数不等于可读正文数量。分段按钮按需读取，每段至多 8 KiB 并复验当前权限。来源页、修订历史、固定修订比较、完整范围/来源/时间段过滤、搜索、原始来源/制品区间及其余页面仍待闭合；没有后台模型也能读取已有记忆。入口、安全边界和会话期限见[使用方法](usage.md#本机网页--local-webui)。
 
 Use the printed one-time local link and keep it private. The Python WebUI exposes current-only metadata browsing with native kind/Atom-axis filters, recording-order paging/counts, semantic details, original-revision semantic ranges and status. Counts do not promise readable bodies. Range buttons fetch at most 8 KiB and recheck current access; they do not automatically load the whole value. Source/history/exact comparison, full scope/source/time filtering, search, original-source/artifact ranges and other pages remain incomplete. Existing memory can be read with LLM processing off. See [Usage](usage.md#本机网页--local-webui) for access and session limits.
 

@@ -39,6 +39,14 @@ pub struct HumanSemanticDetail {
 const MAX_CONTENT_BYTES: usize = 32 * 1024;
 pub(super) const READ_DEADLINE: std::time::Duration = std::time::Duration::from_secs(3);
 
+pub(super) fn display_name(value: &str) -> String {
+    value
+        .split(|ch: char| ch.is_whitespace() || ch.is_control())
+        .filter(|part| !part.is_empty())
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
 fn source_context_fields(
     receipt: &evertrace_domain::evidence::SourceReceipt,
     directory: Option<String>,

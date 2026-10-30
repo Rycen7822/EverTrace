@@ -520,6 +520,17 @@ pub enum MemoryReadingKind {
     References,
 }
 
+/// Provenance of an existing list excerpt, not a claim about its truth.
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum MemorySummaryOrigin {
+    StoredValue,
+    TypeFallback,
+    DigestDeterministic,
+    DigestLlmEnriched,
+    DigestRejectedGeneration,
+}
+
 /// Explicit human browsing scope; distinct from applicability/agent binding.
 #[derive(Clone, Copy, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
