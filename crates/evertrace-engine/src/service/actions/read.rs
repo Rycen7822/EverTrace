@@ -154,6 +154,7 @@ impl McpActionService {
                 .anchor
                 .execution_context(scope.context.frontier, &scope.context.scope),
             query_facets: QueryFacetSet {
+                statement_role: evertrace_domain::query::StatementRole::Unknown,
                 parse_status: FacetParseStatus::Unknown,
                 target_anchors: Vec::new(),
                 exact_identifiers: Vec::new(),
@@ -717,6 +718,7 @@ impl McpActionService {
             protected_facets: BTreeSet::new(),
             execution: None,
             query_facets: QueryFacetSet {
+                statement_role: evertrace_domain::query::StatementRole::Unknown,
                 parse_status: FacetParseStatus::Unknown,
                 target_anchors: Vec::new(),
                 exact_identifiers: Vec::new(),
@@ -1430,6 +1432,7 @@ impl McpActionService {
                 raw_query: query,
                 execution: None,
                 query_facets: QueryFacetSet {
+                    statement_role: evertrace_domain::query::StatementRole::Unknown,
                     parse_status: FacetParseStatus::Complete,
                     target_anchors: Vec::new(),
                     exact_identifiers,

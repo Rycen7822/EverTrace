@@ -55,6 +55,9 @@ pub struct SearchHardFilter {
     pub worktree_id: Option<String>,
     pub source_kind: Option<String>,
     pub source_role: Option<String>,
+    pub source_roles: BTreeSet<String>,
+    pub content_trust: Option<String>,
+    pub capture_completeness: Option<String>,
     pub authority: Option<String>,
     pub lifecycle: Option<String>,
     pub object_only: bool,
@@ -584,12 +587,23 @@ fn filter_sql(filter: &SearchHardFilter) -> Option<String> {
     for (column, value) in [
         ("source_kind", filter.source_kind.as_ref()),
         ("source_role", filter.source_role.as_ref()),
+        ("content_trust", filter.content_trust.as_ref()),
+        ("capture_completeness", filter.capture_completeness.as_ref()),
         ("authority", filter.authority.as_ref()),
         ("lifecycle", filter.lifecycle.as_ref()),
     ] {
         if let Some(value) = value {
             clauses.push(format!("{column} = {}", sql_literal(value)));
         }
+    }
+    if !filter.source_roles.is_empty() {
+        let values = filter
+            .source_roles
+            .iter()
+            .map(|value| sql_literal(value))
+            .collect::<Vec<_>>()
+            .join(", ");
+        clauses.push(format!("source_role IN ({values})"));
     }
     if !filter.suppressed_hashes.is_empty() {
         let values = filter

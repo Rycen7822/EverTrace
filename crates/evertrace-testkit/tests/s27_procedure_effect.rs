@@ -3996,6 +3996,7 @@ fn f_off_is_identical_and_trusted_controlled_effects_only_tie_break_or_suppress(
             scope_boundary: None,
             source_boundary: None,
             answer_shape: Some(AnswerShape::EntityList),
+            statement_role: evertrace_domain::query::StatementRole::Unknown,
             lifecycle_boundary: LifecycleBoundary::Active,
         },
         task_id: Some(effect_context.task_id),

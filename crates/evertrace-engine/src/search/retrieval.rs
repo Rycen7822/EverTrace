@@ -38,6 +38,40 @@ fn relation_allowed(kind: &str) -> bool {
     )
 }
 
+// Only the evidence FTS tier uses this preference; it is neither a grant nor
+// a truth/authority upgrade. Existing exact and normative candidates stay first.
+fn preferred_evidence_filter(
+    context: &SearchContext,
+    filter: &SearchHardFilter,
+) -> Option<SearchHardFilter> {
+    if context.unverified_hard_constraint() {
+        return None;
+    }
+    let (roles, trust): (&[&str], &str) = match context.query_facets.statement_role {
+        StatementRole::ObservedSymptom => (&["tool", "host"], "observed"),
+        StatementRole::DesiredOutcome | StatementRole::ExplicitConstraint => {
+            (&["user"], "user_statement")
+        }
+        _ => return None,
+    };
+    if filter
+        .source_role
+        .as_deref()
+        .is_some_and(|role| !roles.contains(&role))
+    {
+        return None;
+    }
+    let mut preferred = filter.clone();
+    preferred.source_roles = roles.iter().map(|role| (*role).to_owned()).collect();
+    preferred.content_trust = Some(trust.into());
+    // Soft provenance priority must not consume the pool with rows that cannot
+    // satisfy the answer. The general tier still preserves relation bridges.
+    preferred
+        .condition_literals
+        .extend(context.query_facets.condition_literals.iter().cloned());
+    Some(preferred)
+}
+
 pub(super) struct NativeRetrieval<'a> {
     pub snapshot: &'a SearchSnapshot,
     pub context: &'a SearchContext,
@@ -54,6 +88,38 @@ impl NativeRetrieval<'_> {
     }
     fn remaining(&self) -> usize {
         self.result.budget.candidates_remaining.min(32) as usize
+    }
+    async fn evidence_fts(&mut self, filter: &SearchHardFilter) -> Result<(), SearchError> {
+        if self.remaining() == 0 {
+            self.degraded("evidence_channel_budget_exhausted");
+            return Ok(());
+        }
+        if self.deadline.remaining().is_none() {
+            self.degraded("retrieval_deadline_exhausted");
+            return Ok(());
+        }
+        // Include retained evidence in the fetch bound so duplicate hits cannot
+        // crowd out remaining slots. Admission never refills the shared budget.
+        let retained = self
+            .result
+            .candidates
+            .iter()
+            .filter(|candidate| candidate.row_variant == SearchCandidateVariant::EvidenceSurface)
+            .count();
+        let limit = (self.remaining() + retained).min(32);
+        match self
+            .deadline
+            .run(
+                self.snapshot
+                    .fts(&self.context.protected_query, filter, limit),
+            )
+            .await
+        {
+            Ok(Ok(rows)) => self.admit(rows, "evidence_fts")?,
+            Ok(Err(_)) => self.degraded("evidence_fts_unavailable"),
+            Err(()) => self.degraded("retrieval_deadline_exhausted"),
+        }
+        Ok(())
     }
     fn references(&self) -> BTreeSet<String> {
         self.result
@@ -244,21 +310,13 @@ impl NativeRetrieval<'_> {
                     Ok(Err(_)) => self.degraded("evidence_structured_unavailable"),
                     Err(()) => self.degraded("retrieval_deadline_exhausted"),
                 }
-                let limit = self.remaining();
-                if limit > 0 {
-                    match self
-                        .deadline
-                        .run(
-                            self.snapshot
-                                .fts(&self.context.protected_query, &filter, limit),
-                        )
-                        .await
-                    {
-                        Ok(Ok(rows)) => self.admit(rows, "evidence_fts")?,
-                        Ok(Err(_)) => self.degraded("evidence_fts_unavailable"),
-                        Err(()) => self.degraded("retrieval_deadline_exhausted"),
-                    }
+                if let Some(mut preferred) = preferred_evidence_filter(self.context, &filter) {
+                    preferred.capture_completeness = Some("complete".into());
+                    self.evidence_fts(&preferred).await?;
+                    preferred.capture_completeness = None;
+                    self.evidence_fts(&preferred).await?;
                 }
+                self.evidence_fts(&filter).await?;
             }
         }
         // C: preserve permission-checked bridge rows for D. Literal conditions

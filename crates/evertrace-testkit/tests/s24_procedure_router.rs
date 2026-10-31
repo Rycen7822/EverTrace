@@ -1126,6 +1126,7 @@ fn eligibility_publication_and_router_gates_are_closed_and_bounded() {
             scope_boundary: None,
             source_boundary: None,
             answer_shape: Some(AnswerShape::EntityList),
+            statement_role: evertrace_domain::query::StatementRole::Unknown,
             lifecycle_boundary: LifecycleBoundary::Active,
         },
         task_id: None,

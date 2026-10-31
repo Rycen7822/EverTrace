@@ -37,6 +37,7 @@ mod tests {
                 scope_boundary: None,
                 source_boundary: None,
                 answer_shape: Some(AnswerShape::SourceSnippet),
+                statement_role: evertrace_domain::query::StatementRole::Unknown,
                 lifecycle_boundary: LifecycleBoundary::Active,
             },
             task_id: None,

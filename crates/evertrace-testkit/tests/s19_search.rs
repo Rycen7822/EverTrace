@@ -159,6 +159,7 @@ fn context(query: &str, exact: &[&str], suppression: SuppressionSnapshot) -> Sea
             scope_boundary: None,
             source_boundary: None,
             answer_shape: Some(AnswerShape::SourceSnippet),
+            statement_role: evertrace_domain::query::StatementRole::Unknown,
             lifecycle_boundary: LifecycleBoundary::Active,
         },
         task_id: None,

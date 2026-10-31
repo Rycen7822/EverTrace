@@ -943,6 +943,7 @@ async fn real_store_scope_union_and_four_actions_preserve_authority_boundaries()
                 scope_boundary: None,
                 source_boundary: None,
                 answer_shape: None,
+                statement_role: evertrace_domain::query::StatementRole::Unknown,
                 lifecycle_boundary: LifecycleBoundary::Any,
             },
             task_id: Some(task_id),

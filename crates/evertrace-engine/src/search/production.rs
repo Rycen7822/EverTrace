@@ -86,6 +86,9 @@ impl ProductionSearch {
             worktree_id: context.worktree_id.map(|id| id.to_string()),
             source_kind: None,
             source_role,
+            source_roles: BTreeSet::new(),
+            content_trust: None,
+            capture_completeness: None,
             authority,
             lifecycle: match context.query_facets.lifecycle_boundary {
                 LifecycleBoundary::Active => Some("active".into()),

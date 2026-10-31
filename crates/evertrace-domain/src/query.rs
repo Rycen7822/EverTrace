@@ -137,6 +137,18 @@ pub enum AnswerShape {
 
 #[derive(Clone, Copy, Debug, Deserialize, Eq, Ord, PartialEq, PartialOrd, Serialize)]
 #[serde(rename_all = "snake_case")]
+pub enum StatementRole {
+    ObservedSymptom,
+    DesiredOutcome,
+    Hypothesis,
+    DisputedClaim,
+    ExplicitConstraint,
+    Other,
+    Unknown,
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, Eq, Ord, PartialEq, PartialOrd, Serialize)]
+#[serde(rename_all = "snake_case")]
 pub enum LifecycleBoundary {
     Active,
     Terminal,
@@ -173,6 +185,7 @@ pub struct QueryFacetSet {
     pub scope_boundary: Option<ScopeBoundary>,
     pub source_boundary: Option<SourceBoundary>,
     pub answer_shape: Option<AnswerShape>,
+    pub statement_role: StatementRole,
     pub lifecycle_boundary: LifecycleBoundary,
 }
 

@@ -956,6 +956,7 @@ async fn prepare_usage_evidence(
         protected_query: "verifier failed".into(),
         protected_facets: Default::default(),
         query_facets: QueryFacetSet {
+            statement_role: evertrace_domain::query::StatementRole::Unknown,
             parse_status: FacetParseStatus::Complete,
             target_anchors: Vec::new(),
             exact_identifiers: Vec::new(),
@@ -3663,6 +3664,7 @@ async fn prepare_real_router_usage_stage() -> RealUsageStage {
         protected_query: "verifier failed".into(),
         protected_facets: Default::default(),
         query_facets: QueryFacetSet {
+            statement_role: evertrace_domain::query::StatementRole::Unknown,
             parse_status: FacetParseStatus::Complete,
             target_anchors: Vec::new(),
             exact_identifiers: Vec::new(),
