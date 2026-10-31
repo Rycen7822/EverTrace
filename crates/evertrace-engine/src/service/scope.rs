@@ -15,6 +15,7 @@ use super::{McpResolvedScope, McpScopeMechanism};
 pub struct McpQueryAnchor {
     pub mechanism: McpScopeMechanism,
     pub session_id: Option<String>,
+    pub turn_id: Option<String>,
     pub execution_lane_id: Option<ExecutionLaneId>,
     pub task_id: Option<TaskId>,
     pub workstream_id: Option<WorkstreamId>,
@@ -30,7 +31,7 @@ impl McpQueryAnchor {
         use evertrace_domain::query::{QueryAnchor, QueryBindingStrength};
         QueryAnchor {
             runtime_session_id: self.session_id.clone(),
-            turn_id: None,
+            turn_id: self.turn_id.clone(),
             execution_lane_id: self.execution_lane_id,
             workstream_id: self.workstream_id,
             episode_id: self.episode_id,
@@ -88,6 +89,7 @@ fn resolve_anchor(
     }
     match (&binding.anchor, binding.mechanism, &binding.workspace) {
         (Some(anchor), McpScopeMechanism::ExactClaim | McpScopeMechanism::ConnectionScoped, _) => {
+            anchor.validate().ok()?;
             let active = exact_anchor(snapshot, anchor, binding.mechanism).or_else(|| {
                 let mut read = cwd_anchor(snapshot, client_cwd)?;
                 read.session_id = Some(anchor.session_id.clone());
@@ -102,6 +104,7 @@ fn resolve_anchor(
             unique_repository(snapshot, *id).map(|_| McpQueryAnchor {
                 mechanism: McpScopeMechanism::Explicit,
                 session_id: None,
+                turn_id: None,
                 execution_lane_id: None,
                 task_id: None,
                 workstream_id: None,
@@ -117,6 +120,7 @@ fn resolve_anchor(
             Some(McpQueryAnchor {
                 mechanism: McpScopeMechanism::Explicit,
                 session_id: None,
+                turn_id: None,
                 execution_lane_id: None,
                 task_id: None,
                 workstream_id: None,
@@ -225,6 +229,7 @@ fn exact_anchor(
     Some(McpQueryAnchor {
         mechanism,
         session_id: Some(anchor.session_id.clone()),
+        turn_id: Some(anchor.turn_id.clone()),
         execution_lane_id: Some(lane.execution_lane_id),
         task_id: Some(workstream.task_id),
         workstream_id: Some(workstream.workstream_id),
@@ -281,6 +286,7 @@ fn cwd_anchor(snapshot: &ScopeFacts<'_>, cwd: &str) -> Option<McpQueryAnchor> {
         return Some(McpQueryAnchor {
             mechanism: McpScopeMechanism::CwdOnly,
             session_id: None,
+            turn_id: None,
             execution_lane_id: None,
             task_id: None,
             workstream_id: None,
@@ -303,6 +309,7 @@ fn cwd_anchor(snapshot: &ScopeFacts<'_>, cwd: &str) -> Option<McpQueryAnchor> {
     Some(McpQueryAnchor {
         mechanism: McpScopeMechanism::CwdOnly,
         session_id: None,
+        turn_id: None,
         execution_lane_id: None,
         task_id: None,
         workstream_id: None,
