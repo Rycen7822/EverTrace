@@ -3976,6 +3976,7 @@ fn f_off_is_identical_and_trusted_controlled_effects_only_tie_break_or_suppress(
         unreachable!()
     };
     let search = SearchContext {
+        query_anchor: evertrace_domain::query::QueryAnchor::unavailable(),
         intent: SearchIntent::FailureRecovery,
         raw_query: "verification failed".into(),
         query_facets: QueryFacetSet {

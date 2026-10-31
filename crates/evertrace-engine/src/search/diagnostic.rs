@@ -474,6 +474,7 @@ fn push_candidate(
         retrieval_origins: BTreeSet::from([origin.into()]),
         instruction_authority: "none".into(),
         conflicted: false,
+        semantic_resolution: None,
     });
     Ok(())
 }

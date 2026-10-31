@@ -42,6 +42,37 @@ pub use scenario_core::{
     ScenarioStatus, ScenarioWorkstream, SupportThresholdSnapshot,
 };
 
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum NormativeResolutionState {
+    Active,
+    Shadowed,
+    Inapplicable,
+    ApplicabilityUnknown,
+    SupportUnavailable,
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum DescriptiveResolutionState {
+    Supported,
+    Disputed,
+    Refuted,
+    Underdetermined,
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(
+    tag = "kind",
+    content = "state",
+    rename_all = "snake_case",
+    deny_unknown_fields
+)]
+pub enum SemanticResolution {
+    Normative(NormativeResolutionState),
+    Descriptive(DescriptiveResolutionState),
+}
+
 const MAX_REFS: usize = 256;
 const MAX_TEXT: usize = 1024;
 

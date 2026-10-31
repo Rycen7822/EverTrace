@@ -131,6 +131,7 @@ impl McpActionService {
             ));
         }
         let context = SearchContext {
+            query_anchor: scope.anchor.search_anchor(),
             intent: SearchIntent::StageAssistance,
             raw_query: query.clone(),
             query_facets: QueryFacetSet {
@@ -654,6 +655,7 @@ impl McpActionService {
             return self.search_due(request_id, scope).await;
         }
         let context = SearchContext {
+            query_anchor: scope.anchor.search_anchor(),
             intent: SearchIntent::StageAssistance,
             raw_query: query,
             query_facets: QueryFacetSet {
@@ -1362,6 +1364,7 @@ impl McpActionService {
         let supplemental = ProductionSearch::new(self.search_index.clone())
             .with_procedure_revisions(BTreeSet::new())
             .search(SearchContext {
+                query_anchor: scope.anchor.search_anchor(),
                 intent: SearchIntent::FailureRecovery,
                 raw_query: query,
                 query_facets: QueryFacetSet {

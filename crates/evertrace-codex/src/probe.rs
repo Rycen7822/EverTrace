@@ -486,6 +486,38 @@ impl HostProbeReport {
         &self.session_catalog_roots
     }
 
+    /// Read only the facts already attested by an enabled policy receipt.
+    /// This cannot qualify an unproved surface or enable another capability.
+    pub fn current_project_policy_evidence(&self) -> Option<PolicyEvidence> {
+        let [surface] = self.manifest.project_policy_surfaces.as_slice() else {
+            return None;
+        };
+        let [digest] = self
+            .project_policy
+            .evidence
+            .evidence_protected_digests
+            .as_slice()
+        else {
+            return None;
+        };
+        let evidence = PolicyEvidence {
+            policy_source_kind: surface.policy_source_kind.clone(),
+            origin: PolicyCandidateOrigin::HostPolicySurface,
+            host_loaded: true,
+            readback_supported: true,
+            readback_matches: true,
+            source_revision: self.project_policy.evidence.identity.clone()?,
+            content_digest: digest.clone(),
+            resolved_scope: Some(surface.max_host_resolved_scope),
+            current_trust: true,
+            current: true,
+            revoked: false,
+            evidence_refs: self.project_policy.evidence.evidence_refs.clone(),
+        };
+        self.verify_project_policy_evidence(&evidence).ok()?;
+        Some(evidence)
+    }
+
     /// Verifies that `evidence` is the exact policy evidence used by this
     /// report's enabled project-policy gate.
     ///

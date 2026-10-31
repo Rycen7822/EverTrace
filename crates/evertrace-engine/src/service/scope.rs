@@ -25,6 +25,38 @@ pub struct McpQueryAnchor {
     pub cwd_only: bool,
 }
 
+impl McpQueryAnchor {
+    pub(crate) fn search_anchor(&self) -> evertrace_domain::query::QueryAnchor {
+        use evertrace_domain::query::{QueryAnchor, QueryBindingStrength};
+        QueryAnchor {
+            runtime_session_id: self.session_id.clone(),
+            turn_id: None,
+            execution_lane_id: self.execution_lane_id,
+            workstream_id: self.workstream_id,
+            episode_id: self.episode_id,
+            episode_revision_id: self.episode_revision_id,
+            binding_strength: if self.cwd_only {
+                QueryBindingStrength::CwdOnly
+            } else {
+                match self.mechanism {
+                    McpScopeMechanism::ExactClaim => QueryBindingStrength::Exact,
+                    McpScopeMechanism::ConnectionScoped => QueryBindingStrength::ConnectionScoped,
+                    McpScopeMechanism::CwdOnly => QueryBindingStrength::CwdOnly,
+                    McpScopeMechanism::Explicit => QueryBindingStrength::Unavailable,
+                }
+            },
+        }
+    }
+}
+
+pub(crate) fn active_worktree_repository(
+    snapshot: &ProjectionSnapshot,
+    worktree_id: WorktreeId,
+) -> Option<RepositoryId> {
+    unique_worktree(&ScopeFacts::Snapshot(snapshot), worktree_id)
+        .map(|worktree| worktree.repository_instance_id)
+}
+
 pub fn resolve_query_anchor(
     snapshot: &ProjectionSnapshot,
     binding: &McpResolvedScope,

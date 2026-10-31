@@ -1106,6 +1106,7 @@ fn eligibility_publication_and_router_gates_are_closed_and_bounded() {
         ],
     };
     let context = SearchContext {
+        query_anchor: evertrace_domain::query::QueryAnchor::unavailable(),
         intent: SearchIntent::FailureRecovery,
         raw_query: "release verifier failed".into(),
         query_facets: QueryFacetSet {

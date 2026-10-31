@@ -7,8 +7,11 @@ use thiserror::Error;
 
 use crate::{
     evidence::EvidenceSurface,
-    ids::{AnyPublicId, RepositoryId, TaskId, WorktreeId},
+    ids::{
+        AnyPublicId, ExecutionLaneId, RepositoryId, TaskId, WorkEpisodeId, WorkstreamId, WorktreeId,
+    },
     revision::RevisionId,
+    semantic::SemanticResolution,
 };
 
 const MAX_QUERY_BYTES: usize = 8 * 1024;
@@ -459,9 +462,82 @@ impl RetrievalBudget {
     }
 }
 
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum QueryBindingStrength {
+    Exact,
+    ConnectionScoped,
+    CwdOnly,
+    Unavailable,
+}
+
+/// Native caller continuity, not a source-session or permission filter.
+/// Requested scope remains in the context's scope fields and query facets.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct QueryAnchor {
+    pub runtime_session_id: Option<String>,
+    pub turn_id: Option<String>,
+    pub execution_lane_id: Option<ExecutionLaneId>,
+    pub workstream_id: Option<WorkstreamId>,
+    pub episode_id: Option<WorkEpisodeId>,
+    pub episode_revision_id: Option<RevisionId>,
+    pub binding_strength: QueryBindingStrength,
+}
+
+impl QueryAnchor {
+    pub const fn unavailable() -> Self {
+        Self {
+            runtime_session_id: None,
+            turn_id: None,
+            execution_lane_id: None,
+            workstream_id: None,
+            episode_id: None,
+            episode_revision_id: None,
+            binding_strength: QueryBindingStrength::Unavailable,
+        }
+    }
+
+    pub fn validate(&self) -> Result<(), QueryError> {
+        if [&self.runtime_session_id, &self.turn_id]
+            .into_iter()
+            .flatten()
+            .any(|value| {
+                value.is_empty() || value.len() > 512 || value.chars().any(char::is_control)
+            })
+        {
+            return Err(QueryError::Invalid);
+        }
+        let execution_fields = [
+            self.execution_lane_id.is_some(),
+            self.workstream_id.is_some(),
+            self.episode_id.is_some(),
+            self.episode_revision_id.is_some(),
+        ];
+        match self.binding_strength {
+            QueryBindingStrength::Exact | QueryBindingStrength::ConnectionScoped => {
+                if self.runtime_session_id.is_none() || execution_fields.contains(&false) {
+                    return Err(QueryError::Invalid);
+                }
+            }
+            QueryBindingStrength::CwdOnly | QueryBindingStrength::Unavailable => {
+                if execution_fields.contains(&true)
+                    || self.turn_id.is_some()
+                    || (self.binding_strength == QueryBindingStrength::Unavailable
+                        && self.runtime_session_id.is_some())
+                {
+                    return Err(QueryError::Invalid);
+                }
+            }
+        }
+        Ok(())
+    }
+}
+
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct SearchContext {
+    pub query_anchor: QueryAnchor,
     pub intent: SearchIntent,
     pub raw_query: String,
     pub query_facets: QueryFacetSet,
@@ -477,6 +553,7 @@ impl SearchContext {
         if self.raw_query.is_empty() || self.raw_query.len() > MAX_QUERY_BYTES {
             return Err(QueryError::Invalid);
         }
+        self.query_anchor.validate()?;
         self.query_facets.validate()?;
         self.suppression.validate()?;
         if self
@@ -519,6 +596,7 @@ pub struct SearchCandidate {
     pub retrieval_origins: BTreeSet<String>,
     pub instruction_authority: String,
     pub conflicted: bool,
+    pub semantic_resolution: Option<SemanticResolution>,
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]

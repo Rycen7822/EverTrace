@@ -45,6 +45,7 @@ pub(super) struct NativeRetrieval<'a> {
     pub objects: SearchHardFilter,
     pub evidence: Option<SearchHardFilter>,
     pub deadline: &'a RequestDeadline,
+    pub semantics: Option<&'a super::resolution::SemanticSearchResolution>,
 }
 
 impl NativeRetrieval<'_> {
@@ -95,6 +96,10 @@ impl NativeRetrieval<'_> {
             {
                 self.degraded("temporal_provenance_unknown");
             }
+            let semantic_resolution = self
+                .semantics
+                .and_then(|value| value.states.get(&id))
+                .copied();
             self.result.candidates.push(SearchCandidate {
                 candidate_id: id,
                 source_ref: row.source_ref.ok_or(SearchError::Corrupt)?,
@@ -110,7 +115,11 @@ impl NativeRetrieval<'_> {
                 capture_completeness: row.capture_completeness,
                 retrieval_origins: BTreeSet::from([origin.into()]),
                 instruction_authority: "none".into(),
-                conflicted: false,
+                conflicted: semantic_resolution
+                    == Some(evertrace_domain::semantic::SemanticResolution::Descriptive(
+                        evertrace_domain::semantic::DescriptiveResolutionState::Disputed,
+                    )),
+                semantic_resolution,
             });
         }
         Ok(())
@@ -236,11 +245,13 @@ impl NativeRetrieval<'_> {
         // constrain answer evidence, not the existence of a connecting object.
         self.result.layer = RetrievalLayer::C;
         let facet_match = |candidate: &SearchCandidate| {
-            self.context
-                .query_facets
-                .condition_literals
-                .iter()
-                .all(|literal| candidate.text.contains(literal))
+            super::resolution::active_rule(candidate)
+                || self
+                    .context
+                    .query_facets
+                    .condition_literals
+                    .iter()
+                    .all(|literal| candidate.text.contains(literal))
         };
         if self.context.query_facets.relation_requirements.is_empty() {
             self.result.candidates.retain(facet_match);
@@ -521,11 +532,13 @@ impl NativeRetrieval<'_> {
                 .candidates
                 .iter()
                 .filter(|candidate| {
-                    self.context
-                        .query_facets
-                        .condition_literals
-                        .iter()
-                        .all(|literal| candidate.text.contains(literal))
+                    super::resolution::active_rule(candidate)
+                        || self
+                            .context
+                            .query_facets
+                            .condition_literals
+                            .iter()
+                            .all(|literal| candidate.text.contains(literal))
                 })
                 .map(|candidate| GroundedStatement {
                     statement: candidate.text.clone(),

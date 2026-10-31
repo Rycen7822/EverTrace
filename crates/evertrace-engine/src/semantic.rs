@@ -18,6 +18,7 @@ pub(crate) use proposal::{
     ProposalAcceptanceAudit, accepted_edited_proposal_successor, accepted_proposal_successor,
     accepted_proposal_successor_with_audit,
 };
+pub(crate) use resolver::scope_applies;
 pub use resolver::{
     CurrentPolicyBinding, DescriptiveFactResolver, DescriptiveResolution,
     DescriptiveResolutionState, NormativeInstructionResolver, NormativeResolution,

@@ -91,6 +91,7 @@ impl HumanGovernanceService {
                 return Err(HumanGovernanceError::Store);
             }
             let context = SearchContext {
+                query_anchor: QueryAnchor::unavailable(),
                 intent: SearchIntent::HistoryLookup,
                 raw_query: query.text,
                 query_facets: query.facets,
@@ -117,7 +118,21 @@ impl HumanGovernanceService {
             )
             .await
             .map_err(|_| HumanGovernanceError::Store)?;
+            let report = match &self.session_report {
+                Some(value) => value.read().await.clone(),
+                None => None,
+            };
+            let (semantics, mut checks) = crate::search::SemanticSearchResolution::for_human_read(
+                &snapshot,
+                &refs,
+                &index,
+                &context,
+                report.as_ref(),
+                now_us()?,
+            )
+            .map_err(|_| HumanGovernanceError::Store)?;
             let mut page = crate::search::ProductionSearch::new(search.clone())
+                .with_semantic_resolution(semantics)
                 .with_validated_frontier(snapshot.frontier)
                 .with_method_proposals(proposals)
                 .with_readable_refs(snapshot.frontier, refs)
@@ -125,15 +140,17 @@ impl HumanGovernanceService {
                 .await
                 .map_err(|_| HumanGovernanceError::Store)?;
             // Trust/report state can change without a new journal event. Recheck
-            // actual returned dependencies before exposing any candidate fields.
+            // returned and interpretation dependencies before exposing fields.
             let mut access_changed = false;
-            for candidate in &page.result.candidates {
-                let key = if candidate.row_variant == SearchCandidateVariant::EvidenceSurface {
-                    &candidate.source_ref
+            checks.extend(page.result.candidates.iter().map(|candidate| {
+                if candidate.row_variant == SearchCandidateVariant::EvidenceSurface {
+                    candidate.source_ref.clone()
                 } else {
-                    &candidate.candidate_id
-                };
-                let Some(rows) = index.get(key.as_str()) else {
+                    candidate.candidate_id.clone()
+                }
+            }));
+            for reference in &checks {
+                let Some(rows) = index.get(reference.as_str()) else {
                     access_changed = true;
                     break;
                 };
@@ -155,7 +172,20 @@ impl HumanGovernanceService {
                 .snapshot_after_validated_frontier(snapshot.frontier)
                 .await
                 .map_err(|_| HumanGovernanceError::Store)?;
+            let current_report = match &self.session_report {
+                Some(value) => value.read().await.clone(),
+                None => None,
+            };
+            let policy = |value: Option<&evertrace_codex::HostProbeReport>| {
+                value.map(|value| {
+                    (
+                        value.manifest().adapter_manifest_id.clone(),
+                        value.current_project_policy_evidence(),
+                    )
+                })
+            };
             if access_changed
+                || policy(current_report.as_ref()) != policy(report.as_ref())
                 || current.frontier() != snapshot.frontier
                 || current.authoritative_frontier() != snapshot.frontier
             {

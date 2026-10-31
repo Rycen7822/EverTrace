@@ -197,14 +197,7 @@ pub struct ResolverContext {
     pub globally_supported_revisions: BTreeSet<RevisionId>,
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub enum NormativeResolutionState {
-    Active,
-    Shadowed,
-    Inapplicable,
-    ApplicabilityUnknown,
-    SupportUnavailable,
-}
+pub use evertrace_domain::semantic::{DescriptiveResolutionState, NormativeResolutionState};
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct NormativeResolution {
@@ -364,14 +357,6 @@ const fn authority_precedence(authority: AtomAuthority) -> u8 {
     }
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub enum DescriptiveResolutionState {
-    Supported,
-    Disputed,
-    Refuted,
-    Underdetermined,
-}
-
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct DescriptiveResolution {
     pub revision_id: RevisionId,
@@ -448,7 +433,7 @@ fn descriptive_applicable(atom: &Atom, context: &ResolverContext) -> bool {
             .allows_enforcement()
 }
 
-fn scope_applies(scope: &AtomScope, context: &ResolverContext) -> bool {
+pub(crate) fn scope_applies(scope: &AtomScope, context: &ResolverContext) -> bool {
     match scope {
         AtomScope::Task { task_id } => context.task_id == Some(*task_id),
         AtomScope::Worktree {

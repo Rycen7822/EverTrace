@@ -949,6 +949,7 @@ async fn prepare_usage_evidence(
         ],
     };
     let search = SearchContext {
+        query_anchor: evertrace_domain::query::QueryAnchor::unavailable(),
         intent: SearchIntent::FailureRecovery,
         raw_query: "verifier failed".into(),
         query_facets: QueryFacetSet {
@@ -3652,6 +3653,7 @@ async fn prepare_real_router_usage_stage() -> RealUsageStage {
             && row.publication_state.as_deref() == Some("active_probationary")
     }));
     let search = SearchContext {
+        query_anchor: evertrace_domain::query::QueryAnchor::unavailable(),
         intent: SearchIntent::FailureRecovery,
         raw_query: "verifier failed".into(),
         query_facets: QueryFacetSet {

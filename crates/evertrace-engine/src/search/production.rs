@@ -20,6 +20,7 @@ pub struct ProductionSearch {
     method_proposal_revisions: BTreeSet<String>,
     validated_frontier: Option<u64>,
     readable_refs: Option<(u64, BTreeSet<String>)>,
+    semantics: Option<super::resolution::SemanticSearchResolution>,
 }
 
 impl ProductionSearch {
@@ -30,6 +31,7 @@ impl ProductionSearch {
             method_proposal_revisions: BTreeSet::new(),
             validated_frontier: None,
             readable_refs: None,
+            semantics: None,
         }
     }
 
@@ -55,6 +57,14 @@ impl ProductionSearch {
     #[must_use]
     pub fn with_readable_refs(mut self, frontier: u64, refs: BTreeSet<String>) -> Self {
         self.readable_refs = Some((frontier, refs));
+        self
+    }
+
+    pub(crate) fn with_semantic_resolution(
+        mut self,
+        semantics: super::resolution::SemanticSearchResolution,
+    ) -> Self {
+        self.semantics = Some(semantics);
         self
     }
 
@@ -186,6 +196,7 @@ impl ProductionSearch {
             objects,
             evidence,
             deadline: &deadline,
+            semantics: self.semantics.as_ref(),
         }
         .run()
         .await
@@ -281,7 +292,11 @@ impl ProductionSearch {
         let started = deadline.started;
         if self.readable_refs.as_ref().is_some_and(|(frontier, _)| {
             *frontier != snapshot.frontier() || *frontier != snapshot.authoritative_frontier()
-        }) {
+        }) || self
+            .semantics
+            .as_ref()
+            .is_some_and(|value| value.frontier != snapshot.frontier())
+        {
             return Ok(SearchResult {
                 layer: RetrievalLayer::A,
                 projection_frontier: snapshot.frontier(),
@@ -317,6 +332,36 @@ impl ProductionSearch {
         exact_identifiers.dedup();
         let mut structured = Vec::new();
         let mut degraded_reasons = BTreeSet::new();
+        let mut omitted_refs = BTreeSet::new();
+        if let Some(semantics) = &self.semantics {
+            if semantics.incomplete {
+                degraded_reasons.insert("normative_resolution_incomplete".into());
+            }
+            let references = semantics.active_references();
+            if !references.is_empty() {
+                match deadline
+                    .run(snapshot.structured(&references, &filter, 33))
+                    .await
+                {
+                    Ok(Ok(mut rows)) => {
+                        if rows.len() > 32 {
+                            omitted_refs.extend(
+                                rows[32..].iter().filter_map(|row| row.candidate_id.clone()),
+                            );
+                            rows.truncate(32);
+                            degraded_reasons.insert("normative_candidate_budget_exhausted".into());
+                        }
+                        structured.extend(rows);
+                    }
+                    Ok(Err(_)) => {
+                        degraded_reasons.insert("normative_channel_unavailable".into());
+                    }
+                    Err(()) => {
+                        degraded_reasons.insert("normative_deadline_exhausted".into());
+                    }
+                }
+            }
+        }
         // Pin object and original-evidence targets before text channels. Both
         // use the existing native filters; neither is a new access grant.
         if !context.query_facets.target_anchors.is_empty() {
@@ -407,10 +452,19 @@ impl ProductionSearch {
             let anchor_position = context.query_facets.target_anchors.iter().position(|id| {
                 row.candidate_id.as_deref() == Some(id) || row.source_ref.as_deref() == Some(id)
             });
-            let rank = if let Some(position) = anchor_position {
-                (0, position)
+            let active = row
+                .candidate_id
+                .as_ref()
+                .and_then(|id| self.semantics.as_ref()?.states.get(id))
+                == Some(&evertrace_domain::semantic::SemanticResolution::Normative(
+                    evertrace_domain::semantic::NormativeResolutionState::Active,
+                ));
+            let rank = if active {
+                (0, 0)
+            } else if let Some(position) = anchor_position {
+                (1, position)
             } else if exact || stable {
-                (1, 0)
+                (2, 0)
             } else if let Some(position) = fts_ranks.get(&row.row_id) {
                 (3, *position)
             } else {
@@ -425,17 +479,24 @@ impl ProductionSearch {
         });
         let mut selected =
             BTreeMap::<String, ((u8, usize), SearchCandidate, &SearchProjectionRow)>::new();
-        let mut omitted_refs = BTreeSet::new();
         for (row_index, (rank, row, explicit_exact)) in ranked.iter().enumerate() {
             let candidate_id = row.candidate_id.clone().ok_or(SearchError::Corrupt)?;
             let origin = match rank.0 {
-                0 => "target_anchor",
-                1 => "exact",
+                0 => "normative",
+                1 => "target_anchor",
+                2 => "exact",
                 _ => "fts",
             };
             let mut origins = BTreeSet::from([origin.to_owned()]);
-            if rank.0 == 0 && *explicit_exact {
+            if rank.0 <= 1 && *explicit_exact {
                 origins.insert("exact".into());
+            }
+            if rank.0 == 0
+                && context.query_facets.target_anchors.iter().any(|id| {
+                    row.candidate_id.as_deref() == Some(id) || row.source_ref.as_deref() == Some(id)
+                })
+            {
+                origins.insert("target_anchor".into());
             }
             if fts_ranks.contains_key(&row.row_id) {
                 origins.insert("fts".into());
@@ -465,6 +526,11 @@ impl ProductionSearch {
                 }
                 _ => return Err(SearchError::Corrupt),
             };
+            let semantic_resolution = self
+                .semantics
+                .as_ref()
+                .and_then(|value| value.states.get(&candidate_id))
+                .copied();
             let candidate = SearchCandidate {
                 candidate_id: candidate_id.clone(),
                 source_ref: row.source_ref.clone().unwrap_or_default(),
@@ -476,7 +542,11 @@ impl ProductionSearch {
                 capture_completeness: row.capture_completeness.clone(),
                 retrieval_origins: origins,
                 instruction_authority: "none".into(),
-                conflicted: false,
+                conflicted: semantic_resolution
+                    == Some(evertrace_domain::semantic::SemanticResolution::Descriptive(
+                        evertrace_domain::semantic::DescriptiveResolutionState::Disputed,
+                    )),
+                semantic_resolution,
             };
             selected.insert(candidate_id, (*rank, candidate, *row));
         }
@@ -494,7 +564,10 @@ impl ProductionSearch {
             );
             candidates.truncate(limit);
         }
-        let conflicted = mark_conservative_conflicts(&mut candidates, &context);
+        let conflicted = mark_conservative_conflicts(&mut candidates, &context)
+            || candidates
+                .iter()
+                .any(|(_, candidate, _)| candidate.conflicted);
         let temporal_partial = temporal_is_partial(&candidates, &context, &mut degraded_reasons);
         let mut completeness = if conflicted {
             RetrievalCompleteness::Conflicted

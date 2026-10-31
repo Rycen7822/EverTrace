@@ -11,6 +11,7 @@ pub use actions::*;
 pub use binding::*;
 pub use human_governance::*;
 pub use scope::McpQueryAnchor;
+pub(crate) use scope::active_worktree_repository;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum RuntimeMode {

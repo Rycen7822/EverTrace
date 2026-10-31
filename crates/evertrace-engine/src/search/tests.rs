@@ -17,6 +17,7 @@ mod tests {
 
     fn context() -> SearchContext {
         SearchContext {
+            query_anchor: evertrace_domain::query::QueryAnchor::unavailable(),
             intent: SearchIntent::StageAssistance,
             raw_query: "needle".into(),
             query_facets: QueryFacetSet {
@@ -69,6 +70,7 @@ mod tests {
                 retrieval_origins: BTreeSet::from(["exact".into()]),
                 instruction_authority: "none".into(),
                 conflicted: false,
+                semantic_resolution: None,
             }],
             completeness: RetrievalCompleteness::Complete,
             degraded_reasons: BTreeSet::new(),
@@ -332,6 +334,7 @@ mod tests {
                 retrieval_origins: BTreeSet::from(["exact".into()]),
                 instruction_authority: "none".into(),
                 conflicted: false,
+                semantic_resolution: None,
             });
         }
         let rows = search_rows(7, Vec::new());
