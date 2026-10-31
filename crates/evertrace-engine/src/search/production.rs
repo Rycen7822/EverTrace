@@ -19,6 +19,7 @@ pub struct ProductionSearch {
     procedure_revisions: Option<BTreeSet<String>>,
     method_proposal_revisions: BTreeSet<String>,
     validated_frontier: Option<u64>,
+    readable_refs: Option<(u64, BTreeSet<String>)>,
 }
 
 impl ProductionSearch {
@@ -28,6 +29,7 @@ impl ProductionSearch {
             procedure_revisions: None,
             method_proposal_revisions: BTreeSet::new(),
             validated_frontier: None,
+            readable_refs: None,
         }
     }
 
@@ -45,6 +47,14 @@ impl ProductionSearch {
     /// pre-pin frontier scan while the store still validates after pinning.
     pub(crate) fn with_validated_frontier(mut self, frontier: u64) -> Self {
         self.validated_frontier = Some(frontier);
+        self
+    }
+
+    /// Grants come from the native canonical access owner at this frontier,
+    /// never caller-built authority or an unversioned Web allowlist.
+    #[must_use]
+    pub fn with_readable_refs(mut self, frontier: u64, refs: BTreeSet<String>) -> Self {
+        self.readable_refs = Some((frontier, refs));
         self
     }
 
@@ -115,12 +125,30 @@ impl ProductionSearch {
                 ));
             }
         };
+        if self.readable_refs.as_ref().is_some_and(|(frontier, _)| {
+            *frontier != snapshot.frontier() || *frontier != snapshot.authoritative_frontier()
+        }) {
+            return Ok(SearchResult {
+                layer: RetrievalLayer::A,
+                projection_frontier: snapshot.frontier(),
+                authoritative_frontier: snapshot.authoritative_frontier(),
+                candidates: Vec::new(),
+                completeness: RetrievalCompleteness::Unknown,
+                degraded_reasons: BTreeSet::from(["read_access_frontier_changed".into()]),
+                omitted_refs: BTreeSet::new(),
+                budget: context.budget,
+            });
+        }
         let suppressed_hashes = match &context.suppression {
             SuppressionSnapshot::Current { ref_hashes, .. } => ref_hashes.clone(),
             SuppressionSnapshot::Unavailable => unreachable!("handled above"),
         };
         let (source_role, authority) = source_filter(context.query_facets.source_boundary);
         let filter = SearchHardFilter {
+            readable_refs: self.readable_refs.as_ref().map(|(_, refs)| refs.clone()),
+            // A is a candidate channel; C owns positive facet compatibility.
+            condition_literals: Vec::new(),
+            excluded_identifiers: context.query_facets.explicit_exclusions.clone(),
             procedure_revisions: self.procedure_revisions.clone(),
             method_proposal_revisions: self.method_proposal_revisions.clone(),
             task_id: context.task_id.map(|id| id.to_string()),

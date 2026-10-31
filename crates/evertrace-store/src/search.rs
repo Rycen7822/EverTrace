@@ -41,6 +41,11 @@ pub struct SearchSnapshot {
 
 #[derive(Clone, Debug, Default)]
 pub struct SearchHardFilter {
+    /// Request-local canonical read grants. None preserves existing caller policy;
+    /// Some(empty) admits nothing. Evidence grants name the observation source.
+    pub readable_refs: Option<BTreeSet<String>>,
+    pub condition_literals: Vec<String>,
+    pub excluded_identifiers: Vec<String>,
     /// Current publication eligibility, separate from deletion suppression.
     pub procedure_revisions: Option<BTreeSet<String>>,
     pub method_proposal_revisions: BTreeSet<String>,
@@ -450,6 +455,37 @@ fn ensure_unique_row_ids(rows: &[SearchProjectionRow]) -> Result<(), StoreError>
 
 fn filter_sql(filter: &SearchHardFilter) -> Option<String> {
     let mut clauses = vec!["row_variant != 'checkpoint'".to_owned()];
+    if let Some(refs) = &filter.readable_refs {
+        if refs.is_empty() {
+            clauses.push("FALSE".into());
+        } else {
+            let values = refs
+                .iter()
+                .map(|value| sql_literal(value))
+                .collect::<Vec<_>>()
+                .join(", ");
+            clauses.push(format!("(candidate_id IN ({values}) OR (row_variant = 'evidence_surface' AND source_ref IN ({values})))"));
+        }
+    }
+    for literal in &filter.condition_literals {
+        // Match the native post-read substring check without interpreting the
+        // typed literal as a wildcard or query expression.
+        clauses.push(format!("contains(text, {})", sql_literal(literal)));
+    }
+    if !filter.excluded_identifiers.is_empty() {
+        let values = filter
+            .excluded_identifiers
+            .iter()
+            .map(|value| sql_literal(value))
+            .collect::<Vec<_>>()
+            .join(", ");
+        clauses.push(format!(
+            "(candidate_id NOT IN ({values}) AND source_ref NOT IN ({values}))"
+        ));
+        for value in &filter.excluded_identifiers {
+            clauses.push(format!("NOT contains(text, {})", sql_literal(value)));
+        }
+    }
     let methods = if filter.method_proposal_revisions.is_empty() {
         "FALSE".into()
     } else {
