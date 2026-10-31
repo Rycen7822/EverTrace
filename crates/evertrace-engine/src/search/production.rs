@@ -14,8 +14,37 @@ use evertrace_domain::query::{
 use evertrace_store::{SearchHardFilter, SearchIndex, SearchProjectionRow, StoreError};
 use thiserror::Error;
 
+/// One canonical source revision, resolved after the native read gate.
+pub(crate) struct SourceSequenceScope {
+    pub source_anchor: evertrace_domain::ids::SourceObservationId,
+    pub positions: BTreeMap<String, u64>,
+}
+
+impl SourceSequenceScope {
+    pub fn position(
+        &self,
+        row: &SearchProjectionRow,
+    ) -> Result<Option<evertrace_domain::query::SourceSequencePosition>, SearchError> {
+        if row.row_variant != "evidence_surface" {
+            return Ok(None);
+        }
+        let sequence = self
+            .positions
+            .get(row.source_ref.as_deref().ok_or(SearchError::Corrupt)?)
+            .ok_or(SearchError::Corrupt)?;
+        if *sequence != row.source_sequence {
+            return Err(SearchError::Corrupt);
+        }
+        Ok(Some(evertrace_domain::query::SourceSequencePosition {
+            source_anchor: self.source_anchor,
+            sequence: *sequence,
+        }))
+    }
+}
+
 pub struct ProductionSearch {
     index: SearchIndex,
+    sequence_scope: Option<SourceSequenceScope>,
     procedure_revisions: Option<BTreeSet<String>>,
     method_proposal_revisions: BTreeSet<String>,
     validated_frontier: Option<u64>,
@@ -27,6 +56,7 @@ impl ProductionSearch {
     pub const fn new(index: SearchIndex) -> Self {
         Self {
             index,
+            sequence_scope: None,
             procedure_revisions: None,
             method_proposal_revisions: BTreeSet::new(),
             validated_frontier: None,
@@ -65,6 +95,11 @@ impl ProductionSearch {
         semantics: super::resolution::SemanticSearchResolution,
     ) -> Self {
         self.semantics = Some(semantics);
+        self
+    }
+
+    pub(crate) fn with_sequence_scope(mut self, scope: Option<SourceSequenceScope>) -> Self {
+        self.sequence_scope = scope;
         self
     }
 
@@ -117,7 +152,7 @@ impl ProductionSearch {
                 _ => None,
             },
             source_sequence_at_most: match context.query_facets.temporal_qualifiers.as_slice() {
-                [TemporalQualifier::SourceSequenceAtMost { sequence }] => Some(*sequence),
+                [TemporalQualifier::SourceSequenceAtMost { sequence, .. }] => Some(*sequence),
                 _ => None,
             },
         }
@@ -181,6 +216,11 @@ impl ProductionSearch {
                     _ => unreachable!(),
                 }
                 .map(str::to_owned);
+                if let Some(scope) = &self.sequence_scope
+                    && let Some(refs) = &mut filter.readable_refs
+                {
+                    refs.retain(|reference| scope.positions.contains_key(reference));
+                }
                 Some(filter)
             }
         };
@@ -202,6 +242,7 @@ impl ProductionSearch {
             evidence,
             deadline: &deadline,
             semantics: self.semantics.as_ref(),
+            sequence_scope: self.sequence_scope.as_ref(),
         }
         .run()
         .await
@@ -310,6 +351,11 @@ impl ProductionSearch {
                 || execution.frontier != snapshot.authoritative_frontier()
         }) {
             changed_frontiers.insert("execution_context_frontier_changed".into());
+        }
+        if context.query_facets.temporal_mode == TemporalMode::Sequence
+            && self.sequence_scope.is_none()
+        {
+            changed_frontiers.insert("source_sequence_scope_unresolved".into());
         }
         if !changed_frontiers.is_empty() {
             return Ok(SearchResult {
@@ -552,7 +598,14 @@ impl ProductionSearch {
                 .as_ref()
                 .and_then(|value| value.states.get(&candidate_id))
                 .copied();
+            let source_sequence = self
+                .sequence_scope
+                .as_ref()
+                .map(|scope| scope.position(row))
+                .transpose()?
+                .flatten();
             let candidate = SearchCandidate {
+                source_sequence,
                 candidate_id: candidate_id.clone(),
                 source_ref: row.source_ref.clone().unwrap_or_default(),
                 row_variant,
@@ -822,7 +875,9 @@ pub(super) fn temporal_is_partial(
         [TemporalQualifier::EventTimeAsOf { .. } | TemporalQualifier::EventTimeInterval { .. }] => {
             "event_time"
         }
-        [TemporalQualifier::SourceSequenceAtMost { .. }] => "source_sequence",
+        // The caller has already pinned a canonical source revision and its
+        // readable references. Event timestamps do not invalidate its sequence.
+        [TemporalQualifier::SourceSequenceAtMost { .. }] => return false,
         _ => {
             degraded.insert("temporal_qualifier_unknown".into());
             return true;
@@ -851,8 +906,8 @@ fn temporal_compatible(row: &SearchProjectionRow, context: &SearchContext) -> bo
                 && row.event_time_us >= *start_us
                 && row.event_time_us < *end_us
         }
-        [TemporalQualifier::SourceSequenceAtMost { sequence }] => {
-            row.time_domain == "source_sequence" && row.source_sequence <= *sequence
+        [TemporalQualifier::SourceSequenceAtMost { sequence, .. }] => {
+            row.row_variant == "evidence_surface" && row.source_sequence <= *sequence
         }
         _ => false,
     }

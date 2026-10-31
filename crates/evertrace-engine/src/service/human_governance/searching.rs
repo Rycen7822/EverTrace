@@ -1,6 +1,81 @@
 use super::*;
 use evertrace_domain::query::*;
 
+fn source_sequence_scope(
+    index: &std::collections::BTreeMap<&str, Vec<&ObjectRow>>,
+    readable: &BTreeSet<String>,
+    facets: &QueryFacetSet,
+    deadline: std::time::Instant,
+) -> Option<crate::search::SourceSequenceScope> {
+    let [TemporalQualifier::SourceSequenceAtMost { source_ref, .. }] =
+        facets.temporal_qualifiers.as_slice()
+    else {
+        return None;
+    };
+    let reference = source_ref.to_string();
+    if facets.temporal_mode != TemporalMode::Sequence
+        || !readable.contains(&reference)
+        || std::time::Instant::now() >= deadline
+    {
+        return None;
+    }
+    let anchor = sequence_receipt(index, &reference)?;
+    let mut positions = std::collections::BTreeMap::new();
+    for reference in readable {
+        if std::time::Instant::now() >= deadline {
+            return None;
+        }
+        let Some(receipt) = sequence_receipt(index, reference) else {
+            continue;
+        };
+        if receipt.source_instance_id == anchor.source_instance_id
+            && receipt.source_revision == anchor.source_revision
+        {
+            positions.insert(reference.clone(), receipt.source_sequence);
+        }
+    }
+    Some(crate::search::SourceSequenceScope {
+        source_anchor: *source_ref,
+        positions,
+    })
+}
+
+fn sequence_receipt(
+    index: &std::collections::BTreeMap<&str, Vec<&ObjectRow>>,
+    reference: &str,
+) -> Option<Box<evertrace_domain::evidence::SourceReceipt>> {
+    // Revision aliases also name derived surfaces; resolve the canonical fact.
+    let key = format!("object:evidence:source_observation:{reference}");
+    let [row] = index.get(key.as_str())?.as_slice() else {
+        return None;
+    };
+    let JournalPayload::SourceObservationRecorded(observation) =
+        serde_json::from_str(row.payload_json.as_deref()?).ok()?
+    else {
+        return None;
+    };
+    let key = format!(
+        "object:evidence:source_receipt:{}",
+        observation.source_receipt_ref
+    );
+    let [row] = index.get(key.as_str())?.as_slice() else {
+        return None;
+    };
+    let JournalPayload::SourceReceiptRecorded(receipt) =
+        serde_json::from_str(row.payload_json.as_deref()?).ok()?
+    else {
+        return None;
+    };
+    if receipt.source_observation_id.to_string() != reference
+        || receipt.source_receipt_id != observation.source_receipt_ref
+        || receipt.source_instance_id != observation.source_instance_id
+        || receipt.source_revision != observation.source_revision
+    {
+        return None;
+    }
+    Some(receipt)
+}
+
 impl HumanGovernanceService {
     /// Native read-only entry: no MCP binding, usage, cue, Returned or journal.
     pub async fn search(
@@ -129,7 +204,13 @@ impl HumanGovernanceService {
                 now_us()?,
             )
             .map_err(|_| HumanGovernanceError::Store)?;
+            let sequence_scope =
+                source_sequence_scope(&index, &refs, &context.query_facets, deadline);
+            if let Some(scope) = &sequence_scope {
+                checks.insert(scope.source_anchor.to_string());
+            }
             let mut page = crate::search::ProductionSearch::new(search.clone())
+                .with_sequence_scope(sequence_scope)
                 .with_semantic_resolution(semantics)
                 .with_validated_frontier(snapshot.frontier)
                 .with_method_proposals(proposals)

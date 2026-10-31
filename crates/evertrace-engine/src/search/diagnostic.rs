@@ -471,6 +471,7 @@ fn push_candidate(
         return Ok(());
     }
     result.candidates.push(SearchCandidate {
+        source_sequence: None,
         candidate_id,
         source_ref: row.source_ref.clone().ok_or(SearchError::Corrupt)?,
         row_variant: match row.row_variant.as_str() {

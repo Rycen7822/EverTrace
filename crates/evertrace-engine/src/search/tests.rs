@@ -63,6 +63,7 @@ mod tests {
             projection_frontier: frontier,
             authoritative_frontier: frontier,
             candidates: vec![SearchCandidate {
+                source_sequence: None,
                 candidate_id: BASE_REVISION.into(),
                 source_ref: BASE_ENTITY.into(),
                 row_variant: evertrace_domain::query::SearchCandidateVariant::Object,
@@ -328,6 +329,7 @@ mod tests {
         for index in 0..20_000u64 {
             let candidate = format!("01890f47-6a4a-7cc1-98b9-{index:012x}");
             result.candidates.push(SearchCandidate {
+                source_sequence: None,
                 candidate_id: candidate.clone(),
                 source_ref: candidate,
                 row_variant: evertrace_domain::query::SearchCandidateVariant::Object,

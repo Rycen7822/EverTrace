@@ -8,7 +8,8 @@ use thiserror::Error;
 use crate::{
     evidence::EvidenceSurface,
     ids::{
-        AnyPublicId, ExecutionLaneId, RepositoryId, TaskId, WorkEpisodeId, WorkstreamId, WorktreeId,
+        AnyPublicId, ExecutionLaneId, RepositoryId, SourceObservationId, TaskId, WorkEpisodeId,
+        WorkstreamId, WorktreeId,
     },
     revision::RevisionId,
     semantic::SemanticResolution,
@@ -158,9 +159,17 @@ pub enum LifecycleBoundary {
 #[derive(Clone, Copy, Debug, Deserialize, Eq, Ord, PartialEq, PartialOrd, Serialize)]
 #[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
 pub enum TemporalQualifier {
-    EventTimeAsOf { at_us: i64 },
-    EventTimeInterval { start_us: i64, end_us: i64 },
-    SourceSequenceAtMost { sequence: u64 },
+    EventTimeAsOf {
+        at_us: i64,
+    },
+    EventTimeInterval {
+        start_us: i64,
+        end_us: i64,
+    },
+    SourceSequenceAtMost {
+        source_ref: SourceObservationId,
+        sequence: u64,
+    },
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -974,10 +983,20 @@ impl std::str::FromStr for SearchCurrentness {
     }
 }
 
+/// Position in the source revision identified by a readable request anchor.
+/// It is neither an event clock nor an ordering across independent sources.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct SourceSequencePosition {
+    pub source_anchor: SourceObservationId,
+    pub sequence: u64,
+}
+
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct SearchCandidate {
     pub candidate_id: String,
+    pub source_sequence: Option<SourceSequencePosition>,
     pub source_ref: String,
     pub row_variant: SearchCandidateVariant,
     pub currentness: Option<SearchCurrentness>,
@@ -1090,7 +1109,9 @@ impl HumanSearchPage {
                     && candidate.text.len() <= 16 * 1024
                     && candidate.instruction_authority == "none"
                     && match candidate.row_variant {
-                        SearchCandidateVariant::Object => candidate.currentness.is_some(),
+                        SearchCandidateVariant::Object => {
+                            candidate.currentness.is_some() && candidate.source_sequence.is_none()
+                        }
                         SearchCandidateVariant::EvidenceSurface => candidate.currentness.is_none(),
                     }
             })
@@ -1100,6 +1121,55 @@ impl HumanSearchPage {
                     && view.candidate_set.candidate_refs == refs
                     && view.completeness == self.result.completeness
             })
+            && self.sequence_positions_valid()
+    }
+
+    fn sequence_positions_valid(&self) -> bool {
+        let sequence_mode = self
+            .grounded_view
+            .as_ref()
+            .is_some_and(|view| view.evidence_need.temporal_scope.mode == TemporalMode::Sequence);
+        for candidate in &self.result.candidates {
+            let Some(position) = &candidate.source_sequence else {
+                if sequence_mode && candidate.row_variant == SearchCandidateVariant::EvidenceSurface
+                {
+                    return false;
+                }
+                continue;
+            };
+            let Some(view) = &self.grounded_view else {
+                return false;
+            };
+            let [
+                TemporalQualifier::SourceSequenceAtMost {
+                    source_ref,
+                    sequence,
+                },
+            ] = view.evidence_need.temporal_scope.qualifiers.as_slice()
+            else {
+                return false;
+            };
+            if view.evidence_need.temporal_scope.mode != TemporalMode::Sequence
+                || position.sequence > *sequence
+                || position.source_anchor != *source_ref
+            {
+                return false;
+            }
+        }
+        self.grounded_view.as_ref().is_none_or(|view| {
+            view.active_evidence.iter().all(|statement| {
+                let positioned = statement.support_refs.iter().all(|reference| {
+                    self.result.candidates.iter().any(|candidate| {
+                        candidate.candidate_id == *reference && candidate.source_sequence.is_some()
+                    })
+                });
+                if statement.ordering_basis == OrderingBasis::SourceSequence {
+                    positioned && statement.derivation_kind == DerivationKind::Quoted
+                } else {
+                    !positioned || statement.derivation_kind != DerivationKind::Quoted
+                }
+            })
+        })
     }
 }
 

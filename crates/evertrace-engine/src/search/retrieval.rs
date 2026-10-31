@@ -52,6 +52,7 @@ pub(super) struct NativeRetrieval<'a> {
     pub evidence: Option<SearchHardFilter>,
     pub deadline: &'a RequestDeadline,
     pub semantics: Option<&'a super::resolution::SemanticSearchResolution>,
+    pub sequence_scope: Option<&'a super::SourceSequenceScope>,
 }
 
 impl NativeRetrieval<'_> {
@@ -140,7 +141,13 @@ impl NativeRetrieval<'_> {
                 .semantics
                 .and_then(|value| value.states.get(&id))
                 .copied();
+            let source_sequence = self
+                .sequence_scope
+                .map(|scope| scope.position(&row))
+                .transpose()?
+                .flatten();
             self.result.candidates.push(SearchCandidate {
+                source_sequence,
                 candidate_id: id,
                 source_ref: row.source_ref.ok_or(SearchError::Corrupt)?,
                 row_variant: if row.row_variant == "object" {
@@ -609,7 +616,11 @@ impl NativeRetrieval<'_> {
                 statement: candidate.text.clone(),
                 support_refs: BTreeSet::from([candidate.candidate_id.clone()]),
                 derivation_kind: DerivationKind::Quoted,
-                ordering_basis: OrderingBasis::Unknown,
+                ordering_basis: if candidate.source_sequence.is_some() {
+                    OrderingBasis::SourceSequence
+                } else {
+                    OrderingBasis::Unknown
+                },
                 content_trust: "untrusted_source_content".into(),
                 instruction_authority: "none".into(),
             });
@@ -691,7 +702,10 @@ impl NativeRetrieval<'_> {
             }
         }
         self.result.candidates = kept;
-        if !matches!(
+        if self.sequence_scope.is_some() {
+            // A per-record receipt does not prove an entire prefix is gap-free.
+            self.degraded("source_sequence_coverage_unverified");
+        } else if !matches!(
             self.context.query_facets.temporal_mode,
             TemporalMode::Any | TemporalMode::Current
         ) || !self.context.query_facets.temporal_qualifiers.is_empty()

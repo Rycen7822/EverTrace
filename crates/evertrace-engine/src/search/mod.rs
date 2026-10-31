@@ -7,6 +7,7 @@ pub(crate) mod protection;
 mod resolution;
 mod retrieval;
 
+pub(crate) use production::SourceSequenceScope;
 pub(crate) use resolution::SemanticSearchResolution;
 
 pub use diagnostic::{DiagnosticRetrieval, DiagnosticSession};
