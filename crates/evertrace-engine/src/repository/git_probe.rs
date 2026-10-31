@@ -929,6 +929,10 @@ fn run_op(
     op: &GitProbeOp,
     limits: &ProbeLimits,
 ) -> Result<CommandOutput, ProbeUnavailableReason> {
+    let local_deadline = Instant::now() + Duration::from_millis(limits.max_duration_ms);
+    let deadline = SHARED_PROBE_DEADLINE
+        .with(|slot| slot.get())
+        .map_or(local_deadline, |shared| shared.min(local_deadline));
     let stdout_limit = op.stdout_limit(limits);
     let stdin_bytes = op.stdin_bytes();
     let mut command = Command::new("git");
@@ -953,6 +957,9 @@ fn run_op(
         })
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
+    if Instant::now() >= deadline {
+        return Err(ProbeUnavailableReason::Timeout);
+    }
     let mut child = command.spawn().map_err(|error| match error.kind() {
         std::io::ErrorKind::PermissionDenied => ProbeUnavailableReason::PermissionDenied,
         _ => ProbeUnavailableReason::SpawnFailed,
@@ -989,10 +996,6 @@ fn run_op(
         }
         drop(stdin);
     }
-    let local_deadline = Instant::now() + Duration::from_millis(limits.max_duration_ms);
-    let deadline = SHARED_PROBE_DEADLINE
-        .with(|slot| slot.get())
-        .map_or(local_deadline, |shared| shared.min(local_deadline));
     let mut timed_out = false;
     let status = loop {
         if truncated.load(Ordering::Acquire) {
