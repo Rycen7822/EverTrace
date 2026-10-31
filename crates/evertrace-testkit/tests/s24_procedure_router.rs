@@ -1110,6 +1110,8 @@ fn eligibility_publication_and_router_gates_are_closed_and_bounded() {
         execution: None,
         intent: SearchIntent::FailureRecovery,
         raw_query: "release verifier failed".into(),
+        protected_query: "release verifier failed".into(),
+        protected_facets: Default::default(),
         query_facets: QueryFacetSet {
             parse_status: FacetParseStatus::Complete,
             target_anchors: Vec::new(),

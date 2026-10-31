@@ -14,7 +14,7 @@ use crate::{
     semantic::SemanticResolution,
 };
 
-const MAX_QUERY_BYTES: usize = 8 * 1024;
+pub const MAX_QUERY_BYTES: usize = 8 * 1024;
 const MAX_FACET_ITEMS: usize = 32;
 
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -23,6 +23,42 @@ pub enum FacetParseStatus {
     Complete,
     Partial,
     Unknown,
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, Eq, Ord, PartialEq, PartialOrd, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ProtectedFacetKind {
+    ExactIdentifier,
+    ConditionLiteral,
+    Exclusion,
+    Relation,
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, Eq, Ord, PartialEq, PartialOrd, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct ProtectedFacet {
+    pub kind: ProtectedFacetKind,
+    /// Index in the original request vector, before removing protected values.
+    pub position: u16,
+}
+
+impl ProtectedFacet {
+    pub fn locator(self) -> String {
+        let field = match self.kind {
+            ProtectedFacetKind::ExactIdentifier => "exact_identifiers",
+            ProtectedFacetKind::ConditionLiteral => "condition_literals",
+            ProtectedFacetKind::Exclusion => "explicit_exclusions",
+            ProtectedFacetKind::Relation => "relation_requirements",
+        };
+        format!("{field}:{}", self.position)
+    }
+
+    pub fn blocks_ordinary_evidence(self) -> bool {
+        matches!(
+            self.kind,
+            ProtectedFacetKind::ConditionLiteral | ProtectedFacetKind::Exclusion
+        )
+    }
 }
 
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -150,7 +186,9 @@ impl QueryFacetSet {
             &self.explicit_exclusions,
         ] {
             if values.len() > MAX_FACET_ITEMS
-                || values.iter().any(|value| value.is_empty())
+                || values
+                    .iter()
+                    .any(|value| value.is_empty() || value.len() > 512)
                 || values.iter().collect::<BTreeSet<_>>().len() != values.len()
             {
                 return Err(QueryError::Invalid);
@@ -278,6 +316,7 @@ pub enum NamedGapKind {
     StableObjectId,
     ExactIdentifier,
     AllowlistedRelationSlot,
+    ProtectedFacet,
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -640,13 +679,15 @@ impl QueryExecution {
     }
 }
 
-#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[derive(Clone, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct SearchContext {
     pub query_anchor: QueryAnchor,
     pub execution: Option<Box<QueryExecution>>,
     pub intent: SearchIntent,
     pub raw_query: String,
+    pub protected_query: String,
+    pub protected_facets: BTreeSet<ProtectedFacet>,
     pub query_facets: QueryFacetSet,
     pub task_id: Option<TaskId>,
     pub repository_id: Option<RepositoryId>,
@@ -656,8 +697,23 @@ pub struct SearchContext {
 }
 
 impl SearchContext {
+    pub fn unverified_hard_constraint(&self) -> bool {
+        self.protected_facets
+            .iter()
+            .any(|facet| facet.blocks_ordinary_evidence())
+    }
+
     pub fn validate(&self) -> Result<(), QueryError> {
-        if self.raw_query.is_empty() || self.raw_query.len() > MAX_QUERY_BYTES {
+        if self.raw_query.is_empty()
+            || self.raw_query.len() > MAX_QUERY_BYTES
+            || self.protected_query.is_empty()
+            || self.protected_query.len() > MAX_QUERY_BYTES
+            || self.protected_facets.len() > MAX_FACET_ITEMS * 4
+            || self
+                .protected_facets
+                .iter()
+                .any(|facet| usize::from(facet.position) >= MAX_FACET_ITEMS)
+        {
             return Err(QueryError::Invalid);
         }
         self.query_anchor.validate()?;
@@ -743,9 +799,22 @@ pub struct SearchResult {
     pub budget: RetrievalBudget,
 }
 
+impl std::fmt::Debug for SearchContext {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("SearchContext")
+            .field("intent", &self.intent)
+            .field("raw_query_bytes", &self.raw_query.len())
+            .field("protected_query_bytes", &self.protected_query.len())
+            .field("protected_facets", &self.protected_facets)
+            .field("budget", &self.budget)
+            .finish_non_exhaustive()
+    }
+}
+
 /// Literal search plus explicitly supplied typed intent. No access grants,
 /// budgets, candidate boundary or completeness proof comes from the client.
-#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[derive(Clone, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct HumanSearchQuery {
     pub text: String,
@@ -753,6 +822,17 @@ pub struct HumanSearchQuery {
     pub facets: QueryFacetSet,
     pub limit: u16,
 }
+impl std::fmt::Debug for HumanSearchQuery {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("HumanSearchQuery")
+            .field("text_bytes", &self.text.len())
+            .field("selection", &self.selection)
+            .field("limit", &self.limit)
+            .finish_non_exhaustive()
+    }
+}
+
 impl HumanSearchQuery {
     pub fn validate(&self) -> Result<(), QueryError> {
         self.facets.validate()?;

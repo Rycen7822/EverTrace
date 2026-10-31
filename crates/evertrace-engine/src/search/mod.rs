@@ -3,6 +3,7 @@
 mod diagnostic;
 pub(crate) mod execution;
 mod production;
+pub(crate) mod protection;
 mod resolution;
 mod retrieval;
 

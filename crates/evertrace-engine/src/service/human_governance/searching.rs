@@ -14,18 +14,13 @@ impl HumanGovernanceService {
             .runtime_snapshot
             .as_ref()
             .ok_or(HumanGovernanceError::Store)?;
+        let deadline = std::time::Instant::now() + presentation::READ_DEADLINE;
         // Load an existing key only. Reading never installs a key or imports data.
         let key = evertrace_capture::DeviceKeyStore::new(runtime.device_key_dir.clone())
             .load()
             .map_err(|_| HumanGovernanceError::Store)?;
-        let protected = evertrace_capture::protect(query.text.as_bytes(), &key)
+        let protected = crate::search::protection::prepare(&query.text, &query.facets, &key)
             .map_err(|_| HumanGovernanceError::InvalidInput)?;
-        if protected.protected_bytes() != query.text.as_bytes() {
-            // Raw secret text cannot enter a Native query, log, cursor or ledger.
-            // Protected-query facet remapping remains required before enabling it.
-            return Err(HumanGovernanceError::InvalidInput);
-        }
-        let deadline = std::time::Instant::now() + presentation::READ_DEADLINE;
         let future = async {
             let snapshot = self
                 .writer
@@ -95,7 +90,9 @@ impl HumanGovernanceService {
                 execution: None,
                 intent: SearchIntent::HistoryLookup,
                 raw_query: query.text,
-                query_facets: query.facets,
+                protected_query: protected.text,
+                protected_facets: protected.protected_facets,
+                query_facets: protected.facets,
                 task_id,
                 repository_id,
                 worktree_id,

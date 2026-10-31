@@ -231,7 +231,10 @@ impl DiagnosticSession {
         if self.followed_up
             || self.result.budget.follow_ups_remaining == 0
             || !self.work_point()
-            || matches!(gap.kind, NamedGapKind::AllowlistedRelationSlot)
+            || matches!(
+                gap.kind,
+                NamedGapKind::AllowlistedRelationSlot | NamedGapKind::ProtectedFacet
+            )
         {
             return Err(SearchError::Unsupported);
         }
@@ -249,7 +252,7 @@ impl DiagnosticSession {
                         && row.currentness.as_deref() == Some("current")
                         && row.source_ref.as_deref() == Some(gap.identifier.as_str())
                 }
-                NamedGapKind::AllowlistedRelationSlot => false,
+                NamedGapKind::AllowlistedRelationSlot | NamedGapKind::ProtectedFacet => false,
             } {
                 matches.push(row);
             }
@@ -494,7 +497,7 @@ fn exact_refs(result: &SearchResult) -> BTreeSet<String> {
 }
 
 fn relevant(row: &SearchProjectionRow, context: &SearchContext) -> bool {
-    row.text.contains(&context.raw_query)
+    row.text.contains(&context.protected_query)
         || context
             .query_facets
             .exact_identifiers

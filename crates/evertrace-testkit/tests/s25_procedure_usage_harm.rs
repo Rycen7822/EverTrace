@@ -953,6 +953,8 @@ async fn prepare_usage_evidence(
         execution: None,
         intent: SearchIntent::FailureRecovery,
         raw_query: "verifier failed".into(),
+        protected_query: "verifier failed".into(),
+        protected_facets: Default::default(),
         query_facets: QueryFacetSet {
             parse_status: FacetParseStatus::Complete,
             target_anchors: Vec::new(),
@@ -3658,6 +3660,8 @@ async fn prepare_real_router_usage_stage() -> RealUsageStage {
         execution: None,
         intent: SearchIntent::FailureRecovery,
         raw_query: "verifier failed".into(),
+        protected_query: "verifier failed".into(),
+        protected_facets: Default::default(),
         query_facets: QueryFacetSet {
             parse_status: FacetParseStatus::Complete,
             target_anchors: Vec::new(),

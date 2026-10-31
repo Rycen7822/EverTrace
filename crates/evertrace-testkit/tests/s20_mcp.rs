@@ -927,6 +927,8 @@ async fn real_store_scope_union_and_four_actions_preserve_authority_boundaries()
             execution: None,
             intent: SearchIntent::StageAssistance,
             raw_query: "needle".into(),
+            protected_query: "needle".into(),
+            protected_facets: Default::default(),
             query_facets: QueryFacetSet {
                 parse_status: FacetParseStatus::Complete,
                 target_anchors: Vec::new(),

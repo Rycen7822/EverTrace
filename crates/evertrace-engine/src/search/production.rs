@@ -339,11 +339,17 @@ impl ProductionSearch {
             limit.saturating_mul(4).min(32)
         };
         let mut exact_identifiers = context.query_facets.exact_identifiers.clone();
-        exact_identifiers.push(context.raw_query.clone());
+        exact_identifiers.push(context.protected_query.clone());
         exact_identifiers.sort();
         exact_identifiers.dedup();
         let mut structured = Vec::new();
         let mut degraded_reasons = BTreeSet::new();
+        if context.raw_query != context.protected_query {
+            degraded_reasons.insert("query_redacted".into());
+        }
+        if !context.protected_facets.is_empty() {
+            degraded_reasons.insert("protected_facet_unverifiable".into());
+        }
         let mut omitted_refs = BTreeSet::new();
         if let Some(semantics) = &self.semantics {
             if semantics.incomplete {
@@ -415,7 +421,7 @@ impl ProductionSearch {
             Err(StoreError::LanceDb)
         } else {
             match deadline
-                .run(snapshot.fts(&context.raw_query, &filter, fetch_limit))
+                .run(snapshot.fts(&context.protected_query, &filter, fetch_limit))
                 .await
             {
                 Ok(result) => result,
@@ -459,8 +465,8 @@ impl ProductionSearch {
             let stable = row
                 .candidate_id
                 .as_deref()
-                .is_some_and(|id| id == context.raw_query)
-                || row.source_ref.as_deref() == Some(context.raw_query.as_str());
+                .is_some_and(|id| id == context.protected_query)
+                || row.source_ref.as_deref() == Some(context.protected_query.as_str());
             let anchor_position = context.query_facets.target_anchors.iter().position(|id| {
                 row.candidate_id.as_deref() == Some(id) || row.source_ref.as_deref() == Some(id)
             });
@@ -569,6 +575,17 @@ impl ProductionSearch {
             selected.insert(candidate_id, (*rank, candidate, *row));
         }
         let mut candidates = selected.into_values().collect::<Vec<_>>();
+        if context.unverified_hard_constraint() {
+            candidates.retain(|(_, candidate, _)| super::resolution::active_rule(candidate));
+            omitted_refs.retain(|reference| {
+                self.semantics.as_ref().is_some_and(|semantics| {
+                    semantics.states.get(reference)
+                        == Some(&evertrace_domain::semantic::SemanticResolution::Normative(
+                            evertrace_domain::semantic::NormativeResolutionState::Active,
+                        ))
+                })
+            });
+        }
         candidates.sort_by(|left, right| {
             left.0
                 .cmp(&right.0)
@@ -591,6 +608,8 @@ impl ProductionSearch {
             RetrievalCompleteness::Conflicted
         } else if temporal_partial
             || context.query_facets.parse_status != FacetParseStatus::Complete
+            || context.raw_query != context.protected_query
+            || !context.protected_facets.is_empty()
         {
             RetrievalCompleteness::Partial
         } else {

@@ -164,7 +164,16 @@ impl NativeRetrieval<'_> {
         Ok(())
     }
     fn gaps(&self, witnessed: &BTreeSet<String>) -> Vec<NamedGap> {
-        let mut gaps = Vec::new();
+        let mut gaps = self
+            .context
+            .protected_facets
+            .iter()
+            .map(|facet| NamedGap {
+                kind: NamedGapKind::ProtectedFacet,
+                identifier: facet.locator(),
+                changes_result: true,
+            })
+            .collect::<Vec<_>>();
         for anchor in &self.context.query_facets.target_anchors {
             if !self.result.candidates.iter().any(|candidate| {
                 candidate.candidate_id == *anchor || candidate.source_ref == *anchor
@@ -239,7 +248,10 @@ impl NativeRetrieval<'_> {
                 if limit > 0 {
                     match self
                         .deadline
-                        .run(self.snapshot.fts(&self.context.raw_query, &filter, limit))
+                        .run(
+                            self.snapshot
+                                .fts(&self.context.protected_query, &filter, limit),
+                        )
                         .await
                     {
                         Ok(Ok(rows)) => self.admit(rows, "evidence_fts")?,
@@ -254,12 +266,13 @@ impl NativeRetrieval<'_> {
         self.result.layer = RetrievalLayer::C;
         let facet_match = |candidate: &SearchCandidate| {
             super::resolution::active_rule(candidate)
-                || self
-                    .context
-                    .query_facets
-                    .condition_literals
-                    .iter()
-                    .all(|literal| candidate.text.contains(literal))
+                || (!self.context.unverified_hard_constraint()
+                    && self
+                        .context
+                        .query_facets
+                        .condition_literals
+                        .iter()
+                        .all(|literal| candidate.text.contains(literal)))
         };
         if self.context.query_facets.relation_requirements.is_empty() {
             self.result.candidates.retain(facet_match);
@@ -541,12 +554,13 @@ impl NativeRetrieval<'_> {
                 .iter()
                 .filter(|candidate| {
                     super::resolution::active_rule(candidate)
-                        || self
-                            .context
-                            .query_facets
-                            .condition_literals
-                            .iter()
-                            .all(|literal| candidate.text.contains(literal))
+                        || (!self.context.unverified_hard_constraint()
+                            && self
+                                .context
+                                .query_facets
+                                .condition_literals
+                                .iter()
+                                .all(|literal| candidate.text.contains(literal)))
                 })
                 .map(|candidate| GroundedStatement {
                     statement: candidate.text.clone(),
@@ -582,6 +596,19 @@ impl NativeRetrieval<'_> {
             .min(32)
     }
     fn pack(&mut self) {
+        if self.context.unverified_hard_constraint() {
+            self.result
+                .candidates
+                .retain(super::resolution::active_rule);
+            self.result.omitted_refs.retain(|reference| {
+                self.semantics.is_some_and(|semantics| {
+                    semantics.states.get(reference)
+                        == Some(&evertrace_domain::semantic::SemanticResolution::Normative(
+                            evertrace_domain::semantic::NormativeResolutionState::Active,
+                        ))
+                })
+            });
+        }
         let limit = self.output_limit();
         let mut bytes = 0;
         let mut kept = Vec::new();

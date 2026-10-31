@@ -27,6 +27,20 @@ struct SearchCandidateReviewInput<'a> {
 }
 
 impl McpActionService {
+    fn protect_search_context(&self, context: &mut SearchContext) -> Result<(), McpServiceError> {
+        let key =
+            evertrace_capture::DeviceKeyStore::new(self.runtime_snapshot.device_key_dir.clone())
+                .load()
+                .map_err(|_| McpServiceError::Store)?;
+        let protected =
+            crate::search::protection::prepare(&context.raw_query, &context.query_facets, &key)
+                .map_err(|_| McpServiceError::Store)?;
+        context.protected_query = protected.text;
+        context.protected_facets = protected.protected_facets;
+        context.query_facets = protected.facets;
+        Ok(())
+    }
+
     pub(super) async fn blocked_read_rows(
         &self,
         report: Option<&evertrace_codex::HostProbeReport>,
@@ -130,10 +144,12 @@ impl McpActionService {
                 ["search_deadline_exhausted"],
             ));
         }
-        let context = SearchContext {
+        let mut context = SearchContext {
             query_anchor: scope.anchor.search_anchor(),
             intent: SearchIntent::StageAssistance,
             raw_query: query.clone(),
+            protected_query: String::new(),
+            protected_facets: BTreeSet::new(),
             execution: scope
                 .anchor
                 .execution_context(scope.context.frontier, &scope.context.scope),
@@ -165,6 +181,23 @@ impl McpActionService {
                 follow_ups_remaining: 0,
             },
         };
+        self.protect_search_context(&mut context)?;
+        context.budget.latency_us_remaining = u64::try_from(
+            scope
+                .deadline
+                .saturating_duration_since(std::time::Instant::now())
+                .as_micros(),
+        )
+        .unwrap_or(u64::MAX);
+        if context.budget.latency_us_remaining == 0 {
+            return Ok(empty_result(
+                request_id,
+                McpServiceStatus::Partial,
+                &label,
+                "partial",
+                ["search_deadline_exhausted"],
+            ));
+        }
         let include_probationary = self.operation_config.as_ref().map_or_else(
             || evertrace_domain::config::ProcedureConfig::default().include_probationary,
             |config| config.config().procedure.include_probationary,
@@ -676,10 +709,12 @@ impl McpActionService {
         if query == "@due" {
             return self.search_due(request_id, scope).await;
         }
-        let context = SearchContext {
+        let mut context = SearchContext {
             query_anchor: scope.anchor.search_anchor(),
             intent: SearchIntent::StageAssistance,
             raw_query: query,
+            protected_query: String::new(),
+            protected_facets: BTreeSet::new(),
             execution: None,
             query_facets: QueryFacetSet {
                 parse_status: FacetParseStatus::Unknown,
@@ -709,6 +744,7 @@ impl McpActionService {
                 follow_ups_remaining: 0,
             },
         };
+        self.protect_search_context(&mut context)?;
         let include_probationary = self.operation_config.as_ref().map_or_else(
             || evertrace_domain::config::ProcedureConfig::default().include_probationary,
             |config| config.config().procedure.include_probationary,
@@ -1389,6 +1425,8 @@ impl McpActionService {
             .search(SearchContext {
                 query_anchor: scope.anchor.search_anchor(),
                 intent: SearchIntent::FailureRecovery,
+                protected_query: query.clone(),
+                protected_facets: BTreeSet::new(),
                 raw_query: query,
                 execution: None,
                 query_facets: QueryFacetSet {

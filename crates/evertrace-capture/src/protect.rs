@@ -10,7 +10,7 @@ use crate::key::DeviceKey;
 
 pub const DETECTOR_REVISION: u32 = 1;
 pub const REDACTION_REVISION: u32 = 1;
-const REDACTION_TOKEN: &[u8] = b"[REDACTED]";
+pub const REDACTION_TOKEN: &[u8] = b"[REDACTED]";
 
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "snake_case")]

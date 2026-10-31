@@ -21,6 +21,8 @@ mod tests {
             execution: None,
             intent: SearchIntent::StageAssistance,
             raw_query: "needle".into(),
+            protected_query: "needle".into(),
+            protected_facets: Default::default(),
             query_facets: QueryFacetSet {
                 parse_status: FacetParseStatus::Complete,
                 target_anchors: Vec::new(),

@@ -3980,6 +3980,8 @@ fn f_off_is_identical_and_trusted_controlled_effects_only_tie_break_or_suppress(
         execution: None,
         intent: SearchIntent::FailureRecovery,
         raw_query: "verification failed".into(),
+        protected_query: "verification failed".into(),
+        protected_facets: Default::default(),
         query_facets: QueryFacetSet {
             parse_status: FacetParseStatus::Complete,
             target_anchors: Vec::new(),
