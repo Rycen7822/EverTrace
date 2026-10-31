@@ -321,96 +321,41 @@ impl ProcedureUsageCurrentView {
             repository_instance_id: anchor.repository_id,
             worktree_instance_id: anchor.worktree_id,
         };
-        let mut checkpoint = None;
+        let Some(execution) = context.execution.as_deref().filter(|execution| {
+            execution.frontier == self.frontier
+                && execution
+                    .validate(&anchor.search_anchor(), anchor.task_id)
+                    .is_ok()
+                && execution.episode == *episode
+                && self.tasks.get(&execution.task.task_id) == Some(&execution.task)
+                && self.workstreams.get(&execution.workstream.workstream_id)
+                    == Some(&execution.workstream)
+        }) else {
+            return Ok(ProcedureRouteResult {
+                status: "insufficient_context",
+                items: vec![],
+            });
+        };
         let mut scenario: Option<evertrace_domain::semantic::Scenario> = None;
-        for row in rows.iter().filter(|row| {
-            matches!(
-                row.object_kind.as_deref(),
-                Some("work_checkpoint" | "scenario")
-            )
-        }) {
+        for row in rows
+            .iter()
+            .filter(|row| row.object_kind.as_deref() == Some("scenario"))
+        {
             let payload: JournalPayload = serde_json::from_str(
                 row.payload_json
                     .as_deref()
                     .ok_or(SemanticServiceError::InvalidInput)?,
             )
             .map_err(|_| SemanticServiceError::InvalidInput)?;
-            match payload {
-                JournalPayload::WorkCheckpointRecorded(value)
-                    if value.episode_id == episode.episode_id
-                        && value.source_watermark == episode.source_watermark
-                        && episode.checkpoint_refs.contains(&value.stable_key())
-                        && value.phase_contract == episode.phase_contract
-                        && value.attempt_revision_refs.len() == episode.attempt_ids.len()
-                        && value.attempt_revision_refs.iter().all(|reference| {
-                            episode.attempt_ids.contains(&reference.attempt_id)
-                                && self
-                                    .attempts
-                                    .get(&reference.attempt_id)
-                                    .is_some_and(|attempt| {
-                                        attempt.revision_id == reference.revision_id
-                                    })
-                        }) =>
-                {
-                    value
-                        .validate()
-                        .map_err(|_| SemanticServiceError::InvalidInput)?;
-                    if checkpoint
-                        .as_ref()
-                        .is_none_or(|(_, seq)| *seq < row.source_event_seq)
-                    {
-                        checkpoint = Some((*value, row.source_event_seq));
-                    }
-                }
-                JournalPayload::ScenarioRecorded(value)
-                    if value.scope == scenario_scope
-                        && scenario.as_ref().is_none_or(|old| {
-                            old.revision_generation < value.revision_generation
-                        }) =>
-                {
-                    scenario = Some(*value);
-                }
-                _ => {}
+            if let JournalPayload::ScenarioRecorded(value) = payload
+                && value.scope == scenario_scope
+                && scenario
+                    .as_ref()
+                    .is_none_or(|old| old.revision_generation < value.revision_generation)
+            {
+                scenario = Some(*value);
             }
         }
-        let (Some(task), Some(stream)) = (
-            self.tasks.get(&episode.task_id),
-            self.workstreams.get(&episode.workstream_id),
-        ) else {
-            return Ok(ProcedureRouteResult {
-                status: "insufficient_context",
-                items: vec![],
-            });
-        };
-        let mut facts = vec![
-            JournalPayload::TaskRecorded(Box::new(task.clone())),
-            JournalPayload::WorkstreamRecorded(Box::new(stream.clone())),
-            JournalPayload::WorkEpisodeRecorded(Box::new(episode.clone())),
-        ];
-        facts.extend(
-            episode
-                .attempt_ids
-                .iter()
-                .filter_map(|id| self.attempts.get(id))
-                .cloned()
-                .map(|value| JournalPayload::AttemptRecorded(Box::new(value))),
-        );
-        if let Some((checkpoint, _)) = &checkpoint {
-            facts.push(JournalPayload::WorkCheckpointRecorded(Box::new(
-                checkpoint.clone(),
-            )));
-        }
-        let Some(execution) = crate::search::execution::from_facts(
-            self.frontier,
-            &facts,
-            &anchor.search_anchor(),
-            anchor.task_id,
-        ) else {
-            return Ok(ProcedureRouteResult {
-                status: "insufficient_context",
-                items: vec![],
-            });
-        };
         let scenario_fresh = execution.checkpoint.is_some()
             && scenario.as_ref().is_some_and(|scenario| {
                 scenario.active_lineage.active_episode_id == Some(episode.episode_id)
@@ -430,8 +375,7 @@ impl ProcedureUsageCurrentView {
                     .and_then(|scenario| scenario.active_lineage.active_attempt_id)
                     .and_then(|id| {
                         execution
-                            .attempt
-                            .as_ref()
+                            .resolved_attempt()
                             .filter(|attempt| attempt.attempt_id == id)
                     })
                     .filter(|attempt| {
@@ -509,7 +453,10 @@ impl ProcedureUsageCurrentView {
                     .is_empty()
                     || scenario.active_workstreams.len() > 1
             });
-        let trace = super::alignment::StageTrace::compile_rows(rows, episode)?;
+        let mut trace = super::alignment::StageTrace::compile_rows(rows, episode)?;
+        if active_attempt.is_none() {
+            trace.clear_attempt_state();
+        }
         let candidates = revisions
             .iter()
             .enumerate()

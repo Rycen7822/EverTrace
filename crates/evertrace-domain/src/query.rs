@@ -793,12 +793,26 @@ pub struct QueryExecution {
     pub task: crate::work::Task,
     pub workstream: crate::work::Workstream,
     pub episode: crate::work::WorkEpisode,
+    /// A canonical candidate; execution operands require `resolved_attempt`.
     pub attempt: Option<crate::work::Attempt>,
     pub work_binding: Option<crate::work::WorkBindingRevision>,
     pub checkpoint: Option<crate::work::WorkCheckpoint>,
 }
 
 impl QueryExecution {
+    /// Resolved execution context, not physical Operation attribution.
+    pub fn resolved_attempt(&self) -> Option<&crate::work::Attempt> {
+        let attempt = self.attempt.as_ref()?;
+        let binding = self.work_binding.as_ref()?;
+        let primary = &binding.primary_binding;
+        (binding.assignment_status == crate::work::AssignmentStatus::Resolved
+            && primary.task_id == Some(self.task.task_id)
+            && primary.workstream_id == Some(self.workstream.workstream_id)
+            && primary.episode_id == Some(self.episode.episode_id)
+            && primary.attempt_id.is_none_or(|id| id == attempt.attempt_id))
+        .then_some(attempt)
+    }
+
     pub fn validate(
         &self,
         anchor: &QueryAnchor,

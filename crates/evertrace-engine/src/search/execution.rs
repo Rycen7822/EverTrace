@@ -82,24 +82,22 @@ pub(crate) fn from_facts(
             _ => None,
         })
         .max_by_key(|lane| lane.lane_revision);
+    // The Native current context owns revision selection. Ambiguity stays
+    // unknown; filtering first must not choose a merely compatible assignment.
     let binding = unique(facts.iter().filter_map(|payload| match payload {
         JournalPayload::WorkBindingRecorded(value)
-            if value.assignment_status == AssignmentStatus::Resolved
-                && lane.is_some_and(|lane| lane.operation_ids.contains(&value.operation_id))
-                && value.primary_binding.task_id == Some(task.task_id)
-                && value.primary_binding.workstream_id == Some(stream.workstream_id)
-                && value.primary_binding.episode_id == Some(episode.episode_id)
-                && attempt.is_none_or(|attempt| {
-                    value
-                        .primary_binding
-                        .attempt_id
-                        .is_none_or(|id| id == attempt.attempt_id)
-                }) =>
+            if lane.is_some_and(|lane| lane.operation_ids.contains(&value.operation_id)) =>
         {
             Some(value.as_ref())
         }
         _ => None,
-    }));
+    }))
+    .filter(|value| {
+        value.assignment_status == AssignmentStatus::Resolved
+            && value.primary_binding.task_id == Some(task.task_id)
+            && value.primary_binding.workstream_id == Some(stream.workstream_id)
+            && value.primary_binding.episode_id == Some(episode.episode_id)
+    });
     let checkpoint = unique(facts.iter().filter_map(|payload| match payload {
         JournalPayload::WorkCheckpointRecorded(value)
             if value.episode_id == episode.episode_id

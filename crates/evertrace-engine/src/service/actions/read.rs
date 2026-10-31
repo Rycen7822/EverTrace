@@ -466,6 +466,11 @@ impl McpActionService {
             .as_ref()
             .map(|context| (context.frontier, context.rows.as_slice()))
             .unwrap_or((scope.context.frontier, scope.context.rows.as_slice()));
+        if let Some(current) = &candidate_context {
+            context.execution = scope
+                .anchor
+                .execution_context(current.frontier, &current.scope);
+        }
         let mut review = self
             .classify_search_candidates(SearchCandidateReviewInput {
                 request_id: &request_id,

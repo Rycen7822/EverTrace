@@ -318,6 +318,20 @@ impl StageTrace {
         Ok(trace)
     }
 
+    pub(crate) fn clear_attempt_state(&mut self) {
+        for frame in &mut self.frames {
+            frame.state.bindings.retain(|binding| {
+                !matches!(
+                    binding.field,
+                    ConstraintField::VerifierState
+                        | ConstraintField::FailureSignature
+                        | ConstraintField::ExperimentState
+                )
+            });
+            frame.verifier_witness = None;
+        }
+    }
+
     pub(crate) fn current(&self) -> Option<&ConstraintState> {
         self.frames.last().map(|frame| &frame.state)
     }
