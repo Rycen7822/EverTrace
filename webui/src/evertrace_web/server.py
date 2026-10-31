@@ -1,4 +1,5 @@
 """One foreground Python HTTP/presentation worker; no daemon state or DB access."""
+
 import asyncio
 import hmac
 from pathlib import Path
@@ -16,10 +17,26 @@ from uvicorn.protocols.http.h11_impl import H11Protocol
 from .backend import Backend, BackendError, _decode
 
 ROOT = Path(__file__).resolve().parent
-CSP = "default-src 'none'; script-src 'self'; style-src 'self'; font-src 'self'; img-src 'self'; connect-src 'self'; base-uri 'none'; object-src 'none'; frame-ancestors 'none'; form-action 'none'"
-SECURITY = {"Content-Security-Policy": CSP, "Cache-Control": "no-store", "X-Content-Type-Options": "nosniff", "Referrer-Policy": "no-referrer", "Connection": "close"}
+CSP = (
+    "default-src 'none'; script-src 'self'; style-src 'self'; font-src 'self'; "
+    "img-src 'self'; connect-src 'self'; base-uri 'none'; object-src 'none'; "
+    "frame-ancestors 'none'; form-action 'none'"
+)
+SECURITY = {
+    "Content-Security-Policy": CSP,
+    "Cache-Control": "no-store",
+    "X-Content-Type-Options": "nosniff",
+    "Referrer-Policy": "no-referrer",
+    "Connection": "close",
+}
 STATIC = {"/styles.css": ("styles.css", "text/css"), "/app.js": ("app.js", "text/javascript")}
-for name in ("IBMPlexSans-Regular.ttf", "IBMPlexSans-Medium.ttf", "IBMPlexSans-Semibold.ttf", "IBMPlexMono-Regular.ttf", "IBMPlexMono-Medium.ttf"):
+for name in (
+    "IBMPlexSans-Regular.ttf",
+    "IBMPlexSans-Medium.ttf",
+    "IBMPlexSans-Semibold.ttf",
+    "IBMPlexMono-Regular.ttf",
+    "IBMPlexMono-Medium.ttf",
+):
     STATIC[f"/assets/fonts/{name}"] = (f"assets/fonts/{name}", "font/ttf")
 for name in ("ibmplexsans-OFL.txt", "ibmplexmono-OFL.txt"):
     STATIC[f"/assets/fonts/{name}"] = (f"assets/fonts/{name}", "text/plain")
@@ -27,6 +44,7 @@ for name in ("ibmplexsans-OFL.txt", "ibmplexmono-OFL.txt"):
 
 class BoundedHTTP(H11Protocol):
     """Apply limits before ASGI starts, including an incomplete HTTP header."""
+
     def connection_made(self, transport):
         self.transport = transport
         self.web_deadline = None
@@ -51,8 +69,16 @@ class App:
         self.capability = secrets.token_hex(32)
         self.bootstrap_deadline = time.monotonic() + 120
         self.session = None
-        self.templates = Environment(loader=FileSystemLoader(str(ROOT / "templates")), autoescape=select_autoescape(("html",)), undefined=StrictUndefined, cache_size=8, auto_reload=False)
-        self.templates.filters["pretty"] = lambda value: orjson.dumps(value, option=orjson.OPT_INDENT_2).decode()
+        self.templates = Environment(
+            loader=FileSystemLoader(str(ROOT / "templates")),
+            autoescape=select_autoescape(("html",)),
+            undefined=StrictUndefined,
+            cache_size=8,
+            auto_reload=False,
+        )
+        self.templates.filters["pretty"] = lambda value: orjson.dumps(
+            value, option=orjson.OPT_INDENT_2
+        ).decode()
         self.templates.filters["field_value"] = display_field_value
 
     def authenticated(self, request, touch=False):
@@ -63,7 +89,11 @@ class App:
         if now - current["started"] >= 8 * 3600 or now - current["seen"] >= 15 * 60:
             self.session = None
             return False
-        cookies = [part.strip().partition("=")[2] for part in request.headers.get("cookie", "").split(";") if part.strip().partition("=")[0] == self.cookie]
+        cookies = [
+            part.strip().partition("=")[2]
+            for part in request.headers.get("cookie", "").split(";")
+            if part.strip().partition("=")[0] == self.cookie
+        ]
         if len(cookies) != 1 or not hmac.compare_digest(cookies[0], current["token"]):
             return False
         if touch:
@@ -84,10 +114,25 @@ class App:
 
     async def handle(self, request):
         raw = request.scope["headers"]
-        sensitive = {b"host", b"origin", b"cookie", b"x-evertrace-web", b"x-evertrace-csrf", b"content-length", b"transfer-encoding"}
-        if len(raw) > 32 or sum(len(key) + len(value) + 4 for key, value in raw) > 16_384 or any(sum(key.lower() == name for key, _ in raw) > 1 for name in sensitive):
+        sensitive = {
+            b"host",
+            b"origin",
+            b"cookie",
+            b"x-evertrace-web",
+            b"x-evertrace-csrf",
+            b"content-length",
+            b"transfer-encoding",
+        }
+        if (
+            len(raw) > 32
+            or sum(len(key) + len(value) + 4 for key, value in raw) > 16_384
+            or any(sum(key.lower() == name for key, _ in raw) > 1 for name in sensitive)
+        ):
             return JSONResponse({"error": "invalid_headers"}, status_code=400)
-        if request.headers.get("host") != self.host or request.headers.get("origin", self.origin) != self.origin:
+        if (
+            request.headers.get("host") != self.host
+            or request.headers.get("origin", self.origin) != self.origin
+        ):
             return JSONResponse({"error": "wrong_origin"}, status_code=403)
         if request.method not in ("GET", "POST"):
             return Response(status_code=405)
@@ -97,21 +142,34 @@ class App:
         if request.method == "GET" and path in STATIC:
             relative, content_type = STATIC[path]
             file = ROOT / "static" / relative
-            if file.is_symlink() or not file.resolve().is_relative_to((ROOT / "static").resolve()) or not file.is_file():
+            if (
+                file.is_symlink()
+                or not file.resolve().is_relative_to((ROOT / "static").resolve())
+                or not file.is_file()
+            ):
                 return Response(status_code=404)
             return FileResponse(file, media_type=content_type)
         if not path.startswith("/api/"):
             return Response(status_code=404)
         if request.headers.get("x-evertrace-web") != "1":
             return JSONResponse({"error": "web_header_required"}, status_code=403)
-        expected_method = {"/api/session": "GET", "/api/status": "GET", "/api/bootstrap": "POST", "/api/logout": "POST", "/api/read": "POST"}.get(path)
+        expected_method = {
+            "/api/session": "GET",
+            "/api/status": "GET",
+            "/api/bootstrap": "POST",
+            "/api/logout": "POST",
+            "/api/read": "POST",
+        }.get(path)
         if expected_method is None:
             return Response(status_code=404)
         if request.method != expected_method:
             return Response(status_code=405)
         payload = None
         if request.method == "POST":
-            if request.headers.get("origin") != self.origin or request.headers.get("content-type") != "application/json":
+            if (
+                request.headers.get("origin") != self.origin
+                or request.headers.get("content-type") != "application/json"
+            ):
                 return JSONResponse({"error": "invalid_post"}, status_code=403)
             body = bytearray()
             async for chunk in request.stream():
@@ -123,18 +181,33 @@ class App:
                 return JSONResponse({"error": "invalid_body"}, status_code=400)
         if path == "/api/bootstrap":
             supplied = payload.get("token")
-            if set(payload) != {"token"} or not isinstance(supplied, str) or self.capability is None or time.monotonic() >= self.bootstrap_deadline or not hmac.compare_digest(supplied, self.capability):
+            if (
+                set(payload) != {"token"}
+                or not isinstance(supplied, str)
+                or self.capability is None
+                or time.monotonic() >= self.bootstrap_deadline
+                or not hmac.compare_digest(supplied, self.capability)
+            ):
                 return JSONResponse({"error": "invalid_capability"}, status_code=403)
             now = time.monotonic()
             self.capability = None
-            self.session = {"token": secrets.token_hex(32), "csrf": secrets.token_hex(32), "started": now, "seen": now}
+            self.session = {
+                "token": secrets.token_hex(32),
+                "csrf": secrets.token_hex(32),
+                "started": now,
+                "seen": now,
+            }
             response = JSONResponse({"csrf": self.session["csrf"]})
-            response.set_cookie(self.cookie, self.session["token"], httponly=True, samesite="strict", path="/")
+            response.set_cookie(
+                self.cookie, self.session["token"], httponly=True, samesite="strict", path="/"
+            )
             return response
         if not self.authenticated(request, touch=True):
             return JSONResponse({"error": "session_expired"}, status_code=401)
         current = self.session
-        if request.method == "POST" and not hmac.compare_digest(request.headers.get("x-evertrace-csrf", ""), current["csrf"]):
+        if request.method == "POST" and not hmac.compare_digest(
+            request.headers.get("x-evertrace-csrf", ""), current["csrf"]
+        ):
             return JSONResponse({"error": "csrf_required"}, status_code=403)
         if path == "/api/session":
             return JSONResponse({"csrf": current["csrf"]})
@@ -149,7 +222,9 @@ class App:
             if path == "/api/status":
                 result = await self.backend.health()
                 data = {"mode": result["mode"], "config_hash": result["effective_config_hash"]}
-            elif payload.get("kind") == "list" and not (set(payload) - {"kind", "query", "after", "expected_frontier"}):
+            elif payload.get("kind") == "list" and not (
+                set(payload) - {"kind", "query", "after", "expected_frontier"}
+            ):
                 after = payload.get("after")
                 frontier = parse_frontier(payload.get("expected_frontier"), optional=True)
                 if not valid_ref(after, optional=True):
@@ -158,9 +233,61 @@ class App:
                 if result["kind"] == "conflict":
                     data = {"conflict": True}
                 else:
-                    empty = "范围不存在、已移除或当前不可用；这不表示记忆数量为零。" if not result["scope_available"] else "这些条件下没有条目；可以清除筛选。" if result["total_count"] else "当前范围没有可列出的元数据记录。"
-                    data = {"html": self.templates.get_template("list.html").render(items=result["items"], empty_message=empty), "frontier": str(result["frontier"]), "next_cursor": result["next_cursor"], "count": len(result["items"]), "degraded": result["status"] != "ready", "query": present_memory_query(result["query"]), "total_count": str(result["total_count"]) if result["total_count"] is not None else None, "matching_count": str(result["matching_count"]) if result["matching_count"] is not None else None, "scope_available": result["scope_available"], "counts_complete": result["counts_complete"], "unresolved_scope_count": str(result["unresolved_scope_count"])}
-            elif payload.get("kind") == "source_archive" and not (set(payload) - {"kind", "query", "after", "expected_frontier"}):
+                    empty = (
+                        "范围不存在、已移除或当前不可用；这不表示记忆数量为零。"
+                        if not result["scope_available"]
+                        else "这些条件下没有条目；可以清除筛选。"
+                        if result["total_count"]
+                        else "当前范围没有可列出的元数据记录。"
+                    )
+                    data = {
+                        "html": self.templates.get_template("list.html").render(
+                            items=result["items"], empty_message=empty
+                        ),
+                        "frontier": str(result["frontier"]),
+                        "next_cursor": result["next_cursor"],
+                        "count": len(result["items"]),
+                        "degraded": result["status"] != "ready",
+                        "query": present_memory_query(result["query"]),
+                        "total_count": str(result["total_count"])
+                        if result["total_count"] is not None
+                        else None,
+                        "matching_count": str(result["matching_count"])
+                        if result["matching_count"] is not None
+                        else None,
+                        "scope_available": result["scope_available"],
+                        "counts_complete": result["counts_complete"],
+                        "unresolved_scope_count": str(result["unresolved_scope_count"]),
+                    }
+            elif payload.get("kind") in ("inbox", "jobs") and not (
+                set(payload) - {"kind", "after", "expected_frontier"}
+            ):
+                after = payload.get("after")
+                frontier = parse_frontier(payload.get("expected_frontier"), optional=True)
+                if not valid_ref(after, optional=True):
+                    return JSONResponse({"error": "invalid_read"}, 400)
+                surface = "inbox" if payload["kind"] == "inbox" else "system"
+                result = await self.backend.observations(surface, after, frontier)
+                if result["kind"] == "conflict":
+                    data = {"conflict": True}
+                else:
+                    data = {
+                        "html": self.templates.get_template("observations.html").render(
+                            items=result["items"], surface=surface
+                        ),
+                        "frontier": str(result["frontier"]),
+                        "next_cursor": result["next_cursor"],
+                        "count": len(result["items"]),
+                        "degraded": result["status"] != "ready",
+                    }
+            elif payload.get("kind") == "job" and set(payload) == {"kind", "job_id", "frontier"}:
+                result = await self.backend.job(
+                    payload["job_id"], parse_frontier(payload["frontier"])
+                )
+                data = present_detail(self.templates, result, "system")
+            elif payload.get("kind") == "source_archive" and not (
+                set(payload) - {"kind", "query", "after", "expected_frontier"}
+            ):
                 frontier = parse_frontier(payload.get("expected_frontier"), optional=True)
                 after = payload.get("after")
                 if not valid_ref(after, optional=True):
@@ -174,8 +301,18 @@ class App:
                     if query["kind"] == "records":
                         for key in ("from_sequence", "until_sequence"):
                             query[key] = str(query[key]) if query[key] is not None else None
-                    data = {"html": self.templates.get_template("source_archive.html").render(page=page), "query": query, "frontier": str(page["frontier"]), "next_cursor": page["next_cursor"], "state": page["state"]}
-            elif payload.get("kind") == "source_catalog" and not (set(payload) - {"kind", "query", "after", "expected_frontier"}):
+                    data = {
+                        "html": self.templates.get_template("source_archive.html").render(
+                            page=page
+                        ),
+                        "query": query,
+                        "frontier": str(page["frontier"]),
+                        "next_cursor": page["next_cursor"],
+                        "state": page["state"],
+                    }
+            elif payload.get("kind") == "source_catalog" and not (
+                set(payload) - {"kind", "query", "after", "expected_frontier"}
+            ):
                 frontier = parse_frontier(payload.get("expected_frontier"), optional=True)
                 after = payload.get("after")
                 if not valid_ref(after, optional=True):
@@ -185,9 +322,27 @@ class App:
                     data = {"conflict": True}
                 else:
                     page = result["page"]
-                    selected = page["entries"][0] if page["query"]["source_instance_id"] is not None and len(page["entries"]) == 1 else None
-                    data = {"html": self.templates.get_template("source_catalog.html").render(items=page["entries"]), "detail_html": self.templates.get_template("source_catalog_detail.html").render(item=selected), "query": page["query"], "frontier": str(page["frontier"]), "next_cursor": page["next_cursor"], "count": len(page["entries"])}
-            elif payload.get("kind") == "scopes" and not (set(payload) - {"kind", "query", "after", "expected_frontier"}):
+                    selected = (
+                        page["entries"][0]
+                        if page["query"]["source_instance_id"] is not None
+                        and len(page["entries"]) == 1
+                        else None
+                    )
+                    data = {
+                        "html": self.templates.get_template("source_catalog.html").render(
+                            items=page["entries"]
+                        ),
+                        "detail_html": self.templates.get_template(
+                            "source_catalog_detail.html"
+                        ).render(item=selected),
+                        "query": page["query"],
+                        "frontier": str(page["frontier"]),
+                        "next_cursor": page["next_cursor"],
+                        "count": len(page["entries"]),
+                    }
+            elif payload.get("kind") == "scopes" and not (
+                set(payload) - {"kind", "query", "after", "expected_frontier"}
+            ):
                 frontier = parse_frontier(payload.get("expected_frontier"), optional=True)
                 after = payload.get("after")
                 if not valid_ref(after, optional=True):
@@ -197,8 +352,23 @@ class App:
                     data = {"conflict": True}
                 else:
                     page = result["page"]
-                    data = {"html": self.templates.get_template("scopes.html").render(items=page["items"]), "query": page["query"], "frontier": str(page["frontier"]), "next_cursor": page["next_cursor"], "parent_available": page["parent_available"], "complete": page["complete"], "names_complete": page["names_complete"]}
-            elif payload.get("kind") == "compare" and set(payload) == {"kind", "query", "frontier", "after"}:
+                    data = {
+                        "html": self.templates.get_template("scopes.html").render(
+                            items=page["items"]
+                        ),
+                        "query": page["query"],
+                        "frontier": str(page["frontier"]),
+                        "next_cursor": page["next_cursor"],
+                        "parent_available": page["parent_available"],
+                        "complete": page["complete"],
+                        "names_complete": page["names_complete"],
+                    }
+            elif payload.get("kind") == "compare" and set(payload) == {
+                "kind",
+                "query",
+                "frontier",
+                "after",
+            }:
                 frontier = parse_frontier(payload["frontier"])
                 if not valid_ref(payload["after"], optional=True):
                     return JSONResponse({"error": "invalid_read"}, 400)
@@ -207,63 +377,181 @@ class App:
                     data = {"conflict": True}
                 else:
                     comparison = result["comparison"]
-                    data = {"html": self.templates.get_template("comparison.html").render(comparison=comparison), "frontier": str(comparison["frontier"]), "next_cursor": comparison["next_cursor"], "status": comparison["status"]}
-            elif payload.get("kind") == "content" and set(payload) == {"kind", "reference", "frontier", "revision", "representation", "after"}:
+                    data = {
+                        "html": self.templates.get_template("comparison.html").render(
+                            comparison=comparison
+                        ),
+                        "frontier": str(comparison["frontier"]),
+                        "next_cursor": comparison["next_cursor"],
+                        "status": comparison["status"],
+                    }
+            elif payload.get("kind") == "content" and set(payload) == {
+                "kind",
+                "reference",
+                "frontier",
+                "revision",
+                "representation",
+                "after",
+            }:
                 frontier = parse_frontier(payload["frontier"])
-                if not valid_ref(payload["reference"]) or not valid_ref(payload["revision"]) or not valid_ref(payload["after"], optional=True):
+                if (
+                    not valid_ref(payload["reference"])
+                    or not valid_ref(payload["revision"])
+                    or not valid_ref(payload["after"], optional=True)
+                ):
                     return JSONResponse({"error": "invalid_read"}, 400)
-                result = await self.backend.content(payload["reference"], frontier, payload["revision"], payload["representation"], payload["after"])
+                result = await self.backend.content(
+                    payload["reference"],
+                    frontier,
+                    payload["revision"],
+                    payload["representation"],
+                    payload["after"],
+                )
                 if result["kind"] == "conflict":
                     data = {"conflict": True}
                 else:
                     content = result["content"]
-                    data = {"html": self.templates.get_template("content.html").render(content=content), "text": content["text"], "state": content["state"], "previous_cursor": content["previous_cursor"], "next_cursor": content["next_cursor"], "frontier": str(content["frontier"]), **{key: str(content[key]) if content[key] is not None else None for key in ("total_bytes", "range_start", "range_end")}}
-            elif payload.get("kind") == "sources" and set(payload) == {"kind", "reference", "frontier", "revision", "after"}:
+                    data = {
+                        "html": self.templates.get_template("content.html").render(content=content),
+                        "text": content["text"],
+                        "state": content["state"],
+                        "previous_cursor": content["previous_cursor"],
+                        "next_cursor": content["next_cursor"],
+                        "frontier": str(content["frontier"]),
+                        **{
+                            key: str(content[key]) if content[key] is not None else None
+                            for key in ("total_bytes", "range_start", "range_end")
+                        },
+                    }
+            elif payload.get("kind") == "sources" and set(payload) == {
+                "kind",
+                "reference",
+                "frontier",
+                "revision",
+                "after",
+            }:
                 frontier = parse_frontier(payload["frontier"])
-                if not valid_ref(payload["reference"]) or not valid_ref(payload["revision"]) or not valid_ref(payload["after"], optional=True):
+                if (
+                    not valid_ref(payload["reference"])
+                    or not valid_ref(payload["revision"])
+                    or not valid_ref(payload["after"], optional=True)
+                ):
                     return JSONResponse({"error": "invalid_read"}, 400)
-                result = await self.backend.sources(payload["reference"], frontier, payload["revision"], payload["after"])
+                result = await self.backend.sources(
+                    payload["reference"], frontier, payload["revision"], payload["after"]
+                )
                 if result["kind"] == "conflict":
                     data = {"conflict": True}
                 else:
-                    data = {"html": self.templates.get_template("sources.html").render(items=result["items"], status=result["status"], reasons=result["degraded_reasons"]), "frontier": str(result["frontier"]), "next_cursor": result["next_cursor"], "degraded_reasons": result["degraded_reasons"]}
-            elif payload.get("kind") == "revisions" and set(payload) == {"kind", "reference", "frontier", "revision", "after"}:
+                    data = {
+                        "html": self.templates.get_template("sources.html").render(
+                            items=result["items"],
+                            status=result["status"],
+                            reasons=result["degraded_reasons"],
+                        ),
+                        "frontier": str(result["frontier"]),
+                        "next_cursor": result["next_cursor"],
+                        "degraded_reasons": result["degraded_reasons"],
+                    }
+            elif payload.get("kind") == "revisions" and set(payload) == {
+                "kind",
+                "reference",
+                "frontier",
+                "revision",
+                "after",
+            }:
                 frontier = parse_frontier(payload["frontier"])
-                if not valid_ref(payload["reference"]) or not valid_ref(payload["revision"]) or not valid_ref(payload["after"], optional=True):
+                if (
+                    not valid_ref(payload["reference"])
+                    or not valid_ref(payload["revision"])
+                    or not valid_ref(payload["after"], optional=True)
+                ):
                     return JSONResponse({"error": "invalid_read"}, 400)
-                result = await self.backend.revisions(payload["reference"], frontier, payload["revision"], payload["after"])
+                result = await self.backend.revisions(
+                    payload["reference"], frontier, payload["revision"], payload["after"]
+                )
                 if result["kind"] == "conflict":
                     data = {"conflict": True}
                 else:
-                    data = {"html": self.templates.get_template("revisions.html").render(items=result["items"], source_revision=payload["revision"], status=result["status"]), "frontier": str(result["frontier"]), "next_cursor": result["next_cursor"]}
-            elif payload.get("kind") == "detail" and set(payload) == {"kind", "reference", "frontier", "revision"}:
+                    data = {
+                        "html": self.templates.get_template("revisions.html").render(
+                            items=result["items"],
+                            source_revision=payload["revision"],
+                            status=result["status"],
+                        ),
+                        "frontier": str(result["frontier"]),
+                        "next_cursor": result["next_cursor"],
+                    }
+            elif payload.get("kind") == "detail" and set(payload) == {
+                "kind",
+                "reference",
+                "frontier",
+                "revision",
+                "surface",
+            }:
                 frontier = parse_frontier(payload["frontier"])
-                if not valid_ref(payload["reference"]) or not valid_ref(payload["revision"], optional=True):
+                surface = payload["surface"]
+                if (
+                    surface not in ("explorer", "inbox", "system")
+                    or not valid_ref(payload["reference"])
+                    or not valid_ref(payload["revision"], optional=True)
+                ):
                     return JSONResponse({"error": "invalid_read"}, status_code=400)
-                result = await self.backend.detail(payload["reference"], frontier, payload["revision"])
-                if result["kind"] == "conflict":
-                    data = {"conflict": True}
-                else:
-                    item = result["items"][0] if len(result["items"]) == 1 else None
-                    evidence = item.get("evidence_detail") if item else None
-                    presentation = evidence.get("protected_presentation") if evidence else None
-                    preview = presentation.get("text") if presentation and presentation.get("kind") in ("inline", "preview") else None
-                    data = {"html": self.templates.get_template("detail.html").render(items=result["items"]), "source_preview": preview}
+                result = await self.backend.detail(
+                    payload["reference"], frontier, payload["revision"], surface
+                )
+                data = present_detail(self.templates, result, surface)
             else:
                 return JSONResponse({"error": "read_unavailable"}, status_code=400)
         except BackendError as error:
             code = 400 if error.code == "invalid_input" else 503
-            return JSONResponse({"error": "invalid_read" if code == 400 else "daemon_unavailable"}, status_code=code)
+            return JSONResponse(
+                {"error": "invalid_read" if code == 400 else "daemon_unavailable"}, status_code=code
+            )
         if self.session is not current or not self.authenticated(request):
             return JSONResponse({"error": "session_expired"}, status_code=401)
         return JSONResponse(data)
+
+
+def present_detail(templates, result, surface):
+    if result["kind"] == "conflict":
+        return {"conflict": True}
+    item = result["items"][0] if len(result["items"]) == 1 else None
+    evidence = item.get("evidence_detail") if item else None
+    presentation = evidence.get("protected_presentation") if evidence else None
+    preview = (
+        presentation.get("text")
+        if presentation and presentation.get("kind") in ("inline", "preview")
+        else None
+    )
+    template = "detail.html" if surface == "explorer" else "observation_detail.html"
+    selection = (
+        {
+            "key": item["stable_key"],
+            "revision": item["revision_ref"],
+            "object": item["object_ref"],
+            "kind": item["object_kind"],
+            "surface": surface,
+        }
+        if item
+        else None
+    )
+    return {
+        "html": templates.get_template(template).render(items=result["items"], surface=surface),
+        "source_preview": preview,
+        "selection": selection,
+    }
 
 
 def present_memory_query(query):
     result = dict(query)
     window = query.get("time_range")
     if window is not None:
-        result["time_range"] = {"basis": window["basis"], "from_us": str(window["from_us"]) if window["from_us"] is not None else None, "until_us": str(window["until_us"]) if window["until_us"] is not None else None}
+        result["time_range"] = {
+            "basis": window["basis"],
+            "from_us": str(window["from_us"]) if window["from_us"] is not None else None,
+            "until_us": str(window["until_us"]) if window["until_us"] is not None else None,
+        }
     return result
 
 
@@ -275,7 +563,13 @@ def display_field_value(text):
 
 
 def valid_ref(value, optional=False):
-    return optional and value is None or isinstance(value, str) and 0 < len(value) <= 4096 and not any(ord(char) < 32 for char in value)
+    return (
+        optional
+        and value is None
+        or isinstance(value, str)
+        and 0 < len(value) <= 4096
+        and not any(ord(char) < 32 for char in value)
+    )
 
 
 def parse_frontier(value, optional=False):
@@ -300,7 +594,20 @@ async def serve(context, port):
         listener.setblocking(False)
         host = f"127.0.0.1:{listener.getsockname()[1]}"
         app = App(backend, host)
-        config = uvicorn.Config(app, http=BoundedHTTP, loop="asyncio", ws="none", workers=1, lifespan="off", access_log=False, server_header=False, date_header=False, log_level="warning", timeout_keep_alive=0, h11_max_incomplete_event_size=16_384)
+        config = uvicorn.Config(
+            app,
+            http=BoundedHTTP,
+            loop="asyncio",
+            ws="none",
+            workers=1,
+            lifespan="off",
+            access_log=False,
+            server_header=False,
+            date_header=False,
+            log_level="warning",
+            timeout_keep_alive=0,
+            h11_max_incomplete_event_size=16_384,
+        )
         print(f"WebUI: {app.origin}/#bootstrap={app.capability}", flush=True)
         await uvicorn.Server(config).serve(sockets=[listener])
     finally:

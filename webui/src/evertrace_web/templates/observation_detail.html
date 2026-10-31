@@ -1,0 +1,118 @@
+{% if items|length != 1 %}
+<div class="empty">没有找到这份记录，或当前无法读取。未用其它任务、当前修订或空正文代替。</div>
+{% else %}
+{% set item = items[0] %}
+{% set system = item.get('system_detail') %}
+{% set job = system.detail if system and system.kind == 'job' else none %}
+<div class="detail-title">
+  <div class="badges">
+    <span class="badge">只读观察</span>
+    <span class="badge">{{ item.category }}</span>
+  </div>
+  <h2>{{ job.job_kind if job else item.object_kind }}</h2>
+  <p>{{ job.job_id if job else item.revision_ref or item.object_ref or item.stable_key }}</p>
+</div>
+{% if job %}
+{% set states = {'queued': '排队中', 'leased': '已租用', 'succeeded': '已结束', 'failed': '失败'} %}
+<section>
+  <h3>任务状态</h3>
+  <dl class="observation-facts">
+    <dt>原生状态</dt><dd>{{ states.get(job.state, job.state) }}（{{ job.state }}）</dd>
+    <dt>终态原因</dt><dd>{{ job.terminal_reason or '尚无终态原因' }}</dd>
+    <dt>提交审计引用</dt><dd>此读面尚未提供；请保留 CLI 返回的 audit_event_ref。</dd>
+    <dt>结果引用</dt><dd>{{ job.terminal_result_ref or '未记录结果引用' }}</dd>
+    <dt>目标修订</dt><dd>{{ job.target_revision }}</dd>
+    <dt>目标水位 / 代次</dt><dd>{{ job.target_watermark }} / {{ job.target_generation }}</dd>
+    <dt>尝试次数</dt><dd>{{ job.attempt }}</dd>
+    <dt>重试不早于（原生微秒）</dt>
+    <dd>{{ job.backoff_until_us if job.backoff_until_us is not none else '未记录' }}</dd>
+    <dt>租约截至（原生微秒）</dt>
+    <dd>{{ job.lease_until_us if job.lease_until_us is not none else '未记录' }}</dd>
+    <dt>算法</dt><dd>{{ job.algorithm_revision }}</dd>
+    <dt>模型</dt><dd>{{ job.model_id or '未记录模型' }}</dd>
+  </dl>
+  <p class="muted">
+    “已租用”只表示原生租约状态；“已结束”仍须结合终态原因和结果判断，不自动等于产生了新结果。
+    此页面不会续租、重试、取消或提交任务。
+  </p>
+</section>
+{% if job.get('backup_summary') %}
+<section>
+  <h3>原生备份结果</h3>
+  <dl class="observation-facts">
+    <dt>验证依据</dt><dd>{{ job.backup_summary.validation_result }}</dd>
+    <dt>备份水位</dt><dd>{{ job.backup_summary.frontier }}</dd>
+    <dt>文件数 / 声明字节</dt>
+    <dd>{{ job.backup_summary.file_count }} / {{ job.backup_summary.total_bytes }}</dd>
+    <dt>预检所需 / 当时可用字节</dt>
+    <dd>{{ job.backup_summary.required_space_bytes }} / {{ job.backup_summary.available_space_bytes_at_preflight }}</dd>
+  </dl>
+  <p class="muted">这是该任务保存的结果与验证依据，不代表此刻重新扫描并验证了备份内容。</p>
+  <details>
+    <summary>备份结果元数据</summary>
+    <pre>{{ job.backup_summary|pretty }}</pre>
+  </details>
+</section>
+{% endif %}
+{% if job.get('gc_summary') %}
+<section>
+  <h3>原生 GC 结果</h3>
+  <p>
+    检查 {{ job.gc_summary.examined_files }} 个文件；标记 {{ job.gc_summary.marked_candidates }} 个候选；
+    删除 {{ job.gc_summary.deleted_count }} 个、{{ job.gc_summary.deleted_bytes }} 字节；
+    未知 {{ job.gc_summary.unknown_count }} 个。
+  </p>
+  <details><summary>GC 水位与校验记录</summary><pre>{{ job.gc_summary|pretty }}</pre></details>
+</section>
+{% endif %}
+{% if job.get('native_history_cleanup_availability') %}
+<p>原生历史清理仍不可用：外部读取者排除尚未验证。没有开放清理操作。</p>
+{% endif %}
+{% elif surface == 'inbox' %}
+<p class="notice">
+  审核操作尚未开放。这里显示现有原生事实；能看见元数据不代表正文可读、提案可接受或支持已恢复。
+</p>
+{% if item.proposal %}
+<section>
+  <h3>提案与预期修订</h3>
+  <dl class="observation-facts">
+    <dt>操作 / 目标</dt><dd>{{ item.proposal.operation }} / {{ item.proposal.target_kind }}</dd>
+    <dt>提案状态 / 资格</dt><dd>{{ item.proposal.status }} / {{ item.proposal.eligibility }}</dd>
+    <dt>指纹</dt><dd>{{ item.proposal.fingerprint }}</dd>
+    <dt>基准修订</dt><dd>{{ item.proposal.base_revision_id or '无基准修订' }}</dd>
+  </dl>
+</section>
+{% endif %}
+{% if item.proposal_review %}
+<section>
+  <h3>原生提案正文（只读）</h3>
+  <p>
+    普通接受资格：{{ '具备' if item.proposal_review.plain_accept_eligible else '不具备' }}；
+    合并接受资格：{{ '具备' if item.proposal_review.merge_and_accept_eligible else '不具备' }}。
+    这不是浏览器授权。
+  </p>
+  <pre>{{ item.proposal_review.proposal.payload|pretty }}</pre>
+</section>
+{% elif item.proposal %}
+<p>本次没有返回可读提案正文或审核上下文；不显示旧正文。</p>
+{% endif %}
+{% if item.get('proposal_base') %}
+<section><h3>原基准修订</h3><pre>{{ item.proposal_base|pretty }}</pre></section>
+{% endif %}
+{% for field, label in [
+  ('negative_review', '负面证据审核'),
+  ('support_detail', '支持状态'),
+  ('competing_detail', '竞争状态'),
+  ('recovery_detail', '恢复证据'),
+  ('work_detail', '工作证据'),
+  ('worktree_detail', '工作树谱系'),
+  ('execution_integrity_detail', '执行完整性')
+] %}
+{% if item.get(field) %}
+<section><h3>{{ label }}</h3><pre>{{ item[field]|pretty }}</pre></section>
+{% endif %}
+{% endfor %}
+{% else %}
+<p>这份记录不是任务详情；没有转为其它系统操作。</p>
+{% endif %}
+{% endif %}

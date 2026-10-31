@@ -1,0 +1,60 @@
+{% set categories = {
+  'proposal': '提案',
+  'support': '支持复核',
+  'negative_review': '负面证据审核',
+  'competing_resolution': '竞争状态纠正',
+  'recovery_correction': '恢复纠正',
+  'review_hold': '待复核',
+  'attempt_resume': '继续尝试',
+  'capture_integrity': '捕获完整性',
+  'runtime': '后台任务'
+} %}
+{% set states = {'queued': '排队中', 'leased': '已租用', 'succeeded': '已结束', 'failed': '失败'} %}
+{% for item in items %}
+{% set system = item.get('system_detail') %}
+{% set job = system.detail if system and system.kind == 'job' else none %}
+<button
+  class="memory-item"
+  data-key="{{ item.stable_key }}"
+  data-revision="{{ item.revision_ref or '' }}"
+  data-kind="{{ item.object_kind }}"
+  data-object="{{ item.object_ref or '' }}"
+  data-surface="{{ surface }}"
+>
+  <div class="item-topline">
+    <span class="type-pill">
+      {{ '后台任务' if job else categories.get(item.category, item.category) }}
+    </span>
+    {% if job %}
+    <span class="badge">{{ states.get(job.state, job.state) }}</span>
+    {% elif item.proposal %}
+    <span class="badge">{{ item.proposal.status }}</span>
+    {% elif item.lifecycle %}
+    <span class="badge">{{ item.lifecycle }}</span>
+    {% endif %}
+  </div>
+  <h3>{{ job.job_kind if job else item.proposal.target_kind if item.proposal else item.object_kind }}</h3>
+  {% if job %}
+  <p class="reading-excerpt">Job ID：{{ job.job_id }}</p>
+  <p class="muted">
+    尝试 {{ job.attempt }}
+    {% if job.terminal_reason %} · 终态原因：{{ job.terminal_reason }}
+    {% elif job.backoff_until_us is not none %} · 有原生 backoff 水位{% endif %}
+  </p>
+  {% elif item.proposal %}
+  <p class="reading-excerpt">{{ item.proposal.operation }} · {{ item.proposal.eligibility }}</p>
+  <p class="muted">{{ item.proposal.proposal_id }}</p>
+  {% else %}
+  <p class="muted">{{ item.revision_ref or item.object_ref or item.stable_key }}</p>
+  {% endif %}
+  <p class="scope-ref">{{ item.scope_ref or '范围在打开详情时按原权限复验' }}</p>
+</button>
+{% else %}
+<div class="empty">
+  {% if surface == 'system' %}
+  当前没有可列出的任务记录。未找到记录不表示某个任务已成功。
+  {% else %}
+  当前没有待处理条目。这里只读取原生审核队列，不自动接受、忽略或执行任何操作。
+  {% endif %}
+</div>
+{% endfor %}
