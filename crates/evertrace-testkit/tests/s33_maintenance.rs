@@ -1487,7 +1487,7 @@ async fn old_live_ledger_merges_into_converted_candidate_without_resurrection() 
     // Mint the real pre-deletion v2 backup with the original publication
     // algorithm, then leave the live root carrying the later deletion ledger.
     std::fs::remove_dir_all(data_root.join("store")).unwrap();
-    evertrace_store::test_support::write_legacy_fixture(&data_root, true, "L0002", &rows_t0)
+    evertrace_store::test_support::write_conversion_fixture(&data_root, true, "L0002", &rows_t0)
         .await
         .unwrap();
     let prepared = evertrace_store::restore::prepare_native_upgrade(
@@ -1512,7 +1512,7 @@ async fn old_live_ledger_merges_into_converted_candidate_without_resurrection() 
     let backup = prepared.backup().to_owned();
     prepared.discard().unwrap();
     std::fs::remove_dir_all(data_root.join("store")).unwrap();
-    evertrace_store::test_support::write_legacy_fixture(&data_root, true, "L0002", &rows_t1)
+    evertrace_store::test_support::write_conversion_fixture(&data_root, true, "L0002", &rows_t1)
         .await
         .unwrap();
 

@@ -1596,7 +1596,7 @@ async fn verify_legacy_backup_tables(
     directory: &Path,
     manifest: &BackupManifest,
 ) -> Result<(), BackupError> {
-    let legacy = crate::legacy_lance::read_legacy_store(&directory.join("store"))
+    let legacy = crate::conversion_input::read_conversion_input(&directory.join("store"))
         .await
         .map_err(map_store)?
         .ok_or(BackupError::Corrupt)?;

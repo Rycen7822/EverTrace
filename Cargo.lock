@@ -1908,6 +1908,7 @@ dependencies = [
  "arrow-schema",
  "evertrace-capture",
  "evertrace-domain",
+ "evertrace-store",
  "fs2",
  "lancedb",
  "rusqlite",

@@ -1,7 +1,7 @@
 use std::{fs, path::PathBuf};
 
-use evertrace_store::{
-    CompatibilityStore, ProbeRow, probe_batch, probe_schema, schema_fingerprint,
+use evertrace_store::test_support::{
+    ProbeRow, TestIndexStore, probe_batch, probe_schema, schema_fingerprint,
 };
 use tempfile::TempDir;
 
@@ -98,9 +98,7 @@ fn profile_freezes_visibility_prune_snapshot_concurrency_and_negative_results() 
 #[tokio::test]
 async fn profile_helpers_create_only_isolated_probe_tables() {
     let temp = TempDir::new().unwrap();
-    let store = CompatibilityStore::connect_local(temp.path())
-        .await
-        .unwrap();
+    let store = TestIndexStore::connect_local(temp.path()).await.unwrap();
     let batch = probe_batch(&[ProbeRow {
         id: 1,
         command_id: "contract-1",

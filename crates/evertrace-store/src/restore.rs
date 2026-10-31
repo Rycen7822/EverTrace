@@ -188,7 +188,7 @@ async fn prepare_upgrade_inner(
     } else {
         data_dir
     };
-    let Some(legacy) = crate::legacy_lance::read_legacy_store(source).await? else {
+    let Some(legacy) = crate::conversion_input::read_conversion_input(source).await? else {
         if canonical_exists {
             // An existing canonical container without either physical format
             // must never be replaced by a fresh empty database.
@@ -801,7 +801,7 @@ pub async fn verify_package_resume(
         } else {
             data
         };
-        let legacy = crate::legacy_lance::read_legacy_store(source)
+        let legacy = crate::conversion_input::read_conversion_input(source)
             .await?
             .ok_or(StoreError::StoreCorrupt)?;
         let refs = legacy.full_snapshot()?.live_cas_refs()?;
@@ -1374,7 +1374,7 @@ fn current_store_format(data_dir: &Path) -> Result<CurrentStoreFormat, RestoreEr
     } else {
         data_dir
     };
-    match crate::legacy_lance::legacy_profile(source)? {
+    match crate::conversion_input::conversion_profile(source)? {
         Some(_) => Ok(CurrentStoreFormat::Legacy(source.to_owned())),
         None if canonical_exists => Err(StoreError::StoreCorrupt.into()),
         None => Ok(CurrentStoreFormat::Empty),
@@ -1425,7 +1425,7 @@ pub async fn prepare(
         // A historical copy keeps the verified original manifest and files;
         // only a candidate with current deletion authority is converted.
         if legacy_backup && !matches!(&current, CurrentStoreFormat::Empty) {
-            let legacy = crate::legacy_lance::read_legacy_store(&path.join("store"))
+            let legacy = crate::conversion_input::read_conversion_input(&path.join("store"))
                 .await?
                 .ok_or(StoreError::StoreCorrupt)?;
             crate::writer::bootstrap_legacy_candidate(
@@ -1662,7 +1662,7 @@ impl CurrentLedger {
     /// The same validated-history ledger from a read-only retired layout. The
     /// live store is never converted or reopened as a writer just to read it.
     async fn read_legacy(dir: &Path, lock_inode: (u64, u64)) -> Result<Self, StoreError> {
-        let store = crate::legacy_lance::read_legacy_store(dir)
+        let store = crate::conversion_input::read_conversion_input(dir)
             .await?
             .ok_or(StoreError::StoreCorrupt)?;
         let mut result = Self::from_rows(&store.rows, lock_inode)?;

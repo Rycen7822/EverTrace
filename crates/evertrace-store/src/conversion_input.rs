@@ -1,7 +1,7 @@
 //! Read-only decoder for the retired four-Lance physical layout.
 //!
-//! The offline converter and the offline restore of a legacy backup are the
-//! only consumers. Normal opens never reach this module: the current format is
+//! Explicit conversion and backup verification/restore are the only consumers.
+//! Normal opens never reach this module: the current format is
 //! one SQLite database plus the Lance search projection. Nothing here writes,
 //! repairs or renumbers logical history.
 
@@ -17,7 +17,7 @@ use crate::objects::{ObjectRow, ObjectRowClass, ObjectRowKind};
 use crate::relations::RelationProjectionRow;
 use crate::search::SearchProjectionRow;
 
-const LEGACY_TABLES: [&str; 4] = [
+const INPUT_TABLES: [&str; 4] = [
     crate::JOURNAL_TABLE,
     crate::OBJECTS_TABLE,
     crate::RELATIONS_TABLE,
@@ -27,7 +27,7 @@ const LEGACY_TABLES: [&str; 4] = [
 /// One fully decoded and validated retired layout, bound to the exact bytes
 /// read from `dir`. Physical versions and checkpoints are preserved; the
 /// caller decides what to write where.
-pub(crate) struct LegacyStore {
+pub(crate) struct ConversionInput {
     pub(crate) profile: &'static str,
     pub(crate) rows: Vec<JournalRow>,
     pub(crate) journal_version: u64,
@@ -39,7 +39,7 @@ pub(crate) struct LegacyStore {
     pub(crate) search_checkpoint: Option<u64>,
 }
 
-impl LegacyStore {
+impl ConversionInput {
     /// The journal frontier, i.e. the last logical command row.
     pub(crate) fn frontier(&self) -> u64 {
         self.rows.last().map(|row| row.seq).unwrap_or(0)
@@ -85,9 +85,9 @@ impl LegacyStore {
 /// Detect the retired layout in `dir` (a canonical old `store/` directory, a
 /// flat old data root or a copied backup `store/`). `None` means no old table
 /// at all; a partial or mixed set is corruption, never "absent".
-pub(crate) fn legacy_profile(dir: &Path) -> Result<Option<&'static str>, StoreError> {
+pub(crate) fn conversion_profile(dir: &Path) -> Result<Option<&'static str>, StoreError> {
     let mut present = BTreeSet::new();
-    for name in LEGACY_TABLES {
+    for name in INPUT_TABLES {
         match std::fs::symlink_metadata(dir.join(format!("{name}.lance"))) {
             Ok(metadata) => {
                 if !metadata.is_dir() || metadata.file_type().is_symlink() {
@@ -123,8 +123,10 @@ fn prefix_rows(rows: &[JournalRow], frontier: u64) -> Vec<JournalRow> {
 /// Read and validate the whole retired layout. Every logical journal field,
 /// complete command, migration marker, domain admission and derived family is
 /// checked against the actual bytes; the caller receives typed rows only.
-pub(crate) async fn read_legacy_store(dir: &Path) -> Result<Option<LegacyStore>, StoreError> {
-    let Some(profile) = legacy_profile(dir)? else {
+pub(crate) async fn read_conversion_input(
+    dir: &Path,
+) -> Result<Option<ConversionInput>, StoreError> {
+    let Some(profile) = conversion_profile(dir)? else {
         return Ok(None);
     };
     let connection = lancedb::connect(dir.to_str().ok_or(StoreError::InvalidPath)?)
@@ -262,7 +264,7 @@ pub(crate) async fn read_legacy_store(dir: &Path) -> Result<Option<LegacyStore>,
             (None, None, None, None)
         };
 
-    Ok(Some(LegacyStore {
+    Ok(Some(ConversionInput {
         profile,
         rows,
         journal_version,
@@ -791,7 +793,7 @@ pub(crate) mod test_format {
     /// creates the requested tables (canonical `store/` or flat) and never
     /// deletes or converts an existing store.
     #[cfg(feature = "test-utils")]
-    pub(crate) async fn write_legacy_fixture(
+    pub(crate) async fn write_conversion_fixture(
         root: &Path,
         canonical: bool,
         profile: &str,
@@ -855,8 +857,8 @@ mod tests {
     use super::*;
     use crate::backup::{BackupFrozenBoundary, BackupHookBoundary};
     use crate::command::{DirtyTarget, DirtyTargetKind, prepare_command};
+    use crate::conversion_input::test_format::{journal_batch, relations_batch, write_tables};
     use crate::journal::rows_for_append;
-    use crate::legacy_lance::test_format::{journal_batch, relations_batch, write_tables};
     use crate::{JournalCommand, JournalEventDraft, JournalPayload, ProjectionSnapshot};
 
     #[test]
@@ -1135,7 +1137,7 @@ mod tests {
     }
 
     async fn legacy_v2_backup(fixture: &Fixture) -> PathBuf {
-        let legacy = read_legacy_store(&fixture.data.join("store"))
+        let legacy = read_conversion_input(&fixture.data.join("store"))
             .await
             .unwrap()
             .unwrap();
@@ -1234,7 +1236,7 @@ mod tests {
             .unwrap();
         assert!(!directory.join("store/evertrace.sqlite").exists());
         assert_eq!(
-            read_legacy_store(&directory.join("store"))
+            read_conversion_input(&directory.join("store"))
                 .await
                 .unwrap()
                 .unwrap()
@@ -1270,7 +1272,7 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(verification.manifest_version(), 2);
-        let stored = read_legacy_store(&backup.join("store"))
+        let stored = read_conversion_input(&backup.join("store"))
             .await
             .unwrap()
             .unwrap();
@@ -1337,7 +1339,7 @@ mod tests {
         ] {
             assert!(!fixture.data.join(format!("{table}.lance")).exists());
         }
-        let stored = read_legacy_store(&backup.join("store"))
+        let stored = read_conversion_input(&backup.join("store"))
             .await
             .unwrap()
             .unwrap();
@@ -1521,7 +1523,7 @@ mod tests {
             .execute()
             .await
             .unwrap();
-        let result = read_legacy_store(&native).await;
+        let result = read_conversion_input(&native).await;
         assert!(matches!(result, Err(StoreError::StoreCorrupt)));
     }
 
@@ -1648,7 +1650,7 @@ mod tests {
                 };
                 let status = Command::new(std::env::current_exe().unwrap())
                     .arg("--exact")
-                    .arg("legacy_lance::tests::native_publication_process_child")
+                    .arg("conversion_input::tests::native_publication_process_child")
                     .arg("--nocapture")
                     .env("EVERTRACE_STORE_UPGRADE_CHILD", mode)
                     .env("EVERTRACE_STORE_UPGRADE_DATA", &data)
@@ -1799,7 +1801,7 @@ mod tests {
         let fixture = stage_at(&data, true, "L0002", false, 1, false).await;
         let mut child = Command::new(std::env::current_exe().unwrap())
             .arg("--exact")
-            .arg("legacy_lance::tests::native_publication_process_child")
+            .arg("conversion_input::tests::native_publication_process_child")
             .arg("--nocapture")
             .env("EVERTRACE_STORE_UPGRADE_CHILD", "lock")
             .env("EVERTRACE_STORE_UPGRADE_DATA", &data)
@@ -1843,7 +1845,7 @@ mod tests {
         };
         let blocked = Command::new(std::env::current_exe().unwrap())
             .arg("--exact")
-            .arg("legacy_lance::tests::native_publication_process_child")
+            .arg("conversion_input::tests::native_publication_process_child")
             .env("EVERTRACE_STORE_UPGRADE_CHILD", "probe-lock")
             .env("EVERTRACE_STORE_UPGRADE_DATA", &data)
             .env("EVERTRACE_STORE_UPGRADE_CONFIG", &fixture.config)

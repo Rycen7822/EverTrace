@@ -4524,7 +4524,7 @@ async fn real_hook_capture_during_prepared_native_upgrade_is_durable_and_ingests
         .unwrap();
     assert!(!rows.is_empty());
     fs::remove_dir_all(paths.data_root.join("store")).unwrap();
-    evertrace_store::test_support::write_legacy_fixture(&paths.data_root, true, "L0002", &rows)
+    evertrace_store::test_support::write_conversion_fixture(&paths.data_root, true, "L0002", &rows)
         .await
         .unwrap();
     CasStore::open(paths.data_root.join("cas")).unwrap();
@@ -4772,7 +4772,7 @@ async fn retired_live_fixture(
         .unwrap();
     assert!(!rows.is_empty());
     fs::remove_dir_all(paths.data_root.join("store")).unwrap();
-    evertrace_store::test_support::write_legacy_fixture(
+    evertrace_store::test_support::write_conversion_fixture(
         &paths.data_root,
         canonical,
         "L0002",

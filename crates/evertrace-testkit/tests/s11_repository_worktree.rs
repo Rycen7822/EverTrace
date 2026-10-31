@@ -38,10 +38,10 @@ use evertrace_engine::{
         resolve_repository, resolve_repository_source_start,
     },
 };
+use evertrace_store::test_support::TestIndexStore;
 use evertrace_store::{
-    CompatibilityStore, DirtyTarget, DirtyTargetKind, JournalCommand, JournalEventDraft,
-    JournalPayload, JournalWriter, SourceIngestWatermark, StoreError, objects_schema,
-    reduce_journal,
+    DirtyTarget, DirtyTargetKind, JournalCommand, JournalEventDraft, JournalPayload, JournalWriter,
+    SourceIngestWatermark, StoreError, objects_schema, reduce_journal,
     relations::{PhysicalRelationKind, build_physical_relation_rows},
     repository::RepositoryCurrentView,
 };
@@ -3171,10 +3171,9 @@ async fn production_tables_stay_at_the_four_l0002_tables() {
     // A wrong-schema partial L0002 table makes opening the store fail closed.
     let temp = TempDir::new().unwrap();
     let root = temp.path().join("store");
-    let reader =
-        CompatibilityStore::connect_local(&evertrace_store::connection::native_root(&root))
-            .await
-            .unwrap();
+    let reader = TestIndexStore::connect_local(&evertrace_store::connection::native_root(&root))
+        .await
+        .unwrap();
     reader
         .connection()
         .create_empty_table("evertrace_relations", objects_schema())

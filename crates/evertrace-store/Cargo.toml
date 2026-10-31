@@ -6,7 +6,7 @@ rust-version.workspace = true
 license.workspace = true
 
 [features]
-# Test-only fault-injection surface for integration tests.
+# Test-only qualification fixtures and fault injection.
 test-utils = []
 
 [dependencies]
@@ -23,6 +23,8 @@ thiserror.workspace = true
 tokio.workspace = true
 
 [dev-dependencies]
+# Enable fixtures for this crate's integration tests, never for product builds.
+evertrace-store = { path = ".", features = ["test-utils"] }
 tempfile.workspace = true
 tokio.workspace = true
 

@@ -8,8 +8,9 @@ use std::{
 
 use arrow_array::{Int64Array, RecordBatch, RecordBatchIterator, StringArray};
 use arrow_schema::{DataType, Field, Schema};
-use evertrace_store::{
-    CompatibilityStore, ProbeRow, collect_batches, probe_batch, probe_schema, schema_fingerprint,
+use evertrace_store::collect_batches;
+use evertrace_store::test_support::{
+    ProbeRow, TestIndexStore, probe_batch, probe_schema, schema_fingerprint,
 };
 use lancedb::{
     Table,
@@ -54,9 +55,7 @@ fn count_batches(batches: &[RecordBatch]) -> usize {
 async fn local_create_open_add_filter_select_count_and_schema_contract() {
     let started = Instant::now();
     let temp = TempDir::new().unwrap();
-    let store = CompatibilityStore::connect_local(temp.path())
-        .await
-        .unwrap();
+    let store = TestIndexStore::connect_local(temp.path()).await.unwrap();
     let table = store
         .create_probe_table(
             "probe_core",
@@ -119,9 +118,7 @@ async fn local_create_open_add_filter_select_count_and_schema_contract() {
 #[tokio::test]
 async fn merge_insert_is_insert_only_and_exact_query_detects_retries() {
     let temp = TempDir::new().unwrap();
-    let store = CompatibilityStore::connect_local(temp.path())
-        .await
-        .unwrap();
+    let store = TestIndexStore::connect_local(temp.path()).await.unwrap();
     let table = store
         .create_probe_table("probe_merge", rows(&[(1, "command-a", "original", 1)]))
         .await
@@ -161,9 +158,7 @@ async fn merge_insert_is_insert_only_and_exact_query_detects_retries() {
 #[tokio::test]
 async fn mixed_language_fts_sees_indexed_and_latest_unindexed_rows() {
     let temp = TempDir::new().unwrap();
-    let store = CompatibilityStore::connect_local(temp.path())
-        .await
-        .unwrap();
+    let store = TestIndexStore::connect_local(temp.path()).await.unwrap();
     let table = store
         .create_probe_table(
             "probe_fts",
@@ -240,7 +235,7 @@ async fn versions_restore_delete_compact_prune_snapshot_and_independent_reopen()
     let temp = TempDir::new().unwrap();
     let source = temp.path().join("source");
     fs::create_dir(&source).unwrap();
-    let store = CompatibilityStore::connect_local(&source).await.unwrap();
+    let store = TestIndexStore::connect_local(&source).await.unwrap();
     let table = store
         .create_probe_table("probe_versions", rows(&[(1, "v-1", "one", 1)]))
         .await
@@ -279,8 +274,8 @@ async fn versions_restore_delete_compact_prune_snapshot_and_independent_reopen()
 
     let snapshot = temp.path().join("snapshot");
     copy_directory(&source, &snapshot);
-    let source_store = CompatibilityStore::connect_local(&source).await.unwrap();
-    let snapshot_store = CompatibilityStore::connect_local(&snapshot).await.unwrap();
+    let source_store = TestIndexStore::connect_local(&source).await.unwrap();
+    let snapshot_store = TestIndexStore::connect_local(&snapshot).await.unwrap();
     let source_table = source_store
         .open_probe_table("probe_versions")
         .await
@@ -299,7 +294,7 @@ async fn versions_restore_delete_compact_prune_snapshot_and_independent_reopen()
     drop(source_store);
     drop(snapshot_store);
 
-    let exclusive = CompatibilityStore::connect_local(&source).await.unwrap();
+    let exclusive = TestIndexStore::connect_local(&source).await.unwrap();
     let exclusive_table = exclusive.open_probe_table("probe_versions").await.unwrap();
     let versions_before_aggressive = exclusive_table.list_versions().await.unwrap().len();
     exclusive_table
@@ -316,9 +311,7 @@ async fn versions_restore_delete_compact_prune_snapshot_and_independent_reopen()
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn concurrent_readers_one_writer_crash_reopen_and_true_second_process() {
     let temp = TempDir::new().unwrap();
-    let store = CompatibilityStore::connect_local(temp.path())
-        .await
-        .unwrap();
+    let store = TestIndexStore::connect_local(temp.path()).await.unwrap();
     let table = store
         .create_probe_table("probe_process", rows(&[(1, "p-1", "one", 1)]))
         .await
@@ -350,9 +343,7 @@ async fn concurrent_readers_one_writer_crash_reopen_and_true_second_process() {
     assert!(status.success());
     drop(table);
     drop(store);
-    let reopened = CompatibilityStore::connect_local(temp.path())
-        .await
-        .unwrap();
+    let reopened = TestIndexStore::connect_local(temp.path()).await.unwrap();
     assert_eq!(
         reopened
             .open_probe_table("probe_process")
@@ -371,7 +362,7 @@ async fn second_process_probe_entry() {
         return;
     };
     let root = PathBuf::from(env::var_os(CHILD_STORE).unwrap());
-    let store = CompatibilityStore::connect_local(&root).await.unwrap();
+    let store = TestIndexStore::connect_local(&root).await.unwrap();
     if mode == "open_corrupt" {
         // Isolated upstream behaviour: a short malformed manifest may return a
         // typed error or panic inside Lance. The parent distinguishes
@@ -395,9 +386,7 @@ async fn second_process_probe_entry() {
 #[tokio::test]
 async fn corrupt_derived_probe_table_fails_open() {
     let temp = TempDir::new().unwrap();
-    let store = CompatibilityStore::connect_local(temp.path())
-        .await
-        .unwrap();
+    let store = TestIndexStore::connect_local(temp.path()).await.unwrap();
     let missing_table = store
         .create_probe_table("probe_corrupt", rows(&[(1, "c-1", "one", 1)]))
         .await
@@ -411,9 +400,7 @@ async fn corrupt_derived_probe_table_fails_open() {
     drop(store);
     let missing_manifest = first_manifest(&temp.path().join("probe_corrupt.lance/_versions"));
     fs::remove_file(missing_manifest).unwrap();
-    let reopened = CompatibilityStore::connect_local(temp.path())
-        .await
-        .unwrap();
+    let reopened = TestIndexStore::connect_local(temp.path()).await.unwrap();
     assert!(reopened.open_probe_table("probe_corrupt").await.is_err());
 
     let malformed_manifest = first_manifest(&temp.path().join("probe_malformed.lance/_versions"));
