@@ -4875,6 +4875,7 @@ impl JournalAdmissionState {
         let mut worktrees = BTreeSet::new();
         repositories.extend(request.repository);
         worktrees.extend(request.worktree);
+        let mut primary_worktree = None;
         if let Some(session) = request.session.as_deref() {
             let mut lanes = Vec::new();
             for (lane, seq) in self.execution_lanes.values().filter(|(lane, _)| {
@@ -4923,6 +4924,8 @@ impl JournalAdmissionState {
                         let payload =
                             JournalPayload::WorkEpisodeRecorded(Box::new(episode.clone()));
                         if self.scope_fact_visible(&payload, *seq)? {
+                            primary_worktree = episode.worktree_instance_id;
+                            worktrees.extend(primary_worktree);
                             facts.push(payload);
                             for id in &episode.attempt_ids {
                                 if let Some((attempt, seq)) = self.attempts.get(id) {
@@ -5031,6 +5034,17 @@ impl JournalAdmissionState {
                 if self.scope_fact_visible(&payload, *seq)? {
                     repositories.insert(tree.repository_instance_id);
                     facts.push(payload);
+                    if Some(id) == primary_worktree
+                        && let Some(snapshot_id) = tree.current_snapshot_id
+                        && let Some((snapshot, seq)) = self.worktree_snapshots.get(&snapshot_id)
+                        && snapshot.worktree_instance_id == id
+                    {
+                        let payload =
+                            JournalPayload::WorktreeSnapshotRecorded(Box::new(snapshot.clone()));
+                        if self.scope_fact_visible(&payload, *seq)? {
+                            facts.push(payload);
+                        }
+                    }
                 }
             }
         }
@@ -5332,6 +5346,11 @@ impl JournalAdmissionState {
                 "worktree",
                 v.worktree_instance_id.to_string(),
                 format!("{}@{}", v.worktree_instance_id, v.worktree_revision),
+            ),
+            JournalPayload::WorktreeSnapshotRecorded(v) => (
+                "worktree_snapshot",
+                v.worktree_snapshot_id.to_string(),
+                v.worktree_snapshot_id.to_string(),
             ),
             JournalPayload::TaskRecorded(v) => {
                 ("task", v.task_id.to_string(), v.revision_id.to_string())

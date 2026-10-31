@@ -1,7 +1,7 @@
 //! One request's canonical Work state, shared with the existing Procedure route.
 use evertrace_domain::{
     ids::TaskId,
-    query::{QueryAnchor, QueryBindingStrength, QueryExecution},
+    query::{QueryAnchor, QueryBindingStrength, QueryExecution, QueryRepositoryState},
     work::{AssignmentStatus, AttemptExecutionStatus, AttemptLifecycleStatus},
 };
 use evertrace_store::JournalPayload;
@@ -119,6 +119,7 @@ pub(crate) fn from_facts(
     }));
     let execution = QueryExecution {
         frontier,
+        repository_state: primary_repository(facts, episode),
         task: task.clone(),
         workstream: stream.clone(),
         episode: episode.clone(),
@@ -132,6 +133,48 @@ pub(crate) fn from_facts(
         return None;
     }
     Some(Box::new(execution))
+}
+
+fn primary_repository(
+    facts: &[JournalPayload],
+    episode: &evertrace_domain::work::WorkEpisode,
+) -> Option<Box<QueryRepositoryState>> {
+    let id = episode.repository_instance_id?;
+    let repository = unique(facts.iter().filter_map(|fact| match fact {
+        JournalPayload::RepositoryInstanceRecorded(value) if value.repository_id == id => {
+            Some(value.as_ref())
+        }
+        _ => None,
+    }))?
+    .clone();
+    let worktree = unique(facts.iter().filter_map(|fact| match fact {
+        JournalPayload::WorktreeInstanceRecorded(value)
+            if Some(value.worktree_instance_id) == episode.worktree_instance_id
+                && value.repository_instance_id == id =>
+        {
+            Some(value.as_ref())
+        }
+        _ => None,
+    }))
+    .cloned();
+    let snapshot = unique(facts.iter().filter_map(|fact| match fact {
+        JournalPayload::WorktreeSnapshotRecorded(value)
+            if worktree.as_ref().is_some_and(|worktree| {
+                worktree.current_snapshot_id == Some(value.worktree_snapshot_id)
+                    && value.worktree_instance_id == worktree.worktree_instance_id
+            }) =>
+        {
+            Some(value.as_ref())
+        }
+        _ => None,
+    }))
+    .cloned();
+    let state = QueryRepositoryState {
+        repository,
+        worktree,
+        snapshot,
+    };
+    state.validate(episode).ok().map(|()| Box::new(state))
 }
 
 fn unique<T>(mut values: impl Iterator<Item = T>) -> Option<T> {

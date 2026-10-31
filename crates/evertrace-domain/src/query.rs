@@ -737,11 +737,50 @@ impl QueryAnchor {
     }
 }
 
+/// Canonical primary-shard observations, not a permission or trust grant.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct QueryRepositoryState {
+    pub repository: crate::repository::RepositoryInstance,
+    pub worktree: Option<crate::repository::WorktreeInstance>,
+    pub snapshot: Option<crate::repository::WorktreeSnapshot>,
+}
+
+impl QueryRepositoryState {
+    pub fn validate(&self, episode: &crate::work::WorkEpisode) -> Result<(), QueryError> {
+        self.repository
+            .validate()
+            .map_err(|_| QueryError::Invalid)?;
+        if episode.repository_instance_id != Some(self.repository.repository_id) {
+            return Err(QueryError::Invalid);
+        }
+        if let Some(worktree) = &self.worktree {
+            worktree.validate().map_err(|_| QueryError::Invalid)?;
+            if Some(worktree.worktree_instance_id) != episode.worktree_instance_id
+                || worktree.repository_instance_id != self.repository.repository_id
+            {
+                return Err(QueryError::Invalid);
+            }
+        }
+        if let Some(snapshot) = &self.snapshot {
+            snapshot.validate().map_err(|_| QueryError::Invalid)?;
+            let worktree = self.worktree.as_ref().ok_or(QueryError::Invalid)?;
+            if worktree.current_snapshot_id != Some(snapshot.worktree_snapshot_id)
+                || snapshot.worktree_instance_id != worktree.worktree_instance_id
+            {
+                return Err(QueryError::Invalid);
+            }
+        }
+        Ok(())
+    }
+}
+
 /// Canonical Work revisions pinned to one read, never another state store.
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct QueryExecution {
     pub frontier: u64,
+    pub repository_state: Option<Box<QueryRepositoryState>>,
     pub task: crate::work::Task,
     pub workstream: crate::work::Workstream,
     pub episode: crate::work::WorkEpisode,
@@ -763,6 +802,9 @@ impl QueryExecution {
             .validate()
             .map_err(|_| QueryError::Invalid)?;
         self.episode.validate().map_err(|_| QueryError::Invalid)?;
+        if let Some(repository) = &self.repository_state {
+            repository.validate(&self.episode)?;
+        }
         if self.frontier == 0
             || !matches!(
                 anchor.binding_strength,

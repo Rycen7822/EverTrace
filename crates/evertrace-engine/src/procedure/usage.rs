@@ -311,6 +311,11 @@ impl ProcedureUsageCurrentView {
                 items: vec![],
             });
         };
+        // An explicit workspace is a read target, not a replacement execution.
+        let mut primary_anchor = (*anchor).clone();
+        primary_anchor.repository_id = episode.repository_instance_id;
+        primary_anchor.worktree_id = episode.worktree_instance_id;
+        let anchor = &primary_anchor;
         let scenario_scope = ScenarioScope {
             task_id: episode.task_id,
             repository_instance_id: anchor.repository_id,
