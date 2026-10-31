@@ -7,6 +7,7 @@ use evertrace_domain::query::{
 #[derive(Debug)]
 pub struct MemoryBrowseContext {
     pub page: MemoriesCurrentContext,
+    pub event_times: BTreeMap<u64, i64>,
     /// Current metadata records; body access remains an independent decision.
     pub total_count: Option<u64>,
     pub matching_count: Option<u64>,
@@ -402,16 +403,27 @@ impl JournalAdmissionState {
                     .values()
                     .map(|(v, seq)| Ok(MemoriesCandidate::Digest(v, *seq))),
             );
-        let rank = |seq: u64, key: String| {
-            (
-                match query.order {
-                    MemoryBrowseOrder::RecordedNewest => u64::MAX - seq,
-                    MemoryBrowseOrder::RecordedOldest => seq,
-                },
+        let newest = matches!(
+            query.order,
+            MemoryBrowseOrder::RecordedNewest | MemoryBrowseOrder::EventNewest
+        );
+        let rank = |seq: u64, key: String, event: Option<i64>| -> Result<_, StoreError> {
+            let event = if query.order.uses_event_time() {
+                i128::from(event.ok_or(StoreError::StoreCorrupt)?)
+            } else {
+                0
+            };
+            let seq = i128::from(seq);
+            Ok((
+                if newest { -event } else { event },
+                if newest { -seq } else { seq },
                 key,
-            )
+            ))
         };
-        let after_rank = after.map(|v| rank(v.source_event_seq, v.row_id.clone()));
+        let after_rank = after
+            .map(|v| rank(v.source_event_seq, v.row_id.clone(), v.event_time_us))
+            .transpose()?;
+        let mut after_verified = after.is_none() || !query.order.uses_event_time();
         let mut selected = BTreeMap::new();
         let (mut total_count, mut matching_count, mut unresolved_scope_count) =
             (0_u64, 0_u64, 0_u64);
@@ -449,34 +461,54 @@ impl JournalAdmissionState {
             if !candidate.matches_query(query) {
                 continue;
             }
+            let times = if query.time_range.is_some() || query.order.uses_event_time() {
+                Some(journal_times.as_mut().ok_or(StoreError::StoreCorrupt)?(
+                    candidate.source_event_seq(),
+                )?)
+            } else {
+                None
+            };
             if let Some(range) = &query.time_range {
-                let (occurred, ingested) =
-                    journal_times.as_mut().ok_or(StoreError::StoreCorrupt)?(
-                        candidate.source_event_seq(),
-                    )?;
+                let (occurred, ingested) = times.ok_or(StoreError::StoreCorrupt)?;
                 if !range.contains(occurred, ingested) {
                     continue;
                 }
             }
             matching_count += 1;
-            let position = rank(candidate.source_event_seq(), candidate.row_id());
+            let event = times.map(|value| value.0);
+            let position = rank(candidate.source_event_seq(), candidate.row_id(), event)?;
+            if let Some(after) = after
+                && query.order.uses_event_time()
+                && candidate.source_event_seq() == after.source_event_seq
+                && position.2 == after.row_id
+            {
+                after_verified = event == after.event_time_us;
+            }
             if after_rank.as_ref().is_some_and(|after| position <= *after) {
                 continue;
             }
-            selected.insert(position, candidate);
+            selected.insert(position, (candidate, event));
             if selected.len() > limit + 1 {
                 selected.pop_last();
             }
         }
+        if !after_verified {
+            return Err(StoreError::InvalidInput);
+        }
         let mut selected = selected.into_iter().collect::<Vec<_>>();
         let next_cursor = if selected.len() > limit {
-            let (position, last) = &selected[limit - 1];
+            let (position, (last, event)) = &selected[limit - 1];
             Some(
                 serde_json::to_string(&MemoryBrowseCursor {
                     frontier: self.frontier,
                     query: query.clone(),
+                    event_time_us: if query.order.uses_event_time() {
+                        *event
+                    } else {
+                        None
+                    },
                     source_event_seq: last.source_event_seq(),
-                    row_id: position.1.clone(),
+                    row_id: position.2.clone(),
                 })
                 .map_err(|_| StoreError::StoreCorrupt)?,
             )
@@ -485,9 +517,17 @@ impl JournalAdmissionState {
         };
         selected.truncate(limit);
         let expected_count = selected.len();
+        let mut event_times = BTreeMap::new();
         let items = selected
             .into_iter()
-            .map(|(_, candidate)| self.memory_candidate_row(candidate, &contracts))
+            .map(|(_, (candidate, event))| {
+                if query.order.uses_event_time()
+                    && let Some(event) = event
+                {
+                    event_times.insert(candidate.source_event_seq(), event);
+                }
+                self.memory_candidate_row(candidate, &contracts)
+            })
             .collect::<Result<Vec<_>, _>>()?;
         // Keep the existing canonical selected-row check as well. A divergence
         // is corruption, not a silently shorter page with overstated counts.
@@ -507,6 +547,7 @@ impl JournalAdmissionState {
             .filter_map(|id| self.proposals.get(&id).map(|(v, _)| v.proposal_revision_id))
             .collect();
         Ok(MemoryBrowseContext {
+            event_times,
             page: MemoriesCurrentContext {
                 frontier: self.frontier,
                 has_failed_job,

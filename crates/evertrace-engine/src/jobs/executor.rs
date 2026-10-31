@@ -1418,7 +1418,9 @@ async fn run_writer(
                         .memory_browse_context(&query, after.as_ref(), limit)
                         .await
                         .map_err(map_store_error);
-                    let fatal = result.is_err();
+                    let fatal = result
+                        .as_ref()
+                        .is_err_and(|error| *error != WriterActorError::InvalidInput);
                     let _ = reply.send(result);
                     if fatal {
                         return Err(WriterActorError::Store);

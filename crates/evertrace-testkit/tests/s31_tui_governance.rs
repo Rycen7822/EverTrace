@@ -760,6 +760,7 @@ fn human_wire_is_closed_and_tui_renders_daemon_snapshot() {
         status: ProposalStatus::Pending,
     };
     let proposal_item = HumanSnapshotItem {
+        native_event_time_us: None,
         reading_preview: None,
         source_context: None,
         semantic_detail: None,

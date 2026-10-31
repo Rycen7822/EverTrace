@@ -818,7 +818,8 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
                             session_import_wakeup.send_replace(next);
                         }
                         Ok(Response::SessionImportAdmin(match outcome {
-                            SessionImportAdminOutcome::Partial { changed, unavailable, remaining } => SessionImportAdminResponse::Partial { changed, unavailable, remaining },
+                            SessionImportAdminOutcome::Partial { changed, unavailable, remaining } =>
+                                SessionImportAdminResponse::Partial { changed, unavailable, remaining },
                             SessionImportAdminOutcome::Queued => SessionImportAdminResponse::Queued,
                             SessionImportAdminOutcome::Revoked => {
                                 SessionImportAdminResponse::Revoked
@@ -849,7 +850,8 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
                                     result: evertrace_protocol::dto::HumanExportResult {
                                         status: match result.status {
                                             evertrace_engine::HumanExportStatus::Published => evertrace_protocol::dto::HumanExportStatus::Published,
-                                            evertrace_engine::HumanExportStatus::PublicationUncertain => evertrace_protocol::dto::HumanExportStatus::PublicationUncertain,
+                                            evertrace_engine::HumanExportStatus::PublicationUncertain =>
+                                                evertrace_protocol::dto::HumanExportStatus::PublicationUncertain,
                                             evertrace_engine::HumanExportStatus::Conflict => evertrace_protocol::dto::HumanExportStatus::Conflict,
                                             evertrace_engine::HumanExportStatus::Denied => evertrace_protocol::dto::HumanExportStatus::Denied,
                                             evertrace_engine::HumanExportStatus::Failed => evertrace_protocol::dto::HumanExportStatus::Failed,
@@ -868,25 +870,29 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
                                     HumanGovernanceResponse::Search {page: Box::new(page)}
                                 }
                                 HumanReadRequest::CompareRevisions {query, expected_frontier, after, limit} => {
-                                    match human_governance.compare_revisions(query, expected_frontier, after.as_deref(), limit).await.map_err(map_human_error)? {
+                                    match human_governance.compare_revisions(query, expected_frontier, after.as_deref(), limit)
+                                        .await.map_err(map_human_error)? {
                                         Ok(comparison) => HumanGovernanceResponse::RevisionComparison {comparison:Box::new(comparison)},
                                         Err(frontier) => HumanGovernanceResponse::Conflict {current_frontier:frontier,current_revision_ref:None},
                                     }
                                 }
                                 HumanReadRequest::SourceArchive {query,expected_frontier,after,limit} => {
-                                    match human_governance.source_archive(query,expected_frontier,after.as_deref(),limit).await.map_err(map_human_error)? {
+                                    match human_governance.source_archive(query, expected_frontier, after.as_deref(), limit)
+                                        .await.map_err(map_human_error)? {
                                         Ok(page)=>HumanGovernanceResponse::SourceArchive{page:Box::new(page)},
                                         Err(frontier)=>HumanGovernanceResponse::Conflict{current_frontier:frontier,current_revision_ref:None},
                                     }
                                 }
                                 HumanReadRequest::SourceCatalog {query,expected_frontier,after,limit} => {
-                                    match human_governance.source_catalog(query,expected_frontier,after.as_deref(),limit).await.map_err(map_human_error)? {
+                                    match human_governance.source_catalog(query, expected_frontier, after.as_deref(), limit)
+                                        .await.map_err(map_human_error)? {
                                         Ok(page)=>HumanGovernanceResponse::SourceCatalog {page:Box::new(page)},
                                         Err(frontier)=>HumanGovernanceResponse::Conflict {current_frontier:frontier,current_revision_ref:None},
                                     }
                                 }
                                 HumanReadRequest::ScopeDirectory {query,expected_frontier,after,limit} => {
-                                    match human_governance.scope_directory(query,expected_frontier,after.as_deref(),limit).await.map_err(map_human_error)? {
+                                    match human_governance.scope_directory(query, expected_frontier, after.as_deref(), limit)
+                                        .await.map_err(map_human_error)? {
                                         Ok(page)=>HumanGovernanceResponse::ScopeDirectory {page:Box::new(page)},
                                         Err(frontier)=>HumanGovernanceResponse::Conflict {current_frontier:frontier,current_revision_ref:None},
                                     }
@@ -894,7 +900,9 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
                                 HumanReadRequest::Content {
                                     object_ref, expected_revision_ref, expected_frontier, representation, after, limit,
                                 } => {
-                                    match human_governance.content(&object_ref, &expected_revision_ref, expected_frontier, representation, after.as_deref(), limit)
+                                    match human_governance.content(
+                                        &object_ref, &expected_revision_ref, expected_frontier, representation, after.as_deref(), limit,
+                                    )
                                         .await.map_err(map_human_error)?
                                     {
                                         Ok(content) => HumanGovernanceResponse::Content {content: Box::new(map_content_chunk(content))},
@@ -950,8 +958,10 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
                                         after.as_deref(),
                                         limit,
                                         explorer_selection.map(|value| match value {
-                                            evertrace_protocol::dto::HumanExplorerListSelection::Memories => evertrace_engine::HumanExplorerListSelection::Memories,
-                                            evertrace_protocol::dto::HumanExplorerListSelection::Capture => evertrace_engine::HumanExplorerListSelection::Capture,
+                                            evertrace_protocol::dto::HumanExplorerListSelection::Memories =>
+                                                evertrace_engine::HumanExplorerListSelection::Memories,
+                                            evertrace_protocol::dto::HumanExplorerListSelection::Capture =>
+                                                evertrace_engine::HumanExplorerListSelection::Capture,
                                         }),
                                     ).await }
                                     .map_err(map_human_error)?
@@ -1197,14 +1207,19 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
                                             )
                                             .await
                                     }
-                                    HumanActionRequest::RepositoryAccess { repository_id, expected_repository_revision, action, worktree_id, inventory_ref } => {
+                                    HumanActionRequest::RepositoryAccess {
+                                        repository_id, expected_repository_revision, action, worktree_id, inventory_ref,
+                                    } => {
                                         human_governance.repository_access(request_id, expected_frontier,
                                             evertrace_engine::HumanRepositoryAccess {
                                                 repository_id, expected_repository_revision, worktree_id, inventory_ref,
                                                 action: match action {
-                                                    evertrace_protocol::dto::RepositoryAccessAction::Disable => evertrace_engine::HumanRepositoryAccessAction::Disable,
-                                                    evertrace_protocol::dto::RepositoryAccessAction::Enable => evertrace_engine::HumanRepositoryAccessAction::Enable,
-                                                    evertrace_protocol::dto::RepositoryAccessAction::Rescan => evertrace_engine::HumanRepositoryAccessAction::Rescan,
+                                                    evertrace_protocol::dto::RepositoryAccessAction::Disable =>
+                                                        evertrace_engine::HumanRepositoryAccessAction::Disable,
+                                                    evertrace_protocol::dto::RepositoryAccessAction::Enable =>
+                                                        evertrace_engine::HumanRepositoryAccessAction::Enable,
+                                                    evertrace_protocol::dto::RepositoryAccessAction::Rescan =>
+                                                        evertrace_engine::HumanRepositoryAccessAction::Rescan,
                                                 },
                                             }).await
                                     }
@@ -1228,13 +1243,17 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
                                     HumanActionRequest::Unavailable { action } => {
                                         Ok(EngineHumanActionOutcome::Unavailable {
                                             reason: match action {
-                                                evertrace_protocol::dto::HumanUnavailableAction::SupportGovernance => "support_governance_unavailable",
-                                                evertrace_protocol::dto::HumanUnavailableAction::SegmentationCorrection => "segmentation_correction_unavailable",
+                                                evertrace_protocol::dto::HumanUnavailableAction::SupportGovernance =>
+                                                    "support_governance_unavailable",
+                                                evertrace_protocol::dto::HumanUnavailableAction::SegmentationCorrection =>
+                                                    "segmentation_correction_unavailable",
                                                 evertrace_protocol::dto::HumanUnavailableAction::LaneCorrection => "lane_correction_unavailable",
                                                 evertrace_protocol::dto::HumanUnavailableAction::ResumeCorrection => "resume_correction_unavailable",
-                                                evertrace_protocol::dto::HumanUnavailableAction::LineageCorrection => "lineage_correction_unavailable",
+                                                evertrace_protocol::dto::HumanUnavailableAction::LineageCorrection =>
+                                                    "lineage_correction_unavailable",
                                                 evertrace_protocol::dto::HumanUnavailableAction::ForgetOrPurge => "forget_or_purge_unavailable",
-                                                evertrace_protocol::dto::HumanUnavailableAction::ConfigurationWrite => "configuration_write_unavailable",
+                                                evertrace_protocol::dto::HumanUnavailableAction::ConfigurationWrite =>
+                                                    "configuration_write_unavailable",
                                                 evertrace_protocol::dto::HumanUnavailableAction::BackupRestoreOrGc => "offline_cli_or_future_s33",
                                             },
                                         })
@@ -1286,8 +1305,10 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
                     Ok(Some(result)) => {
                         last_watch_failure = None;
                         match result.outcome {
-                            evertrace_engine::ConfigReloadOutcome::Applied => tracing::info!(target: "evertrace_lifecycle", "configuration watch applied"),
-                            evertrace_engine::ConfigReloadOutcome::RestartRequired => tracing::info!(target: "evertrace_lifecycle", "configuration watch restart required"),
+                            evertrace_engine::ConfigReloadOutcome::Applied =>
+                                tracing::info!(target: "evertrace_lifecycle", "configuration watch applied"),
+                            evertrace_engine::ConfigReloadOutcome::RestartRequired =>
+                                tracing::info!(target: "evertrace_lifecycle", "configuration watch restart required"),
                             _ => tracing::warn!(target: "evertrace_lifecycle", "configuration watch rejected"),
                         }
                         let next = (*session_import_wakeup_tx.borrow()).wrapping_add(1);
@@ -1612,7 +1633,10 @@ fn map_human_page(page: evertrace_engine::HumanPage) -> HumanGovernanceResponse 
             .items
             .into_iter()
             .map(|item| HumanSnapshotItem {
-                reading_preview: item.reading_preview.map(|value| evertrace_protocol::dto::HumanMemoryPreview {state:value.state,title:value.title,excerpt:value.excerpt,origin:value.origin,truncated:value.truncated}),
+                reading_preview: item.reading_preview.map(|value| evertrace_protocol::dto::HumanMemoryPreview {
+                    state: value.state, title: value.title, excerpt: value.excerpt,
+                    origin: value.origin, truncated: value.truncated,
+                }),
                 source_context: item.source_context.map(|value| evertrace_protocol::dto::HumanSourceContext {
                     directory: value.directory, session: value.session,
                     event_time_us: value.event_time_us, recorded_at_us: value.recorded_at_us,
@@ -1996,9 +2020,23 @@ fn map_human_page(page: evertrace_engine::HumanPage) -> HumanGovernanceResponse 
                     }
                 }),
                 system_detail: item.system_detail.map(|detail| match detail {
-                    EngineHumanSystemDetail::Repository { repository_id, repository_revision, user_disabled, trust_revoked, revalidated_inventory_ref, worktree_id } => HumanSystemDetail::Repository { repository_id, repository_revision, user_disabled, trust_revoked, revalidated_inventory_ref, worktree_id },
-                    EngineHumanSystemDetail::CapabilityInventory { job_id, repository_id, repository_revision, worktree_id, cwd, state, source_count, signature_count, unobserved_source_count, unknown_contract_count, asset_names } => HumanSystemDetail::CapabilityInventory { job_id, repository_id, repository_revision, worktree_id, cwd, state, source_count, signature_count, unobserved_source_count, unknown_contract_count, asset_names },
-                    EngineHumanSystemDetail::SessionImport { session_id, source_instance_id, body_state, access, workspace, repository_read_restrictions } => HumanSystemDetail::SessionImport { session_id, source_instance_id, body_state, access, workspace, repository_read_restrictions },
+                    EngineHumanSystemDetail::Repository {
+                        repository_id, repository_revision, user_disabled, trust_revoked, revalidated_inventory_ref, worktree_id,
+                    } => HumanSystemDetail::Repository {
+                        repository_id, repository_revision, user_disabled, trust_revoked, revalidated_inventory_ref, worktree_id,
+                    },
+                    EngineHumanSystemDetail::CapabilityInventory {
+                        job_id, repository_id, repository_revision, worktree_id, cwd, state, source_count, signature_count,
+                        unobserved_source_count, unknown_contract_count, asset_names,
+                    } => HumanSystemDetail::CapabilityInventory {
+                        job_id, repository_id, repository_revision, worktree_id, cwd, state, source_count, signature_count,
+                        unobserved_source_count, unknown_contract_count, asset_names,
+                    },
+                    EngineHumanSystemDetail::SessionImport {
+                        session_id, source_instance_id, body_state, access, workspace, repository_read_restrictions,
+                    } => HumanSystemDetail::SessionImport {
+                        session_id, source_instance_id, body_state, access, workspace, repository_read_restrictions,
+                    },
                     EngineHumanSystemDetail::Job { detail } => {
                         let EngineHumanJobDetail {
                             native_history_cleanup_availability,
@@ -2023,9 +2061,13 @@ fn map_human_page(page: evertrace_engine::HumanPage) -> HumanGovernanceResponse 
                         } = *detail;
                         HumanSystemDetail::Job {
                             detail: Box::new(HumanJobDetail {
-                                native_history_cleanup_availability: native_history_cleanup_availability.map(|availability| match availability {
-                                    evertrace_engine::HumanNativeHistoryCleanupAvailability::ExternalReaderExclusionUnverified => evertrace_protocol::dto::HumanNativeHistoryCleanupAvailability::ExternalReaderExclusionUnverified,
-                                }),
+                                native_history_cleanup_availability: native_history_cleanup_availability.map(
+                                    |availability| match availability {
+                                        evertrace_engine::HumanNativeHistoryCleanupAvailability::ExternalReaderExclusionUnverified => {
+                                            evertrace_protocol::dto::HumanNativeHistoryCleanupAvailability::ExternalReaderExclusionUnverified
+                                        }
+                                    },
+                                ),
                                 job_id,
                                 target_revision,
                                 target_watermark,
@@ -2089,8 +2131,10 @@ fn map_human_page(page: evertrace_engine::HumanPage) -> HumanGovernanceResponse 
                                     mark_watermark: report.mark_watermark,
                                     sweep_watermark: report.sweep_watermark,
                                     checksum: report.checksum,
-                                    conservative_prune: report.conservative_prune.into_iter().map(|result| evertrace_protocol::dto::HumanConservativePruneResult {
-                                        table: result.table, bytes_removed: result.bytes_removed, old_versions: result.old_versions,
+                                    conservative_prune: report.conservative_prune.into_iter().map(|result| {
+                                        evertrace_protocol::dto::HumanConservativePruneResult {
+                                            table: result.table, bytes_removed: result.bytes_removed, old_versions: result.old_versions,
+                                        }
                                     }).collect(),
                                 }),
                             }),
@@ -2116,7 +2160,8 @@ fn map_human_page(page: evertrace_engine::HumanPage) -> HumanGovernanceResponse 
                                 evertrace_engine::ConfigReloadOutcome::Prepared => evertrace_protocol::dto::ConfigReloadOutcome::Prepared,
                                 evertrace_engine::ConfigReloadOutcome::Applied => evertrace_protocol::dto::ConfigReloadOutcome::Applied,
                                 evertrace_engine::ConfigReloadOutcome::Rejected => evertrace_protocol::dto::ConfigReloadOutcome::Rejected,
-                                evertrace_engine::ConfigReloadOutcome::RestartRequired => evertrace_protocol::dto::ConfigReloadOutcome::RestartRequired,
+                                evertrace_engine::ConfigReloadOutcome::RestartRequired =>
+                                    evertrace_protocol::dto::ConfigReloadOutcome::RestartRequired,
                             },
                         }),
                     },
@@ -2134,6 +2179,7 @@ fn map_human_page(page: evertrace_engine::HumanPage) -> HumanGovernanceResponse 
                 publication_state: item.publication_state,
                 support_state: item.support_state,
                 scope_ref: item.scope_ref,
+                native_event_time_us: item.native_event_time_us,
                 source_event_seq: item.source_event_seq,
             })
             .collect(),

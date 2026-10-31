@@ -1310,13 +1310,21 @@ pub struct ScopeDirectoryPage {
     pub next_cursor: Option<String>,
 }
 
-/// Journal recording order, not a claim about event timestamps.
+/// Recording sequence and canonical native event clocks are distinct orders.
 #[derive(Clone, Copy, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum MemoryBrowseOrder {
     #[default]
     RecordedNewest,
     RecordedOldest,
+    EventNewest,
+    EventOldest,
+}
+
+impl MemoryBrowseOrder {
+    pub fn uses_event_time(self) -> bool {
+        matches!(self, Self::EventNewest | Self::EventOldest)
+    }
 }
 
 /// Time on the canonical native event, not a source message timestamp or
@@ -1397,6 +1405,7 @@ impl MemoryBrowseQuery {
 pub struct MemoryBrowseCursor {
     pub frontier: u64,
     pub query: MemoryBrowseQuery,
+    pub event_time_us: Option<i64>,
     pub source_event_seq: u64,
     pub row_id: String,
 }
@@ -1404,6 +1413,7 @@ pub struct MemoryBrowseCursor {
 impl MemoryBrowseCursor {
     pub fn validate_for(&self, query: &MemoryBrowseQuery) -> Result<(), QueryError> {
         if self.query != *query
+            || query.order.uses_event_time() != self.event_time_us.is_some()
             || self.row_id.is_empty()
             || self.row_id.len() > 512
             || self.row_id.chars().any(char::is_control)

@@ -162,7 +162,7 @@ class Backend:
         # than misreporting the native codec's connection close as daemon loss.
         wire_values = {
             "kind": ("all", "summaries", "facts_and_constraints", "methods", "references"),
-            "order": ("recorded_newest", "recorded_oldest"),
+            "order": ("recorded_newest", "recorded_oldest", "event_newest", "event_oldest"),
             "epistemic_status": (
                 None,
                 "not_applicable",

@@ -161,9 +161,11 @@
                   <option value="facts_and_constraints">事实与约束</option>
                   <option value="methods">正式方法</option>
                   <option value="references">提案参考</option></select
-                ><select id="browse-order" aria-label="录入顺序">
+                ><select id="browse-order" aria-label="排序依据" title="事件时间来自原生记录，不代表来源消息时间">
                   <option value="recorded_newest">后录入在前</option>
-                  <option value="recorded_oldest">先录入在前</option></select
+                  <option value="recorded_oldest">先录入在前</option>
+                  <option value="event_newest">事件时间从新到旧</option>
+                  <option value="event_oldest">事件时间从旧到新</option></select
                 ><select id="epistemic-filter" aria-label="Atom 真值状态">
                   <option value="">全部真值状态</option>
                   <option value="not_applicable">不适用</option>

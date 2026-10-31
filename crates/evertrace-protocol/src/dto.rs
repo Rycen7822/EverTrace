@@ -531,6 +531,7 @@ pub struct HumanSnapshotItem {
     pub publication_state: Option<String>,
     pub support_state: Option<String>,
     pub scope_ref: Option<String>,
+    pub native_event_time_us: Option<i64>,
     pub source_event_seq: u64,
 }
 
@@ -1574,16 +1575,25 @@ impl HumanGovernanceResponse {
                 unresolved_scope_count,
             } => {
                 use evertrace_domain::query::{MemoryBrowseCursor, MemoryBrowseOrder};
+                let newest = matches!(
+                    query.order,
+                    MemoryBrowseOrder::RecordedNewest | MemoryBrowseOrder::EventNewest
+                );
                 let rank = |item: &HumanSnapshotItem| {
-                    (
-                        match query.order {
-                            MemoryBrowseOrder::RecordedNewest => u64::MAX - item.source_event_seq,
-                            MemoryBrowseOrder::RecordedOldest => item.source_event_seq,
-                        },
+                    let event = if query.order.uses_event_time() {
+                        i128::from(item.native_event_time_us?)
+                    } else {
+                        0
+                    };
+                    let seq = i128::from(item.source_event_seq);
+                    Some((
+                        if newest { -event } else { event },
+                        if newest { -seq } else { seq },
                         item.stable_key.clone(),
-                    )
+                    ))
                 };
                 query.validate().is_ok()
+                    && items.iter().all(|item| rank(item).is_some())
                     && if *scope_available {
                         total_count
                             .zip(*matching_count)
@@ -1617,6 +1627,7 @@ impl HumanGovernanceResponse {
                                     && items.last().is_some_and(|last| {
                                         last.stable_key == cursor.row_id
                                             && last.source_event_seq == cursor.source_event_seq
+                                            && last.native_event_time_us == cursor.event_time_us
                                     })
                             })
                     })
@@ -3052,6 +3063,7 @@ mod human_backup_summary_tests {
                 publication_state: None,
                 support_state: None,
                 scope_ref: None,
+                native_event_time_us: None,
                 source_event_seq: 1,
             }],
             next_cursor: None,

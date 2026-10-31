@@ -270,6 +270,7 @@ pub struct HumanSummary {
     pub publication_state: Option<String>,
     pub support_state: Option<String>,
     pub scope_ref: Option<String>,
+    pub native_event_time_us: Option<i64>,
     pub source_event_seq: u64,
 }
 
@@ -1270,11 +1271,17 @@ impl HumanGovernanceService {
             .writer
             .memory_browse_context(&query, cursor.as_ref(), usize::from(limit))
             .await
-            .map_err(|_| HumanGovernanceError::Store)?;
+            .map_err(|error| match error {
+                crate::WriterActorError::InvalidInput => HumanGovernanceError::InvalidInput,
+                _ => HumanGovernanceError::Store,
+            })?;
         if expected_frontier.is_some_and(|frontier| frontier != context.page.frontier) {
             return Ok(Err(context.page.frontier));
         }
         let mut page = memories_page(context.page)?;
+        for item in &mut page.items {
+            item.native_event_time_us = context.event_times.get(&item.source_event_seq).copied();
+        }
         self.reading_previews(&mut page.items).await;
         Ok(Ok(HumanMemoryBrowsePage {
             page,
@@ -3705,8 +3712,10 @@ impl HumanGovernanceService {
             };
             if let Some(reference) = request.inventory_ref {
                 let exists = snapshot.data_rows().filter(|row| row.object_kind.as_deref() == Some("capability_inventory")).any(|row| {
-                    matches!(row.payload_json.as_deref().and_then(|json| serde_json::from_str::<JournalPayload>(json).ok()), Some(JournalPayload::CapabilityInventoryRecorded(fact))
-                        if fact.job_id == reference && fact.context.repository_id == repository.repository_id && fact.context.worktree_id == worktree.worktree_instance_id)
+                    let fact = row.payload_json.as_deref().and_then(|json| serde_json::from_str::<JournalPayload>(json).ok());
+                    matches!(fact, Some(JournalPayload::CapabilityInventoryRecorded(fact))
+                        if fact.job_id == reference && fact.context.repository_id == repository.repository_id
+                            && fact.context.worktree_id == worktree.worktree_instance_id)
                 });
                 if !exists {
                     return Err(HumanGovernanceError::InvalidInput);
@@ -5403,6 +5412,7 @@ fn summary_fields(row: &ObjectRow, surface: HumanSurface) -> HumanSummary {
             .or_else(|| row.repository_id.clone())
             .or_else(|| row.project_id.clone())
             .or_else(|| row.session_id.clone()),
+        native_event_time_us: None,
         source_event_seq: row.source_event_seq,
     }
 }

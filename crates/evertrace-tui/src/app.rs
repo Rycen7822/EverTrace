@@ -3567,6 +3567,7 @@ mod tests {
             publication_state: None,
             support_state: None,
             scope_ref: None,
+            native_event_time_us: None,
             source_event_seq: 9,
         };
         let mut app = App::with_language(crate::Language::English);
@@ -4585,6 +4586,7 @@ mod tests {
             publication_state: None,
             support_state: None,
             scope_ref: None,
+            native_event_time_us: None,
             source_event_seq: 1,
         }
     }

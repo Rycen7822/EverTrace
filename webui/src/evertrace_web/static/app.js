@@ -797,7 +797,7 @@ async function refresh() {
     state.next = page.next_cursor;
     fragmentInto($("memory-items"), page.html);
     $("memory-items").scrollTop = listScroll;
-    showTimeRange(page.query.time_range);
+    showTimeRange(page.query.time_range, page.query.order);
     $("page-count").textContent = !page.scope_available
       ? "范围不可用 · 计数未知"
       : "本页 " +
@@ -814,7 +814,7 @@ async function refresh() {
         ? "所选身份不存在、已移除或当前不可用，未改查全部范围。"
         : page.degraded
           ? "只读数据有降级；不是完整成功。"
-          : "按录入顺序浏览所选关联范围；计数不是可读正文数，也不表示方法可执行。" +
+          : "按" + browseOrderLabel(page.query.order) + "浏览所选关联范围；计数不是可读正文数，也不表示方法可执行。" +
             (page.unresolved_scope_count !== "0"
               ? " 另有 " + page.unresolved_scope_count + " 条元数据归属尚未判定。"
               : "") +
@@ -1177,7 +1177,16 @@ function displayTime(value) {
     (us % 1000n ? " (" + value + " µs)" : "")
   );
 }
-function showTimeRange(range) {
+function browseOrderLabel(order) {
+  return {
+    recorded_newest: "录入顺序（后录入在前）",
+    recorded_oldest: "录入顺序（先录入在前）",
+    event_newest: "原生事件时间（从新到旧）",
+    event_oldest: "原生事件时间（从旧到新）",
+  }[order] || "未知顺序";
+}
+function showTimeRange(range, order = state.query.order) {
+  const sort = "按" + browseOrderLabel(order) + "排序。";
   $("time-applied").textContent = range
     ? "已应用" +
       (range.basis === "recorded" ? "原生录入时间" : "原生事件时间") +
@@ -1185,8 +1194,8 @@ function showTimeRange(range) {
       displayTime(range.from_us) +
       "，" +
       displayTime(range.until_us) +
-      ")；不是来源消息或生成时间。"
-    : "未设时间窗；排序仍按原生录入顺序。";
+      ")；不是来源消息或生成时间。" + sort
+    : "未设时间窗；" + sort;
 }
 function timeInput(id) {
   const value = $(id).value;

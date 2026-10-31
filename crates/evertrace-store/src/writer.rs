@@ -1483,7 +1483,7 @@ impl JournalWriter {
         limit: usize,
     ) -> Result<crate::projections::MemoryBrowseContext, StoreError> {
         self.validated_current_read(|state, stamp| {
-            if query.time_range.is_some() {
+            if query.time_range.is_some() || query.order.uses_event_time() {
                 self.lock_sqlite()?.with_memory_journal_times(|times| {
                     state.memory_browse_context(
                         query,
