@@ -10,34 +10,6 @@ use super::{
     production::{RequestDeadline, hard_compatible},
 };
 
-fn relation_allowed(kind: &str) -> bool {
-    matches!(
-        kind,
-        "task_contains_workstream"
-            | "workstream_parent"
-            | "workstream_dependency"
-            | "attempt_to_task"
-            | "attempt_to_workstream"
-            | "attempt_to_episode"
-            | "episode_to_task"
-            | "episode_to_attempt"
-            | "run_to_workstream"
-            | "run_to_attempt"
-            | "run_to_artifact"
-            | "result_produced_by_run"
-            | "result_to_raw_artifact"
-            | "artifact_produced_by_run"
-            | "artifact_produced_by_operation"
-            | "operation_to_scope_effect"
-            | "binding_to_primary_task"
-            | "binding_to_primary_workstream"
-            | "atom_from_source_observation"
-            | "atom_supports"
-            | "atom_contradicts"
-            | "atom_supersedes"
-    )
-}
-
 // Only the evidence FTS tier uses this preference; it is neither a grant nor
 // a truth/authority upgrade. Existing exact and normative candidates stay first.
 fn preferred_evidence_filter(
@@ -545,26 +517,32 @@ impl NativeRetrieval<'_> {
             };
             let endpoints = (resolve(&source), resolve(&target));
             if let (Some(source_ref), Some(target_ref)) = endpoints {
-                let statement = serde_json::json!({
-                    "relation_kind": kind,
-                    "source_ref": source_ref,
-                    "target_ref": target_ref,
-                    "frontier": self.result.projection_frontier,
+                let statement = serde_json::to_string(&GroundedRelationStatement {
+                    relation_kind: kind.clone(),
+                    source_ref: source_ref.clone(),
+                    target_ref: target_ref.clone(),
+                    frontier: self.result.projection_frontier,
                 })
-                .to_string();
+                .map_err(|_| SearchError::Corrupt)?;
                 if answer_bytes + statement.len() > 4800 {
                     self.degraded("relation_trace_pack_budget_exhausted");
                     continue;
                 }
                 answer_bytes += statement.len();
-                projected.push(GroundedStatement {
-                    statement,
-                    support_refs: BTreeSet::from([source_ref, target_ref]),
-                    derivation_kind: DerivationKind::DeterministicDerived,
-                    ordering_basis: OrderingBasis::Unknown,
-                    content_trust: "untrusted_source_content".into(),
-                    instruction_authority: "none".into(),
-                });
+                let role = EvidenceRole::for_relation(&kind).ok_or(SearchError::Corrupt)?;
+                let ordering_basis = role.ordering_basis();
+                projected.push((
+                    GroundedStatement {
+                        statement,
+                        support_refs: BTreeSet::from([source_ref, target_ref]),
+                        derivation_kind: DerivationKind::DeterministicDerived,
+                        ordering_basis,
+                        content_trust: "untrusted_source_content".into(),
+                        instruction_authority: "none".into(),
+                    },
+                    role,
+                    kind,
+                ));
             } else {
                 self.degraded("relation_endpoint_omitted_or_ambiguous");
             }
@@ -599,43 +577,67 @@ impl NativeRetrieval<'_> {
             .iter()
             .map(|candidate| candidate.candidate_id.clone())
             .collect();
+        let mut active_evidence = Vec::new();
+        let mut trace = Vec::new();
+        for candidate in &self.result.candidates {
+            let rule = super::resolution::active_rule(candidate);
+            let compatible = !self.context.unverified_hard_constraint()
+                && self
+                    .context
+                    .query_facets
+                    .condition_literals
+                    .iter()
+                    .all(|literal| candidate.text.contains(literal));
+            if !rule && !compatible {
+                continue;
+            }
+            let role = if rule {
+                EvidenceRole::ConstraintSupport
+            } else if candidate.retrieval_origins.len() == 1
+                && candidate.retrieval_origins.contains("typed_relation")
+            {
+                EvidenceRole::Bridge
+            } else {
+                EvidenceRole::Direct
+            };
+            trace.push(GroundedTraceStep {
+                role,
+                statement_index: active_evidence.len() as u32,
+                relation: None,
+            });
+            active_evidence.push(GroundedStatement {
+                statement: candidate.text.clone(),
+                support_refs: BTreeSet::from([candidate.candidate_id.clone()]),
+                derivation_kind: DerivationKind::Quoted,
+                ordering_basis: OrderingBasis::Unknown,
+                content_trust: "untrusted_source_content".into(),
+                instruction_authority: "none".into(),
+            });
+        }
+        for (statement, role, relation) in projected {
+            trace.push(GroundedTraceStep {
+                role,
+                statement_index: active_evidence.len() as u32,
+                relation: Some(relation),
+            });
+            active_evidence.push(statement);
+        }
         let view = GroundedEvidenceView {
+            evidence_need: EvidenceNeed::from_context(self.context),
             candidate_set: CandidateBoundary {
                 generation: if added.is_empty() { 1 } else { 2 },
                 base_candidate_refs: base,
                 added_candidate_refs: added,
                 candidate_refs: refs,
             },
-            active_evidence: self
-                .result
-                .candidates
-                .iter()
-                .filter(|candidate| {
-                    super::resolution::active_rule(candidate)
-                        || (!self.context.unverified_hard_constraint()
-                            && self
-                                .context
-                                .query_facets
-                                .condition_literals
-                                .iter()
-                                .all(|literal| candidate.text.contains(literal)))
-                })
-                .map(|candidate| GroundedStatement {
-                    statement: candidate.text.clone(),
-                    support_refs: BTreeSet::from([candidate.candidate_id.clone()]),
-                    derivation_kind: DerivationKind::Quoted,
-                    ordering_basis: OrderingBasis::Unknown,
-                    content_trust: "untrusted_source_content".into(),
-                    instruction_authority: "none".into(),
-                })
-                .chain(projected)
-                .collect(),
+            trace,
+            active_evidence,
             unresolved_gaps: gaps,
             conflicts,
             completeness: self.result.completeness,
             omitted_refs: self.result.omitted_refs.clone(),
         };
-        view.validate()?;
+        view.validate_at_frontier(self.result.projection_frontier)?;
         Ok(HumanSearchPage {
             result: self.result,
             grounded_view: Some(view),

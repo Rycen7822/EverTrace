@@ -163,6 +163,47 @@ pub enum TemporalQualifier {
     SourceSequenceAtMost { sequence: u64 },
 }
 
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct TemporalScope {
+    pub mode: TemporalMode,
+    pub qualifiers: Vec<TemporalQualifier>,
+}
+
+impl TemporalScope {
+    fn validate(&self) -> Result<(), QueryError> {
+        Self::validate_parts(self.mode, &self.qualifiers)
+    }
+
+    fn validate_parts(
+        mode: TemporalMode,
+        qualifiers: &[TemporalQualifier],
+    ) -> Result<(), QueryError> {
+        let valid = match (mode, qualifiers) {
+            (TemporalMode::Current | TemporalMode::Any | TemporalMode::Unknown, []) => true,
+            (TemporalMode::AsOf, [TemporalQualifier::EventTimeAsOf { at_us }]) => *at_us >= 0,
+            (
+                TemporalMode::Interval,
+                [TemporalQualifier::EventTimeInterval { start_us, end_us }],
+            ) => *start_us >= 0 && end_us > start_us,
+            (TemporalMode::Sequence, [TemporalQualifier::SourceSequenceAtMost { .. }]) => true,
+            _ => false,
+        };
+        if valid {
+            Ok(())
+        } else {
+            Err(QueryError::Invalid)
+        }
+    }
+}
+
+fn valid_target(value: &str) -> bool {
+    value.len() <= 512
+        && (value.parse::<AnyPublicId>().is_ok()
+            || value.parse::<RevisionId>().is_ok()
+            || EvidenceSurface::parse_candidate_ref(value).is_some())
+}
+
 #[derive(Clone, Copy, Debug, Deserialize, Eq, Ord, PartialEq, PartialOrd, Serialize)]
 #[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
 pub enum QuantityConstraint {
@@ -207,19 +248,8 @@ impl QueryFacetSet {
                 return Err(QueryError::Invalid);
             }
         }
-        if self.target_anchors.iter().any(|value| {
-            value.len() > 512
-                || (value.parse::<AnyPublicId>().is_err()
-                    && value.parse::<RevisionId>().is_err()
-                    && EvidenceSurface::parse_candidate_ref(value).is_none())
-        }) || self.temporal_qualifiers.len() > MAX_FACET_ITEMS
+        if self.target_anchors.iter().any(|value| !valid_target(value))
             || self.quantity_constraints.len() > MAX_FACET_ITEMS
-            || self
-                .temporal_qualifiers
-                .iter()
-                .collect::<BTreeSet<_>>()
-                .len()
-                != self.temporal_qualifiers.len()
             || self
                 .quantity_constraints
                 .iter()
@@ -230,37 +260,10 @@ impl QueryFacetSet {
                 .quantity_constraints
                 .iter()
                 .any(|value| matches!(value, QuantityConstraint::ResultLimit { limit: 0 }))
-            || self.temporal_qualifiers.iter().any(|value| match value {
-                TemporalQualifier::EventTimeAsOf { at_us } => *at_us < 0,
-                TemporalQualifier::EventTimeInterval { start_us, end_us } => {
-                    *start_us < 0 || end_us <= start_us
-                }
-                TemporalQualifier::SourceSequenceAtMost { .. } => false,
-            })
         {
             return Err(QueryError::Invalid);
         }
-        let temporal_shape = match self.temporal_mode {
-            TemporalMode::Current | TemporalMode::Any | TemporalMode::Unknown => {
-                self.temporal_qualifiers.is_empty()
-            }
-            TemporalMode::AsOf => matches!(
-                self.temporal_qualifiers.as_slice(),
-                [TemporalQualifier::EventTimeAsOf { .. }]
-            ),
-            TemporalMode::Interval => matches!(
-                self.temporal_qualifiers.as_slice(),
-                [TemporalQualifier::EventTimeInterval { .. }]
-            ),
-            TemporalMode::Sequence => matches!(
-                self.temporal_qualifiers.as_slice(),
-                [TemporalQualifier::SourceSequenceAtMost { .. }]
-            ),
-        };
-        if !temporal_shape {
-            return Err(QueryError::Invalid);
-        }
-        Ok(())
+        TemporalScope::validate_parts(self.temporal_mode, &self.temporal_qualifiers)
     }
 }
 
@@ -380,6 +383,117 @@ impl CandidateBoundary {
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
+pub struct EvidenceNeed {
+    pub intent: SearchIntent,
+    pub target: Vec<String>,
+    pub answer_shape: Option<AnswerShape>,
+    pub temporal_scope: TemporalScope,
+    pub source_boundary: Option<SourceBoundary>,
+    pub statement_role: StatementRole,
+    pub parse_status: FacetParseStatus,
+}
+
+impl EvidenceNeed {
+    pub fn from_context(context: &SearchContext) -> Self {
+        let facets = &context.query_facets;
+        Self {
+            intent: context.intent,
+            target: facets.target_anchors.clone(),
+            answer_shape: facets.answer_shape,
+            temporal_scope: TemporalScope {
+                mode: facets.temporal_mode,
+                qualifiers: facets.temporal_qualifiers.clone(),
+            },
+            source_boundary: facets.source_boundary,
+            statement_role: facets.statement_role,
+            parse_status: facets.parse_status,
+        }
+    }
+
+    fn validate(&self) -> Result<(), QueryError> {
+        if self.target.len() > MAX_FACET_ITEMS
+            || self.target.iter().any(|value| !valid_target(value))
+            || self.target.iter().collect::<BTreeSet<_>>().len() != self.target.len()
+        {
+            return Err(QueryError::Invalid);
+        }
+        self.temporal_scope.validate()
+    }
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum EvidenceRole {
+    Direct,
+    Bridge,
+    Update,
+    Contrast,
+    ConstraintSupport,
+}
+
+impl EvidenceRole {
+    pub fn for_relation(kind: &str) -> Option<Self> {
+        match kind {
+            "atom_supersedes" => Some(Self::Update),
+            "atom_contradicts" => Some(Self::Contrast),
+            "task_contains_workstream"
+            | "workstream_parent"
+            | "workstream_dependency"
+            | "attempt_to_task"
+            | "attempt_to_workstream"
+            | "attempt_to_episode"
+            | "episode_to_task"
+            | "episode_to_attempt"
+            | "run_to_workstream"
+            | "run_to_attempt"
+            | "run_to_artifact"
+            | "result_produced_by_run"
+            | "result_to_raw_artifact"
+            | "artifact_produced_by_run"
+            | "artifact_produced_by_operation"
+            | "operation_to_scope_effect"
+            | "binding_to_primary_task"
+            | "binding_to_primary_workstream"
+            | "atom_from_source_observation"
+            | "atom_supports" => Some(Self::Bridge),
+            _ => None,
+        }
+    }
+
+    pub fn ordering_basis(self) -> OrderingBasis {
+        match self {
+            Self::Update => OrderingBasis::Supersession,
+            _ => OrderingBasis::Unknown,
+        }
+    }
+}
+
+pub fn relation_allowed(kind: &str) -> bool {
+    EvidenceRole::for_relation(kind).is_some()
+}
+
+/// Closed mechanical projection of a validated typed edge, not free prose.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct GroundedRelationStatement {
+    pub relation_kind: String,
+    pub source_ref: String,
+    pub target_ref: String,
+    pub frontier: u64,
+}
+
+/// Resolve the statement, support refs, ordering and trust from active_evidence.
+/// Keeping one clause prevents trace metadata from duplicating the answer budget.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct GroundedTraceStep {
+    pub role: EvidenceRole,
+    pub statement_index: u32,
+    pub relation: Option<String>,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
 pub struct GroundedStatement {
     pub statement: String,
     pub support_refs: BTreeSet<String>,
@@ -392,7 +506,9 @@ pub struct GroundedStatement {
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct GroundedEvidenceView {
+    pub evidence_need: EvidenceNeed,
     pub candidate_set: CandidateBoundary,
+    pub trace: Vec<GroundedTraceStep>,
     pub active_evidence: Vec<GroundedStatement>,
     pub unresolved_gaps: Vec<NamedGap>,
     pub conflicts: BTreeSet<String>,
@@ -402,7 +518,41 @@ pub struct GroundedEvidenceView {
 
 impl GroundedEvidenceView {
     pub fn validate(&self) -> Result<(), QueryError> {
+        self.validate_inner(None)
+    }
+
+    pub fn validate_at_frontier(&self, frontier: u64) -> Result<(), QueryError> {
+        self.validate_inner(Some(frontier))
+    }
+
+    fn validate_inner(&self, frontier: Option<u64>) -> Result<(), QueryError> {
+        self.evidence_need.validate()?;
         self.candidate_set.validate()?;
+        let mut covered = BTreeSet::new();
+        for step in &self.trace {
+            let index = step.statement_index as usize;
+            let statement = self.active_evidence.get(index).ok_or(QueryError::Invalid)?;
+            if !covered.insert(index) {
+                return Err(QueryError::Invalid);
+            }
+            if let Some(kind) = &step.relation {
+                let clause: GroundedRelationStatement =
+                    serde_json::from_str(&statement.statement).map_err(|_| QueryError::Invalid)?;
+                if Some(step.role) != EvidenceRole::for_relation(kind)
+                    || statement.ordering_basis != step.role.ordering_basis()
+                    || statement.derivation_kind != DerivationKind::DeterministicDerived
+                    || clause.relation_kind != *kind
+                    || statement.support_refs
+                        != BTreeSet::from([clause.source_ref, clause.target_ref])
+                    || frontier.is_some_and(|expected| clause.frontier != expected)
+                {
+                    return Err(QueryError::Invalid);
+                }
+            }
+        }
+        if covered.len() != self.active_evidence.len() {
+            return Err(QueryError::Invalid);
+        }
         for gap in &self.unresolved_gaps {
             gap.validate()?;
         }
@@ -419,7 +569,8 @@ impl GroundedEvidenceView {
             }
         }
         if self.completeness == RetrievalCompleteness::Complete
-            && (!self.unresolved_gaps.is_empty()
+            && (self.evidence_need.parse_status != FacetParseStatus::Complete
+                || !self.unresolved_gaps.is_empty()
                 || !self.conflicts.is_empty()
                 || !self.omitted_refs.is_empty())
         {
@@ -902,7 +1053,8 @@ impl HumanSearchPage {
                     }
             })
             && self.grounded_view.as_ref().is_none_or(|view| {
-                view.validate().is_ok()
+                view.validate_at_frontier(self.result.projection_frontier)
+                    .is_ok()
                     && view.candidate_set.candidate_refs == refs
                     && view.completeness == self.result.completeness
             })

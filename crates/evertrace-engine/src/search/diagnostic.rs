@@ -6,9 +6,9 @@ use std::{
 };
 
 use evertrace_domain::query::{
-    CandidateBoundary, DerivationKind, GroundedEvidenceView, GroundedStatement, NamedGap,
-    NamedGapKind, OrderingBasis, RetrievalCompleteness, RetrievalLayer, SearchCandidate,
-    SearchContext, SearchResult,
+    CandidateBoundary, DerivationKind, EvidenceNeed, EvidenceRole, GroundedEvidenceView,
+    GroundedStatement, GroundedTraceStep, NamedGap, NamedGapKind, OrderingBasis,
+    RetrievalCompleteness, RetrievalLayer, SearchCandidate, SearchContext, SearchResult,
 };
 use evertrace_store::{
     RelationProjectionRow, SearchProjectionRow, relations::RELATIONS_CHECKPOINT_ID,
@@ -345,7 +345,15 @@ impl DiagnosticSession {
                 instruction_authority: "none".into(),
             });
         }
+        let trace = (0..active_evidence.len())
+            .map(|index| GroundedTraceStep {
+                role: EvidenceRole::Direct,
+                statement_index: index as u32,
+                relation: None,
+            })
+            .collect();
         let view = GroundedEvidenceView {
+            evidence_need: EvidenceNeed::from_context(&self.context),
             candidate_set: CandidateBoundary {
                 generation: if self.result.layer == RetrievalLayer::E {
                     2
@@ -356,13 +364,14 @@ impl DiagnosticSession {
                 added_candidate_refs,
                 candidate_refs,
             },
+            trace,
             active_evidence,
             unresolved_gaps,
             conflicts,
             completeness,
             omitted_refs: self.result.omitted_refs.clone(),
         };
-        view.validate()?;
+        view.validate_at_frontier(self.result.projection_frontier)?;
         Ok(view)
     }
 
