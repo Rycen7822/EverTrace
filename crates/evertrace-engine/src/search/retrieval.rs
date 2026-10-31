@@ -91,8 +91,10 @@ impl NativeRetrieval<'_> {
             if row.retrieval_completeness != "complete" {
                 self.degraded("source_retrieval_partial");
             }
-            if self.context.query_facets.temporal_mode != TemporalMode::Any
-                && row.time_domain == "none"
+            if !matches!(
+                self.context.query_facets.temporal_mode,
+                TemporalMode::Any | TemporalMode::Current
+            ) && row.time_domain == "none"
             {
                 self.degraded("temporal_provenance_unknown");
             }
@@ -108,6 +110,12 @@ impl NativeRetrieval<'_> {
                 } else {
                     SearchCandidateVariant::EvidenceSurface
                 },
+                currentness: row
+                    .currentness
+                    .as_deref()
+                    .map(str::parse)
+                    .transpose()
+                    .map_err(|_| SearchError::Corrupt)?,
                 object_kind: row.object_kind,
                 text: row.text,
                 source_role: row.source_role,
@@ -596,8 +604,10 @@ impl NativeRetrieval<'_> {
             }
         }
         self.result.candidates = kept;
-        if self.context.query_facets.temporal_mode != TemporalMode::Any
-            || !self.context.query_facets.temporal_qualifiers.is_empty()
+        if !matches!(
+            self.context.query_facets.temporal_mode,
+            TemporalMode::Any | TemporalMode::Current
+        ) || !self.context.query_facets.temporal_qualifiers.is_empty()
         {
             self.degraded("ordering_provenance_not_verified");
         }

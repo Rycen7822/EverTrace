@@ -582,12 +582,33 @@ pub enum SearchCandidateVariant {
     EvidenceSurface,
 }
 
+/// Native revision identity at the pinned frontier, not an event timestamp.
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SearchCurrentness {
+    Current,
+    Historical,
+}
+
+impl std::str::FromStr for SearchCurrentness {
+    type Err = QueryError;
+
+    fn from_str(value: &str) -> Result<Self, Self::Err> {
+        match value {
+            "current" => Ok(Self::Current),
+            "historical" => Ok(Self::Historical),
+            _ => Err(QueryError::Invalid),
+        }
+    }
+}
+
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct SearchCandidate {
     pub candidate_id: String,
     pub source_ref: String,
     pub row_variant: SearchCandidateVariant,
+    pub currentness: Option<SearchCurrentness>,
     pub object_kind: Option<String>,
     pub text: String,
     pub source_role: Option<String>,
@@ -672,6 +693,10 @@ impl HumanSearchPage {
                     && !candidate.text.is_empty()
                     && candidate.text.len() <= 16 * 1024
                     && candidate.instruction_authority == "none"
+                    && match candidate.row_variant {
+                        SearchCandidateVariant::Object => candidate.currentness.is_some(),
+                        SearchCandidateVariant::EvidenceSurface => candidate.currentness.is_none(),
+                    }
             })
             && self.grounded_view.as_ref().is_none_or(|view| {
                 view.validate().is_ok()

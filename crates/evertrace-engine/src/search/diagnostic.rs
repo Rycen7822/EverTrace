@@ -466,6 +466,12 @@ fn push_candidate(
             "evidence_surface" => evertrace_domain::query::SearchCandidateVariant::EvidenceSurface,
             _ => return Err(SearchError::Corrupt),
         },
+        currentness: row
+            .currentness
+            .as_deref()
+            .map(str::parse)
+            .transpose()
+            .map_err(|_| SearchError::Corrupt)?,
         object_kind: row.object_kind.clone(),
         text: row.text.clone(),
         source_role: row.source_role.clone(),

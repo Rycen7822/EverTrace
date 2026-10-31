@@ -94,11 +94,13 @@ impl ProductionSearch {
             },
             object_only,
             global_only: false,
-            current_only: context.intent != evertrace_domain::query::SearchIntent::HistoryLookup
-                && matches!(
-                    context.query_facets.temporal_mode,
-                    TemporalMode::Current | TemporalMode::Any | TemporalMode::Unknown
-                ),
+            current_only: match context.query_facets.temporal_mode {
+                TemporalMode::Current => true,
+                TemporalMode::Any | TemporalMode::Unknown => {
+                    context.intent != evertrace_domain::query::SearchIntent::HistoryLookup
+                }
+                TemporalMode::AsOf | TemporalMode::Interval | TemporalMode::Sequence => false,
+            },
             suppressed_refs: suppressed_hashes.clone(),
             suppressed_hashes,
             event_time_as_of: match context.query_facets.temporal_qualifiers.as_slice() {
@@ -535,6 +537,12 @@ impl ProductionSearch {
                 candidate_id: candidate_id.clone(),
                 source_ref: row.source_ref.clone().unwrap_or_default(),
                 row_variant,
+                currentness: row
+                    .currentness
+                    .as_deref()
+                    .map(str::parse)
+                    .transpose()
+                    .map_err(|_| SearchError::Corrupt)?,
                 object_kind: row.object_kind.clone(),
                 text: row.text.clone(),
                 source_role: row.source_role.clone(),
