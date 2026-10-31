@@ -5,7 +5,7 @@ impl HumanGovernanceService {
     /// Native read-only entry: no MCP binding, usage, cue, Returned or journal.
     pub async fn search(
         &self,
-        query: HumanSearchQuery,
+        query: Box<HumanSearchQuery>,
     ) -> Result<HumanSearchPage, HumanGovernanceError> {
         query
             .validate()

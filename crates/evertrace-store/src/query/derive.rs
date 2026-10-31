@@ -355,12 +355,7 @@ pub(super) fn surface_row(
             surface.source_observation_revision_ref, surface.span_hash
         ),
         row_variant: "evidence_surface".into(),
-        candidate_id: Some(format!(
-            "{}:{}:{}",
-            surface.source_observation_revision_ref,
-            surface.canonicalization_version,
-            surface.span_hash
-        )),
+        candidate_id: Some(surface.candidate_ref()),
         source_ref: Some(surface.source_observation_revision_ref.to_string()),
         source_kind: Some("evidence_surface".into()),
         text: surface.protected_text.clone(),

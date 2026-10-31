@@ -1296,6 +1296,26 @@ impl std::fmt::Debug for EvidenceSurface {
 }
 
 impl EvidenceSurface {
+    pub fn candidate_ref(&self) -> String {
+        format!(
+            "{}:{}:{}",
+            self.source_observation_revision_ref, self.canonicalization_version, self.span_hash
+        )
+    }
+
+    pub fn parse_candidate_ref(value: &str) -> Option<(SourceObservationId, u32, &str)> {
+        let mut parts = value.rsplitn(3, ':');
+        let span_hash = parts.next()?;
+        validate_digest(span_hash).ok()?;
+        let version_text = parts.next()?;
+        let version = version_text.parse::<u32>().ok()?;
+        if version == 0 || version.to_string() != version_text {
+            return None;
+        }
+        let source = parts.next()?.parse::<SourceObservationId>().ok()?;
+        Some((source, version, span_hash))
+    }
+
     pub fn validate(&self) -> Result<(), EvidenceError> {
         if self.instruction_authority != InstructionAuthority::None
             || self.event_time_us < 0

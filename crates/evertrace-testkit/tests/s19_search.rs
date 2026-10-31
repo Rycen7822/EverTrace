@@ -143,6 +143,7 @@ fn context(query: &str, exact: &[&str], suppression: SuppressionSnapshot) -> Sea
         raw_query: query.into(),
         query_facets: QueryFacetSet {
             parse_status: FacetParseStatus::Complete,
+            target_anchors: Vec::new(),
             exact_identifiers: exact.iter().map(|value| (*value).into()).collect(),
             condition_literals: Vec::new(),
             relation_requirements: Vec::new(),

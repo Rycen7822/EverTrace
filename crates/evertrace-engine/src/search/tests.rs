@@ -21,6 +21,7 @@ mod tests {
             raw_query: "needle".into(),
             query_facets: QueryFacetSet {
                 parse_status: FacetParseStatus::Complete,
+                target_anchors: Vec::new(),
                 exact_identifiers: Vec::new(),
                 condition_literals: Vec::new(),
                 relation_requirements: Vec::new(),
@@ -120,6 +121,7 @@ mod tests {
             "needle evidence",
         );
         let hash = "11".repeat(32);
+        row.source_ref = Some(evertrace_domain::ids::SourceObservationId::from_digest([1; 32]).to_string());
         row.row_id = format!("search:evidence:{}:{hash}", row.source_ref.as_deref().unwrap());
         row.row_variant = "evidence_surface".into();
         row.candidate_id = Some(format!(
@@ -368,13 +370,13 @@ mod tests {
             vec![TemporalQualifier::EventTimeAsOf { at_us: 8 }];
         let mut reasons = BTreeSet::new();
         assert!(!temporal_is_partial(
-            &[(0, candidate.clone(), &object)],
+            &[((0, 0), candidate.clone(), &object)],
             &temporal,
             &mut reasons
         ));
         object.time_domain = "none".into();
         assert!(temporal_is_partial(
-            &[(0, candidate, &object)],
+            &[((0, 0), candidate, &object)],
             &temporal,
             &mut reasons
         ));

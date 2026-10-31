@@ -143,9 +143,6 @@ impl ProductionSearch {
                 });
             }
         };
-        let result = self
-            .search_snapshot(context.clone(), false, &snapshot, &deadline, global_only)
-            .await?;
         let mut objects = self.hard_filter(&context, true);
         objects.global_only = global_only;
         let evidence = match context.query_facets.source_boundary {
@@ -172,6 +169,16 @@ impl ProductionSearch {
                 Some(filter)
             }
         };
+        let result = self
+            .search_snapshot(
+                context.clone(),
+                false,
+                &snapshot,
+                &deadline,
+                global_only,
+                evidence.as_ref(),
+            )
+            .await?;
         super::retrieval::NativeRetrieval {
             snapshot: &snapshot,
             context: &context,
@@ -251,8 +258,15 @@ impl ProductionSearch {
                 ));
             }
         };
-        self.search_snapshot(context, force_fts_failure, &snapshot, &deadline, false)
-            .await
+        self.search_snapshot(
+            context,
+            force_fts_failure,
+            &snapshot,
+            &deadline,
+            false,
+            None,
+        )
+        .await
     }
 
     async fn search_snapshot(
@@ -262,6 +276,7 @@ impl ProductionSearch {
         snapshot: &evertrace_store::SearchSnapshot,
         deadline: &RequestDeadline,
         global_only: bool,
+        anchor_evidence: Option<&SearchHardFilter>,
     ) -> Result<SearchResult, SearchError> {
         let started = deadline.started;
         if self.readable_refs.as_ref().is_some_and(|(frontier, _)| {
@@ -300,11 +315,35 @@ impl ProductionSearch {
         exact_identifiers.push(context.raw_query.clone());
         exact_identifiers.sort();
         exact_identifiers.dedup();
-        let structured = match deadline
+        let mut structured = Vec::new();
+        let mut degraded_reasons = BTreeSet::new();
+        // Pin object and original-evidence targets before text channels. Both
+        // use the existing native filters; neither is a new access grant.
+        if !context.query_facets.target_anchors.is_empty() {
+            for anchor_filter in std::iter::once(&filter).chain(anchor_evidence) {
+                match deadline
+                    .run(snapshot.structured(
+                        &context.query_facets.target_anchors,
+                        anchor_filter,
+                        32,
+                    ))
+                    .await
+                {
+                    Ok(Ok(rows)) => structured.extend(rows),
+                    Ok(Err(_)) => {
+                        degraded_reasons.insert("target_anchor_channel_unavailable".into());
+                    }
+                    Err(()) => {
+                        degraded_reasons.insert("target_anchor_deadline_exhausted".into());
+                    }
+                }
+            }
+        }
+        match deadline
             .run(snapshot.structured(&exact_identifiers, &filter, fetch_limit))
             .await
         {
-            Ok(Ok(rows)) => rows,
+            Ok(Ok(rows)) => structured.extend(rows),
             Ok(Err(error)) => return Err(error.into()),
             Err(()) => {
                 return Ok(deadline_result(
@@ -314,8 +353,7 @@ impl ProductionSearch {
                     snapshot.authoritative_frontier(),
                 ));
             }
-        };
-        let mut degraded_reasons = BTreeSet::new();
+        }
         let fts_result = if force_fts_failure {
             Err(StoreError::LanceDb)
         } else {
@@ -357,36 +395,53 @@ impl ProductionSearch {
                 .exact_identifiers
                 .iter()
                 .any(|identifier| {
-                    row.candidate_id.as_deref() == Some(identifier) || row.text.contains(identifier)
+                    row.candidate_id.as_deref() == Some(identifier)
+                        || row.source_ref.as_deref() == Some(identifier)
+                        || row.text.contains(identifier)
                 });
             let stable = row
                 .candidate_id
                 .as_deref()
-                .is_some_and(|id| id == context.raw_query);
-            let rank = if exact || stable {
-                (0, 0)
+                .is_some_and(|id| id == context.raw_query)
+                || row.source_ref.as_deref() == Some(context.raw_query.as_str());
+            let anchor_position = context.query_facets.target_anchors.iter().position(|id| {
+                row.candidate_id.as_deref() == Some(id) || row.source_ref.as_deref() == Some(id)
+            });
+            let rank = if let Some(position) = anchor_position {
+                (0, position)
+            } else if exact || stable {
+                (1, 0)
             } else if let Some(position) = fts_ranks.get(&row.row_id) {
                 (3, *position)
             } else {
                 continue;
             };
-            ranked.push((rank, row));
+            ranked.push((rank, row, exact || stable));
         }
-        ranked.sort_by(|(left_rank, left), (right_rank, right)| {
+        ranked.sort_by(|(left_rank, left, _), (right_rank, right, _)| {
             left_rank
                 .cmp(right_rank)
                 .then_with(|| left.candidate_id.cmp(&right.candidate_id))
         });
-        let mut selected = BTreeMap::<String, (u8, SearchCandidate, &SearchProjectionRow)>::new();
+        let mut selected =
+            BTreeMap::<String, ((u8, usize), SearchCandidate, &SearchProjectionRow)>::new();
         let mut omitted_refs = BTreeSet::new();
-        for (row_index, (rank, row)) in ranked.iter().enumerate() {
+        for (row_index, (rank, row, explicit_exact)) in ranked.iter().enumerate() {
             let candidate_id = row.candidate_id.clone().ok_or(SearchError::Corrupt)?;
-            let origin = if rank.0 == 0 { "exact" } else { "fts" };
+            let origin = match rank.0 {
+                0 => "target_anchor",
+                1 => "exact",
+                _ => "fts",
+            };
+            let mut origins = BTreeSet::from([origin.to_owned()]);
+            if rank.0 == 0 && *explicit_exact {
+                origins.insert("exact".into());
+            }
+            if fts_ranks.contains_key(&row.row_id) {
+                origins.insert("fts".into());
+            }
             if let Some(entry) = selected.get_mut(&candidate_id) {
-                entry.1.retrieval_origins.insert(origin.into());
-                if fts_ranks.contains_key(&row.row_id) {
-                    entry.1.retrieval_origins.insert("fts".into());
-                }
+                entry.1.retrieval_origins.extend(origins);
                 continue;
             }
             if context
@@ -397,7 +452,7 @@ impl ProductionSearch {
                 omitted_refs.extend(
                     ranked[row_index..]
                         .iter()
-                        .filter_map(|(_, value)| value.candidate_id.as_ref())
+                        .filter_map(|(_, value, _)| value.candidate_id.as_ref())
                         .filter(|id| !selected.contains_key(*id))
                         .cloned(),
                 );
@@ -410,43 +465,25 @@ impl ProductionSearch {
                 }
                 _ => return Err(SearchError::Corrupt),
             };
-            let entry = selected.entry(candidate_id.clone()).or_insert_with(|| {
-                (
-                    rank.0,
-                    SearchCandidate {
-                        candidate_id,
-                        source_ref: row.source_ref.clone().unwrap_or_default(),
-                        row_variant,
-                        object_kind: row.object_kind.clone(),
-                        text: row.text.clone(),
-                        source_role: row.source_role.clone(),
-                        content_trust: row.content_trust.clone(),
-                        capture_completeness: row.capture_completeness.clone(),
-                        retrieval_origins: BTreeSet::new(),
-                        instruction_authority: "none".into(),
-                        conflicted: false,
-                    },
-                    row,
-                )
-            });
-            entry.1.retrieval_origins.insert(origin.into());
-            if fts_ranks.contains_key(&row.row_id) {
-                entry.1.retrieval_origins.insert("fts".into());
-            }
+            let candidate = SearchCandidate {
+                candidate_id: candidate_id.clone(),
+                source_ref: row.source_ref.clone().unwrap_or_default(),
+                row_variant,
+                object_kind: row.object_kind.clone(),
+                text: row.text.clone(),
+                source_role: row.source_role.clone(),
+                content_trust: row.content_trust.clone(),
+                capture_completeness: row.capture_completeness.clone(),
+                retrieval_origins: origins,
+                instruction_authority: "none".into(),
+                conflicted: false,
+            };
+            selected.insert(candidate_id, (*rank, candidate, *row));
         }
         let mut candidates = selected.into_values().collect::<Vec<_>>();
         candidates.sort_by(|left, right| {
             left.0
                 .cmp(&right.0)
-                .then_with(|| {
-                    if left.0 == 3 {
-                        fts_ranks
-                            .get(&left.2.row_id)
-                            .cmp(&fts_ranks.get(&right.2.row_id))
-                    } else {
-                        std::cmp::Ordering::Equal
-                    }
-                })
                 .then_with(|| left.1.candidate_id.cmp(&right.1.candidate_id))
         });
         if candidates.len() > limit {
@@ -663,7 +700,7 @@ fn source_compatible(row: &SearchProjectionRow, boundary: Option<SourceBoundary>
 }
 
 pub(super) fn temporal_is_partial(
-    candidates: &[(u8, SearchCandidate, &SearchProjectionRow)],
+    candidates: &[((u8, usize), SearchCandidate, &SearchProjectionRow)],
     context: &SearchContext,
     degraded: &mut BTreeSet<String>,
 ) -> bool {
@@ -709,7 +746,7 @@ fn temporal_compatible(row: &SearchProjectionRow, context: &SearchContext) -> bo
 }
 
 fn mark_conservative_conflicts(
-    candidates: &mut [(u8, SearchCandidate, &SearchProjectionRow)],
+    candidates: &mut [((u8, usize), SearchCandidate, &SearchProjectionRow)],
     context: &SearchContext,
 ) -> bool {
     let mut conflicted = false;

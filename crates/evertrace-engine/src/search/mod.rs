@@ -1,4 +1,4 @@
-//! Bounded retrieval with a production-only A path and request-local diagnostics.
+//! Bounded production retrieval and separate request-local diagnostics.
 
 mod diagnostic;
 mod production;

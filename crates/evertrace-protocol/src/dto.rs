@@ -103,7 +103,7 @@ pub enum HumanRelationKind {
 #[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
 pub enum HumanReadRequest {
     Search {
-        query: evertrace_domain::query::HumanSearchQuery,
+        query: Box<evertrace_domain::query::HumanSearchQuery>,
     },
     CompareRevisions {
         query: evertrace_domain::query::RevisionCompareQuery,

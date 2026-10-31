@@ -5,7 +5,11 @@ use std::collections::BTreeSet;
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
-use crate::ids::{RepositoryId, TaskId, WorktreeId};
+use crate::{
+    evidence::EvidenceSurface,
+    ids::{AnyPublicId, RepositoryId, TaskId, WorktreeId},
+    revision::RevisionId,
+};
 
 const MAX_QUERY_BYTES: usize = 8 * 1024;
 const MAX_FACET_ITEMS: usize = 32;
@@ -118,6 +122,7 @@ pub enum QuantityConstraint {
 #[serde(deny_unknown_fields)]
 pub struct QueryFacetSet {
     pub parse_status: FacetParseStatus,
+    pub target_anchors: Vec<String>,
     pub exact_identifiers: Vec<String>,
     pub condition_literals: Vec<String>,
     pub relation_requirements: Vec<String>,
@@ -135,6 +140,7 @@ pub struct QueryFacetSet {
 impl QueryFacetSet {
     pub fn validate(&self) -> Result<(), QueryError> {
         for values in [
+            &self.target_anchors,
             &self.exact_identifiers,
             &self.condition_literals,
             &self.relation_requirements,
@@ -147,7 +153,12 @@ impl QueryFacetSet {
                 return Err(QueryError::Invalid);
             }
         }
-        if self.temporal_qualifiers.len() > MAX_FACET_ITEMS
+        if self.target_anchors.iter().any(|value| {
+            value.len() > 512
+                || (value.parse::<AnyPublicId>().is_err()
+                    && value.parse::<RevisionId>().is_err()
+                    && EvidenceSurface::parse_candidate_ref(value).is_none())
+        }) || self.temporal_qualifiers.len() > MAX_FACET_ITEMS
             || self.quantity_constraints.len() > MAX_FACET_ITEMS
             || self
                 .temporal_qualifiers

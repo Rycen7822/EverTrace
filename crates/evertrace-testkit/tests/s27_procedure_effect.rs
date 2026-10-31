@@ -3980,6 +3980,7 @@ fn f_off_is_identical_and_trusted_controlled_effects_only_tie_break_or_suppress(
         raw_query: "verification failed".into(),
         query_facets: QueryFacetSet {
             parse_status: FacetParseStatus::Complete,
+            target_anchors: Vec::new(),
             exact_identifiers: Vec::new(),
             condition_literals: Vec::new(),
             relation_requirements: Vec::new(),

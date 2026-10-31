@@ -784,17 +784,10 @@ impl SearchProjectionRow {
         } else if self.row_variant == "evidence_surface" {
             let source_ref = self.source_ref.as_deref().unwrap_or_default();
             let candidate = self.candidate_id.as_deref().unwrap_or_default();
-            let mut parts = candidate.rsplitn(3, ':');
-            let span_hash = parts.next().unwrap_or_default();
-            let candidate_shape = is_hex_64(span_hash)
-                && parts
-                    .next()
-                    .and_then(|value| value.parse::<u32>().ok())
-                    .is_some_and(|value| value > 0)
-                && parts.next() == Some(source_ref);
+            let (source, _, span_hash) =
+                EvidenceSurface::parse_candidate_ref(candidate).ok_or(StoreError::StoreCorrupt)?;
             if self.source_kind.as_deref() != Some("evidence_surface")
-                || !valid_uuid(source_ref)
-                || !candidate_shape
+                || source.to_string() != source_ref
                 || self.row_id != format!("search:evidence:{source_ref}:{}", span_hash)
                 || !valid_source_role(self.source_role.as_deref())
                 || !matches!(

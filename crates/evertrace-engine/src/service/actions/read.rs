@@ -135,6 +135,7 @@ impl McpActionService {
             raw_query: query.clone(),
             query_facets: QueryFacetSet {
                 parse_status: FacetParseStatus::Unknown,
+                target_anchors: Vec::new(),
                 exact_identifiers: Vec::new(),
                 condition_literals: Vec::new(),
                 relation_requirements: Vec::new(),
@@ -657,6 +658,7 @@ impl McpActionService {
             raw_query: query,
             query_facets: QueryFacetSet {
                 parse_status: FacetParseStatus::Unknown,
+                target_anchors: Vec::new(),
                 exact_identifiers: Vec::new(),
                 condition_literals: Vec::new(),
                 relation_requirements: Vec::new(),
@@ -1364,6 +1366,7 @@ impl McpActionService {
                 raw_query: query,
                 query_facets: QueryFacetSet {
                     parse_status: FacetParseStatus::Complete,
+                    target_anchors: Vec::new(),
                     exact_identifiers,
                     condition_literals: Vec::new(),
                     relation_requirements: Vec::new(),

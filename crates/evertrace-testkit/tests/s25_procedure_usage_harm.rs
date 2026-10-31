@@ -953,6 +953,7 @@ async fn prepare_usage_evidence(
         raw_query: "verifier failed".into(),
         query_facets: QueryFacetSet {
             parse_status: FacetParseStatus::Complete,
+            target_anchors: Vec::new(),
             exact_identifiers: Vec::new(),
             condition_literals: Vec::new(),
             relation_requirements: Vec::new(),
@@ -3655,6 +3656,7 @@ async fn prepare_real_router_usage_stage() -> RealUsageStage {
         raw_query: "verifier failed".into(),
         query_facets: QueryFacetSet {
             parse_status: FacetParseStatus::Complete,
+            target_anchors: Vec::new(),
             exact_identifiers: Vec::new(),
             condition_literals: Vec::new(),
             relation_requirements: Vec::new(),
@@ -5767,7 +5769,18 @@ async fn mcp_generated_alignment_is_returned_only_after_real_stdout() {
     handle.commit(generated, 10).await.unwrap();
     let snapshot = handle.project().await.unwrap();
     let view = SemanticCurrentView::from_snapshot(&snapshot).unwrap();
-    let proposal = view.proposals.values().find(|proposal| matches!(&proposal.payload, ProposalPayload::Procedure(payload) if payload.draft().stage_alignment.as_ref() == Some(&mapping))).unwrap().clone();
+    let proposal = view
+        .proposals
+        .values()
+        .find(|proposal| {
+            matches!(
+                &proposal.payload,
+                ProposalPayload::Procedure(payload)
+                    if payload.draft().stage_alignment.as_ref() == Some(&mapping)
+            )
+        })
+        .unwrap()
+        .clone();
     let ProposalPayload::Procedure(payload) = &proposal.payload else {
         unreachable!()
     };
@@ -5963,7 +5976,10 @@ async fn mcp_generated_alignment_is_returned_only_after_real_stdout() {
             synthetic_manifest.event_identity =
                 evertrace_codex::adapter_manifest::EventIdentity::StableNative;
             synthetic_manifest.eligible_event_manifest_refs = vec!["eligible-s25".into()];
-            synthetic_manifest.observable = evertrace_codex::source_catalog::ELIGIBLE_CAPABILITIES.iter().copied().filter(|value| *value != evertrace_codex::adapter_manifest::ObservableCapability::RawHiddenReasoning).collect();
+            synthetic_manifest.observable = evertrace_codex::source_catalog::ELIGIBLE_CAPABILITIES
+                .iter().copied().filter(|value| {
+                    *value != evertrace_codex::adapter_manifest::ObservableCapability::RawHiddenReasoning
+                }).collect();
             synthetic_manifest.unavailable_by_design =
                 vec![evertrace_codex::adapter_manifest::ObservableCapability::RawHiddenReasoning];
             synthetic_manifest.finalize_content_revision().unwrap();
@@ -6527,7 +6543,18 @@ async fn mcp_generated_alignment_is_returned_only_after_real_stdout() {
             .spawn()
             .unwrap();
         let mut stdin = cli.stdin.take().unwrap();
-        writeln!(stdin, "{}", serde_json::json!({"jsonrpc":"2.0","id":0,"method":"initialize","params":{"protocolVersion":"2025-11-25","capabilities":{},"clientInfo":{"name":"s25","version":"1"}}})).unwrap();
+        writeln!(
+            stdin,
+            "{}",
+            serde_json::json!({
+                "jsonrpc": "2.0", "id": 0, "method": "initialize",
+                "params": {
+                    "protocolVersion": "2025-11-25", "capabilities": {},
+                    "clientInfo": {"name": "s25", "version": "1"},
+                },
+            })
+        )
+        .unwrap();
         writeln!(
             stdin,
             "{}",
@@ -6535,7 +6562,21 @@ async fn mcp_generated_alignment_is_returned_only_after_real_stdout() {
         )
         .unwrap();
         for (index, grant) in grants.iter().enumerate() {
-            writeln!(stdin, "{}", serde_json::json!({"jsonrpc":"2.0","id":index + 1,"method":"tools/call","params":{"name":"evertrace","arguments":{"action":"search","workspace":grant.bound_workspace,"input":query,"refs":[]}}})).unwrap();
+            writeln!(
+                stdin,
+                "{}",
+                serde_json::json!({
+                    "jsonrpc": "2.0", "id": index + 1, "method": "tools/call",
+                    "params": {
+                        "name": "evertrace",
+                        "arguments": {
+                            "action": "search", "workspace": grant.bound_workspace,
+                            "input": query, "refs": [],
+                        },
+                    },
+                })
+            )
+            .unwrap();
         }
         drop(stdin);
         let output = cli.wait_with_output().unwrap();

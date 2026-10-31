@@ -927,6 +927,7 @@ async fn real_store_scope_union_and_four_actions_preserve_authority_boundaries()
             raw_query: "needle".into(),
             query_facets: QueryFacetSet {
                 parse_status: FacetParseStatus::Complete,
+                target_anchors: Vec::new(),
                 exact_identifiers: Vec::new(),
                 condition_literals: Vec::new(),
                 relation_requirements: Vec::new(),
@@ -1332,7 +1333,8 @@ async fn real_store_scope_union_and_four_actions_preserve_authority_boundaries()
     );
 
     let organize_input = format!(
-        "{{\"v\":1,\"op\":\"deprecate\",\"target\":\"{repo_atom_id}\",\"expected_revision\":\"{successor_revision}\",\"patch\":{{}},\"reason\":\"manual review\"}}"
+        "{{\"v\":1,\"op\":\"deprecate\",\"target\":\"{repo_atom_id}\",\
+         \"expected_revision\":\"{successor_revision}\",\"patch\":{{}},\"reason\":\"manual review\"}}"
     );
     let before_protected = handle.project().await.unwrap();
     let protected = service
@@ -1343,7 +1345,9 @@ async fn real_store_scope_union_and_four_actions_preserve_authority_boundaries()
                 action: McpServiceAction::Organize,
                 workspace: workspace.clone(),
                 input: format!(
-                    "{{\"v\":1,\"op\":\"deprecate\",\"target\":\"{repo_atom_id}\",\"expected_revision\":\"{successor_revision}\",\"patch\":{{\"nested\":{{\"authority\":\"user_explicit\"}}}},\"reason\":\"malicious\"}}"
+                    "{{\"v\":1,\"op\":\"deprecate\",\"target\":\"{repo_atom_id}\",\
+                     \"expected_revision\":\"{successor_revision}\",\
+                     \"patch\":{{\"nested\":{{\"authority\":\"user_explicit\"}}}},\"reason\":\"malicious\"}}"
                 ),
                 refs: vec![observation_ref.clone()],
                 client_cwd: repository_path.clone(),

@@ -148,7 +148,26 @@ impl NativeRetrieval<'_> {
     }
     fn gaps(&self, witnessed: &BTreeSet<String>) -> Vec<NamedGap> {
         let mut gaps = Vec::new();
+        for anchor in &self.context.query_facets.target_anchors {
+            if !self.result.candidates.iter().any(|candidate| {
+                candidate.candidate_id == *anchor || candidate.source_ref == *anchor
+            }) {
+                gaps.push(NamedGap {
+                    kind: NamedGapKind::StableObjectId,
+                    identifier: anchor.clone(),
+                    changes_result: true,
+                });
+            }
+        }
         for identifier in &self.context.query_facets.exact_identifiers {
+            if self
+                .context
+                .query_facets
+                .target_anchors
+                .contains(identifier)
+            {
+                continue;
+            }
             if !self.result.candidates.iter().any(|candidate| {
                 candidate.candidate_id == *identifier
                     || candidate.source_ref == *identifier
@@ -436,7 +455,13 @@ impl NativeRetrieval<'_> {
             };
             let endpoints = (resolve(&source), resolve(&target));
             if let (Some(source_ref), Some(target_ref)) = endpoints {
-                let statement = serde_json::json!({"relation_kind":kind,"source_ref":source_ref,"target_ref":target_ref,"frontier":self.result.projection_frontier}).to_string();
+                let statement = serde_json::json!({
+                    "relation_kind": kind,
+                    "source_ref": source_ref,
+                    "target_ref": target_ref,
+                    "frontier": self.result.projection_frontier,
+                })
+                .to_string();
                 if answer_bytes + statement.len() > 4800 {
                     self.degraded("relation_trace_pack_budget_exhausted");
                     continue;

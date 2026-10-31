@@ -1110,6 +1110,7 @@ fn eligibility_publication_and_router_gates_are_closed_and_bounded() {
         raw_query: "release verifier failed".into(),
         query_facets: QueryFacetSet {
             parse_status: FacetParseStatus::Complete,
+            target_anchors: Vec::new(),
             exact_identifiers: Vec::new(),
             condition_literals: Vec::new(),
             relation_requirements: Vec::new(),
