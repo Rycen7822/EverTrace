@@ -90,7 +90,15 @@ impl NativeRetrieval<'_> {
         self.result.budget.candidates_remaining.min(32) as usize
     }
     async fn evidence_fts(&mut self, filter: &SearchHardFilter) -> Result<(), SearchError> {
-        if self.remaining() == 0 {
+        // Retained hits occupy fetch slots, not new budget. One further hit
+        // proves truncation; exact-fit duplicate hits must not invent omission.
+        let retained = self
+            .result
+            .candidates
+            .iter()
+            .filter(|candidate| candidate.row_variant == SearchCandidateVariant::EvidenceSurface)
+            .count();
+        if self.remaining() == 0 && retained == 0 {
             self.degraded("evidence_channel_budget_exhausted");
             return Ok(());
         }
@@ -98,15 +106,7 @@ impl NativeRetrieval<'_> {
             self.degraded("retrieval_deadline_exhausted");
             return Ok(());
         }
-        // Include retained evidence in the fetch bound so duplicate hits cannot
-        // crowd out remaining slots. Admission never refills the shared budget.
-        let retained = self
-            .result
-            .candidates
-            .iter()
-            .filter(|candidate| candidate.row_variant == SearchCandidateVariant::EvidenceSurface)
-            .count();
-        let limit = (self.remaining() + retained).min(32);
+        let limit = (self.remaining() + retained).min(32) + 1;
         match self
             .deadline
             .run(
@@ -218,7 +218,7 @@ impl NativeRetrieval<'_> {
                 .deadline
                 .run(
                     self.snapshot
-                        .structured(identifiers, &filter, limit.min(32)),
+                        .structured(identifiers, &filter, limit.min(32) + 1),
                 )
                 .await
             {
