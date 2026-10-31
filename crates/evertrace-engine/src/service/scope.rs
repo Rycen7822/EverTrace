@@ -37,6 +37,7 @@ impl McpQueryAnchor {
             &context.facts,
             &self.search_anchor(),
             self.task_id,
+            context.capture_context.as_deref(),
         )
     }
 

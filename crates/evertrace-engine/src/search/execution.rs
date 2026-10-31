@@ -11,6 +11,7 @@ pub(crate) fn from_facts(
     facts: &[JournalPayload],
     anchor: &QueryAnchor,
     task_id: Option<TaskId>,
+    capture_context: Option<&evertrace_domain::query::QueryCaptureContext>,
 ) -> Option<Box<QueryExecution>> {
     if !matches!(
         anchor.binding_strength,
@@ -118,6 +119,7 @@ pub(crate) fn from_facts(
     let execution = QueryExecution {
         frontier,
         repository_state: primary_repository(facts, episode),
+        capture_context: capture_context.cloned().map(Box::new),
         task: task.clone(),
         workstream: stream.clone(),
         episode: episode.clone(),

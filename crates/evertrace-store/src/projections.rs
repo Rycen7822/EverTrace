@@ -3092,6 +3092,7 @@ impl<'a> InboxCandidate<'a> {
 #[derive(Debug, Default)]
 pub struct ScopeCurrentContext {
     pub facts: Vec<JournalPayload>,
+    pub capture_context: Option<Box<evertrace_domain::query::QueryCaptureContext>>,
 }
 
 /// One current directory metadata window, never a complete projection.
@@ -4876,6 +4877,7 @@ impl JournalAdmissionState {
         repositories.extend(request.repository);
         worktrees.extend(request.worktree);
         let mut primary_worktree = None;
+        let mut capture_context = None;
         if let Some(session) = request.session.as_deref() {
             let mut lanes = Vec::new();
             for (lane, seq) in self.execution_lanes.values().filter(|(lane, _)| {
@@ -4927,6 +4929,8 @@ impl JournalAdmissionState {
                             primary_worktree = episode.worktree_instance_id;
                             worktrees.extend(primary_worktree);
                             facts.push(payload);
+                            capture_context =
+                                Some(Box::new(self.scope_capture_context(lane, episode)?));
                             for id in &episode.attempt_ids {
                                 if let Some((attempt, seq)) = self.attempts.get(id) {
                                     let payload =
@@ -5056,7 +5060,10 @@ impl JournalAdmissionState {
                 }
             }
         }
-        Ok(ScopeCurrentContext { facts })
+        Ok(ScopeCurrentContext {
+            facts,
+            capture_context,
+        })
     }
 
     /// Materialize only the stable control families ordinary Search consumes
@@ -5331,6 +5338,11 @@ impl JournalAdmissionState {
         payload: &JournalPayload,
         seq: u64,
     ) -> Result<Option<ObjectRow>, StoreError> {
+        if matches!(payload, JournalPayload::CaptureReceiptRecorded(_)) {
+            return Ok(self
+                .capture_product_rows(vec![inbox_work_row(payload, seq)?])?
+                .pop());
+        }
         let (kind, id, revision) = match payload {
             JournalPayload::ExecutionLaneRecorded(v) => (
                 "execution_lane",
@@ -5429,6 +5441,112 @@ impl JournalAdmissionState {
             _ => physical_object_row(ObjectFamily::Work, kind, id, revision, payload, seq)?,
         };
         Ok(self.capture_product_rows(vec![row])?.pop())
+    }
+
+    fn scope_capture_context(
+        &self,
+        anchor_lane: &ExecutionLane,
+        episode: &evertrace_domain::work::WorkEpisode,
+    ) -> Result<evertrace_domain::query::QueryCaptureContext, StoreError> {
+        use evertrace_domain::work::{
+            CaptureSummary, CoverageLevel, OrderingIntegrity, PairingIntegrity, PayloadIntegrity,
+            SourceCoverage,
+        };
+        let relevant = episode
+            .execution_lane_ids
+            .iter()
+            .copied()
+            .chain(std::iter::once(anchor_lane.execution_lane_id))
+            .collect::<BTreeSet<_>>();
+        let mut receipts = Vec::new();
+        let mut unavailable = Vec::new();
+        let mut gaps = BTreeSet::new();
+        let mut markers = BTreeSet::new();
+        let mut outages = BTreeSet::new();
+        for id in &relevant {
+            let Some((lane, seq)) = self.execution_lanes.get(id) else {
+                unavailable.push(*id);
+                continue;
+            };
+            if *id != anchor_lane.execution_lane_id
+                && !self.scope_fact_visible(
+                    &JournalPayload::ExecutionLaneRecorded(Box::new(lane.clone())),
+                    *seq,
+                )?
+            {
+                unavailable.push(*id);
+                continue;
+            }
+            let Some((receipt, seq)) = self
+                .capture_receipt_revisions
+                .get(&lane.active_capture_receipt_revision_id)
+            else {
+                unavailable.push(*id);
+                continue;
+            };
+            if receipt.execution_lane_id != *id {
+                return Err(StoreError::StoreCorrupt);
+            }
+            if !self.scope_fact_visible(
+                &JournalPayload::CaptureReceiptRecorded(Box::new(receipt.clone())),
+                *seq,
+            )? {
+                unavailable.push(*id);
+                continue;
+            }
+            gaps.extend(
+                receipt
+                    .sequence_gaps
+                    .iter()
+                    .map(|gap| (*id, gap.first_sequence, gap.last_sequence)),
+            );
+            markers.extend(receipt.capture_gap_marker_refs.iter());
+            outages.extend(receipt.capture_outage_interval_refs.iter().copied());
+            receipts.push(receipt);
+        }
+        let mut summary = CaptureSummary::from_receipts(receipts.iter().copied())
+            .map_err(|_| StoreError::StoreCorrupt)?;
+        if !unavailable.is_empty() {
+            summary.minimum_coverage_level = CoverageLevel::Opaque;
+            summary
+                .source_coverage_states
+                .push(SourceCoverage::Unavailable);
+            summary.source_coverage_states.sort();
+            summary.source_coverage_states.dedup();
+            summary
+                .pairing_integrity_states
+                .push(PairingIntegrity::Unavailable);
+            summary.pairing_integrity_states.sort();
+            summary.pairing_integrity_states.dedup();
+            summary
+                .payload_integrity_states
+                .push(PayloadIntegrity::Unavailable);
+            summary.payload_integrity_states.sort();
+            summary.payload_integrity_states.dedup();
+            summary
+                .ordering_integrity_states
+                .push(OrderingIntegrity::Unavailable);
+            summary.ordering_integrity_states.sort();
+            summary.ordering_integrity_states.dedup();
+        }
+        let gap_count = gaps
+            .len()
+            .checked_add(markers.len())
+            .and_then(|count| count.checked_add(outages.len()))
+            .and_then(|count| u64::try_from(count).ok())
+            .ok_or(StoreError::StoreCorrupt)?;
+        let mut receipt_ids = receipts
+            .iter()
+            .map(|receipt| receipt.capture_receipt_revision_id)
+            .collect::<Vec<_>>();
+        receipt_ids.sort();
+        Ok(evertrace_domain::query::QueryCaptureContext {
+            relevant_lane_ids: relevant.into_iter().collect(),
+            relevant_capture_receipt_revision_ids: receipt_ids,
+            unresolved_gap_count: unavailable.is_empty().then_some(gap_count),
+            unavailable_lane_ids: unavailable,
+            summary,
+        })
     }
 
     fn inbox_candidates(&self) -> impl Iterator<Item = (InboxCandidate<'_>, u64)> {

@@ -784,12 +784,85 @@ impl QueryRepositoryState {
     }
 }
 
+/// Receipt-derived metadata, not an execution or permission grant.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct QueryCaptureContext {
+    pub relevant_lane_ids: Vec<ExecutionLaneId>,
+    pub relevant_capture_receipt_revision_ids: Vec<crate::ids::CaptureReceiptId>,
+    pub unavailable_lane_ids: Vec<ExecutionLaneId>,
+    pub summary: crate::work::CaptureSummary,
+    /// Distinct declared gap ranges/markers/outages, not physical event count.
+    /// None means a relevant lane's receipt could not be read.
+    pub unresolved_gap_count: Option<u64>,
+}
+
+impl QueryCaptureContext {
+    pub fn validate(
+        &self,
+        episode: &crate::work::WorkEpisode,
+        anchor: &QueryAnchor,
+    ) -> Result<(), QueryError> {
+        use crate::work::{
+            CoverageLevel, OrderingIntegrity, PairingIntegrity, PayloadIntegrity, SourceCoverage,
+        };
+        let mut expected = episode.execution_lane_ids.clone();
+        expected.extend(anchor.execution_lane_id);
+        expected.sort();
+        expected.dedup();
+        self.summary.validate().map_err(|_| QueryError::Invalid)?;
+        if expected.is_empty()
+            || self.relevant_lane_ids != expected
+            || !self
+                .unavailable_lane_ids
+                .windows(2)
+                .all(|pair| pair[0] < pair[1])
+            || self
+                .unavailable_lane_ids
+                .iter()
+                .any(|id| expected.binary_search(id).is_err())
+            || !self
+                .relevant_capture_receipt_revision_ids
+                .windows(2)
+                .all(|pair| pair[0] < pair[1])
+            || self.relevant_capture_receipt_revision_ids.len() + self.unavailable_lane_ids.len()
+                != expected.len()
+            || self.unavailable_lane_ids.is_empty() != self.unresolved_gap_count.is_some()
+        {
+            return Err(QueryError::Invalid);
+        }
+        if !self.unavailable_lane_ids.is_empty()
+            && (self.summary.minimum_coverage_level != CoverageLevel::Opaque
+                || !self
+                    .summary
+                    .source_coverage_states
+                    .contains(&SourceCoverage::Unavailable)
+                || !self
+                    .summary
+                    .pairing_integrity_states
+                    .contains(&PairingIntegrity::Unavailable)
+                || !self
+                    .summary
+                    .payload_integrity_states
+                    .contains(&PayloadIntegrity::Unavailable)
+                || !self
+                    .summary
+                    .ordering_integrity_states
+                    .contains(&OrderingIntegrity::Unavailable))
+        {
+            return Err(QueryError::Invalid);
+        }
+        Ok(())
+    }
+}
+
 /// Canonical Work revisions pinned to one read, never another state store.
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct QueryExecution {
     pub frontier: u64,
     pub repository_state: Option<Box<QueryRepositoryState>>,
+    pub capture_context: Option<Box<QueryCaptureContext>>,
     pub task: crate::work::Task,
     pub workstream: crate::work::Workstream,
     pub episode: crate::work::WorkEpisode,
@@ -827,6 +900,9 @@ impl QueryExecution {
         self.episode.validate().map_err(|_| QueryError::Invalid)?;
         if let Some(repository) = &self.repository_state {
             repository.validate(&self.episode)?;
+        }
+        if let Some(capture) = &self.capture_context {
+            capture.validate(&self.episode, anchor)?;
         }
         if self.frontier == 0
             || !matches!(

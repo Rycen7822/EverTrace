@@ -220,11 +220,14 @@ impl CaptureSummary {
         Ok(())
     }
 
-    pub fn from_receipts(receipts: &[super::CaptureReceipt]) -> Result<Self, WorkError> {
+    pub fn from_receipts<'a>(
+        receipts: impl IntoIterator<Item = &'a super::CaptureReceipt>,
+    ) -> Result<Self, WorkError> {
+        let receipts = receipts.into_iter().collect::<Vec<_>>();
         if receipts.is_empty() {
             return Ok(Self::default());
         }
-        for receipt in receipts {
+        for receipt in &receipts {
             receipt.validate()?;
         }
         let mut source = receipts
