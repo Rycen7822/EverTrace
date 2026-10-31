@@ -335,6 +335,7 @@ pub struct SiblingWriterLock {
     data_dir: PathBuf,
     lock_path: PathBuf,
     file: File,
+    owner_pid: u32,
     parent_file: File,
     data_identity: (u64, u64),
 }
@@ -383,6 +384,7 @@ impl SiblingWriterLock {
             data_dir: data_dir.to_owned(),
             lock_path,
             file,
+            owner_pid: std::process::id(),
             parent_file,
             data_identity: (data_metadata.dev(), data_metadata.ino()),
         })
@@ -402,6 +404,9 @@ impl SiblingWriterLock {
     }
 
     fn validate_parent_and_lock(&self) -> Result<(), StoreError> {
+        if self.owner_pid != std::process::id() {
+            return Err(StoreError::WriterAlreadyRunning);
+        }
         validate_lock_identity(&self.lock_path, &self.file)?;
         let parent = self.data_dir.parent().ok_or(StoreError::InvalidPath)?;
         validate_parent(parent)?;
@@ -437,6 +442,16 @@ impl SiblingWriterLock {
         self.data_identity = expected;
         self.parent_file.sync_all().map_err(|_| StoreError::Io)?;
         self.validate_held()
+    }
+}
+
+impl Drop for SiblingWriterLock {
+    fn drop(&mut self) {
+        // Closing one FD does not release flock while a fork child retains a
+        // copy. Only the acquiring process may release the shared lock.
+        if self.owner_pid == std::process::id() {
+            let _ = FileExt::unlock(&self.file);
+        }
     }
 }
 
