@@ -35,6 +35,7 @@ pub struct SearchSnapshot {
     table: Table,
     frontier: u64,
     authoritative_frontier: u64,
+    readers: StoreReadHandle,
     // Declared last so the pinned table drops before the read fence and permit.
     _lease: crate::connection::StoreReadLease,
 }
@@ -57,6 +58,7 @@ pub struct SearchHardFilter {
     pub authority: Option<String>,
     pub lifecycle: Option<String>,
     pub object_only: bool,
+    pub global_only: bool,
     pub current_only: bool,
     pub suppressed_hashes: BTreeSet<String>,
     pub suppressed_refs: BTreeSet<String>,
@@ -163,6 +165,7 @@ impl SearchIndex {
                     table,
                     frontier,
                     authoritative_frontier: after,
+                    readers: self.readers.clone(),
                     _lease: lease,
                 });
             }
@@ -240,6 +243,45 @@ fn exact_checkpoint_frontier(rows: &[SearchProjectionRow]) -> Result<u64, StoreE
 }
 
 impl SearchSnapshot {
+    pub async fn is_current(&self) -> Result<bool, StoreError> {
+        let frontier = self.frontier;
+        self.readers
+            .lease_read(&self._lease, move |connection, _| {
+                Ok(crate::sqlite_state::read_persisted_frontier(connection)? == frontier)
+            })
+            .await
+    }
+
+    pub async fn adjacent_relations(
+        &self,
+        sources: &[String],
+        kinds: &[String],
+        limit: usize,
+    ) -> Result<Option<Vec<crate::RelationProjectionRow>>, StoreError> {
+        if sources.len() > 64
+            || kinds.len() > 32
+            || !(1..=65).contains(&limit)
+            || kinds
+                .iter()
+                .any(|kind| !crate::relations::is_persisted_relation_kind(kind))
+        {
+            return Err(StoreError::InvalidInput);
+        }
+        if sources.is_empty() || kinds.is_empty() {
+            return Ok(Some(Vec::new()));
+        }
+        let frontier = self.frontier;
+        let (sources, kinds) = (sources.to_vec(), kinds.to_vec());
+        self.readers
+            .lease_read(&self._lease, move |connection, cancel| {
+                cancel.check()?;
+                crate::sqlite_state::read_relation_neighbours(
+                    connection, frontier, &sources, &kinds, limit,
+                )
+            })
+            .await
+    }
+
     pub const fn frontier(&self) -> u64 {
         self.frontier
     }
@@ -519,6 +561,9 @@ fn filter_sql(filter: &SearchHardFilter) -> Option<String> {
             "(object_kind IS NULL OR object_kind != 'procedure_revision' OR ({allowed}))"
         ));
     }
+    if filter.global_only {
+        clauses.push("task_id IS NULL AND repository_id IS NULL AND worktree_id IS NULL".into());
+    }
     if filter.object_only {
         clauses.push("row_variant = 'object'".into());
     }
@@ -710,26 +755,10 @@ impl SearchProjectionRow {
         } else if self.row_variant == "object" {
             if self.source_kind.as_deref() != Some("object_projection")
                 || self.object_kind.as_deref().is_none_or(str::is_empty)
-                || !matches!(
-                    self.object_kind.as_deref(),
-                    Some(
-                        "atom_revision"
-                            | "task"
-                            | "workstream"
-                            | "attempt"
-                            | "experiment_run"
-                            | "result_evidence"
-                            | "work_artifact"
-                            | "scenario"
-                            | "core_membership"
-                            | "global_support_contract"
-                            | "global_support_validation"
-                            | "procedure_revision"
-                            | "revision_proposal_revision"
-                            | "semantic_digest"
-                            | "wiki_projection"
-                    )
-                )
+                || !self
+                    .object_kind
+                    .as_deref()
+                    .is_some_and(is_searchable_object_kind)
                 || !matches!(self.currentness.as_deref(), Some("current" | "historical"))
                 || !matches!(
                     self.lifecycle.as_deref(),
@@ -816,6 +845,27 @@ fn is_hex_64(value: &str) -> bool {
 fn valid_uuid(value: &str) -> bool {
     evertrace_domain::revision::RevisionId::from_str(value).is_ok()
         || evertrace_domain::ids::AnyPublicId::from_str(value).is_ok()
+}
+
+pub fn is_searchable_object_kind(kind: &str) -> bool {
+    matches!(
+        kind,
+        "atom_revision"
+            | "task"
+            | "workstream"
+            | "attempt"
+            | "experiment_run"
+            | "result_evidence"
+            | "work_artifact"
+            | "scenario"
+            | "core_membership"
+            | "global_support_contract"
+            | "global_support_validation"
+            | "procedure_revision"
+            | "revision_proposal_revision"
+            | "semantic_digest"
+            | "wiki_projection"
+    )
 }
 
 fn valid_entity_ref(value: &str) -> bool {

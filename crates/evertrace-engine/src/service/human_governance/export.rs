@@ -212,17 +212,17 @@ impl HumanGovernanceService {
         };
         for chunk in rows.chunks(MAX_SELECTIONS) {
             check_deadline(deadline)?;
-            if !crate::session_import::blocked_source_rows_from_rows_before(
+            if !crate::session_import::source_rows_read_assessment(
                 &self.writer,
                 report.as_ref(),
                 all_rows,
                 chunk,
-                self.effective_config_hash,
                 None,
-                None,
+                Some(deadline),
             )
             .await
             .map_err(|_| Failure::Corrupt)?
+            .0
             .is_empty()
             {
                 return Err(Failure::Denied);
@@ -230,14 +230,15 @@ impl HumanGovernanceService {
         }
         let scopes = crate::repository::row_repository_contexts_from_scopes(all_rows.iter(), rows)
             .map_err(|_| Failure::Corrupt)?;
-        if !crate::repository::blocked_repositories(
+        if !crate::repository::repository_read_assessment(
             &self.writer,
             scopes.values().flatten().copied().collect(),
             report.as_ref(),
-            self.effective_config_hash,
+            deadline,
         )
         .await
         .map_err(|_| Failure::Corrupt)?
+        .0
         .is_empty()
         {
             return Err(Failure::Denied);

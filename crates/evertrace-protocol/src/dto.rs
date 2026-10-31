@@ -102,6 +102,9 @@ pub enum HumanRelationKind {
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
 pub enum HumanReadRequest {
+    Search {
+        query: evertrace_domain::query::HumanSearchQuery,
+    },
     CompareRevisions {
         query: evertrace_domain::query::RevisionCompareQuery,
         expected_frontier: u64,
@@ -933,6 +936,9 @@ pub struct HumanActionResult {
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
 pub enum HumanGovernanceResponse {
+    Search {
+        page: Box<evertrace_domain::query::HumanSearchPage>,
+    },
     RevisionComparison {
         comparison: Box<evertrace_domain::query::HumanRevisionComparison>,
     },
@@ -1014,6 +1020,7 @@ impl HumanGovernanceRequest {
 impl HumanReadRequest {
     fn validate(&self) -> bool {
         match self {
+            Self::Search { query } => query.validate().is_ok(),
             Self::CompareRevisions {
                 query,
                 expected_frontier,
@@ -1352,6 +1359,7 @@ impl HumanDiagnostics {
 impl HumanGovernanceResponse {
     pub fn validate(&self) -> bool {
         match self {
+            Self::Search { page } => page.validate(),
             Self::RevisionComparison { comparison } => {
                 use evertrace_domain::query::{HumanComparedValue, RevisionCompareCursor};
                 comparison.validate()

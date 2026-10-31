@@ -2,6 +2,7 @@
 
 mod diagnostic;
 mod production;
+mod retrieval;
 
 pub use diagnostic::{DiagnosticRetrieval, DiagnosticSession};
 pub use production::{DiagnosticFtsFailure, ProductionSearch, SearchError};

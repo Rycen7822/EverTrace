@@ -523,6 +523,75 @@ pub struct SearchResult {
     pub budget: RetrievalBudget,
 }
 
+/// Literal search plus explicitly supplied typed intent. No access grants,
+/// budgets, candidate boundary or completeness proof comes from the client.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct HumanSearchQuery {
+    pub text: String,
+    pub selection: MemoryScopeSelection,
+    pub facets: QueryFacetSet,
+    pub limit: u16,
+}
+impl HumanSearchQuery {
+    pub fn validate(&self) -> Result<(), QueryError> {
+        self.facets.validate()?;
+        if self.text.trim().is_empty()
+            || self.text.len() > MAX_QUERY_BYTES
+            || !(1..=32).contains(&self.limit)
+            || self.selection == MemoryScopeSelection::Unassigned
+            || self.facets.scope_boundary != self.selection.boundary()
+            || self.facets.quantity_constraints
+                != vec![QuantityConstraint::ResultLimit {
+                    limit: u32::from(self.limit),
+                }]
+            || [
+                &self.facets.exact_identifiers,
+                &self.facets.condition_literals,
+                &self.facets.explicit_exclusions,
+            ]
+            .into_iter()
+            .flatten()
+            .any(|value| value.len() > 512 || !self.text.contains(value))
+        {
+            return Err(QueryError::Invalid);
+        }
+        Ok(())
+    }
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct HumanSearchPage {
+    pub result: SearchResult,
+    pub grounded_view: Option<GroundedEvidenceView>,
+}
+impl HumanSearchPage {
+    pub fn validate(&self) -> bool {
+        let refs = self
+            .result
+            .candidates
+            .iter()
+            .map(|candidate| candidate.candidate_id.clone())
+            .collect::<BTreeSet<_>>();
+        self.result.projection_frontier <= self.result.authoritative_frontier
+            && refs.len() == self.result.candidates.len()
+            && refs.len() <= 32
+            && self.result.candidates.iter().all(|candidate| {
+                !candidate.candidate_id.is_empty()
+                    && !candidate.source_ref.is_empty()
+                    && !candidate.text.is_empty()
+                    && candidate.text.len() <= 16 * 1024
+                    && candidate.instruction_authority == "none"
+            })
+            && self.grounded_view.as_ref().is_none_or(|view| {
+                view.validate().is_ok()
+                    && view.candidate_set.candidate_refs == refs
+                    && view.completeness == self.result.completeness
+            })
+    }
+}
+
 /// Metadata browsing is not an alternative text-retrieval pipeline.
 #[derive(Clone, Copy, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "snake_case")]

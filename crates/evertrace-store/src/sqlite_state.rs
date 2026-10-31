@@ -1710,6 +1710,83 @@ pub(crate) fn object_checkpoint_from_rows(rows: &[ObjectRow]) -> Result<(u64, u6
     Ok((frontier, checkpoint.projection_generation))
 }
 
+/// One bounded read transaction, tied to the same frontier as a pinned search.
+/// None is version drift, not an empty neighbourhood or corrupt relation data.
+pub(crate) fn read_relation_neighbours(
+    connection: &Connection,
+    frontier: u64,
+    sources: &[String],
+    kinds: &[String],
+    limit: usize,
+) -> Result<Option<Vec<RelationProjectionRow>>, StoreError> {
+    let transaction = connection
+        .unchecked_transaction()
+        .map_err(|_| StoreError::Io)?;
+    if read_persisted_frontier(connection)? != frontier {
+        return Ok(None);
+    }
+    let mut statement = connection
+        .prepare(SELECT_RELATION_CHECKPOINT)
+        .map_err(|_| StoreError::StoreCorrupt)?;
+    let mut checkpoint = statement
+        .query(params![crate::RELATIONS_CHECKPOINT_ID])
+        .map_err(|_| StoreError::StoreCorrupt)?;
+    let row = checkpoint
+        .next()
+        .map_err(|_| StoreError::StoreCorrupt)?
+        .ok_or(StoreError::StoreCorrupt)?;
+    let row = relation_row_from_sql(row)?;
+    row.validate()?;
+    if checkpoint
+        .next()
+        .map_err(|_| StoreError::StoreCorrupt)?
+        .is_some()
+    {
+        return Err(StoreError::StoreCorrupt);
+    }
+    if row.source_event_seq != frontier {
+        return Ok(None);
+    }
+    drop(checkpoint);
+    drop(statement);
+    let placeholders = |count| vec!["?"; count].join(",");
+    let sql = format!(
+        "SELECT row_id, relation_kind, source_id, target_id, source_event_seq, projection_generation FROM relation_rows WHERE (source_id IN ({}) OR target_id IN ({})) AND relation_kind IN ({}) ORDER BY row_id LIMIT ?",
+        placeholders(sources.len()),
+        placeholders(sources.len()),
+        placeholders(kinds.len())
+    );
+    let mut values = sources
+        .iter()
+        .chain(sources)
+        .chain(kinds)
+        .cloned()
+        .map(rusqlite::types::Value::Text)
+        .collect::<Vec<_>>();
+    values.push(rusqlite::types::Value::Integer(
+        i64::try_from(limit).map_err(|_| StoreError::InvalidInput)?,
+    ));
+    let mut statement = connection
+        .prepare(&sql)
+        .map_err(|_| StoreError::StoreCorrupt)?;
+    let mut queried = statement
+        .query(rusqlite::params_from_iter(values))
+        .map_err(|_| StoreError::StoreCorrupt)?;
+    let mut rows = Vec::with_capacity(limit);
+    while let Some(row) = queried.next().map_err(|_| StoreError::StoreCorrupt)? {
+        let row = relation_row_from_sql(row)?;
+        row.validate()?;
+        if row.source_event_seq > frontier {
+            return Err(StoreError::StoreCorrupt);
+        }
+        rows.push(row);
+    }
+    drop(queried);
+    drop(statement);
+    drop(transaction);
+    Ok(Some(rows))
+}
+
 fn read_relation_rows(connection: &Connection) -> Result<Vec<RelationProjectionRow>, StoreError> {
     let mut statement = connection
         .prepare(SELECT_RELATION_ROWS)

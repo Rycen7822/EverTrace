@@ -1,4 +1,4 @@
-//! Deterministic, deletion-first retrieval. Production is permanently layer A.
+//! Deterministic, deletion-first production retrieval over one pinned snapshot.
 
 use std::{
     collections::{BTreeMap, BTreeSet},
@@ -58,6 +58,132 @@ impl ProductionSearch {
         self
     }
 
+    fn hard_filter(&self, context: &SearchContext, object_only: bool) -> SearchHardFilter {
+        let suppressed_hashes = match &context.suppression {
+            SuppressionSnapshot::Current { ref_hashes, .. } => ref_hashes.clone(),
+            SuppressionSnapshot::Unavailable => unreachable!("handled above"),
+        };
+        let (source_role, authority) = source_filter(context.query_facets.source_boundary);
+        SearchHardFilter {
+            readable_refs: self.readable_refs.as_ref().map(|(_, refs)| refs.clone()),
+            // A is a candidate channel; C owns positive facet compatibility.
+            condition_literals: Vec::new(),
+            excluded_identifiers: context.query_facets.explicit_exclusions.clone(),
+            procedure_revisions: self.procedure_revisions.clone(),
+            method_proposal_revisions: self.method_proposal_revisions.clone(),
+            task_id: context.task_id.map(|id| id.to_string()),
+            repository_id: context.repository_id.map(|id| id.to_string()),
+            worktree_id: context.worktree_id.map(|id| id.to_string()),
+            source_kind: None,
+            source_role,
+            authority,
+            lifecycle: match context.query_facets.lifecycle_boundary {
+                LifecycleBoundary::Active => Some("active".into()),
+                LifecycleBoundary::Terminal => Some("terminal".into()),
+                LifecycleBoundary::Any => None,
+            },
+            object_only,
+            global_only: false,
+            current_only: context.intent != evertrace_domain::query::SearchIntent::HistoryLookup
+                && matches!(
+                    context.query_facets.temporal_mode,
+                    TemporalMode::Current | TemporalMode::Any | TemporalMode::Unknown
+                ),
+            suppressed_refs: suppressed_hashes.clone(),
+            suppressed_hashes,
+            event_time_as_of: match context.query_facets.temporal_qualifiers.as_slice() {
+                [TemporalQualifier::EventTimeAsOf { at_us }] => Some(*at_us),
+                _ => None,
+            },
+            event_time_interval: match context.query_facets.temporal_qualifiers.as_slice() {
+                [TemporalQualifier::EventTimeInterval { start_us, end_us }] => {
+                    Some((*start_us, *end_us))
+                }
+                _ => None,
+            },
+            source_sequence_at_most: match context.query_facets.temporal_qualifiers.as_slice() {
+                [TemporalQualifier::SourceSequenceAtMost { sequence }] => Some(*sequence),
+                _ => None,
+            },
+        }
+    }
+
+    pub(crate) async fn retrieve(
+        &self,
+        context: SearchContext,
+        global_only: bool,
+    ) -> Result<evertrace_domain::query::HumanSearchPage, SearchError> {
+        use evertrace_domain::query::{HumanSearchPage, SourceBoundary};
+        context.validate()?;
+        if self.readable_refs.is_none() {
+            return Err(SearchError::Unsupported);
+        }
+        if matches!(context.suppression, SuppressionSnapshot::Unavailable)
+            || (context.query_facets.polarity != Polarity::Positive
+                && context.query_facets.explicit_exclusions.is_empty())
+        {
+            return Ok(HumanSearchPage {
+                result: self.search(context).await?,
+                grounded_view: None,
+            });
+        }
+        let deadline = RequestDeadline::new(Instant::now(), context.budget.latency_us_remaining);
+        let snapshot = match deadline
+            .run(
+                self.index
+                    .snapshot_after_validated_frontier(self.validated_frontier.unwrap_or(0)),
+            )
+            .await
+        {
+            Ok(snapshot) => snapshot?,
+            Err(()) => {
+                return Ok(HumanSearchPage {
+                    result: deadline_result(context, "snapshot_deadline_exhausted", 0, 0),
+                    grounded_view: None,
+                });
+            }
+        };
+        let result = self
+            .search_snapshot(context.clone(), false, &snapshot, &deadline, global_only)
+            .await?;
+        let mut objects = self.hard_filter(&context, true);
+        objects.global_only = global_only;
+        let evidence = match context.query_facets.source_boundary {
+            Some(SourceBoundary::ProjectPolicy | SourceBoundary::ObjectiveEvidence) => None,
+            role => {
+                let mut filter = self.hard_filter(&context, false);
+                filter.global_only = global_only;
+                filter.current_only = false;
+                filter.lifecycle = None;
+                filter.authority = None;
+                filter.source_kind = Some("evidence_surface".into());
+                filter.source_role = match role {
+                    None => None,
+                    Some(SourceBoundary::User) => Some("user"),
+                    Some(SourceBoundary::Assistant | SourceBoundary::AgentInferred) => {
+                        Some("assistant")
+                    }
+                    Some(SourceBoundary::Tool) => Some("tool"),
+                    Some(SourceBoundary::Host) => Some("host"),
+                    Some(SourceBoundary::Imported) => Some("imported"),
+                    _ => unreachable!(),
+                }
+                .map(str::to_owned);
+                Some(filter)
+            }
+        };
+        super::retrieval::NativeRetrieval {
+            snapshot: &snapshot,
+            context: &context,
+            result,
+            objects,
+            evidence,
+            deadline: &deadline,
+        }
+        .run()
+        .await
+    }
+
     pub async fn search(&self, context: SearchContext) -> Result<SearchResult, SearchError> {
         self.search_inner(context, false).await
     }
@@ -72,7 +198,7 @@ impl ProductionSearch {
 
     async fn search_inner(
         &self,
-        mut context: SearchContext,
+        context: SearchContext,
         force_fts_failure: bool,
     ) -> Result<SearchResult, SearchError> {
         let started = Instant::now();
@@ -125,6 +251,19 @@ impl ProductionSearch {
                 ));
             }
         };
+        self.search_snapshot(context, force_fts_failure, &snapshot, &deadline, false)
+            .await
+    }
+
+    async fn search_snapshot(
+        &self,
+        mut context: SearchContext,
+        force_fts_failure: bool,
+        snapshot: &evertrace_store::SearchSnapshot,
+        deadline: &RequestDeadline,
+        global_only: bool,
+    ) -> Result<SearchResult, SearchError> {
+        let started = deadline.started;
         if self.readable_refs.as_ref().is_some_and(|(frontier, _)| {
             *frontier != snapshot.frontier() || *frontier != snapshot.authoritative_frontier()
         }) {
@@ -139,52 +278,8 @@ impl ProductionSearch {
                 budget: context.budget,
             });
         }
-        let suppressed_hashes = match &context.suppression {
-            SuppressionSnapshot::Current { ref_hashes, .. } => ref_hashes.clone(),
-            SuppressionSnapshot::Unavailable => unreachable!("handled above"),
-        };
-        let (source_role, authority) = source_filter(context.query_facets.source_boundary);
-        let filter = SearchHardFilter {
-            readable_refs: self.readable_refs.as_ref().map(|(_, refs)| refs.clone()),
-            // A is a candidate channel; C owns positive facet compatibility.
-            condition_literals: Vec::new(),
-            excluded_identifiers: context.query_facets.explicit_exclusions.clone(),
-            procedure_revisions: self.procedure_revisions.clone(),
-            method_proposal_revisions: self.method_proposal_revisions.clone(),
-            task_id: context.task_id.map(|id| id.to_string()),
-            repository_id: context.repository_id.map(|id| id.to_string()),
-            worktree_id: context.worktree_id.map(|id| id.to_string()),
-            source_kind: None,
-            source_role,
-            authority,
-            lifecycle: match context.query_facets.lifecycle_boundary {
-                LifecycleBoundary::Active => Some("active".into()),
-                LifecycleBoundary::Terminal => Some("terminal".into()),
-                LifecycleBoundary::Any => None,
-            },
-            object_only: true,
-            current_only: context.intent != evertrace_domain::query::SearchIntent::HistoryLookup
-                && matches!(
-                    context.query_facets.temporal_mode,
-                    TemporalMode::Current | TemporalMode::Any | TemporalMode::Unknown
-                ),
-            suppressed_refs: suppressed_hashes.clone(),
-            suppressed_hashes,
-            event_time_as_of: match context.query_facets.temporal_qualifiers.as_slice() {
-                [TemporalQualifier::EventTimeAsOf { at_us }] => Some(*at_us),
-                _ => None,
-            },
-            event_time_interval: match context.query_facets.temporal_qualifiers.as_slice() {
-                [TemporalQualifier::EventTimeInterval { start_us, end_us }] => {
-                    Some((*start_us, *end_us))
-                }
-                _ => None,
-            },
-            source_sequence_at_most: match context.query_facets.temporal_qualifiers.as_slice() {
-                [TemporalQualifier::SourceSequenceAtMost { sequence }] => Some(*sequence),
-                _ => None,
-            },
-        };
+        let mut filter = self.hard_filter(&context, true);
+        filter.global_only = global_only;
         let requested_limit = context
             .query_facets
             .quantity_constraints
@@ -400,22 +495,24 @@ impl ProductionSearch {
     }
 }
 
-struct RequestDeadline {
+pub(super) struct RequestDeadline {
+    started: Instant,
     at: Instant,
 }
 
 impl RequestDeadline {
     fn new(started: Instant, latency_us: u64) -> Self {
         Self {
+            started,
             at: started + Duration::from_micros(latency_us),
         }
     }
 
-    fn remaining(&self) -> Option<Duration> {
+    pub(super) fn remaining(&self) -> Option<Duration> {
         self.at.checked_duration_since(Instant::now())
     }
 
-    async fn run<F: std::future::Future>(&self, future: F) -> Result<F::Output, ()> {
+    pub(super) async fn run<F: std::future::Future>(&self, future: F) -> Result<F::Output, ()> {
         let remaining = self
             .remaining()
             .filter(|value| !value.is_zero())

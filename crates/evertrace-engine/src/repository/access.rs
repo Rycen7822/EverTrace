@@ -208,8 +208,19 @@ pub(crate) async fn blocked_repositories_before(
     config_hash: [u8; 32],
     deadline: Instant,
 ) -> Result<BTreeSet<RepositoryId>, crate::WriterActorError> {
+    let (blocked, revoked) = repository_read_assessment(writer, ids, report, deadline).await?;
+    record_trust_revocations(writer, revoked, config_hash).await?;
+    Ok(blocked)
+}
+
+pub(crate) async fn repository_read_assessment(
+    writer: &crate::WriterHandle,
+    ids: BTreeSet<RepositoryId>,
+    report: Option<&evertrace_codex::probe::HostProbeReport>,
+    deadline: Instant,
+) -> Result<(BTreeSet<RepositoryId>, Vec<RepositoryInstance>), crate::WriterActorError> {
     if ids.is_empty() {
-        return Ok(BTreeSet::new());
+        return Ok((BTreeSet::new(), Vec::new()));
     }
     let context = writer.repository_read_context(ids.clone()).await?;
     let observed_location = report
@@ -251,8 +262,7 @@ pub(crate) async fn blocked_repositories_before(
             revoked.push(repository.clone());
         }
     }
-    record_trust_revocations(writer, revoked, config_hash).await?;
-    Ok(blocked)
+    Ok((blocked, revoked))
 }
 
 /// Current finite assets are read from protected CAS only after matching the

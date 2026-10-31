@@ -863,6 +863,10 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
                                 }
                             }
                             HumanGovernanceRequest::Read { request } => match request {
+                                HumanReadRequest::Search {query} => {
+                                    let page = human_governance.search(query).await.map_err(map_human_error)?;
+                                    HumanGovernanceResponse::Search {page: Box::new(page)}
+                                }
                                 HumanReadRequest::CompareRevisions {query, expected_frontier, after, limit} => {
                                     match human_governance.compare_revisions(query, expected_frontier, after.as_deref(), limit).await.map_err(map_human_error)? {
                                         Ok(comparison) => HumanGovernanceResponse::RevisionComparison {comparison:Box::new(comparison)},

@@ -3209,6 +3209,28 @@ pub(crate) async fn blocked_source_rows_from_rows_before(
     lookup: Option<&BTreeMap<&str, &evertrace_store::ObjectRow>>,
     deadline: Option<Instant>,
 ) -> Result<std::collections::BTreeSet<String>, SessionImportServiceError> {
+    let (blocked, revoked) =
+        source_rows_read_assessment(writer, report, all_rows, rows, lookup, deadline).await?;
+    crate::repository::record_trust_revocations(writer, revoked, config_hash)
+        .await
+        .map_err(map_writer)?;
+    Ok(blocked)
+}
+
+pub(crate) async fn source_rows_read_assessment(
+    writer: &WriterHandle,
+    report: Option<&HostProbeReport>,
+    all_rows: &[evertrace_store::ObjectRow],
+    rows: &[&evertrace_store::ObjectRow],
+    lookup: Option<&BTreeMap<&str, &evertrace_store::ObjectRow>>,
+    deadline: Option<Instant>,
+) -> Result<
+    (
+        std::collections::BTreeSet<String>,
+        Vec<evertrace_domain::repository::RepositoryInstance>,
+    ),
+    SessionImportServiceError,
+> {
     let mut sources = BTreeMap::new();
     let mut observations = BTreeMap::new();
     let mut blocked = std::collections::BTreeSet::new();
@@ -3308,8 +3330,10 @@ pub(crate) async fn blocked_source_rows_from_rows_before(
     {
         return Err(SessionImportServiceError::Corrupt);
     }
-    blocked.extend(blocked_source_instances(writer, report, sources, config_hash, deadline).await?);
-    Ok(blocked)
+    let (denied, revoked) =
+        source_instance_read_assessment(writer, report, sources, deadline).await?;
+    blocked.extend(denied);
+    Ok((blocked, revoked))
 }
 
 pub(crate) async fn blocked_source_instances(
@@ -3319,6 +3343,26 @@ pub(crate) async fn blocked_source_instances(
     config_hash: [u8; 32],
     deadline: Option<Instant>,
 ) -> Result<std::collections::BTreeSet<String>, SessionImportServiceError> {
+    let (blocked, revoked) =
+        source_instance_read_assessment(writer, report, sources, deadline).await?;
+    crate::repository::record_trust_revocations(writer, revoked, config_hash)
+        .await
+        .map_err(map_writer)?;
+    Ok(blocked)
+}
+
+async fn source_instance_read_assessment(
+    writer: &WriterHandle,
+    report: Option<&HostProbeReport>,
+    sources: BTreeMap<String, String>,
+    deadline: Option<Instant>,
+) -> Result<
+    (
+        std::collections::BTreeSet<String>,
+        Vec<evertrace_domain::repository::RepositoryInstance>,
+    ),
+    SessionImportServiceError,
+> {
     let mut contexts = BTreeMap::new();
     for source in sources
         .values()
@@ -3358,13 +3402,11 @@ pub(crate) async fn blocked_source_instances(
             (source, allowed)
         })
         .collect::<BTreeMap<_, _>>();
-    crate::repository::record_trust_revocations(writer, revoked, config_hash)
-        .await
-        .map_err(map_writer)?;
-    Ok(sources
+    let blocked = sources
         .into_iter()
         .filter_map(|(row, source)| (permissions.get(&source) == Some(&false)).then_some(row))
-        .collect())
+        .collect();
+    Ok((blocked, revoked))
 }
 
 fn resolve_workspace(

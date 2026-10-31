@@ -111,7 +111,8 @@ async fn send_human(
     let kind = match &request {
         HumanGovernanceRequest::Export { .. } => PendingKind::Export,
         HumanGovernanceRequest::Read { request } => match request {
-            HumanReadRequest::CompareRevisions { .. }
+            HumanReadRequest::Search { .. }
+            | HumanReadRequest::CompareRevisions { .. }
             | HumanReadRequest::BrowseMemories { .. }
             | HumanReadRequest::Content { .. }
             | HumanReadRequest::ScopeDirectory { .. }
