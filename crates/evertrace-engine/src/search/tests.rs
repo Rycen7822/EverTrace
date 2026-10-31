@@ -18,6 +18,7 @@ mod tests {
     fn context() -> SearchContext {
         SearchContext {
             query_anchor: evertrace_domain::query::QueryAnchor::unavailable(),
+            execution: None,
             intent: SearchIntent::StageAssistance,
             raw_query: "needle".into(),
             query_facets: QueryFacetSet {

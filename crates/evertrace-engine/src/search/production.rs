@@ -292,6 +292,7 @@ impl ProductionSearch {
         anchor_evidence: Option<&SearchHardFilter>,
     ) -> Result<SearchResult, SearchError> {
         let started = deadline.started;
+        let mut changed_frontiers = BTreeSet::new();
         if self.readable_refs.as_ref().is_some_and(|(frontier, _)| {
             *frontier != snapshot.frontier() || *frontier != snapshot.authoritative_frontier()
         }) || self
@@ -299,13 +300,22 @@ impl ProductionSearch {
             .as_ref()
             .is_some_and(|value| value.frontier != snapshot.frontier())
         {
+            changed_frontiers.insert("read_access_frontier_changed".into());
+        }
+        if context.execution.as_ref().is_some_and(|execution| {
+            execution.frontier != snapshot.frontier()
+                || execution.frontier != snapshot.authoritative_frontier()
+        }) {
+            changed_frontiers.insert("execution_context_frontier_changed".into());
+        }
+        if !changed_frontiers.is_empty() {
             return Ok(SearchResult {
                 layer: RetrievalLayer::A,
                 projection_frontier: snapshot.frontier(),
                 authoritative_frontier: snapshot.authoritative_frontier(),
                 candidates: Vec::new(),
                 completeness: RetrievalCompleteness::Unknown,
-                degraded_reasons: BTreeSet::from(["read_access_frontier_changed".into()]),
+                degraded_reasons: changed_frontiers,
                 omitted_refs: BTreeSet::new(),
                 budget: context.budget,
             });

@@ -134,6 +134,9 @@ impl McpActionService {
             query_anchor: scope.anchor.search_anchor(),
             intent: SearchIntent::StageAssistance,
             raw_query: query.clone(),
+            execution: scope
+                .anchor
+                .execution_context(scope.context.frontier, &scope.context.scope),
             query_facets: QueryFacetSet {
                 parse_status: FacetParseStatus::Unknown,
                 target_anchors: Vec::new(),
@@ -217,7 +220,17 @@ impl McpActionService {
         let has_procedure = selected_candidates
             .iter()
             .any(|candidate| candidate.object_kind.as_deref() == Some("procedure_revision"));
-        let candidate_context = if candidate_ids.is_empty() {
+        let execution_changed = found
+            .degraded_reasons
+            .contains("execution_context_frontier_changed");
+        let candidate_context = if execution_changed {
+            Some(
+                self.writer
+                    .normal_search_current_context(scope.request.clone())
+                    .await
+                    .map_err(|_| McpServiceError::Store)?,
+            )
+        } else if candidate_ids.is_empty() {
             None
         } else {
             Some(
@@ -256,7 +269,7 @@ impl McpActionService {
                 &scope.binding,
                 &scope.client_cwd,
             );
-            if fresh_anchor.as_ref() != Some(&scope.anchor) {
+            if fresh_anchor.as_ref() != Some(&scope.anchor) || execution_changed {
                 if !retried_anchor && let Some(anchor) = fresh_anchor {
                     return Box::pin(self.normal_search_inner(
                         request_id,
@@ -272,6 +285,15 @@ impl McpActionService {
                         true,
                     ))
                     .await;
+                }
+                if execution_changed {
+                    return Ok(empty_result(
+                        request_id,
+                        McpServiceStatus::Partial,
+                        &label,
+                        "partial",
+                        ["execution_context_frontier_changed"],
+                    ));
                 }
                 return Ok(scope_unresolved(request_id));
             }
@@ -658,6 +680,7 @@ impl McpActionService {
             query_anchor: scope.anchor.search_anchor(),
             intent: SearchIntent::StageAssistance,
             raw_query: query,
+            execution: None,
             query_facets: QueryFacetSet {
                 parse_status: FacetParseStatus::Unknown,
                 target_anchors: Vec::new(),
@@ -1367,6 +1390,7 @@ impl McpActionService {
                 query_anchor: scope.anchor.search_anchor(),
                 intent: SearchIntent::FailureRecovery,
                 raw_query: query,
+                execution: None,
                 query_facets: QueryFacetSet {
                     parse_status: FacetParseStatus::Complete,
                     target_anchors: Vec::new(),

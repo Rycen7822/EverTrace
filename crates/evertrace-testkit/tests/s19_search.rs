@@ -140,6 +140,7 @@ fn input(record: &str, sequence: u64, text: &str, role: SourceRole) -> CaptureRe
 fn context(query: &str, exact: &[&str], suppression: SuppressionSnapshot) -> SearchContext {
     SearchContext {
         query_anchor: evertrace_domain::query::QueryAnchor::unavailable(),
+        execution: None,
         intent: SearchIntent::StageAssistance,
         raw_query: query.into(),
         query_facets: QueryFacetSet {

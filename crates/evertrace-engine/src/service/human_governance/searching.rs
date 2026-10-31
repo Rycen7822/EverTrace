@@ -92,6 +92,7 @@ impl HumanGovernanceService {
             }
             let context = SearchContext {
                 query_anchor: QueryAnchor::unavailable(),
+                execution: None,
                 intent: SearchIntent::HistoryLookup,
                 raw_query: query.text,
                 query_facets: query.facets,

@@ -924,6 +924,7 @@ async fn real_store_scope_union_and_four_actions_preserve_authority_boundaries()
     let search = ProductionSearch::new(search_index)
         .search(SearchContext {
             query_anchor: evertrace_domain::query::QueryAnchor::unavailable(),
+            execution: None,
             intent: SearchIntent::StageAssistance,
             raw_query: "needle".into(),
             query_facets: QueryFacetSet {

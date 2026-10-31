@@ -27,6 +27,19 @@ pub struct McpQueryAnchor {
 }
 
 impl McpQueryAnchor {
+    pub(crate) fn execution_context(
+        &self,
+        frontier: u64,
+        context: &evertrace_store::projections::ScopeCurrentContext,
+    ) -> Option<Box<evertrace_domain::query::QueryExecution>> {
+        crate::search::execution::from_facts(
+            frontier,
+            &context.facts,
+            &self.search_anchor(),
+            self.task_id,
+        )
+    }
+
     pub(crate) fn search_anchor(&self) -> evertrace_domain::query::QueryAnchor {
         use evertrace_domain::query::{QueryAnchor, QueryBindingStrength};
         QueryAnchor {

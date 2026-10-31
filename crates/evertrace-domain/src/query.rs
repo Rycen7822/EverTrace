@@ -534,10 +534,117 @@ impl QueryAnchor {
     }
 }
 
+/// Canonical Work revisions pinned to one read, never another state store.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct QueryExecution {
+    pub frontier: u64,
+    pub task: crate::work::Task,
+    pub workstream: crate::work::Workstream,
+    pub episode: crate::work::WorkEpisode,
+    pub attempt: Option<crate::work::Attempt>,
+    pub work_binding: Option<crate::work::WorkBindingRevision>,
+    pub checkpoint: Option<crate::work::WorkCheckpoint>,
+}
+
+impl QueryExecution {
+    pub fn validate(
+        &self,
+        anchor: &QueryAnchor,
+        task_id: Option<TaskId>,
+    ) -> Result<(), QueryError> {
+        use crate::work::{AssignmentStatus, EpisodeLifecycle, WorkstreamStatus};
+        anchor.validate()?;
+        self.task.validate().map_err(|_| QueryError::Invalid)?;
+        self.workstream
+            .validate()
+            .map_err(|_| QueryError::Invalid)?;
+        self.episode.validate().map_err(|_| QueryError::Invalid)?;
+        if self.frontier == 0
+            || !matches!(
+                anchor.binding_strength,
+                QueryBindingStrength::Exact | QueryBindingStrength::ConnectionScoped
+            )
+            || task_id != Some(self.task.task_id)
+            || self.task.lifecycle.is_terminal()
+            || self.workstream.task_id != self.task.task_id
+            || anchor.workstream_id != Some(self.workstream.workstream_id)
+            || self.workstream.status != WorkstreamStatus::Active
+            || self.workstream.active_episode_id != Some(self.episode.episode_id)
+            || self.episode.task_id != self.task.task_id
+            || self.episode.workstream_id != self.workstream.workstream_id
+            || anchor.episode_id != Some(self.episode.episode_id)
+            || anchor.episode_revision_id != Some(self.episode.revision_id)
+            || self.episode.lifecycle_status != EpisodeLifecycle::Open
+            || self.episode.repository_instance_id != self.workstream.repository_instance_id
+            || !anchor
+                .execution_lane_id
+                .is_some_and(|id| self.workstream.execution_lane_ids.contains(&id))
+        {
+            return Err(QueryError::Invalid);
+        }
+        if let Some(attempt) = &self.attempt {
+            attempt.validate().map_err(|_| QueryError::Invalid)?;
+            if attempt.task_id != self.task.task_id
+                || attempt.workstream_id != self.workstream.workstream_id
+                || attempt.episode_id != Some(self.episode.episode_id)
+                || attempt.repository_instance_id != self.episode.repository_instance_id
+                || !self.episode.attempt_ids.contains(&attempt.attempt_id)
+                || !anchor
+                    .execution_lane_id
+                    .is_some_and(|id| attempt.execution_lane_ids.contains(&id))
+                || match self.episode.worktree_instance_id {
+                    Some(id) => !attempt.worktree_instance_ids.contains(&id),
+                    None => !attempt.worktree_instance_ids.is_empty(),
+                }
+            {
+                return Err(QueryError::Invalid);
+            }
+        }
+        if let Some(binding) = &self.work_binding {
+            binding.validate().map_err(|_| QueryError::Invalid)?;
+            let primary = &binding.primary_binding;
+            if binding.assignment_status != AssignmentStatus::Resolved
+                || primary.task_id != Some(self.task.task_id)
+                || primary.workstream_id != Some(self.workstream.workstream_id)
+                || primary.episode_id != Some(self.episode.episode_id)
+                || self.attempt.as_ref().is_some_and(|attempt| {
+                    primary
+                        .attempt_id
+                        .is_some_and(|id| id != attempt.attempt_id)
+                })
+            {
+                return Err(QueryError::Invalid);
+            }
+        }
+        if let Some(checkpoint) = &self.checkpoint {
+            checkpoint.validate().map_err(|_| QueryError::Invalid)?;
+            if checkpoint.episode_id != self.episode.episode_id
+                || checkpoint.source_watermark != self.episode.source_watermark
+                || checkpoint.phase_contract != self.episode.phase_contract
+                || !self
+                    .episode
+                    .checkpoint_refs
+                    .contains(&checkpoint.stable_key())
+                || self.attempt.as_ref().is_some_and(|attempt| {
+                    !checkpoint.attempt_revision_refs.iter().any(|reference| {
+                        reference.attempt_id == attempt.attempt_id
+                            && reference.revision_id == attempt.revision_id
+                    })
+                })
+            {
+                return Err(QueryError::Invalid);
+            }
+        }
+        Ok(())
+    }
+}
+
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct SearchContext {
     pub query_anchor: QueryAnchor,
+    pub execution: Option<Box<QueryExecution>>,
     pub intent: SearchIntent,
     pub raw_query: String,
     pub query_facets: QueryFacetSet,
@@ -554,6 +661,9 @@ impl SearchContext {
             return Err(QueryError::Invalid);
         }
         self.query_anchor.validate()?;
+        if let Some(execution) = &self.execution {
+            execution.validate(&self.query_anchor, self.task_id)?;
+        }
         self.query_facets.validate()?;
         self.suppression.validate()?;
         if self

@@ -4924,6 +4924,63 @@ impl JournalAdmissionState {
                             JournalPayload::WorkEpisodeRecorded(Box::new(episode.clone()));
                         if self.scope_fact_visible(&payload, *seq)? {
                             facts.push(payload);
+                            for id in &episode.attempt_ids {
+                                if let Some((attempt, seq)) = self.attempts.get(id) {
+                                    let payload =
+                                        JournalPayload::AttemptRecorded(Box::new(attempt.clone()));
+                                    if self.scope_fact_visible(&payload, *seq)? {
+                                        facts.push(payload);
+                                    }
+                                }
+                            }
+                            let checkpoint = episode
+                                .checkpoint_refs
+                                .iter()
+                                .filter_map(|key| self.checkpoints.get(key))
+                                .filter(|(value, _)| {
+                                    value.source_watermark == episode.source_watermark
+                                        && value.phase_contract == episode.phase_contract
+                                })
+                                .max_by_key(|(_, seq)| *seq);
+                            if let Some((checkpoint, seq)) = checkpoint {
+                                let payload = JournalPayload::WorkCheckpointRecorded(Box::new(
+                                    checkpoint.clone(),
+                                ));
+                                if self.scope_fact_visible(&payload, *seq)? {
+                                    facts.push(payload);
+                                }
+                            }
+                            let operations =
+                                lane.operation_ids.iter().copied().collect::<BTreeSet<_>>();
+                            let mut bindings = BTreeMap::new();
+                            if !operations.is_empty() {
+                                for (binding, seq) in
+                                    self.work_bindings.values().filter(|(binding, _)| {
+                                        operations.contains(&binding.operation_id)
+                                    })
+                                {
+                                    let entry = bindings
+                                        .entry(binding.operation_id)
+                                        .or_insert((binding, seq));
+                                    if entry.0.revision_generation < binding.revision_generation {
+                                        *entry = (binding, seq);
+                                    }
+                                }
+                            }
+                            for (binding, seq) in bindings.values().filter(|(binding, _)| {
+                                binding.primary_binding.task_id == Some(episode.task_id)
+                                    && binding.primary_binding.workstream_id
+                                        == Some(episode.workstream_id)
+                                    && binding.primary_binding.episode_id
+                                        == Some(episode.episode_id)
+                            }) {
+                                let payload = JournalPayload::WorkBindingRecorded(Box::new(
+                                    (*binding).clone(),
+                                ));
+                                if self.scope_fact_visible(&payload, **seq)? {
+                                    facts.push(payload);
+                                }
+                            }
                         }
                     }
                     repositories.extend(stream.repository_instance_id);
@@ -5289,9 +5346,27 @@ impl JournalAdmissionState {
                 v.episode_id.to_string(),
                 v.revision_id.to_string(),
             ),
+            JournalPayload::AttemptRecorded(v) => (
+                "attempt",
+                v.attempt_id.to_string(),
+                v.revision_id.to_string(),
+            ),
+            JournalPayload::WorkBindingRecorded(v) => (
+                "work_binding",
+                v.work_binding_revision_id.to_string(),
+                v.work_binding_revision_id.to_string(),
+            ),
+            JournalPayload::WorkCheckpointRecorded(v) => (
+                "work_checkpoint",
+                v.stable_key(),
+                v.episode_revision_id.to_string(),
+            ),
             _ => return Err(StoreError::InvalidInput),
         };
         let row = match payload {
+            JournalPayload::WorkCheckpointRecorded(_) => work_identity_row(
+                kind, id, revision, "derived", None, None, None, None, payload, seq,
+            )?,
             JournalPayload::TaskRecorded(v) => work_identity_row(
                 kind,
                 id.clone(),

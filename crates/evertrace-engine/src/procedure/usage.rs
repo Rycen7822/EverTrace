@@ -368,7 +368,45 @@ impl ProcedureUsageCurrentView {
                 _ => {}
             }
         }
-        let scenario_fresh = checkpoint.is_some()
+        let (Some(task), Some(stream)) = (
+            self.tasks.get(&episode.task_id),
+            self.workstreams.get(&episode.workstream_id),
+        ) else {
+            return Ok(ProcedureRouteResult {
+                status: "insufficient_context",
+                items: vec![],
+            });
+        };
+        let mut facts = vec![
+            JournalPayload::TaskRecorded(Box::new(task.clone())),
+            JournalPayload::WorkstreamRecorded(Box::new(stream.clone())),
+            JournalPayload::WorkEpisodeRecorded(Box::new(episode.clone())),
+        ];
+        facts.extend(
+            episode
+                .attempt_ids
+                .iter()
+                .filter_map(|id| self.attempts.get(id))
+                .cloned()
+                .map(|value| JournalPayload::AttemptRecorded(Box::new(value))),
+        );
+        if let Some((checkpoint, _)) = &checkpoint {
+            facts.push(JournalPayload::WorkCheckpointRecorded(Box::new(
+                checkpoint.clone(),
+            )));
+        }
+        let Some(execution) = crate::search::execution::from_facts(
+            self.frontier,
+            &facts,
+            &anchor.search_anchor(),
+            anchor.task_id,
+        ) else {
+            return Ok(ProcedureRouteResult {
+                status: "insufficient_context",
+                items: vec![],
+            });
+        };
+        let scenario_fresh = execution.checkpoint.is_some()
             && scenario.as_ref().is_some_and(|scenario| {
                 scenario.active_lineage.active_episode_id == Some(episode.episode_id)
                     && crate::semantic::ScenarioCompiler::compile_rows(
@@ -385,9 +423,14 @@ impl ProcedureUsageCurrentView {
                 scenario
                     .as_ref()
                     .and_then(|scenario| scenario.active_lineage.active_attempt_id)
-                    .and_then(|id| self.attempts.get(&id))
+                    .and_then(|id| {
+                        execution
+                            .attempt
+                            .as_ref()
+                            .filter(|attempt| attempt.attempt_id == id)
+                    })
                     .filter(|attempt| {
-                        let checkpoint = &checkpoint.as_ref().expect("fresh checkpoint").0;
+                        let checkpoint = execution.checkpoint.as_ref().expect("fresh checkpoint");
                         checkpoint.active_attempt_ids.as_slice() == [attempt.attempt_id]
                             && checkpoint.attempt_revision_refs.iter().any(|reference| {
                                 reference.attempt_id == attempt.attempt_id
@@ -397,14 +440,18 @@ impl ProcedureUsageCurrentView {
                             && attempt.workstream_id == episode.workstream_id
                             && attempt.episode_id == Some(episode.episode_id)
                             && attempt.repository_instance_id == anchor.repository_id
-                            && anchor
-                                .worktree_id
-                                .is_some_and(|id| attempt.worktree_instance_ids.contains(&id))
+                            && match anchor.worktree_id {
+                                Some(id) => attempt.worktree_instance_ids.contains(&id),
+                                None => {
+                                    anchor.repository_id.is_none()
+                                        && attempt.worktree_instance_ids.is_empty()
+                                }
+                            }
                             && attempt.lifecycle_status == AttemptLifecycleStatus::Active
                     })
             })
             .flatten();
-        if let Some((checkpoint, _)) = &checkpoint {
+        if let Some(checkpoint) = &execution.checkpoint {
             // These are typed current Work facts, not query text or guessed
             // host state. All other constraint fields remain unknown.
             let phase_kind = serde_json::to_value(checkpoint.phase_contract.phase_kind)

@@ -1,6 +1,7 @@
 //! Bounded production retrieval and separate request-local diagnostics.
 
 mod diagnostic;
+pub(crate) mod execution;
 mod production;
 mod resolution;
 mod retrieval;
