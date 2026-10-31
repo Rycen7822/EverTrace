@@ -191,6 +191,7 @@ impl HumanGovernanceService {
                     | "revision_proposal_revision"
                     | "source_receipt"
                     | "source_observation"
+                    | "work_episode"
             )
         ) {
             result.state = HumanContentState::Unsupported;
@@ -224,6 +225,28 @@ impl HumanGovernanceService {
                     return Ok(Ok(result));
                 }
             }
+        } else if row.object_kind.as_deref() == Some("work_episode") {
+            if representation != HumanContentRepresentation::Text {
+                result.state = HumanContentState::Unsupported;
+                return Ok(Ok(result));
+            }
+            let payload: JournalPayload = serde_json::from_str(
+                row.payload_json
+                    .as_deref()
+                    .ok_or(HumanGovernanceError::Store)?,
+            )
+            .map_err(|_| HumanGovernanceError::Store)?;
+            let JournalPayload::WorkEpisodeRecorded(value) = payload else {
+                return Err(HumanGovernanceError::Store);
+            };
+            let mut text = value.phase_contract.local_goal;
+            text.push_str("\n\n未解决事项\n");
+            for (index, entry) in value.open_loops.iter().enumerate() {
+                use std::fmt::Write;
+                writeln!(text, "{}. {}", index + 1, entry)
+                    .map_err(|_| HumanGovernanceError::Store)?;
+            }
+            text
         } else if row.object_kind.as_deref() == Some("revision_proposal_revision") {
             let payload: JournalPayload = serde_json::from_str(
                 row.payload_json

@@ -1490,11 +1490,58 @@ impl JournalWriter {
                         after,
                         limit,
                         stamp.has_failed_job,
+                        false,
                         Some(times),
                     )
                 })
             } else {
-                state.memory_browse_context(query, after, limit, stamp.has_failed_job, None)
+                state.memory_browse_context(query, after, limit, stamp.has_failed_job, false, None)
+            }
+        })
+        .await
+    }
+
+    pub async fn memory_overview_context(
+        &self,
+        query: &evertrace_domain::query::MemoryOverviewQuery,
+    ) -> Result<crate::projections::MemoryOverviewContext, StoreError> {
+        use evertrace_domain::query::MemoryReadingKind as Kind;
+        query.validate().map_err(|_| StoreError::InvalidInput)?;
+        self.validated_current_read(|state, stamp| {
+            let build = |mut times: Option<&mut crate::sqlite_state::JournalTimeReader<'_>>| {
+                let (summaries, facts, methods, reviews) = {
+                    let mut browse = |kind, review_pending| {
+                        state.memory_browse_context(
+                            &query.browse(kind),
+                            None,
+                            usize::from(query.limit),
+                            stamp.has_failed_job,
+                            review_pending,
+                            times.as_deref_mut(),
+                        )
+                    };
+                    (
+                        browse(Kind::Summaries, false)?,
+                        browse(Kind::FactsAndConstraints, false)?,
+                        browse(Kind::Methods, false)?,
+                        browse(Kind::References, true)?,
+                    )
+                };
+                let work = state.memory_overview_work_context(query, times)?;
+                Ok(crate::projections::MemoryOverviewContext {
+                    frontier: summaries.page.frontier,
+                    summaries,
+                    facts,
+                    methods,
+                    reviews,
+                    work,
+                })
+            };
+            if query.time_range.is_some() {
+                self.lock_sqlite()?
+                    .with_memory_journal_times(|times| build(Some(times)))
+            } else {
+                build(None)
             }
         })
         .await

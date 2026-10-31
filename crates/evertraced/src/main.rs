@@ -281,7 +281,8 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
             engine.effective_config().config().global_promotion.clone(),
         )
         .with_session_report(Arc::clone(&current_session_catalog_report))
-        .with_inventory_bindings(mcp_bindings.clone());
+        .with_inventory_bindings(mcp_bindings.clone())
+        .with_summary_policy(&engine.effective_config().config().llm);
         human_governance.reconcile_reserved_once().await?;
         let (session_import_wakeup_tx, session_import_wakeup_rx) = watch::channel(0_u64);
         let (session_import_shutdown_tx, session_import_shutdown_rx) = watch::channel(false);
@@ -907,6 +908,14 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
                                     {
                                         Ok(content) => HumanGovernanceResponse::Content {content: Box::new(map_content_chunk(content))},
                                         Err(frontier) => HumanGovernanceResponse::Conflict {current_frontier: frontier, current_revision_ref: None},
+                                    }
+                                }
+                                HumanReadRequest::MemoryOverview { query, expected_frontier } => {
+                                    match human_governance.memory_overview(query, expected_frontier).await.map_err(map_human_error)? {
+                                        Ok(page) => HumanGovernanceResponse::MemoryOverview { page: Box::new(map_human_overview(page)) },
+                                        Err(current_frontier) => HumanGovernanceResponse::Conflict {
+                                            current_revision_ref: None, current_frontier,
+                                        },
                                     }
                                 }
                                 HumanReadRequest::BrowseMemories {
@@ -1611,9 +1620,32 @@ fn map_semantic_detail(
     }
 }
 
+fn map_human_overview(
+    page: evertrace_engine::HumanMemoryOverviewPage,
+) -> evertrace_protocol::dto::HumanMemoryOverviewPage {
+    evertrace_protocol::dto::HumanMemoryOverviewPage {
+        frontier: page.frontier,
+        observed_at_us: page.observed_at_us,
+        query: page.query,
+        scope_available: page.scope_available,
+        complete: page.complete,
+        summaries: map_human_items(page.summaries),
+        changes: map_human_items(page.changes),
+        unresolved: map_human_items(page.unresolved),
+        reviews: map_human_items(page.reviews),
+        summary_count: page.summary_count,
+        formal_count: page.formal_count,
+        loop_count: page.loop_count,
+        review_count: page.review_count,
+        generation: page.generation,
+    }
+}
+
 fn map_human_page(page: evertrace_engine::HumanPage) -> HumanGovernanceResponse {
     HumanGovernanceResponse::Snapshot {
-        diagnostics: page.diagnostics.map(|value| Box::new(map_diagnostics(value))),
+        diagnostics: page
+            .diagnostics
+            .map(|value| Box::new(map_diagnostics(value))),
         frontier: page.frontier,
         status: match page.status {
             evertrace_engine::HumanSnapshotStatus::Ready => HumanSnapshotStatus::Ready,
@@ -1626,13 +1658,18 @@ fn map_human_page(page: evertrace_engine::HumanPage) -> HumanGovernanceResponse 
                 evertrace_engine::HumanDegradedReason::CurrentJobFailed => {
                     HumanDegradedReason::CurrentJobFailed
                 }
-                evertrace_engine::HumanDegradedReason::RelatedReferencesUnavailable => HumanDegradedReason::RelatedReferencesUnavailable,
+                evertrace_engine::HumanDegradedReason::RelatedReferencesUnavailable => {
+                    HumanDegradedReason::RelatedReferencesUnavailable
+                }
             })
             .collect(),
-        items: page
-            .items
-            .into_iter()
-            .map(|item| HumanSnapshotItem {
+        items: map_human_items(page.items),
+        next_cursor: page.next_cursor,
+    }
+}
+
+fn map_human_items(items: Vec<evertrace_engine::HumanSummary>) -> Vec<HumanSnapshotItem> {
+    items.into_iter().map(|item| HumanSnapshotItem {
                 reading_preview: item.reading_preview.map(|value| evertrace_protocol::dto::HumanMemoryPreview {
                     state: value.state, title: value.title, excerpt: value.excerpt,
                     origin: value.origin, truncated: value.truncated,
@@ -2181,10 +2218,7 @@ fn map_human_page(page: evertrace_engine::HumanPage) -> HumanGovernanceResponse 
                 scope_ref: item.scope_ref,
                 native_event_time_us: item.native_event_time_us,
                 source_event_seq: item.source_event_seq,
-            })
-            .collect(),
-        next_cursor: page.next_cursor,
-    }
+            }).collect()
 }
 
 fn map_diagnostics(

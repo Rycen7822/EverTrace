@@ -747,6 +747,56 @@ $("job-lookup").onsubmit = async (event) => {
     if (state.controller === controller) state.controller = null;
   }
 };
+async function readOverview(controller) {
+  const selected = state.selected;
+  const listScroll = $("memory-items").scrollTop,
+    detailScroll = $("detail-body").scrollTop;
+  const page = await api(
+    "read",
+    {
+      kind: "overview",
+      query: {
+        selection: state.query.selection,
+        include_global: state.query.include_global,
+        time_range: state.query.time_range,
+        limit: Number($("overview-limit").value),
+      },
+      expected_frontier: null,
+    },
+    controller.signal,
+  );
+  if (state.controller !== controller || document.hidden || state.route !== "overview") return;
+  clear();
+  if (page.conflict) {
+    state.frontier = null;
+    state.selected = null;
+    notice("读取水位已变化，请刷新。");
+    return;
+  }
+  state.frontier = page.frontier;
+  fragmentInto($("memory-items"), page.html);
+  $("memory-items").scrollTop = listScroll;
+  showTimeRange(
+    page.query.time_range,
+    page.query.time_range?.basis === "event" ? "event_newest" : "recorded_newest",
+  );
+  $("page-count").textContent = "所选范围 · 当前修订";
+  notice(
+    !page.scope_available
+      ? "范围不可用，未回退到其它范围。"
+      : !page.complete
+        ? "部分记录或正文未能完整读取；未触发生成或重试。"
+        : "只读当前记录；这里的读取不会生成摘要，也不会提交或接受提案。",
+  );
+  const visible = selected && [...$("memory-items").querySelectorAll(".memory-item")]
+    .some((row) => row.dataset.key === selected.key);
+  if (selected && (selected.direct || visible)) {
+    await readSelection(selected, controller, detailScroll);
+  } else {
+    state.selected = null;
+    $("detail-body").textContent = "选择一条记录查看原文。";
+  }
+}
 async function refresh() {
   if (!state.active || document.hidden) return;
   if ($("scope-dialog").open) {
@@ -766,6 +816,10 @@ async function refresh() {
     }
     if (state.route === "sources") {
       await readCatalogue(controller);
+      return;
+    }
+    if (state.route === "overview") {
+      await readOverview(controller);
       return;
     }
     if (state.route !== "memories") return;
@@ -871,24 +925,27 @@ function route(name) {
     if (active) button.setAttribute("aria-current", "page");
     else button.removeAttribute("aria-current");
   }
-  $("reader").hidden = !state.active || !["memories", "sources", "review", "system"].includes(name);
+  const reading = ["overview", "memories"].includes(name);
+  $("reader").hidden = !state.active || !["overview", "memories", "sources", "review", "system"].includes(name);
   $("system-panel").hidden = !state.active || name !== "system";
   $("job-lookup").hidden = name !== "system";
   $("job-id").value = "";
   $("records-title").textContent =
-    { sources: "已登记来源", review: "待处理条目", system: "后台任务" }[name] || "记忆记录";
+    { overview: "范围总览", sources: "已登记来源", review: "待处理条目", system: "后台任务" }[name] || "记忆记录";
   $("source-filter").hidden = name !== "sources";
-  $("time-filter").hidden = name !== "memories";
+  $("time-filter").hidden = !reading;
+  $("overview-limit-control").hidden = name !== "overview";
+  $("first-page").parentElement.hidden = name === "overview";
   document.querySelector(".browse-filters").hidden = name !== "memories";
-  $("scope-open").hidden = name !== "memories";
-  $("include-global").parentElement.hidden = name !== "memories";
+  $("scope-open").hidden = !reading;
+  $("include-global").parentElement.hidden = !reading;
   const label = document.querySelector('[data-route="' + name + '"]')?.textContent.trim() || name;
   $("breadcrumb").textContent = label;
   $("page-title").textContent = label;
   $("page-description").textContent =
     "独立 Python Web，只读调用现有 daemon；未接入的页面不使用示例数据。";
   notice(
-    ["memories", "sources", "review", "system"].includes(name)
+    ["overview", "memories", "sources", "review", "system"].includes(name)
       ? "正在读取…"
       : "该页面尚未接入真实后端。",
   );
@@ -1138,6 +1195,7 @@ $("scope-items").onclick = (event) => {
 for (const button of document.querySelectorAll("[data-scope-fixed]"))
   button.onclick = () => chooseScope({ kind: button.dataset.scopeFixed });
 $("include-global").onchange = () => changeQuery();
+$("overview-limit").onchange = () => changeQuery();
 function changeQuery() {
   cancel();
   clear();

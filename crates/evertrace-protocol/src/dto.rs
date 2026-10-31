@@ -1,3 +1,6 @@
+mod overview;
+pub use overview::HumanMemoryOverviewPage;
+
 use evertrace_domain::{
     evidence::IdentityStrength,
     ids::{
@@ -102,6 +105,10 @@ pub enum HumanRelationKind {
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
 pub enum HumanReadRequest {
+    MemoryOverview {
+        query: evertrace_domain::query::MemoryOverviewQuery,
+        expected_frontier: Option<u64>,
+    },
     Search {
         query: Box<evertrace_domain::query::HumanSearchQuery>,
     },
@@ -937,6 +944,9 @@ pub struct HumanActionResult {
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
 pub enum HumanGovernanceResponse {
+    MemoryOverview {
+        page: Box<HumanMemoryOverviewPage>,
+    },
     Search {
         page: Box<evertrace_domain::query::HumanSearchPage>,
     },
@@ -1021,6 +1031,7 @@ impl HumanGovernanceRequest {
 impl HumanReadRequest {
     fn validate(&self) -> bool {
         match self {
+            Self::MemoryOverview { query, .. } => query.validate().is_ok(),
             Self::Search { query } => query.validate().is_ok(),
             Self::CompareRevisions {
                 query,
@@ -1360,6 +1371,7 @@ impl HumanDiagnostics {
 impl HumanGovernanceResponse {
     pub fn validate(&self) -> bool {
         match self {
+            Self::MemoryOverview { page } => page.validate(),
             Self::Search { page } => page.validate(),
             Self::RevisionComparison { comparison } => {
                 use evertrace_domain::query::{HumanComparedValue, RevisionCompareCursor};
@@ -1908,6 +1920,7 @@ impl HumanSnapshotItem {
                         | "procedure_revision"
                         | "core_membership"
                         | "revision_proposal_revision"
+                        | "work_episode"
                 )
         }) {
             return false;

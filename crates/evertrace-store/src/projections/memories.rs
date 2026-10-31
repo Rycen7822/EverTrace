@@ -326,6 +326,7 @@ impl JournalAdmissionState {
         after: Option<&MemoryBrowseCursor>,
         limit: usize,
         has_failed_job: bool,
+        review_pending: bool,
         mut journal_times: Option<&mut crate::sqlite_state::JournalTimeReader<'_>>,
     ) -> Result<MemoryBrowseContext, StoreError> {
         query.validate().map_err(|_| StoreError::InvalidInput)?;
@@ -429,6 +430,14 @@ impl JournalAdmissionState {
             (0_u64, 0_u64, 0_u64);
         for candidate in candidates {
             let candidate = candidate?;
+            if review_pending
+                && !matches!(candidate, MemoriesCandidate::Proposal(value, _) if matches!(value.status,
+                    evertrace_domain::semantic::ProposalStatus::Pending
+                    | evertrace_domain::semantic::ProposalStatus::Validating
+                    | evertrace_domain::semantic::ProposalStatus::Deferred))
+            {
+                continue;
+            }
             if candidate.product_deleted(
                 &deleted.revision_ids,
                 &deleted.atom_ids,
@@ -609,7 +618,7 @@ impl JournalAdmissionState {
         Ok(row)
     }
 
-    fn memory_scope_context(
+    pub(super) fn memory_scope_context(
         &self,
         selection: evertrace_domain::query::MemoryScopeSelection,
     ) -> Result<MemoryScopeContext, StoreError> {
@@ -981,16 +990,16 @@ impl RepositoryClosureKeys {
 }
 
 #[derive(Default)]
-struct MemoryScopeContext {
-    available: bool,
-    complete: bool,
+pub(super) struct MemoryScopeContext {
+    pub(super) available: bool,
+    pub(super) complete: bool,
     tasks: BTreeSet<TaskId>,
     repositories: BTreeSet<RepositoryId>,
     worktrees: BTreeSet<WorktreeId>,
 }
 
 impl MemoryScopeContext {
-    fn includes(
+    pub(super) fn includes(
         &self,
         selection: evertrace_domain::query::MemoryScopeSelection,
         include_global: bool,

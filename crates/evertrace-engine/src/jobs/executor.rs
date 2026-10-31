@@ -100,6 +100,12 @@ enum WriterRequest {
             Result<evertrace_store::projections::ScopeDirectoryReadContext, WriterActorError>,
         >,
     },
+    MemoryOverview {
+        query: evertrace_domain::query::MemoryOverviewQuery,
+        reply: oneshot::Sender<
+            Result<evertrace_store::projections::MemoryOverviewContext, WriterActorError>,
+        >,
+    },
     MemoryBrowse {
         query: evertrace_domain::query::MemoryBrowseQuery,
         after: Option<evertrace_domain::query::MemoryBrowseCursor>,
@@ -665,6 +671,21 @@ impl WriterHandle {
                 query: query.clone(),
                 after: after.map(str::to_owned),
                 deadline,
+                reply,
+            })
+            .await
+            .map_err(|_| WriterActorError::Stopped)?;
+        response.await.map_err(|_| WriterActorError::Stopped)?
+    }
+
+    pub(crate) async fn memory_overview_context(
+        &self,
+        query: &evertrace_domain::query::MemoryOverviewQuery,
+    ) -> Result<evertrace_store::projections::MemoryOverviewContext, WriterActorError> {
+        let (reply, response) = oneshot::channel();
+        self.sender
+            .send(WriterRequest::MemoryOverview {
+                query: query.clone(),
                 reply,
             })
             .await
@@ -1398,6 +1419,24 @@ async fn run_writer(
                         .await
                         .map_err(map_store_error);
                     let fatal = result.is_err();
+                    let _ = reply.send(result);
+                    if fatal {
+                        return Err(WriterActorError::Store);
+                    }
+                }
+                WriterRequest::MemoryOverview { query, reply } => {
+                    if reply.is_closed() {
+                        continue;
+                    }
+                    let result = writer
+                        .as_ref()
+                        .ok_or(WriterActorError::Stopped)?
+                        .memory_overview_context(&query)
+                        .await
+                        .map_err(map_store_error);
+                    let fatal = result
+                        .as_ref()
+                        .is_err_and(|error| *error != WriterActorError::InvalidInput);
                     let _ = reply.send(result);
                     if fatal {
                         return Err(WriterActorError::Store);

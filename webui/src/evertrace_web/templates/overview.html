@@ -1,0 +1,49 @@
+{% set reasons = {
+  'no_inputs': '当前没有可供生成的来源或工作记录。',
+  'llm_disabled': '当前配置未启用模型。',
+  'episode_enrichment_disabled': '当前配置未启用工作片段摘要补充。',
+  'work_in_progress': '这个范围内还有未结束的工作片段。',
+  'last_attempt_budget_exhausted': '匹配当前输入和配置的上次生成记录为预算不足。',
+  'last_attempt_provider_unavailable': '匹配当前输入和配置的上次生成记录为提供方不可用或失败。',
+  'not_read': '未取得足以说明生成状态的记录。'
+} %}
+<div class="overview-observation">
+  <p>读取时间：{{ page.observed_at_us }} µs · Native 水位：{{ page.frontier }}</p>
+  <p>下列数字统计当前修订的元数据，不是正文可读数量，也不是期间内的全部历史变更。</p>
+  {% if not page.scope_available %}
+  <p>所选范围不可用；没有改查全部范围，计数未知。</p>
+  {% elif not page.complete %}
+  <p>部分元数据或正文未能完整读取；请分别查看计数依据和条目提示。</p>
+  {% endif %}
+</div>
+{% for title, key, count, unit in [
+  ('最近摘要', 'summaries', page.summary_count, '条当前摘要修订'),
+  ('正式记忆', 'changes', page.formal_count, '条当前正式修订'),
+  ('未解决事项', 'unresolved', page.loop_count, '项未解决事项'),
+  ('待审核提案', 'reviews', page.review_count, '条待审核提案修订')
+] %}
+<section class="overview-section" data-overview-section="{{ key }}">
+  <h2>{{ title }}
+    <small>{% if count.count is none %}数量未知{% else %}
+      {{ '至少 ' if count.basis == 'lower_bound' else '' }}{{ count.count }} {{ unit }}
+    {% endif %}</small>
+  </h2>
+  {% if key == 'unresolved' %}<p class="muted">按工作片段列出。一个片段可能包含多项未解决事项。</p>{% endif %}
+  {% if key == 'reviews' %}<p class="muted">只列 pending、validating、deferred 提案；其它待处理内容请到“审核”页查看。</p>{% endif %}
+  {% with items=page[key], empty_message='本次读取未列出条目；请结合范围、时间窗和计数判断。' %}
+    {% include 'list.html' %}
+  {% endwith %}
+  {% if key == 'summaries' and (page.summary_count.count is none or page.summary_count.count == 0) %}
+  <div class="overview-observation">
+    <h3>生成观察</h3>
+    <p>这些是当前配置和已记录事实，不单凭它们判定没有摘要的原因。</p>
+    <ul>{% for reason in page.generation.observations %}<li>{{ reasons[reason] }}</li>{% endfor %}</ul>
+    {% set run = page.generation.last_run %}
+    {% if run %}
+    <p>最近匹配输入水位的记录：{{ run.run_id }} · 状态 {{ run.status }}</p>
+    <p>工作片段：{{ run.episode_id }} · 输入修订：{{ run.input_revision_id }} · {{ run.created_at_us }} µs</p>
+    {% endif %}
+  </div>
+  {% endif %}
+</section>
+{% endfor %}

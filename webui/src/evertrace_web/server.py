@@ -259,6 +259,23 @@ class App:
                         "counts_complete": result["counts_complete"],
                         "unresolved_scope_count": str(result["unresolved_scope_count"]),
                     }
+            elif payload.get("kind") == "overview" and not (
+                set(payload) - {"kind", "query", "expected_frontier"}
+            ):
+                frontier = parse_frontier(payload.get("expected_frontier"), optional=True)
+                result = await self.backend.overview(payload.get("query", {}), frontier)
+                if result["kind"] == "conflict":
+                    data = {"conflict": True}
+                else:
+                    page = result["page"]
+                    data = {
+                        "html": self.templates.get_template("overview.html").render(page=page),
+                        "frontier": str(page["frontier"]),
+                        "observed_at_us": str(page["observed_at_us"]),
+                        "query": present_memory_query(page["query"]),
+                        "scope_available": page["scope_available"],
+                        "complete": page["complete"],
+                    }
             elif payload.get("kind") in ("inbox", "jobs") and not (
                 set(payload) - {"kind", "after", "expected_frontier"}
             ):

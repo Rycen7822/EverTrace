@@ -211,6 +211,26 @@ class Backend:
             }
         )
 
+    async def overview(self, query, expected_frontier=None):
+        if not isinstance(query, dict) or set(query) - {
+            "selection", "include_global", "time_range", "limit"
+        }:
+            raise BackendError("invalid_input")
+        include_global = query.get("include_global", False)
+        limit = query.get("limit", 8)
+        if type(include_global) is not bool or type(limit) is not int or not 1 <= limit <= 64:
+            raise BackendError("invalid_input")
+        return await self._request({
+            "kind": "memory_overview",
+            "query": {
+                "selection": normalize_scope(query.get("selection", {"kind": "all"})),
+                "include_global": include_global,
+                "time_range": normalize_time_range(query.get("time_range")),
+                "limit": limit,
+            },
+            "expected_frontier": expected_frontier,
+        })
+
     async def source_archive(self, query, after=None, expected_frontier=None):
         if not isinstance(query, dict) or query.get("kind") not in ("revisions", "records"):
             raise BackendError("invalid_input")
@@ -493,6 +513,7 @@ class Backend:
                 if result.get("kind") not in (
                     "snapshot",
                     "memory_page",
+                    "memory_overview",
                     "revision_page",
                     "scope_directory",
                     "source_catalog",

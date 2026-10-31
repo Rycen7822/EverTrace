@@ -1468,6 +1468,102 @@ pub struct MemoryBrowseQuery {
     pub time_range: Option<MemoryTimeRange>,
 }
 
+/// A scoped overview is a read; it never requests summary generation.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct MemoryOverviewQuery {
+    pub selection: MemoryScopeSelection,
+    pub include_global: bool,
+    pub time_range: Option<MemoryTimeRange>,
+    pub limit: u16,
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum OverviewCountBasis {
+    Exact,
+    LowerBound,
+    Unknown,
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum OverviewCountUnit {
+    CurrentSummaryRevisions,
+    CurrentFormalRevisions,
+    OpenLoopEntries,
+    PendingProposalRevisions,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct MemoryOverviewCount {
+    pub count: Option<u64>,
+    pub basis: OverviewCountBasis,
+    pub unit: OverviewCountUnit,
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SummaryGenerationObservation {
+    NoInputs,
+    LlmDisabled,
+    EpisodeEnrichmentDisabled,
+    WorkInProgress,
+    LastAttemptBudgetExhausted,
+    LastAttemptProviderUnavailable,
+    NotRead,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct SummaryGenerationRecord {
+    pub run_id: crate::ids::SemanticDerivationRunId,
+    pub episode_id: WorkEpisodeId,
+    pub input_revision_id: crate::revision::RevisionId,
+    pub status: crate::semantic::DerivationRunStatus,
+    pub created_at_us: i64,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct MemoryOverviewGeneration {
+    pub observations: Vec<SummaryGenerationObservation>,
+    pub llm_enabled: Option<bool>,
+    pub episode_enrichment_enabled: Option<bool>,
+    pub last_run: Option<SummaryGenerationRecord>,
+}
+
+impl MemoryOverviewQuery {
+    pub fn validate(&self) -> Result<(), QueryError> {
+        if !(1..=64).contains(&self.limit) {
+            return Err(QueryError::Invalid);
+        }
+        self.browse(MemoryReadingKind::All).validate()
+    }
+
+    pub fn browse(&self, kind: MemoryReadingKind) -> MemoryBrowseQuery {
+        MemoryBrowseQuery {
+            selection: self.selection,
+            include_global: self.include_global,
+            kind,
+            order: if self
+                .time_range
+                .as_ref()
+                .is_some_and(|range| range.basis == MemoryTimeBasis::Event)
+            {
+                MemoryBrowseOrder::EventNewest
+            } else {
+                MemoryBrowseOrder::RecordedNewest
+            },
+            epistemic_status: None,
+            authority: None,
+            atom_lifecycle: None,
+            time_range: self.time_range.clone(),
+        }
+    }
+}
+
 impl MemoryBrowseQuery {
     pub fn validate(&self) -> Result<(), QueryError> {
         if let Some(range) = &self.time_range {

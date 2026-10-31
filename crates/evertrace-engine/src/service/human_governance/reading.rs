@@ -162,6 +162,22 @@ fn stored_preview(
             };
             HumanMemoryPreview::stored(title, delta.map(|delta| delta.value.as_str()), origin)
         }
+        JournalPayload::WorkEpisodeRecorded(value) => {
+            let excerpt = value
+                .open_loops
+                .iter()
+                .take(4)
+                .map(String::as_str)
+                .collect::<Vec<_>>()
+                .join("\n");
+            let mut preview = HumanMemoryPreview::stored(
+                &value.phase_contract.local_goal,
+                Some(&excerpt),
+                Origin::StoredValue,
+            );
+            preview.truncated |= value.open_loops.len() > 4;
+            preview
+        }
         JournalPayload::RevisionProposalRecorded(value) => match value.payload {
             P::Atom(value) => match value.as_ref() {
                 A::Create { draft }
