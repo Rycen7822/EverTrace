@@ -1626,6 +1626,9 @@ fn map_semantic_detail(
             evertrace_engine::HumanSemanticContent::WorkEpisode(value) => {
                 Content::WorkEpisode(value)
             }
+            evertrace_engine::HumanSemanticContent::CaptureReceipt(value) => {
+                Content::CaptureReceipt(value)
+            }
             evertrace_engine::HumanSemanticContent::Atom(value) => Content::Atom(value),
             evertrace_engine::HumanSemanticContent::Procedure(value) => Content::Procedure(value),
             evertrace_engine::HumanSemanticContent::CoreMembership(value) => {

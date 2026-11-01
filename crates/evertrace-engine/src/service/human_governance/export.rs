@@ -774,6 +774,12 @@ pub(super) fn dependencies_for(row: &ObjectRow, payload: &JournalPayload) -> BTr
             );
         }
         JournalPayload::WorkEpisodeRecorded(value) => {
+            refs.extend(
+                value
+                    .capture_receipt_revision_ids
+                    .iter()
+                    .map(ToString::to_string),
+            );
             refs.extend(value.operation_burst_refs.iter().map(ToString::to_string));
             refs.extend(value.semantic_digest_refs.iter().cloned());
             refs.extend(value.verification_refs.iter().cloned());

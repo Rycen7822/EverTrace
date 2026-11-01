@@ -495,6 +495,11 @@ fn semantic_lines(
         }];
     };
     match content {
+        HumanSemanticContent::CaptureReceipt(_) => vec![crate::locale::format!(
+            language,
+            "Read capture receipt content in Web",
+            "请在 Web 中阅读采集覆盖凭证"
+        )],
         HumanSemanticContent::WorkEpisode(_) => vec![crate::locale::format!(
             language,
             "Read WorkEpisode content in Web",

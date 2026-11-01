@@ -178,7 +178,7 @@ impl HumanGovernanceService {
                 HumanSemanticContent::Procedure(value) => serde_json::to_value(value),
                 HumanSemanticContent::CoreMembership(value) => serde_json::to_value(value),
                 HumanSemanticContent::Digest(value) => serde_json::to_value(value),
-                HumanSemanticContent::WorkEpisode(_) => {
+                HumanSemanticContent::WorkEpisode(_) | HumanSemanticContent::CaptureReceipt(_) => {
                     return Ok((HumanContentState::Unsupported, None));
                 }
             }

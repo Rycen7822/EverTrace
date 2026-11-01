@@ -25,7 +25,7 @@
 {% elif detail.state != 'ready' %}
   <p>正文状态：{{ detail.state }}。
     {% if detail.state == 'too_large' %}
-    语义结构共 {{ detail.original_bytes }} 字节，可按下方按钮分段读取。
+    {{ '凭证结构' if item.object_kind in ('capture_receipt', 'capture_receipt_revision') else '语义结构' }}共 {{ detail.original_bytes }} 字节，可按下方按钮分段读取。
     {% else %}未用空正文或当前版本代替。{% endif %}
   </p>
 {% else %}
@@ -37,8 +37,18 @@
   {% if item.object_kind == 'atom_revision' %}
   <button class="button" type="button" data-content-open="text">分段读取完整正文</button>
   {% endif %}
-  <button class="button" type="button" data-content-open="semantic_json">分段读取完整语义结构</button>
+  <button class="button" type="button" data-content-open="semantic_json">
+    {{ '分段读取完整采集覆盖凭证' if item.object_kind in ('capture_receipt', 'capture_receipt_revision') else '分段读取完整语义结构' }}
+  </button>
 </div>
+{% if item.object_kind == 'capture_receipt' and detail.state == 'too_large' %}
+{% set capture = item.execution_integrity_detail %}
+{% if capture and capture.kind == 'receipt' and capture.predecessor_revision_id %}
+<button class="button" type="button" data-link-key="{{ capture.predecessor_revision_id }}"
+  data-revision="{{ capture.predecessor_revision_id }}" data-object="{{ capture.predecessor_revision_id }}"
+  data-kind="capture_receipt">读取原前序凭证</button>
+{% endif %}
+{% endif %}
 {% endif %}
 {% if item.object_kind == 'work_episode' %}
 <button class="button" type="button" data-content-open="text">读取目标与未解决事项文本</button>

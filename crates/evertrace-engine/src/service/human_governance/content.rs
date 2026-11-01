@@ -192,6 +192,8 @@ impl HumanGovernanceService {
                     | "source_receipt"
                     | "source_observation"
                     | "work_episode"
+                    | "capture_receipt"
+                    | "capture_receipt_revision"
             )
         ) {
             result.state = HumanContentState::Unsupported;

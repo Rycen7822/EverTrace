@@ -83,6 +83,61 @@
     {{ text_list('证据引用', draft.evidence_refs) }}
     {{ text_list('支持修订', draft.support_revision_refs) }}
   </details>
+{% elif content.kind == 'capture_receipt' %}
+  <h2>采集覆盖凭证</h2>
+  <p class="muted">这是原生采集记录，不是原消息正文；覆盖状态、终止或 finalized 不代表工作成功，也不授予读取或执行资格。</p>
+  <section class="semantic-section">
+    <h3>各维度状态</h3>
+    <dl>
+      {% for label, field in [
+        ('观察覆盖', 'coverage_level'), ('来源完整性', 'source_coverage'),
+        ('配对完整性', 'pairing_integrity'), ('内容完整性', 'payload_integrity'),
+        ('顺序完整性', 'ordering_integrity'), ('准入失败可观察性', 'admission_failure_observability'),
+        ('身份强度', 'identity_strength')
+      ] %}<div><dt>{{ label }}</dt><dd>{{ value[field] }}</dd></div>{% endfor %}
+    </dl>
+    <p>可见 reasoning 类型：{{ value.reasoning_visibility|join('、') or '未记录任何类型' }}；此处不提供 reasoning/CoT 原文。</p>
+    <p>原生 exact-byte replay 标记：{{ value.exact_byte_replay }}；不单独据此宣称来源覆盖完整或提供字节重放。</p>
+  </section>
+  <section class="semantic-section">
+    <h3>结束与范围</h3>
+    <p>finalized：{{ value.finalized }} · 终止类型：{{ value.terminal_event_kind or '未记录' }}</p>
+    <p>delegation start：{{ value.delegation_start_seen }} · child session linked：{{ value.child_session_linked }}</p>
+    <p>parent session end：{{ value.parent_session_end_seen }} · lifecycle end：{{ value.lifecycle_end_seen }}</p>
+    <p>原序号范围：{{ value.first_sequence if value.first_sequence is not none else '未观测' }}
+      — {{ value.last_sequence if value.last_sequence is not none else '未观测' }}；来源水位：{{ value.import_watermark }}</p>
+    {% if value.finalization_reason %}<div class="memory-prose">{{ value.finalization_reason }}</div>{% endif %}
+    {% if value.sequence_gaps %}<h3>已记录序号缺口</h3><ul>{% for gap in value.sequence_gaps %}
+      <li>{{ gap.first_sequence }} — {{ gap.last_sequence }}</li>{% endfor %}</ul>{% endif %}
+  </section>
+  <details><summary>缺口、配对及内容处理的原始引用</summary>
+    {{ text_list('捕获 gap marker', value.capture_gap_marker_refs) }}
+    {{ text_list('捕获 outage', value.capture_outage_interval_refs) }}
+    {{ text_list('未配对 tool call', value.unmatched_tool_call_ids) }}
+    {{ text_list('未配对 tool result', value.unmatched_tool_result_ids) }}
+    {{ text_list('截断', value.payload_truncations) }}
+    {{ text_list('脱敏', value.redaction_refs) }}
+    {{ text_list('损坏', value.corrupt_payload_refs) }}
+    {{ text_list('不支持的 record 类型', value.unsupported_record_types) }}
+  </details>
+  <details><summary>身份、manifest 与关闭证据</summary>
+    <p>所选凭证修订：{{ value.capture_receipt_revision_id }} · ExecutionLane：{{ value.execution_lane_id }}</p>
+    <p>{{ '历史凭证修订' if item.object_kind == 'capture_receipt_revision' else '当前凭证投影' }}；
+      类别来自本次 Native 读取，不按时间或 finalized 猜测。凭证身份不可变。</p>
+    <p>child session：{{ value.child_session_id or '未关联' }} · resolver version：{{ value.resolver_version }}</p>
+    {{ text_list('adapter manifest', value.adapter_manifest_ids) }}
+    {{ text_list('eligible event manifest', value.eligible_event_manifest_refs) }}
+    {{ text_list('来源修订', value.source_revision_refs) }}
+    {{ text_list('source-close watermark', value.source_close_watermark_refs) }}
+    {{ text_list('source-close reconciliation', value.source_close_reconciliation_refs) }}
+    {{ text_list('准入失败证据', value.admission_failure_evidence_refs) }}
+    {{ text_list('终止证据', value.termination_evidence_refs) }}
+    {{ text_list('来源关闭', value.source_closed_refs) }}
+    {{ text_list('liveness probe', value.liveness_probe_refs) }}
+  </details>
+  {% if value.predecessor_revision_id %}<button class="button" type="button"
+    data-link-key="{{ value.predecessor_revision_id }}" data-revision="{{ value.predecessor_revision_id }}"
+    data-object="{{ value.predecessor_revision_id }}" data-kind="capture_receipt">读取原前序凭证</button>{% endif %}
 {% elif content.kind == 'work_episode' %}
   <h2>工作片段</h2>
   <p class="muted">原片段记录仅作上下文和来源；目标、状态或结果引用不等于已验证结论，也不授予执行资格。</p>
@@ -106,6 +161,7 @@
   <details><summary>结果、摘要和验证的原始引用</summary>
     <p>这里只列已存引用；其内容与资格须在原记录中按权限查看。</p>
     {{ text_list('语义摘要', value.semantic_digest_refs) }}
+    {{ text_list('采集覆盖凭证', value.capture_receipt_revision_ids) }}
     {{ text_list('已完成结果', value.completed_outcome_refs) }}
     {{ text_list('已选结果', value.selected_outcome_refs) }}
     {{ text_list('验证', value.verification_refs) }}
