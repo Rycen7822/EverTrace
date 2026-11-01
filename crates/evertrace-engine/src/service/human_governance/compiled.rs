@@ -212,13 +212,9 @@ impl HumanGovernanceService {
                         {
                             Ok(()) => {
                                 let mut item = summary_fields(row, HumanSurface::Explorer);
-                                if !source.contextual {
-                                    item.semantic_detail = Some(presentation::present(row)?);
-                                }
-                                entry.state = item
-                                    .semantic_detail
-                                    .as_ref()
-                                    .map_or(HumanContentState::Unsupported, |v| v.state);
+                                let detail = presentation::present(row)?;
+                                entry.state = detail.state;
+                                item.semantic_detail = Some(detail);
                                 entry.item = Some(item);
                             }
                             Err(export::Failure::Denied) => {
@@ -236,19 +232,18 @@ impl HumanGovernanceService {
             entries.push(entry);
         }
         let body_read = entries.iter().any(|entry| {
-            matches!(
-                entry.state,
-                HumanContentState::Ready | HumanContentState::TooLarge
-            )
+            !entry.contextual
+                && matches!(
+                    entry.state,
+                    HumanContentState::Ready | HumanContentState::TooLarge
+                )
         });
         let complete = context.complete
             && entries.iter().all(|entry| {
                 matches!(
                     entry.state,
                     HumanContentState::Ready | HumanContentState::TooLarge
-                ) || entry.contextual
-                    && entry.item.is_some()
-                    && entry.state == HumanContentState::Unsupported
+                )
             });
         let state = if context.metadata.is_none() {
             HumanContentState::Missing

@@ -1623,6 +1623,9 @@ fn map_semantic_detail(
         state: detail.state,
         content: detail.content.map(|content| match content {
             evertrace_engine::HumanSemanticContent::Digest(value) => Content::Digest(value),
+            evertrace_engine::HumanSemanticContent::WorkEpisode(value) => {
+                Content::WorkEpisode(value)
+            }
             evertrace_engine::HumanSemanticContent::Atom(value) => Content::Atom(value),
             evertrace_engine::HumanSemanticContent::Procedure(value) => Content::Procedure(value),
             evertrace_engine::HumanSemanticContent::CoreMembership(value) => {

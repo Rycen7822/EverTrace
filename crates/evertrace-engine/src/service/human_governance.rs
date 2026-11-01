@@ -1747,6 +1747,7 @@ impl HumanGovernanceService {
                             | "revision_proposal_revision"
                             | "source_receipt"
                             | "source_observation"
+                            | "work_episode"
                     )
                 ) {
                     return Err(HumanGovernanceError::InvalidInput);

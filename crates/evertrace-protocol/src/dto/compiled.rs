@@ -122,10 +122,11 @@ impl HumanCompiledPage {
                             && !v.is_empty()
                             && v.len() <= 4096
                             && entries.iter().any(|v| {
-                                matches!(
-                                    v.state,
-                                    HumanContentState::Ready | HumanContentState::TooLarge
-                                )
+                                !v.contextual
+                                    && matches!(
+                                        v.state,
+                                        HumanContentState::Ready | HumanContentState::TooLarge
+                                    )
                             })
                     })
                     && entries.iter().all(|entry| {
@@ -141,9 +142,7 @@ impl HumanCompiledPage {
                                 || matches!(
                                     entry.state,
                                     HumanContentState::Ready | HumanContentState::TooLarge
-                                )
-                                || entry.contextual
-                                    && entry.state == HumanContentState::Unsupported)
+                                ))
                             && entry
                                 .membership_revision
                                 .as_ref()
@@ -171,9 +170,6 @@ impl HumanCompiledPage {
                                             .as_ref()
                                             .is_some_and(|v| v.state == entry.state)
                                     })
-                                }
-                                HumanContentState::Unsupported => {
-                                    entry.contextual && entry.item.is_some()
                                 }
                                 _ => entry.item.is_none(),
                             }

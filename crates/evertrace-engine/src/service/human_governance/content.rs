@@ -225,11 +225,9 @@ impl HumanGovernanceService {
                     return Ok(Ok(result));
                 }
             }
-        } else if row.object_kind.as_deref() == Some("work_episode") {
-            if representation != HumanContentRepresentation::Text {
-                result.state = HumanContentState::Unsupported;
-                return Ok(Ok(result));
-            }
+        } else if row.object_kind.as_deref() == Some("work_episode")
+            && representation == HumanContentRepresentation::Text
+        {
             let payload: JournalPayload = serde_json::from_str(
                 row.payload_json
                     .as_deref()

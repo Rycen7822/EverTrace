@@ -12,6 +12,7 @@ pub enum HumanSemanticContent {
     Atom(Box<evertrace_domain::semantic::Atom>),
     Procedure(Box<evertrace_domain::procedure::ProcedureRevision>),
     CoreMembership(Box<evertrace_domain::semantic::CoreMembership>),
+    WorkEpisode(Box<evertrace_domain::work::WorkEpisode>),
 }
 
 pub use evertrace_domain::query::HumanContentState;
@@ -381,6 +382,7 @@ impl HumanGovernanceService {
                     | "core_membership"
                     | "revision_proposal_revision"
                     | "semantic_digest"
+                    | "work_episode"
             )
         }) {
             return Ok(());
@@ -400,6 +402,7 @@ impl HumanGovernanceService {
                         | "procedure_revision"
                         | "core_membership"
                         | "revision_proposal_revision"
+                        | "work_episode"
                 )
             ) {
                 continue;
@@ -563,6 +566,18 @@ pub(super) fn semantic_value(
             (
                 HumanSemanticContent::CoreMembership(value),
                 None,
+                object,
+                revision,
+            )
+        }
+        JournalPayload::WorkEpisodeRecorded(value) => {
+            value.validate().map_err(|_| HumanGovernanceError::Store)?;
+            let preview = value.phase_contract.local_goal.chars().take(160).collect();
+            let object = value.episode_id.to_string();
+            let revision = value.revision_id.to_string();
+            (
+                HumanSemanticContent::WorkEpisode(value),
+                Some(preview),
                 object,
                 revision,
             )

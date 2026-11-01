@@ -83,6 +83,36 @@
     {{ text_list('证据引用', draft.evidence_refs) }}
     {{ text_list('支持修订', draft.support_revision_refs) }}
   </details>
+{% elif content.kind == 'work_episode' %}
+  <h2>工作片段</h2>
+  <p class="muted">原片段记录仅作上下文和来源；目标、状态或结果引用不等于已验证结论，也不授予执行资格。</p>
+  <section class="semantic-section">
+    <h3>片段目标</h3><div class="memory-prose">{{ value.phase_contract.local_goal }}</div>
+    <p>阶段：{{ value.phase_contract.phase_kind }} · {{ value.phase_contract.phase_label }}</p>
+    {{ text_list('主要对象', value.phase_contract.primary_targets) }}
+    {{ text_list('进入条件', value.phase_contract.entry_conditions) }}
+    <h3>验收边界</h3><div class="memory-prose">{{ value.phase_contract.acceptance_boundary }}</div>
+    <h3>预期状态变化</h3><div class="memory-prose">{{ value.phase_contract.expected_state_transition }}</div>
+  </section>
+  {{ text_list('未解决事项', value.open_loops) }}
+  <details><summary>原生状态、范围与水位</summary>
+    <p>生命周期：{{ value.lifecycle_status }} · 边界：{{ value.boundary_status }}</p>
+    <p>修订：{{ value.revision_id }} · 修订代数：{{ value.revision_generation }}</p>
+    <p>Task：{{ value.task_id }} · Workstream：{{ value.workstream_id }}</p>
+    <p>Repository：{{ value.repository_instance_id or '未归属' }} · Worktree：{{ value.worktree_instance_id or '未归属' }}</p>
+    <p>来源水位：{{ value.source_watermark }} · 语义水位：{{ value.semantic_watermark }}
+      · 确认水位：{{ value.confirmation_watermark }} · 捕获水位：{{ value.capture_watermark }}</p>
+  </details>
+  <details><summary>结果、摘要和验证的原始引用</summary>
+    <p>这里只列已存引用；其内容与资格须在原记录中按权限查看。</p>
+    {{ text_list('语义摘要', value.semantic_digest_refs) }}
+    {{ text_list('已完成结果', value.completed_outcome_refs) }}
+    {{ text_list('已选结果', value.selected_outcome_refs) }}
+    {{ text_list('验证', value.verification_refs) }}
+    {{ text_list('失败', value.failure_refs) }}
+    {{ text_list('中断', value.interruption_refs) }}
+    {{ text_list('检查点', value.checkpoint_refs) }}
+  </details>
 {% elif content.kind == 'digest' %}
   <h2>{{ '来源摘要' if value.get('source_target') else '工作摘要' }}</h2>
   <p>整理方式：{{ {

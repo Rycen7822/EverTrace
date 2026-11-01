@@ -495,6 +495,11 @@ fn semantic_lines(
         }];
     };
     match content {
+        HumanSemanticContent::WorkEpisode(_) => vec![crate::locale::format!(
+            language,
+            "Read WorkEpisode content in Web",
+            "请在 Web 中阅读工作片段内容"
+        )],
         HumanSemanticContent::Digest(digest) => {
             use evertrace_domain::semantic::{SemanticCompleteness, SemanticDigestStatus};
             let mut lines = vec![crate::locale::format!(

@@ -41,7 +41,7 @@
 </div>
 {% endif %}
 {% if item.object_kind == 'work_episode' %}
-<button class="button" type="button" data-content-open="text">读取完整未解决事项</button>
+<button class="button" type="button" data-content-open="text">读取目标与未解决事项文本</button>
 {% endif %}
 {% if evidence %}
 <section class="source-reading">
@@ -66,7 +66,7 @@
 {% endif %}
 {% if item.object_kind in (
   'atom_revision', 'procedure_revision', 'core_membership', 'revision_proposal_revision',
-  'semantic_digest', 'source_receipt', 'source_observation'
+  'semantic_digest', 'source_receipt', 'source_observation', 'work_episode'
 ) %}<button class="button" type="button" data-sources-open>查看来源与直接关联</button>{% endif %}
 {% if item.object_kind in ('atom_revision', 'procedure_revision', 'core_membership', 'revision_proposal_revision', 'semantic_digest') %}
 <button class="button" type="button" data-compare-base>设为比较左侧</button>

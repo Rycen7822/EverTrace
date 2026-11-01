@@ -24,7 +24,8 @@
     {% set item = entry.item %}
     {% if entry.contextual %}
       <p>这是原工作片段的上下文／来源引用，不作为一条独立知识结论。</p>
-    {% elif entry.state == 'ready' and item and item.semantic_detail %}
+    {% endif %}
+    {% if entry.state == 'ready' and item and item.semantic_detail %}
       {% with content=item.semantic_detail.content %}{% include 'semantic_content.html' %}{% endwith %}
     {% else %}
       <p>原正文状态：{{ entry.state }}。

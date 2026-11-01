@@ -755,6 +755,7 @@ pub(super) fn dependencies_for(row: &ObjectRow, payload: &JournalPayload) -> BTr
         }
         JournalPayload::SemanticDigestRecorded(value) => {
             refs.extend(value.selected_direct_refs.iter().cloned());
+            refs.extend(value.episode_revision_id.map(|id| id.to_string()));
         }
         JournalPayload::TaskRecorded(value) => {
             refs.extend(value.request_root_refs.iter().cloned());

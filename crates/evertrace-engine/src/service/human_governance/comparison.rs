@@ -178,6 +178,9 @@ impl HumanGovernanceService {
                 HumanSemanticContent::Procedure(value) => serde_json::to_value(value),
                 HumanSemanticContent::CoreMembership(value) => serde_json::to_value(value),
                 HumanSemanticContent::Digest(value) => serde_json::to_value(value),
+                HumanSemanticContent::WorkEpisode(_) => {
+                    return Ok((HumanContentState::Unsupported, None));
+                }
             }
         }
         .map_err(|_| HumanGovernanceError::Store)?;

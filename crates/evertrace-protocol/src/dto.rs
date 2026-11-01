@@ -1758,6 +1758,7 @@ pub enum HumanSemanticContent {
     Atom(Box<evertrace_domain::semantic::Atom>),
     Procedure(Box<evertrace_domain::procedure::ProcedureRevision>),
     CoreMembership(Box<evertrace_domain::semantic::CoreMembership>),
+    WorkEpisode(Box<evertrace_domain::work::WorkEpisode>),
 }
 
 pub use evertrace_domain::query::HumanContentState;
@@ -1922,6 +1923,11 @@ impl HumanSemanticDetail {
                     && self.object_ref.as_deref() == Some(value.procedure_id.to_string().as_str())
                     && self.revision_ref.as_deref() == Some(value.revision_id.to_string().as_str())
             }
+            HumanSemanticContent::WorkEpisode(value) => {
+                value.validate().is_ok()
+                    && self.object_ref.as_deref() == Some(value.episode_id.to_string().as_str())
+                    && self.revision_ref.as_deref() == Some(value.revision_id.to_string().as_str())
+            }
             HumanSemanticContent::CoreMembership(value) => {
                 value.validate().is_ok()
                     && self.object_ref.as_deref()
@@ -1964,6 +1970,16 @@ impl HumanSnapshotItem {
             detail.validate()
                 && detail.object_ref == self.object_ref
                 && detail.revision_ref == self.revision_ref
+                && detail.content.as_ref().is_none_or(|content| {
+                    self.object_kind
+                        == match content {
+                            HumanSemanticContent::Digest(_) => "semantic_digest",
+                            HumanSemanticContent::Atom(_) => "atom_revision",
+                            HumanSemanticContent::Procedure(_) => "procedure_revision",
+                            HumanSemanticContent::CoreMembership(_) => "core_membership",
+                            HumanSemanticContent::WorkEpisode(_) => "work_episode",
+                        }
+                })
         }) && self.proposal_base.as_ref().is_none_or(|detail| {
             detail.validate()
                 && self.proposal.as_ref().is_some_and(|proposal| {
