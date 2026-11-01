@@ -467,6 +467,7 @@ impl ProcedureUsageCurrentView {
         if active_attempt.is_none() {
             trace.clear_attempt_state();
         }
+        let current = trace.current_for_search(&constraints);
         let candidates = revisions
             .iter()
             .enumerate()
@@ -497,7 +498,7 @@ impl ProcedureUsageCurrentView {
                     context,
                     candidate,
                     if aligned.is_some() {
-                        trace.current().unwrap_or(&constraints)
+                        current.as_ref().unwrap_or(&constraints)
                     } else {
                         &constraints
                     },

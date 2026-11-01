@@ -77,24 +77,14 @@ impl StageTrace {
         let mut episodes = std::collections::BTreeMap::new();
         let mut holders = std::collections::BTreeMap::new();
         let mut attempts = std::collections::BTreeMap::new();
-        let mut runs = std::collections::BTreeMap::<&str, Vec<&evertrace_store::ObjectRow>>::new();
         for row in rows
             .iter()
             .filter(|row| row.row_kind == evertrace_store::ObjectRowKind::Data)
             .filter(|row| row.source_event_seq <= boundary)
+            .filter(|row| row.object_kind.as_deref() == Some("attempt"))
         {
-            match row.object_kind.as_deref() {
-                Some("attempt") => {
-                    if let Some(id) = row.current_revision_id.as_deref() {
-                        attempts.insert(id, row);
-                    }
-                }
-                Some("experiment_run") => {
-                    if let Some(id) = row.object_id.as_deref() {
-                        runs.entry(id).or_default().push(row);
-                    }
-                }
-                _ => {}
+            if let Some(id) = row.current_revision_id.as_deref() {
+                attempts.insert(id, row);
             }
         }
         for row in rows.iter().filter(|row| {
@@ -268,39 +258,6 @@ impl StageTrace {
                     });
                 }
                 refs.push(attempt.revision_id.to_string());
-                let run_ids = &attempt.experiment_run_ids;
-                if run_ids.len() == 1 {
-                    let mut selected_run = None;
-                    for row in runs
-                        .get(run_ids[0].to_string().as_str())
-                        .into_iter()
-                        .flatten()
-                        .filter(|row| row.source_event_seq <= sequence)
-                    {
-                        let Some(json) = row.payload_json.as_deref() else {
-                            return Err(SemanticServiceError::InvalidInput);
-                        };
-                        if let JournalPayload::ExperimentRunRecorded(run) = decode(json)?
-                            && run.run_id == run_ids[0]
-                            && run.attempt_id == Some(attempt.attempt_id)
-                            && run.workstream_id == episode.workstream_id
-                            && run.attempt_binding_status
-                                == evertrace_domain::work::AttemptBindingStatus::Resolved
-                            && selected_run
-                                .as_ref()
-                                .is_none_or(|(_, seq)| *seq < row.source_event_seq)
-                        {
-                            selected_run = Some((run, row.source_event_seq));
-                        }
-                    }
-                    if let Some((run, _)) = selected_run {
-                        state.bindings.push(ConstraintBinding {
-                            field: ConstraintField::ExperimentState,
-                            value: ConstraintValue::Text(run.execution_status.as_str().into()),
-                        });
-                        refs.push(run.revision_id.to_string());
-                    }
-                }
             }
             state.bindings.sort_by_key(|binding| binding.field);
             state
@@ -337,6 +294,23 @@ impl StageTrace {
     }
     pub(crate) fn previous(&self) -> Option<&ConstraintState> {
         self.frames.iter().rev().nth(1).map(|frame| &frame.state)
+    }
+
+    /// Read-time state only: never rewrite checkpoint facts or stage transitions.
+    pub(crate) fn current_for_search(&self, current: &ConstraintState) -> Option<ConstraintState> {
+        let mut state = self.current()?.clone();
+        state
+            .bindings
+            .retain(|binding| binding.field != ConstraintField::ExperimentState);
+        state.bindings.extend(
+            current
+                .bindings
+                .iter()
+                .filter(|binding| binding.field == ConstraintField::ExperimentState)
+                .cloned(),
+        );
+        state.bindings.sort_by_key(|binding| binding.field);
+        Some(state)
     }
 
     pub(crate) fn supports(&self, draft: &ProcedureDraft) -> bool {
