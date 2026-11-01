@@ -5581,10 +5581,17 @@ impl JournalAdmissionState {
             operation_revision: None,
             receipt_refs: Vec::new(),
         };
-        let Some((operation, _)) = self
-            .operations
-            .get(&binding.operation_id)
-            .filter(|(operation, _)| operation.execution_lane_id == Some(lane.execution_lane_id))
+        // The canonical lane can own an Operation before its optional normalized
+        // back-link is reconciled. A conflicting back-link is never accepted.
+        let Some((operation, _)) =
+            self.operations
+                .get(&binding.operation_id)
+                .filter(|(operation, _)| {
+                    lane.operation_ids.contains(&operation.operation_id)
+                        && operation
+                            .execution_lane_id
+                            .is_none_or(|id| id == lane.execution_lane_id)
+                })
         else {
             return Ok(source);
         };

@@ -940,20 +940,13 @@ impl QueryExecution {
         source: &QueryExperimentSource,
     ) -> QueryStateConfidence {
         use crate::work::{
-            AttemptBindingStatus, CoverageLevel, OrderingIntegrity, PairingIntegrity,
-            PayloadIntegrity, RunContractValidity, RunObservability, SourceCoverage,
+            AttemptBindingStatus, RunContractValidity, RunExecutionStatus, RunObservability,
         };
-        let captured = self.capture_context.as_ref().is_some_and(|capture| {
-            let summary = &capture.summary;
-            capture.unavailable_lane_ids.is_empty()
-                && capture.unresolved_gap_count == Some(0)
-                && summary.minimum_coverage_level == CoverageLevel::Full
-                && summary.source_coverage_states.as_slice() == [SourceCoverage::Complete]
-                && summary.pairing_integrity_states.as_slice() == [PairingIntegrity::Complete]
-                && summary.payload_integrity_states.as_slice() == [PayloadIntegrity::Complete]
-                && summary.ordering_integrity_states.as_slice() == [OrderingIntegrity::Complete]
-        });
-        if captured
+        // This terminal is compiled by the independent deterministic resolver
+        // and admitted with its exact physical/Result cohort, not inferred from
+        // the caller lane's capture summary. Ordinary declarations remain candidates.
+        if run.comparison_execution_binding.is_some()
+            && run.execution_status == RunExecutionStatus::Completed
             && source
                 .operation_revision
                 .is_some_and(|revision| revision > 0)
