@@ -3149,6 +3149,7 @@ pub struct ScopeCurrentContext {
     pub capture_context: Option<Box<evertrace_domain::query::QueryCaptureContext>>,
     pub related_scope_shards: Vec<evertrace_domain::query::QueryRelatedScopeShard>,
     pub experiment_source: Option<evertrace_domain::query::QueryExperimentSource>,
+    pub parent_verifications: Vec<evertrace_domain::query::QueryParentVerificationSource>,
 }
 
 /// One current directory metadata window, never a complete projection.
@@ -4936,6 +4937,7 @@ impl JournalAdmissionState {
         let mut capture_context = None;
         let mut related_scope_shards = Vec::new();
         let mut experiment_source = None;
+        let mut parent_verifications = Vec::new();
         if let Some(session) = request.session.as_deref() {
             let mut lanes = Vec::new();
             for (lane, seq) in self.execution_lanes.values().filter(|(lane, _)| {
@@ -5040,13 +5042,27 @@ impl JournalAdmissionState {
                                     facts.push(payload);
                                 }
                             }
-                            let operations =
+                            let child_operations =
                                 lane.operation_ids.iter().copied().collect::<BTreeSet<_>>();
+                            let mut parent_operations = BTreeSet::new();
+                            let mut parent = None;
+                            if let Some((value, seq)) = lane
+                                .parent_lane_id
+                                .and_then(|id| self.execution_lanes.get(&id))
+                            {
+                                let payload =
+                                    JournalPayload::ExecutionLaneRecorded(Box::new(value.clone()));
+                                if self.scope_fact_visible(&payload, *seq)? {
+                                    parent_operations.extend(value.operation_ids.iter().copied());
+                                    parent = Some(value);
+                                }
+                            }
                             let mut bindings = BTreeMap::new();
-                            if !operations.is_empty() {
+                            if !child_operations.is_empty() || !parent_operations.is_empty() {
                                 for (binding, seq) in
                                     self.work_bindings.values().filter(|(binding, _)| {
-                                        operations.contains(&binding.operation_id)
+                                        child_operations.contains(&binding.operation_id)
+                                            || parent_operations.contains(&binding.operation_id)
                                     })
                                 {
                                     let entry = bindings
@@ -5059,7 +5075,8 @@ impl JournalAdmissionState {
                             }
                             let mut current_bindings = Vec::new();
                             for (binding, seq) in bindings.values().filter(|(binding, _)| {
-                                binding.primary_binding.task_id == Some(episode.task_id)
+                                child_operations.contains(&binding.operation_id)
+                                    && binding.primary_binding.task_id == Some(episode.task_id)
                                     && binding.primary_binding.workstream_id
                                         == Some(episode.workstream_id)
                                     && binding.primary_binding.episode_id
@@ -5090,6 +5107,24 @@ impl JournalAdmissionState {
                                     experiment_source =
                                         Some(self.scope_experiment_source(lane, binding, run)?);
                                     facts.push(payload);
+                                }
+                            }
+                            if let Some(parent) = parent
+                                && let [current] = current_bindings.as_slice()
+                                && current.assignment_status == AssignmentStatus::Resolved
+                            {
+                                for payload in &facts {
+                                    if let JournalPayload::AttemptRecorded(attempt) = payload
+                                        && current
+                                            .primary_binding
+                                            .attempt_id
+                                            .is_none_or(|id| id == attempt.attempt_id)
+                                        && let Some(source) = self.scope_parent_verification(
+                                            lane, parent, attempt, &bindings,
+                                        )?
+                                    {
+                                        parent_verifications.push(source);
+                                    }
                                 }
                             }
                         }
@@ -5169,6 +5204,7 @@ impl JournalAdmissionState {
             capture_context,
             related_scope_shards,
             experiment_source,
+            parent_verifications,
         })
     }
 
@@ -5488,6 +5524,11 @@ impl JournalAdmissionState {
                 v.attempt_id.to_string(),
                 v.revision_id.to_string(),
             ),
+            JournalPayload::ResultEvidenceRecorded(v) => (
+                "result_evidence",
+                v.result_evidence_id.to_string(),
+                v.revision_id.to_string(),
+            ),
             JournalPayload::ExperimentRunRecorded(v) => (
                 "experiment_run",
                 v.run_id.to_string(),
@@ -5533,6 +5574,22 @@ impl JournalAdmissionState {
                 payload,
                 seq,
             )?,
+            JournalPayload::ResultEvidenceRecorded(v) => {
+                let mut row = work_identity_row(
+                    kind,
+                    id,
+                    revision.clone(),
+                    v.completeness.as_str(),
+                    None,
+                    None,
+                    None,
+                    None,
+                    payload,
+                    seq,
+                )?;
+                row.row_id = format!("object:work:result_evidence:{revision}");
+                row
+            }
             JournalPayload::ExperimentRunRecorded(v) => {
                 let mut row = work_identity_row(
                     kind,
@@ -5570,6 +5627,123 @@ impl JournalAdmissionState {
         Ok(self.capture_product_rows(vec![row])?.pop())
     }
 
+    fn scope_parent_verification(
+        &self,
+        caller: &ExecutionLane,
+        parent: &ExecutionLane,
+        attempt: &Attempt,
+        bindings: &BTreeMap<OperationId, (&WorkBindingRevision, &u64)>,
+    ) -> Result<Option<evertrace_domain::query::QueryParentVerificationSource>, StoreError> {
+        use evertrace_domain::{
+            semantic::{EvidenceCompleteness, ParserStatus, ResultScope, VerifierStatus},
+            work::{
+                AttemptVerification, RunContractValidity, RunExecutionStatus, RunObservability,
+            },
+        };
+        if !matches!(
+            attempt.verification,
+            AttemptVerification::Passed | AttemptVerification::Failed
+        ) {
+            return Ok(None);
+        }
+        for reference in &attempt.parent_verification_refs {
+            let selected = reference
+                .parse::<RevisionId>()
+                .ok()
+                .and_then(|id| self.result_evidence_revisions.get(&id))
+                .or_else(|| {
+                    reference
+                        .parse::<ResultEvidenceId>()
+                        .ok()
+                        .and_then(|id| self.result_evidence.get(&id))
+                });
+            let Some((result, seq)) = selected else {
+                continue;
+            };
+            if result.result_scope != ResultScope::Complete
+                || result.completeness != EvidenceCompleteness::Complete
+                || result.parser_receipt.status != ParserStatus::Parsed
+                || result
+                    .verifier_receipt
+                    .as_ref()
+                    .is_none_or(|receipt| receipt.status != VerifierStatus::Passed)
+                || !self.scope_fact_visible(
+                    &JournalPayload::ResultEvidenceRecorded(Box::new(result.clone())),
+                    *seq,
+                )?
+            {
+                continue;
+            }
+            let Some((run, seq)) = self
+                .experiment_run_revisions
+                .get(&result.experiment_run_revision_id)
+            else {
+                continue;
+            };
+            if run.run_id != result.experiment_run_id
+                || run.attempt_id != Some(attempt.attempt_id)
+                || run.attempt_binding_status != AttemptBindingStatus::Resolved
+                || run.workstream_id != attempt.workstream_id
+                || run.strategy_contract_fingerprint != attempt.strategy_contract_fingerprint
+                || run.comparison_execution_binding.is_none()
+                || run.execution_status != RunExecutionStatus::Completed
+                || run.observability != RunObservability::Full
+                || run.contract_validity != RunContractValidity::Valid
+                || !self.scope_fact_visible(
+                    &JournalPayload::ExperimentRunRecorded(Box::new(run.clone())),
+                    *seq,
+                )?
+            {
+                continue;
+            }
+            for id in &attempt.work_binding_revision_refs {
+                let Some((pinned, _)) = self.work_bindings.get(id) else {
+                    continue;
+                };
+                let Some((binding, seq)) = bindings.get(&pinned.operation_id) else {
+                    continue;
+                };
+                if binding.work_binding_revision_id != *id
+                    || !parent.operation_ids.contains(&binding.operation_id)
+                    || binding.assignment_status != AssignmentStatus::Resolved
+                    || binding.primary_binding.task_id != Some(attempt.task_id)
+                    || binding.primary_binding.workstream_id != Some(attempt.workstream_id)
+                    || binding.primary_binding.episode_id != attempt.episode_id
+                    || binding.primary_binding.attempt_id != Some(attempt.attempt_id)
+                    || binding.primary_binding.experiment_run_id != Some(run.run_id)
+                    || !self.scope_fact_visible(
+                        &JournalPayload::WorkBindingRecorded(Box::new((*binding).clone())),
+                        **seq,
+                    )?
+                {
+                    continue;
+                }
+                let source = self.scope_experiment_source(parent, binding, run)?;
+                if let Some(operation_revision) = source.operation_revision
+                    && !source.receipt_refs.is_empty()
+                {
+                    // The explicit decision is Attempt.verification. Parsed metrics
+                    // and the receipt verifier only establish its observed provenance.
+                    return Ok(Some(
+                        evertrace_domain::query::QueryParentVerificationSource {
+                            attempt_revision_id: attempt.revision_id,
+                            caller_lane_id: caller.execution_lane_id,
+                            parent_lane_id: parent.execution_lane_id,
+                            result_id: result.result_evidence_id,
+                            result_revision_id: result.revision_id,
+                            run_revision_id: run.revision_id,
+                            work_binding_revision_id: binding.work_binding_revision_id,
+                            operation_id: binding.operation_id,
+                            operation_revision,
+                            receipt_refs: source.receipt_refs,
+                        },
+                    ));
+                }
+            }
+        }
+        Ok(None)
+    }
+
     fn scope_experiment_source(
         &self,
         lane: &ExecutionLane,
@@ -5596,7 +5770,13 @@ impl JournalAdmissionState {
             return Ok(source);
         };
         source.operation_revision = Some(operation.operation_revision);
-        if operation.pairing_state != evertrace_domain::evidence::PairingState::Paired {
+        if operation.pairing_state != evertrace_domain::evidence::PairingState::Paired
+            || self.host_occurrences.get(&operation.host_occurrence_id).is_none_or(|(occurrence, _)| {
+                occurrence.correlation_strength != evertrace_domain::evidence::CorrelationStrength::Exact
+                    || occurrence.normalization_state == evertrace_domain::evidence::NormalizationState::NormalizationConflicted
+                    || occurrence.possible_duplicate_group_id.is_some()
+            })
+        {
             return Ok(source);
         }
         let (references, observations) = if run.ended_at_us.is_some() {

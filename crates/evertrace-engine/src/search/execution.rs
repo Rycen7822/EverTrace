@@ -14,6 +14,7 @@ pub(crate) fn from_facts(
     capture_context: Option<&evertrace_domain::query::QueryCaptureContext>,
     related_scope_shards: &[evertrace_domain::query::QueryRelatedScopeShard],
     experiment_source: Option<&evertrace_domain::query::QueryExperimentSource>,
+    parent_verifications: &[evertrace_domain::query::QueryParentVerificationSource],
 ) -> Option<Box<QueryExecution>> {
     if !matches!(
         anchor.binding_strength,
@@ -128,9 +129,32 @@ pub(crate) fn from_facts(
         episode: episode.clone(),
         attempt: attempt.cloned(),
         experiment: None,
+        verification: None,
         work_binding: binding.cloned(),
         checkpoint: checkpoint.cloned(),
     };
+    if let Some(attempt) = &execution.attempt {
+        let source = execution
+            .resolved_attempt()
+            .and_then(|_| {
+                unique(
+                    parent_verifications
+                        .iter()
+                        .filter(|source| source.attempt_revision_id == attempt.revision_id),
+                )
+            })
+            .cloned()
+            .map(Box::new);
+        execution.verification = Some(evertrace_domain::query::QueryVerificationState {
+            value: attempt.verification,
+            confidence: if source.is_some() {
+                evertrace_domain::query::QueryStateConfidence::Confirmed
+            } else {
+                evertrace_domain::query::QueryStateConfidence::Candidate
+            },
+            source,
+        });
+    }
     if let Some(binding) = binding
         && let Some(run) = unique(facts.iter().filter_map(|payload| match payload {
             JournalPayload::ExperimentRunRecorded(run)

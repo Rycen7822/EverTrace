@@ -423,18 +423,23 @@ impl ProcedureUsageCurrentView {
             ];
         }
         if let Some(attempt) = active_attempt {
-            constraints.bindings.push(ConstraintBinding {
-                field: ConstraintField::VerifierState,
-                value: ConstraintValue::Text(
-                    match attempt.verification {
-                        AttemptVerification::Unverified => "unverified",
-                        AttemptVerification::Passed => "passed",
-                        AttemptVerification::Failed => "failed",
-                        AttemptVerification::Inconclusive => "inconclusive",
-                    }
-                    .into(),
-                ),
-            });
+            if let Some(verification) = &execution.verification
+                && verification.confidence
+                    == evertrace_domain::query::QueryStateConfidence::Confirmed
+            {
+                constraints.bindings.push(ConstraintBinding {
+                    field: ConstraintField::VerifierState,
+                    value: ConstraintValue::Text(
+                        match verification.value {
+                            AttemptVerification::Unverified => "unverified",
+                            AttemptVerification::Passed => "passed",
+                            AttemptVerification::Failed => "failed",
+                            AttemptVerification::Inconclusive => "inconclusive",
+                        }
+                        .into(),
+                    ),
+                });
+            }
             if let Some(signature) = &attempt.failure_signature {
                 constraints.bindings.push(ConstraintBinding {
                     field: ConstraintField::FailureSignature,
@@ -466,6 +471,12 @@ impl ProcedureUsageCurrentView {
         let mut trace = super::alignment::StageTrace::compile_rows(rows, episode)?;
         if active_attempt.is_none() {
             trace.clear_attempt_state();
+        } else if !constraints
+            .bindings
+            .iter()
+            .any(|binding| binding.field == ConstraintField::VerifierState)
+        {
+            trace.clear_current_verifier_state();
         }
         let current = trace.current_for_search(&constraints);
         let candidates = revisions

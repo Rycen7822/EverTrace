@@ -883,6 +883,30 @@ pub struct QueryExperimentSource {
     pub receipt_refs: Vec<crate::ids::SourceReceiptId>,
 }
 
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct QueryParentVerificationSource {
+    pub attempt_revision_id: RevisionId,
+    pub caller_lane_id: crate::ids::ExecutionLaneId,
+    pub parent_lane_id: crate::ids::ExecutionLaneId,
+    pub result_id: crate::ids::ResultEvidenceId,
+    pub result_revision_id: RevisionId,
+    pub run_revision_id: RevisionId,
+    pub work_binding_revision_id: crate::ids::WorkBindingRevisionId,
+    pub operation_id: crate::ids::OperationId,
+    pub operation_revision: u32,
+    pub receipt_refs: Vec<crate::ids::SourceReceiptId>,
+}
+
+/// The explicit Attempt decision and its provenance, never a metric-to-pass conversion.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct QueryVerificationState {
+    pub value: crate::work::AttemptVerification,
+    pub confidence: QueryStateConfidence,
+    pub source: Option<Box<QueryParentVerificationSource>>,
+}
+
 /// A declared dependency is a reference, never another primary current state.
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
@@ -916,6 +940,7 @@ pub struct QueryExecution {
     /// A canonical candidate; execution operands require `resolved_attempt`.
     pub attempt: Option<crate::work::Attempt>,
     pub experiment: Option<Box<QueryExperimentState>>,
+    pub verification: Option<QueryVerificationState>,
     pub work_binding: Option<crate::work::WorkBindingRevision>,
     pub checkpoint: Option<crate::work::WorkCheckpoint>,
 }
@@ -1054,6 +1079,36 @@ impl QueryExecution {
                         .is_some_and(|id| id != attempt.attempt_id)
                 })
             {
+                return Err(QueryError::Invalid);
+            }
+        }
+        if let Some(verification) = &self.verification {
+            let attempt = self.attempt.as_ref().ok_or(QueryError::Invalid)?;
+            let confirmed = if let Some(source) = &verification.source {
+                if self.resolved_attempt().is_none()
+                    || source.attempt_revision_id != attempt.revision_id
+                    || anchor.execution_lane_id != Some(source.caller_lane_id)
+                    || source.parent_lane_id == source.caller_lane_id
+                    || source.operation_revision == 0
+                    || source.receipt_refs.is_empty()
+                    || !source.receipt_refs.windows(2).all(|pair| pair[0] < pair[1])
+                    || !attempt.parent_verification_refs.iter().any(|reference| {
+                        reference == &source.result_id.to_string()
+                            || reference == &source.result_revision_id.to_string()
+                    })
+                    || !matches!(
+                        attempt.verification,
+                        crate::work::AttemptVerification::Passed
+                            | crate::work::AttemptVerification::Failed
+                    )
+                {
+                    return Err(QueryError::Invalid);
+                }
+                QueryStateConfidence::Confirmed
+            } else {
+                QueryStateConfidence::Candidate
+            };
+            if verification.value != attempt.verification || verification.confidence != confirmed {
                 return Err(QueryError::Invalid);
             }
         }

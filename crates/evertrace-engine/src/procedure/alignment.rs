@@ -289,6 +289,16 @@ impl StageTrace {
         }
     }
 
+    pub(crate) fn clear_current_verifier_state(&mut self) {
+        if let Some(frame) = self.frames.last_mut() {
+            frame
+                .state
+                .bindings
+                .retain(|binding| binding.field != ConstraintField::VerifierState);
+            frame.verifier_witness = None;
+        }
+    }
+
     pub(crate) fn current(&self) -> Option<&ConstraintState> {
         self.frames.last().map(|frame| &frame.state)
     }
@@ -299,14 +309,22 @@ impl StageTrace {
     /// Read-time state only: never rewrite checkpoint facts or stage transitions.
     pub(crate) fn current_for_search(&self, current: &ConstraintState) -> Option<ConstraintState> {
         let mut state = self.current()?.clone();
-        state
-            .bindings
-            .retain(|binding| binding.field != ConstraintField::ExperimentState);
+        state.bindings.retain(|binding| {
+            !matches!(
+                binding.field,
+                ConstraintField::ExperimentState | ConstraintField::VerifierState
+            )
+        });
         state.bindings.extend(
             current
                 .bindings
                 .iter()
-                .filter(|binding| binding.field == ConstraintField::ExperimentState)
+                .filter(|binding| {
+                    matches!(
+                        binding.field,
+                        ConstraintField::ExperimentState | ConstraintField::VerifierState
+                    )
+                })
                 .cloned(),
         );
         state.bindings.sort_by_key(|binding| binding.field);
