@@ -9889,11 +9889,30 @@ impl JournalAdmissionState {
         if limit == 0 || limit > 32 {
             return Err(StoreError::InvalidInput);
         }
+        self.recall_contexts(frontier, limit, None)
+    }
+
+    pub(crate) fn recall_source_contexts(
+        &self,
+        frontier: u64,
+        episode: RevisionId,
+    ) -> Result<Vec<RecallCurrentContext>, StoreError> {
+        // One lookahead distinguishes 32 exact-fit source contexts from overflow.
+        self.recall_contexts(frontier, 33, Some(episode))
+    }
+
+    fn recall_contexts(
+        &self,
+        frontier: u64,
+        limit: usize,
+        source_episode: Option<RevisionId>,
+    ) -> Result<Vec<RecallCurrentContext>, StoreError> {
         let active_operation_ids = self
             .episodes
             .values()
             .filter(|(episode, _)| {
                 episode.lifecycle_status == evertrace_domain::work::EpisodeLifecycle::Open
+                    && source_episode.is_none_or(|id| id == episode.revision_id)
             })
             .flat_map(|(episode, _)| {
                 episode.execution_lane_ids.iter().filter_map(|lane_id| {
@@ -9930,8 +9949,9 @@ impl JournalAdmissionState {
             }
         }
         let mut contexts = Vec::new();
-        for (episode, _) in self.episodes.values().filter(|(episode, _)| {
+        'episodes: for (episode, _) in self.episodes.values().filter(|(episode, _)| {
             episode.lifecycle_status == evertrace_domain::work::EpisodeLifecycle::Open
+                && source_episode.is_none_or(|id| id == episode.revision_id)
         }) {
             for lane_id in &episode.execution_lane_ids {
                 let Some((lane, _)) = self.execution_lanes.get(lane_id).filter(|(lane, _)| {
@@ -9953,6 +9973,9 @@ impl JournalAdmissionState {
                             stream.status == evertrace_domain::work::WorkstreamStatus::Active
                                 && stream.task_id == episode.task_id
                                 && stream.execution_lane_ids.contains(lane_id)
+                                && source_episode.is_none_or(|_| {
+                                    stream.active_episode_id == Some(episode.episode_id)
+                                })
                         })
                 else {
                     continue;
@@ -9982,12 +10005,13 @@ impl JournalAdmissionState {
                     .atoms
                     .values()
                     .filter_map(|(atom, source_event_seq)| {
-                        (atom.lifecycle_status
-                            == evertrace_domain::semantic::AtomLifecycleStatus::Active
+                        (source_episode.is_none()
+                            && atom.lifecycle_status
+                                == evertrace_domain::semantic::AtomLifecycleStatus::Active
                             && atom.kind.is_normative()
                             && self.scenario_core.atom_support_eligible(atom.revision_id)
                             && recall_scope_matches(&atom.scope, episode))
-                        .then_some(RecallCurrentAtom {
+                        .then(|| RecallCurrentAtom {
                             atom: atom.clone(),
                             source_event_seq: *source_event_seq,
                         })
@@ -10001,7 +10025,8 @@ impl JournalAdmissionState {
                     .recall_ledger
                     .values()
                     .filter(|need| {
-                        need.session_id == *session_id
+                        source_episode.is_none()
+                            && need.session_id == *session_id
                             && need.execution_lane_id == *lane_id
                             && need.episode_revision_id == episode.revision_id
                             && need.obligation_state
@@ -10034,6 +10059,9 @@ impl JournalAdmissionState {
                     needs,
                     last_presentation_attempts,
                 });
+                if source_episode.is_some() && contexts.len() == limit {
+                    break 'episodes;
+                }
                 if contexts.len() > limit {
                     return Err(StoreError::ReconciliationDependencyOverflow);
                 }

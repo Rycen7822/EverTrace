@@ -202,6 +202,66 @@ impl RecallTriggerIndex {
             .map(|position| &self.entries[*position])
     }
 
+    /// Evaluate sources against their recorded Native context, never a human execution identity.
+    pub(crate) fn read_matches(
+        &self,
+        context: &evertrace_store::RecallCurrentContext,
+        readable: &BTreeSet<String>,
+    ) -> (BTreeSet<RevisionId>, bool) {
+        let anchor = RecallDetectionAnchor {
+            session_id: context.execution_lane.host_session_id.clone(),
+            execution_lane_id: context.execution_lane.execution_lane_id,
+            task_id: context.task.task_id,
+            workstream_id: context.workstream.workstream_id,
+            episode_revision_id: context.episode.revision_id,
+            repository_id: context.episode.repository_instance_id,
+            worktree_id: context.episode.worktree_instance_id,
+        };
+        let current = detector::checkpoint_state(&context.checkpoint);
+        let previous = context
+            .previous_checkpoint
+            .as_ref()
+            .map(detector::checkpoint_state);
+        let mut sources = BTreeSet::new();
+        let mut unknown = false;
+        for entry in &self.entries {
+            if !readable.contains(&entry.contract.source_revision_id.to_string())
+                || !detector::scope_matches(&entry.scope, &anchor)
+            {
+                continue;
+            }
+            if context.binding.assignment_status
+                != evertrace_domain::work::AssignmentStatus::Resolved
+                || !context.checkpoint.capture_gap_refs.is_empty()
+                || !context.checkpoint.capture_outage_refs.is_empty()
+                || context.checkpoint.verifier_state == CheckpointVerifierState::Inconclusive
+            {
+                unknown = true;
+                continue;
+            }
+            let matched = entry.contract.evaluate_match(&current, previous.as_ref());
+            let suppressed = entry
+                .contract
+                .evaluate_suppress(&current, previous.as_ref());
+            let resolved = entry.contract.evaluate_resolve(&current, previous.as_ref());
+            if matched == ConstraintTruth::False
+                || suppressed == ConstraintTruth::True
+                || resolved == ConstraintTruth::True
+            {
+                continue;
+            }
+            if matched == ConstraintTruth::True
+                && suppressed == ConstraintTruth::False
+                && resolved == ConstraintTruth::False
+            {
+                sources.insert(entry.contract.source_revision_id);
+            } else {
+                unknown = true;
+            }
+        }
+        (sources, unknown)
+    }
+
     pub fn evaluate(
         &self,
         current: &ConstraintState,

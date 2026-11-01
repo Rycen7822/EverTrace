@@ -166,6 +166,7 @@ enum WriterRequest {
     },
     RecallCurrentContexts {
         limit: usize,
+        source_episode: Option<evertrace_domain::revision::RevisionId>,
         reply: oneshot::Sender<Result<Vec<RecallCurrentContext>, WriterActorError>>,
     },
     RepositoryReadContext {
@@ -342,7 +343,27 @@ impl WriterHandle {
     ) -> Result<Vec<RecallCurrentContext>, WriterActorError> {
         let (reply, response) = oneshot::channel();
         self.sender
-            .send(WriterRequest::RecallCurrentContexts { limit, reply })
+            .send(WriterRequest::RecallCurrentContexts {
+                limit,
+                source_episode: None,
+                reply,
+            })
+            .await
+            .map_err(|_| WriterActorError::Stopped)?;
+        response.await.map_err(|_| WriterActorError::Stopped)?
+    }
+
+    pub async fn recall_source_contexts(
+        &self,
+        episode: evertrace_domain::revision::RevisionId,
+    ) -> Result<Vec<RecallCurrentContext>, WriterActorError> {
+        let (reply, response) = oneshot::channel();
+        self.sender
+            .send(WriterRequest::RecallCurrentContexts {
+                limit: 33,
+                source_episode: Some(episode),
+                reply,
+            })
             .await
             .map_err(|_| WriterActorError::Stopped)?;
         response.await.map_err(|_| WriterActorError::Stopped)?
@@ -1653,12 +1674,17 @@ async fn run_writer(
                         return Err(WriterActorError::Store);
                     }
                 }
-                WriterRequest::RecallCurrentContexts { limit, reply } => {
-                    let result = writer
-                        .as_ref()
-                        .ok_or(WriterActorError::Stopped)?
-                        .recall_current_contexts(limit)
-                        .map_err(map_store_error);
+                WriterRequest::RecallCurrentContexts {
+                    limit,
+                    source_episode,
+                    reply,
+                } => {
+                    let writer = writer.as_ref().ok_or(WriterActorError::Stopped)?;
+                    let result = match source_episode {
+                        Some(episode) => writer.recall_source_contexts(episode),
+                        None => writer.recall_current_contexts(limit),
+                    }
+                    .map_err(map_store_error);
                     let _ = reply.send(result);
                 }
                 WriterRequest::SessionImportContext {

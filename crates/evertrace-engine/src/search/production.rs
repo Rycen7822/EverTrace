@@ -52,6 +52,7 @@ pub struct ProductionSearch {
     semantics: Option<super::resolution::SemanticSearchResolution>,
     canonical_sources: Option<(u64, Vec<SearchProjectionRow>)>,
     recall_sources: BTreeSet<String>,
+    matched_sources: BTreeSet<String>,
 }
 
 impl ProductionSearch {
@@ -66,6 +67,7 @@ impl ProductionSearch {
             semantics: None,
             canonical_sources: None,
             recall_sources: BTreeSet::new(),
+            matched_sources: BTreeSet::new(),
         }
     }
 
@@ -99,6 +101,11 @@ impl ProductionSearch {
         semantics: super::resolution::SemanticSearchResolution,
     ) -> Self {
         self.semantics = Some(semantics);
+        self
+    }
+
+    pub(crate) fn with_matched_sources(mut self, refs: BTreeSet<String>) -> Self {
+        self.matched_sources = refs;
         self
     }
 
@@ -464,8 +471,12 @@ impl ProductionSearch {
                 }
             }
         }
-        if !self.recall_sources.is_empty() {
-            let references = self.recall_sources.iter().cloned().collect::<Vec<_>>();
+        if !self.recall_sources.is_empty() || !self.matched_sources.is_empty() {
+            let references = self
+                .recall_sources
+                .union(&self.matched_sources)
+                .cloned()
+                .collect::<Vec<_>>();
             match deadline
                 .run(snapshot.structured(&references, &filter, 33))
                 .await
@@ -586,10 +597,9 @@ impl ProductionSearch {
                 == Some(&evertrace_domain::semantic::SemanticResolution::Normative(
                     evertrace_domain::semantic::NormativeResolutionState::Active,
                 ));
-            let recall = row
-                .candidate_id
-                .as_ref()
-                .is_some_and(|id| self.recall_sources.contains(id));
+            let recall = row.candidate_id.as_ref().is_some_and(|id| {
+                self.recall_sources.contains(id) || self.matched_sources.contains(id)
+            });
             let rank = if active {
                 (0, 0)
             } else if recall {
@@ -616,6 +626,7 @@ impl ProductionSearch {
             let candidate_id = row.candidate_id.clone().ok_or(SearchError::Corrupt)?;
             let origin = match rank.0 {
                 0 if rank.1 == 0 => "normative",
+                0 if self.matched_sources.contains(&candidate_id) => "future_cue_match",
                 0 => "recall_source",
                 1 => "target_anchor",
                 2 => "exact",
@@ -624,6 +635,9 @@ impl ProductionSearch {
             let mut origins = BTreeSet::from([origin.to_owned()]);
             if self.recall_sources.contains(&candidate_id) {
                 origins.insert("recall_source".into());
+            }
+            if self.matched_sources.contains(&candidate_id) {
+                origins.insert("future_cue_match".into());
             }
             if rank.0 <= 1 && *explicit_exact {
                 origins.insert("exact".into());

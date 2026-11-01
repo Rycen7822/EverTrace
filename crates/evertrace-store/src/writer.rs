@@ -732,6 +732,15 @@ impl JournalWriter {
             .await
     }
 
+    /// Current source state only: no obligation, delivery, or presentation data.
+    pub fn recall_source_contexts(
+        &self,
+        episode: evertrace_domain::revision::RevisionId,
+    ) -> Result<Vec<crate::projections::RecallCurrentContext>, StoreError> {
+        self.admission_state
+            .recall_source_contexts(self.frontier(), episode)
+    }
+
     pub fn repository_read_context(
         &self,
         ids: &std::collections::BTreeSet<evertrace_domain::ids::RepositoryId>,
