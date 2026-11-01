@@ -883,12 +883,13 @@ pub struct QueryExperimentSource {
     pub receipt_refs: Vec<crate::ids::SourceReceiptId>,
 }
 
+/// Native provenance from the current lane or its explicitly linked parent.
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
-pub struct QueryParentVerificationSource {
+pub struct QueryVerificationSource {
     pub attempt_revision_id: RevisionId,
     pub caller_lane_id: crate::ids::ExecutionLaneId,
-    pub parent_lane_id: crate::ids::ExecutionLaneId,
+    pub verification_lane_id: crate::ids::ExecutionLaneId,
     pub result_id: crate::ids::ResultEvidenceId,
     pub result_revision_id: RevisionId,
     pub run_revision_id: RevisionId,
@@ -904,7 +905,7 @@ pub struct QueryParentVerificationSource {
 pub struct QueryVerificationState {
     pub value: crate::work::AttemptVerification,
     pub confidence: QueryStateConfidence,
-    pub source: Option<Box<QueryParentVerificationSource>>,
+    pub source: Option<Box<QueryVerificationSource>>,
 }
 
 /// A declared dependency is a reference, never another primary current state.
@@ -1088,7 +1089,6 @@ impl QueryExecution {
                 if self.resolved_attempt().is_none()
                     || source.attempt_revision_id != attempt.revision_id
                     || anchor.execution_lane_id != Some(source.caller_lane_id)
-                    || source.parent_lane_id == source.caller_lane_id
                     || source.operation_revision == 0
                     || source.receipt_refs.is_empty()
                     || !source.receipt_refs.windows(2).all(|pair| pair[0] < pair[1])

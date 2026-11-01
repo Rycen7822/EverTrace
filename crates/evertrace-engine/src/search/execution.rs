@@ -14,7 +14,7 @@ pub(crate) fn from_facts(
     capture_context: Option<&evertrace_domain::query::QueryCaptureContext>,
     related_scope_shards: &[evertrace_domain::query::QueryRelatedScopeShard],
     experiment_source: Option<&evertrace_domain::query::QueryExperimentSource>,
-    parent_verifications: &[evertrace_domain::query::QueryParentVerificationSource],
+    verification_sources: &[evertrace_domain::query::QueryVerificationSource],
 ) -> Option<Box<QueryExecution>> {
     if !matches!(
         anchor.binding_strength,
@@ -138,7 +138,7 @@ pub(crate) fn from_facts(
             .resolved_attempt()
             .and_then(|_| {
                 unique(
-                    parent_verifications
+                    verification_sources
                         .iter()
                         .filter(|source| source.attempt_revision_id == attempt.revision_id),
                 )

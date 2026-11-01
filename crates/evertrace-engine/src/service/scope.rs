@@ -40,7 +40,7 @@ impl McpQueryAnchor {
             context.capture_context.as_deref(),
             &context.related_scope_shards,
             context.experiment_source.as_ref(),
-            &context.parent_verifications,
+            &context.verification_sources,
         )
     }
 

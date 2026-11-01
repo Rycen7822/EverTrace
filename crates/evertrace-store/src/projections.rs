@@ -3149,7 +3149,7 @@ pub struct ScopeCurrentContext {
     pub capture_context: Option<Box<evertrace_domain::query::QueryCaptureContext>>,
     pub related_scope_shards: Vec<evertrace_domain::query::QueryRelatedScopeShard>,
     pub experiment_source: Option<evertrace_domain::query::QueryExperimentSource>,
-    pub parent_verifications: Vec<evertrace_domain::query::QueryParentVerificationSource>,
+    pub verification_sources: Vec<evertrace_domain::query::QueryVerificationSource>,
 }
 
 /// One current directory metadata window, never a complete projection.
@@ -4937,7 +4937,7 @@ impl JournalAdmissionState {
         let mut capture_context = None;
         let mut related_scope_shards = Vec::new();
         let mut experiment_source = None;
-        let mut parent_verifications = Vec::new();
+        let mut verification_sources = Vec::new();
         if let Some(session) = request.session.as_deref() {
             let mut lanes = Vec::new();
             for (lane, seq) in self.execution_lanes.values().filter(|(lane, _)| {
@@ -5109,8 +5109,7 @@ impl JournalAdmissionState {
                                     facts.push(payload);
                                 }
                             }
-                            if let Some(parent) = parent
-                                && let [current] = current_bindings.as_slice()
+                            if let [current] = current_bindings.as_slice()
                                 && current.assignment_status == AssignmentStatus::Resolved
                             {
                                 for payload in &facts {
@@ -5119,11 +5118,18 @@ impl JournalAdmissionState {
                                             .primary_binding
                                             .attempt_id
                                             .is_none_or(|id| id == attempt.attempt_id)
-                                        && let Some(source) = self.scope_parent_verification(
-                                            lane, parent, attempt, &bindings,
-                                        )?
                                     {
-                                        parent_verifications.push(source);
+                                        for evidence_lane in std::iter::once(*lane).chain(parent) {
+                                            if let Some(source) = self.scope_verification_source(
+                                                lane,
+                                                evidence_lane,
+                                                attempt,
+                                                &bindings,
+                                            )? {
+                                                verification_sources.push(source);
+                                                break;
+                                            }
+                                        }
                                     }
                                 }
                             }
@@ -5204,7 +5210,7 @@ impl JournalAdmissionState {
             capture_context,
             related_scope_shards,
             experiment_source,
-            parent_verifications,
+            verification_sources,
         })
     }
 
@@ -5627,13 +5633,13 @@ impl JournalAdmissionState {
         Ok(self.capture_product_rows(vec![row])?.pop())
     }
 
-    fn scope_parent_verification(
+    fn scope_verification_source(
         &self,
         caller: &ExecutionLane,
-        parent: &ExecutionLane,
+        evidence_lane: &ExecutionLane,
         attempt: &Attempt,
         bindings: &BTreeMap<OperationId, (&WorkBindingRevision, &u64)>,
-    ) -> Result<Option<evertrace_domain::query::QueryParentVerificationSource>, StoreError> {
+    ) -> Result<Option<evertrace_domain::query::QueryVerificationSource>, StoreError> {
         use evertrace_domain::{
             semantic::{EvidenceCompleteness, ParserStatus, ResultScope, VerifierStatus},
             work::{
@@ -5704,7 +5710,7 @@ impl JournalAdmissionState {
                     continue;
                 };
                 if binding.work_binding_revision_id != *id
-                    || !parent.operation_ids.contains(&binding.operation_id)
+                    || !evidence_lane.operation_ids.contains(&binding.operation_id)
                     || binding.assignment_status != AssignmentStatus::Resolved
                     || binding.primary_binding.task_id != Some(attempt.task_id)
                     || binding.primary_binding.workstream_id != Some(attempt.workstream_id)
@@ -5718,26 +5724,24 @@ impl JournalAdmissionState {
                 {
                     continue;
                 }
-                let source = self.scope_experiment_source(parent, binding, run)?;
+                let source = self.scope_experiment_source(evidence_lane, binding, run)?;
                 if let Some(operation_revision) = source.operation_revision
                     && !source.receipt_refs.is_empty()
                 {
                     // The explicit decision is Attempt.verification. Parsed metrics
                     // and the receipt verifier only establish its observed provenance.
-                    return Ok(Some(
-                        evertrace_domain::query::QueryParentVerificationSource {
-                            attempt_revision_id: attempt.revision_id,
-                            caller_lane_id: caller.execution_lane_id,
-                            parent_lane_id: parent.execution_lane_id,
-                            result_id: result.result_evidence_id,
-                            result_revision_id: result.revision_id,
-                            run_revision_id: run.revision_id,
-                            work_binding_revision_id: binding.work_binding_revision_id,
-                            operation_id: binding.operation_id,
-                            operation_revision,
-                            receipt_refs: source.receipt_refs,
-                        },
-                    ));
+                    return Ok(Some(evertrace_domain::query::QueryVerificationSource {
+                        attempt_revision_id: attempt.revision_id,
+                        caller_lane_id: caller.execution_lane_id,
+                        verification_lane_id: evidence_lane.execution_lane_id,
+                        result_id: result.result_evidence_id,
+                        result_revision_id: result.revision_id,
+                        run_revision_id: run.revision_id,
+                        work_binding_revision_id: binding.work_binding_revision_id,
+                        operation_id: binding.operation_id,
+                        operation_revision,
+                        receipt_refs: source.receipt_refs,
+                    }));
                 }
             }
         }
