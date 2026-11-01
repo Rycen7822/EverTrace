@@ -117,7 +117,7 @@ mod tests {
             retrieval_completeness: "complete".into(),
             suppression_ref_hash: None,
             source_event_seq: 1,
-            projection_generation: 1,
+            projection_generation: evertrace_store::SEARCH_PROJECTION_GENERATION,
         }
     }
 

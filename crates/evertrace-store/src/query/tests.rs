@@ -539,7 +539,7 @@ mod tests {
             retrieval_completeness: "complete".into(),
             suppression_ref_hash: None,
             source_event_seq: snapshot.frontier,
-            projection_generation: 1,
+            projection_generation: crate::SEARCH_PROJECTION_GENERATION,
         });
         search_rows.sort();
         assert_eq!(

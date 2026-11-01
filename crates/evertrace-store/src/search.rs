@@ -24,7 +24,12 @@ use serde::{Deserialize, Serialize};
 
 pub const SEARCH_TABLE: &str = "evertrace_search";
 pub const SEARCH_CHECKPOINT_ID: &str = "checkpoint:evertrace_search";
-pub const SEARCH_PROJECTION_GENERATION: u64 = 1;
+pub const SEARCH_PROJECTION_GENERATION: u64 = 2;
+pub(crate) const SEARCH_UPGRADE_SOURCE_GENERATION: u64 = 1;
+
+pub(crate) fn supported_search_input_generation(generation: u64) -> bool {
+    generation == SEARCH_PROJECTION_GENERATION || generation == SEARCH_UPGRADE_SOURCE_GENERATION
+}
 
 #[derive(Clone)]
 pub struct SearchIndex {
@@ -809,19 +814,19 @@ impl SearchProjectionRow {
     }
 
     pub fn validate(&self) -> Result<(), StoreError> {
-        self.validate_kind(false)
+        self.validate_kind(false, SEARCH_PROJECTION_GENERATION)
     }
 
     fn validate_canonical_source(&self) -> Result<(), StoreError> {
         if self.row_variant != "object" || self.object_kind.as_deref() != Some("work_episode") {
             return Err(StoreError::StoreCorrupt);
         }
-        self.validate_kind(true)
+        self.validate_kind(true, SEARCH_PROJECTION_GENERATION)
     }
 
-    fn validate_kind(&self, canonical: bool) -> Result<(), StoreError> {
+    fn validate_kind(&self, canonical: bool, generation: u64) -> Result<(), StoreError> {
         if self.row_id.is_empty()
-            || self.projection_generation != SEARCH_PROJECTION_GENERATION
+            || self.projection_generation != generation
             || self.instruction_authority != "none"
             || self.event_time_us < 0
             || self.recorded_at_us < 0
@@ -869,9 +874,14 @@ impl SearchProjectionRow {
         } else if self.row_variant == "object" {
             if self.source_kind.as_deref() != Some("object_projection")
                 || self.object_kind.as_deref().is_none_or(str::is_empty)
-                || !self.object_kind.as_deref().is_some_and(|kind| {
-                    is_searchable_object_kind(kind) || (canonical && kind == "work_episode")
-                })
+                || !self
+                    .object_kind
+                    .as_deref()
+                    .is_some_and(is_searchable_object_kind)
+                || (self.object_kind.as_deref() == Some("work_episode")
+                    && !canonical
+                    && (generation != SEARCH_PROJECTION_GENERATION
+                        || self.lifecycle.as_deref() != Some("terminal")))
                 || !matches!(self.currentness.as_deref(), Some("current" | "historical"))
                 || !matches!(
                     self.lifecycle.as_deref(),
@@ -957,6 +967,7 @@ pub fn is_searchable_object_kind(kind: &str) -> bool {
     matches!(
         kind,
         "atom_revision"
+            | "work_episode"
             | "task"
             | "workstream"
             | "attempt"
@@ -1119,6 +1130,21 @@ pub(crate) fn search_batch(rows: &[SearchProjectionRow]) -> Result<RecordBatch, 
 }
 
 pub async fn read_search_rows(table: &Table) -> Result<Vec<SearchProjectionRow>, StoreError> {
+    read_search_input(table, false).await
+}
+
+/// The writer upgrade and frozen-artifact checks may read the known preceding
+/// compiler. Normal search queries require the current generation.
+pub(crate) async fn read_search_rows_for_rebuild(
+    table: &Table,
+) -> Result<Vec<SearchProjectionRow>, StoreError> {
+    read_search_input(table, true).await
+}
+
+async fn read_search_input(
+    table: &Table,
+    upgrade_input: bool,
+) -> Result<Vec<SearchProjectionRow>, StoreError> {
     table
         .checkout_latest()
         .await
@@ -1130,7 +1156,7 @@ pub async fn read_search_rows(table: &Table) -> Result<Vec<SearchProjectionRow>,
     let batches = crate::collect_batches(&table.query())
         .await
         .map_err(|_| StoreError::LanceDb)?;
-    rows_from_batches(batches, true)
+    decode_rows(batches, true, upgrade_input)
 }
 
 pub(crate) async fn read_search_checkpoint(table: &Table) -> Result<u64, StoreError> {
@@ -1161,6 +1187,14 @@ pub(crate) async fn read_search_checkpoint(table: &Table) -> Result<u64, StoreEr
 fn rows_from_batches(
     batches: Vec<RecordBatch>,
     require_checkpoint: bool,
+) -> Result<Vec<SearchProjectionRow>, StoreError> {
+    decode_rows(batches, require_checkpoint, false)
+}
+
+fn decode_rows(
+    batches: Vec<RecordBatch>,
+    require_checkpoint: bool,
+    upgrade_input: bool,
 ) -> Result<Vec<SearchProjectionRow>, StoreError> {
     let mut rows = Vec::new();
     for batch in batches {
@@ -1248,9 +1282,20 @@ fn rows_from_batches(
                 source_event_seq: frontiers.value(index),
                 projection_generation: generations.value(index),
             };
-            row.validate()?;
             rows.push(row);
         }
+    }
+    let generation = if upgrade_input {
+        rows.iter()
+            .find(|row| row.row_id == SEARCH_CHECKPOINT_ID)
+            .map(|row| row.projection_generation)
+            .filter(|value| supported_search_input_generation(*value))
+            .ok_or(StoreError::StoreCorrupt)?
+    } else {
+        SEARCH_PROJECTION_GENERATION
+    };
+    for row in &rows {
+        row.validate_kind(false, generation)?;
     }
     if require_checkpoint {
         rows.sort();

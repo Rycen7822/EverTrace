@@ -2,10 +2,13 @@ use evertrace_domain::{
     canonical::{CanonicalValue, sha256},
     evidence::{EvidenceSourceKind, EvidenceSurface, SourceReceipt, payload_fingerprint},
     revision::RevisionId,
-    semantic::WikiProjection,
+    semantic::{SemanticDigest, SemanticDigestStatus, WikiProjection},
 };
 
-use crate::{JournalPayload, StoreError, search::SearchProjectionRow};
+use crate::{
+    JournalPayload, StoreError,
+    search::{SEARCH_PROJECTION_GENERATION, SearchProjectionRow},
+};
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum DefaultRetrievalSuppressionGeneration {
@@ -95,7 +98,7 @@ pub(super) fn wiki_search_row(
         retrieval_completeness: "complete".into(),
         suppression_ref_hash: None,
         source_event_seq,
-        projection_generation: 1,
+        projection_generation: SEARCH_PROJECTION_GENERATION,
     }
 }
 
@@ -163,6 +166,70 @@ pub fn canonical_work_episode_source(
     fields.extend(episode.open_loops.iter().cloned());
     fields.extend(episode.completed_outcome_refs.iter().cloned());
     object_identifier_row(row, &payload, is_current, fields, 0, row.source_event_seq)
+}
+
+pub(super) fn closed_episode_search_row(
+    row: &crate::ObjectRow,
+    episode: &evertrace_domain::work::WorkEpisode,
+    digests: &[&SemanticDigest],
+    is_current: bool,
+) -> Result<SearchProjectionRow, StoreError> {
+    if episode.lifecycle_status != evertrace_domain::work::EpisodeLifecycle::Closed {
+        return Err(StoreError::InvalidInput);
+    }
+    let mut source = canonical_work_episode_source(row, is_current)?;
+    let mut fields = vec![
+        episode.phase_contract.local_goal.clone(),
+        episode.phase_contract.phase_label.clone(),
+    ];
+    for digest in digests {
+        digest.validate().map_err(|_| StoreError::StoreCorrupt)?;
+        if digest.episode_id != Some(episode.episode_id)
+            || digest.to_watermark > episode.semantic_watermark
+            || !episode
+                .semantic_digest_refs
+                .contains(&digest.semantic_digest_id.to_string())
+        {
+            return Err(StoreError::StoreCorrupt);
+        }
+        if digest.status == SemanticDigestStatus::RejectedInvalid {
+            continue;
+        }
+        fields.push(format!("digest:{}", digest.semantic_digest_id));
+        let application = &digest.application;
+        for values in [
+            &application.progress_delta,
+            &application.decision_delta,
+            &application.outcome_delta,
+            &application.failed_routes,
+            &application.resolved_items,
+            &application.open_loops,
+        ] {
+            for delta in values {
+                fields.push(format!("{}: {}", delta.label, delta.value));
+                fields.extend(delta.direct_refs.iter().cloned());
+            }
+        }
+        fields.extend(digest.selected_direct_refs.iter().cloned());
+    }
+    fields.push(episode.phase_contract.acceptance_boundary.clone());
+    fields.push(episode.phase_contract.expected_state_transition.clone());
+    for values in [
+        &episode.phase_contract.primary_targets,
+        &episode.open_loops,
+        &episode.failure_refs,
+        &episode.interruption_refs,
+        &episode.completed_outcome_refs,
+        &episode.selected_outcome_refs,
+        &episode.verification_refs,
+    ] {
+        fields.extend(values.iter().cloned());
+    }
+    source.text = bounded_search_text(&episode.episode_id.to_string(), &fields);
+    source.source_sequence = episode.source_watermark;
+    source.time_domain = "source_sequence".into();
+    source.validate()?;
+    Ok(source)
 }
 
 fn object_identifier_row(
@@ -239,7 +306,7 @@ fn object_identifier_row(
         retrieval_completeness: "complete".into(),
         suppression_ref_hash: None,
         source_event_seq,
-        projection_generation: 1,
+        projection_generation: SEARCH_PROJECTION_GENERATION,
     })
 }
 
@@ -459,7 +526,7 @@ pub(super) fn surface_row(
         },
         suppression_ref_hash: Some(suppression),
         source_event_seq: seq,
-        projection_generation: 1,
+        projection_generation: SEARCH_PROJECTION_GENERATION,
     })
 }
 

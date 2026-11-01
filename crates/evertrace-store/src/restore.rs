@@ -216,6 +216,7 @@ async fn prepare_upgrade_inner(
     let table_states = legacy.table_states();
     let compiler_watermark = legacy.object_checkpoint;
     let snapshot = legacy.full_snapshot()?;
+    let index_generation = legacy.index_generation;
     let rows = legacy.rows.clone();
     drop(legacy);
 
@@ -250,7 +251,10 @@ async fn prepare_upgrade_inner(
         id,
         &snapshot,
         table_states,
-        crate::backup::BackupShape::Legacy { compiler_watermark },
+        crate::backup::BackupShape::Legacy {
+            compiler_watermark,
+            index_generation,
+        },
         boundary,
     )?;
     let staging = crate::backup::stage_backup(plan)?;
@@ -422,7 +426,9 @@ pub(crate) async fn verify_native_store_tables(
         || verified.states.search.as_ref().is_none_or(|search| {
             search.checkpoint != frontier
                 || search.version.is_none()
-                || search.projection_generation != Some(crate::SEARCH_PROJECTION_GENERATION)
+                || !search
+                    .projection_generation
+                    .is_some_and(crate::search::supported_search_input_generation)
         })
     {
         return Err(StoreError::Projection.into());
@@ -431,7 +437,14 @@ pub(crate) async fn verify_native_store_tables(
     if expected != verified.objects {
         return Err(StoreError::Projection.into());
     }
-    let derived = crate::query::derive_l0002_projections(&expected)?;
+    let generation = verified
+        .states
+        .search
+        .as_ref()
+        .and_then(|value| value.projection_generation)
+        .ok_or(StoreError::StoreCorrupt)?;
+    let derived =
+        crate::query::derive_l0002_projections(&expected)?.at_search_generation(generation)?;
     let actual = verified.projected;
     if actual.frontier != frontier
         || actual.relation_hash()? != derived.relation_hash()?
@@ -1578,47 +1591,43 @@ async fn reset_runtime_authority(
     occurred_at_us: i64,
     config_hash: [u8; 32],
 ) -> Result<(), StoreError> {
+    use evertrace_domain::recall::{
+        PresentationAttemptState, RecallDeliveryState, RecallLedgerEvent, RecallObligationState,
+        RecallPresentationAttempt,
+    };
     let snapshot = writer.full_projection().await?;
     let mut payloads = Vec::new();
+    // A snapshot also contains native derived rows, not only JournalPayload.
+    // Reset only the current typed authorities, never historical state records.
+    for mut job in crate::RuntimeSchedulerView::from_snapshot(&snapshot)?.jobs {
+        if job.state == crate::JobStatus::Leased {
+            job.state = crate::JobStatus::Queued;
+            job.lease_until_us = None;
+            job.backoff_until_us = None;
+            payloads.push(JournalPayload::JobState(job));
+        }
+    }
     for row in snapshot.data_rows() {
-        let Some(json) = &row.payload_json else {
+        let Some(need) = crate::projections::recall_need(row)? else {
             continue;
         };
-        let payload: JournalPayload =
-            serde_json::from_str(json).map_err(|_| StoreError::StoreCorrupt)?;
-        match payload {
-            JournalPayload::JobState(mut job) if job.state == crate::JobStatus::Leased => {
-                job.state = crate::JobStatus::Queued;
-                job.lease_until_us = None;
-                job.backoff_until_us = None;
-                payloads.push(JournalPayload::JobState(job));
-            }
-            JournalPayload::RecallLedgerRecorded(event) => {
-                use evertrace_domain::recall::{
-                    PresentationAttemptState, RecallDeliveryState, RecallLedgerEvent,
-                    RecallObligationState, RecallPresentationAttempt,
-                };
-                if let RecallLedgerEvent::NeedRecorded { need } = *event
-                    && need.obligation_state == RecallObligationState::Active
-                    && need.delivery_state == RecallDeliveryState::ClaimedForBoundary
-                {
-                    payloads.push(JournalPayload::RecallLedgerRecorded(Box::new(
-                        RecallLedgerEvent::PresentationAttempt {
-                            attempt: RecallPresentationAttempt {
-                                presentation_attempt_id: need
-                                    .active_presentation_attempt_id
-                                    .ok_or(StoreError::StoreCorrupt)?,
-                                recall_need_id: need.recall_need_id,
-                                recall_need_hash: need.recall_need_hash,
-                                boundary_event_ref: need.boundary_event_ref,
-                                state: PresentationAttemptState::PresentationUnknown,
-                                occurred_at_us,
-                            },
-                        },
-                    )));
-                }
-            }
-            _ => {}
+        if need.obligation_state == RecallObligationState::Active
+            && need.delivery_state == RecallDeliveryState::ClaimedForBoundary
+        {
+            payloads.push(JournalPayload::RecallLedgerRecorded(Box::new(
+                RecallLedgerEvent::PresentationAttempt {
+                    attempt: RecallPresentationAttempt {
+                        presentation_attempt_id: need
+                            .active_presentation_attempt_id
+                            .ok_or(StoreError::StoreCorrupt)?,
+                        recall_need_id: need.recall_need_id,
+                        recall_need_hash: need.recall_need_hash,
+                        boundary_event_ref: need.boundary_event_ref,
+                        state: PresentationAttemptState::PresentationUnknown,
+                        occurred_at_us,
+                    },
+                },
+            )));
         }
     }
     for payload in payloads {

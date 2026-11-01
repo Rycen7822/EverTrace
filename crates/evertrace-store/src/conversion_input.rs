@@ -37,6 +37,7 @@ pub(crate) struct ConversionInput {
     pub(crate) object_checkpoint: u64,
     pub(crate) relation_checkpoint: Option<u64>,
     pub(crate) search_checkpoint: Option<u64>,
+    pub(crate) index_generation: u64,
 }
 
 impl ConversionInput {
@@ -200,69 +201,83 @@ pub(crate) async fn read_conversion_input(
         return Err(StoreError::StoreCorrupt);
     }
 
-    let (relation_version, relation_checkpoint, search_version, search_checkpoint) =
-        if profile == "L0002" {
-            let relations_table = connection
-                .open_table(crate::RELATIONS_TABLE)
-                .execute()
-                .await
-                .map_err(|_| StoreError::LanceDb)?;
-            let version = table_version(&relations_table).await?;
-            let relation_rows = read_relation_rows(&relations_table).await?;
-            let checkpoint = crate::relations::checkpoint_from_rows(&relation_rows)?;
+    let (
+        relation_version,
+        relation_checkpoint,
+        search_version,
+        search_checkpoint,
+        index_generation,
+    ) = if profile == "L0002" {
+        let relations_table = connection
+            .open_table(crate::RELATIONS_TABLE)
+            .execute()
+            .await
+            .map_err(|_| StoreError::LanceDb)?;
+        let version = table_version(&relations_table).await?;
+        let relation_rows = read_relation_rows(&relations_table).await?;
+        let checkpoint = crate::relations::checkpoint_from_rows(&relation_rows)?;
 
-            let search_table = connection
-                .open_table(crate::SEARCH_TABLE)
-                .execute()
-                .await
-                .map_err(|_| StoreError::LanceDb)?;
-            let search_version = table_version(&search_table).await?;
-            let indices = search_table
-                .list_indices()
-                .await
-                .map_err(|_| StoreError::LanceDb)?;
-            if indices.len() != 1 || indices[0].columns != ["text"] {
-                return Err(StoreError::StoreCorrupt);
-            }
-            let search_rows = crate::search::read_search_rows(&search_table).await?;
-            let search_checkpoint = crate::search::read_search_checkpoint(&search_table).await?;
-            if checkpoint > frontier
-                || !(checkpoint == 0 || complete.contains(&checkpoint))
-                || search_checkpoint > frontier
-                || !(search_checkpoint == 0 || complete.contains(&search_checkpoint))
-                || relation_rows
-                    .iter()
-                    .any(|row| row.source_event_seq > checkpoint)
-                || search_rows
-                    .iter()
-                    .any(|row| row.source_event_seq > search_checkpoint)
-            {
-                return Err(StoreError::StoreCorrupt);
-            }
-            let objects_at = crate::projections::reduce_journal(&prefix_rows(&rows, checkpoint))?;
-            let derived = crate::query::derive_l0002_projections(&objects_at)?;
-            if sort_relations(derived.relations) != sort_relations(relation_rows) {
-                return Err(StoreError::StoreCorrupt);
-            }
-            let expected_search = if checkpoint == search_checkpoint {
-                derived.search
-            } else {
-                let search_objects =
-                    crate::projections::reduce_journal(&prefix_rows(&rows, search_checkpoint))?;
-                crate::query::derive_l0002_projections(&search_objects)?.search
-            };
-            if sort_search(expected_search) != sort_search(search_rows) {
-                return Err(StoreError::StoreCorrupt);
-            }
-            (
-                Some(version),
-                Some(checkpoint),
-                Some(search_version),
-                Some(search_checkpoint),
-            )
+        let search_table = connection
+            .open_table(crate::SEARCH_TABLE)
+            .execute()
+            .await
+            .map_err(|_| StoreError::LanceDb)?;
+        let search_version = table_version(&search_table).await?;
+        let indices = search_table
+            .list_indices()
+            .await
+            .map_err(|_| StoreError::LanceDb)?;
+        if indices.len() != 1 || indices[0].columns != ["text"] {
+            return Err(StoreError::StoreCorrupt);
+        }
+        let search_rows = crate::search::read_search_rows_for_rebuild(&search_table).await?;
+        let marker = search_rows
+            .iter()
+            .find(|row| row.row_id == crate::SEARCH_CHECKPOINT_ID)
+            .ok_or(StoreError::StoreCorrupt)?;
+        let search_checkpoint = marker.source_event_seq;
+        let generation = marker.projection_generation;
+        if checkpoint > frontier
+            || !(checkpoint == 0 || complete.contains(&checkpoint))
+            || search_checkpoint > frontier
+            || !(search_checkpoint == 0 || complete.contains(&search_checkpoint))
+            || relation_rows
+                .iter()
+                .any(|row| row.source_event_seq > checkpoint)
+            || search_rows
+                .iter()
+                .any(|row| row.source_event_seq > search_checkpoint)
+        {
+            return Err(StoreError::StoreCorrupt);
+        }
+        let objects_at = crate::projections::reduce_journal(&prefix_rows(&rows, checkpoint))?;
+        let derived = crate::query::derive_l0002_projections(&objects_at)?
+            .at_search_generation(generation)?;
+        if sort_relations(derived.relations) != sort_relations(relation_rows) {
+            return Err(StoreError::StoreCorrupt);
+        }
+        let expected_search = if checkpoint == search_checkpoint {
+            derived.search
         } else {
-            (None, None, None, None)
+            let search_objects =
+                crate::projections::reduce_journal(&prefix_rows(&rows, search_checkpoint))?;
+            crate::query::derive_l0002_projections(&search_objects)?
+                .at_search_generation(generation)?
+                .search
         };
+        if sort_search(expected_search) != sort_search(search_rows) {
+            return Err(StoreError::StoreCorrupt);
+        }
+        (
+            Some(version),
+            Some(checkpoint),
+            Some(search_version),
+            Some(search_checkpoint),
+            generation,
+        )
+    } else {
+        (None, None, None, None, 0)
+    };
 
     Ok(Some(ConversionInput {
         profile,
@@ -274,6 +289,7 @@ pub(crate) async fn read_conversion_input(
         object_checkpoint,
         relation_checkpoint,
         search_checkpoint,
+        index_generation,
     }))
 }
 
@@ -1166,6 +1182,7 @@ mod tests {
             legacy.table_states(),
             crate::backup::BackupShape::Legacy {
                 compiler_watermark: legacy.object_checkpoint,
+                index_generation: legacy.index_generation,
             },
             BackupFrozenBoundary {
                 spool: spool_boundary,

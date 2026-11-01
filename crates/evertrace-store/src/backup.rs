@@ -319,7 +319,10 @@ pub(crate) enum BackupShape {
     Current,
     /// Retired four-Lance layout, manifest version 2. `compiler_watermark`
     /// preserves the actual old objects checkpoint, which may lag the journal.
-    Legacy { compiler_watermark: u64 },
+    Legacy {
+        compiler_watermark: u64,
+        index_generation: u64,
+    },
 }
 
 #[derive(Debug)]
@@ -475,9 +478,9 @@ pub(crate) fn prepare_backup(
         || snapshot.frontier == 0
         || match shape {
             BackupShape::Current => !table_states.validate(snapshot.frontier),
-            BackupShape::Legacy { compiler_watermark } => {
-                !table_states.validate_legacy(snapshot.frontier, compiler_watermark)
-            }
+            BackupShape::Legacy {
+                compiler_watermark, ..
+            } => !table_states.validate_legacy(snapshot.frontier, compiler_watermark),
         }
     {
         return Err(BackupError::InvalidInput);
@@ -670,11 +673,21 @@ pub(crate) fn prepare_backup(
         return Err(BackupError::Corrupt);
     }
     let profile = table_states.profile()?;
-    let index_generation = if profile == "L0002" {
-        crate::SEARCH_PROJECTION_GENERATION
-    } else {
-        0
+    let index_generation = match shape {
+        BackupShape::Current => table_states
+            .search
+            .as_ref()
+            .and_then(|table| table.projection_generation)
+            .unwrap_or(0),
+        BackupShape::Legacy {
+            index_generation, ..
+        } => index_generation,
     };
+    if (profile == "L0002" && !crate::search::supported_search_input_generation(index_generation))
+        || (profile == "L0001" && index_generation != 0)
+    {
+        return Err(BackupError::Corrupt);
+    }
     let spool_source_watermarks = spool
         .source_watermarks
         .iter()
@@ -740,7 +753,9 @@ pub(crate) fn prepare_backup(
             index_generation,
             compiler_watermark: match shape {
                 BackupShape::Current => snapshot.frontier,
-                BackupShape::Legacy { compiler_watermark } => compiler_watermark,
+                BackupShape::Legacy {
+                    compiler_watermark, ..
+                } => compiler_watermark,
             },
             effective_config_hash: current_runtime.effective_config_hash,
             runtime_generation: current_runtime.generation,
@@ -1499,15 +1514,17 @@ pub(crate) async fn read_verified_store_tables(
         .execute()
         .await
         .map_err(|_| BackupError::Corrupt)?;
-    let search_rows = crate::search::read_search_rows(&search)
+    let search_rows = crate::search::read_search_rows_for_rebuild(&search)
         .await
         .map_err(map_store)?;
+    let marker = search_rows
+        .iter()
+        .find(|row| row.row_id == crate::SEARCH_CHECKPOINT_ID)
+        .ok_or(BackupError::Corrupt)?;
     let search_state = BackupTableState {
         version: Some(search.version().await.map_err(|_| BackupError::Corrupt)?),
-        checkpoint: crate::search::read_search_checkpoint(&search)
-            .await
-            .map_err(map_store)?,
-        projection_generation: Some(crate::SEARCH_PROJECTION_GENERATION),
+        checkpoint: marker.source_event_seq,
+        projection_generation: Some(marker.projection_generation),
     };
     let actual = BackupTableStates {
         journal: BackupTableState {
@@ -1564,11 +1581,11 @@ async fn verify_backup_tables(
         || !actual.validate(manifest.frontier)
         || manifest.schema_revision != actual.profile()?
         || manifest.index_generation
-            != if actual.profile()? == "L0002" {
-                crate::SEARCH_PROJECTION_GENERATION
-            } else {
-                0
-            }
+            != actual
+                .search
+                .as_ref()
+                .and_then(|table| table.projection_generation)
+                .unwrap_or(0)
         || manifest.compiler_watermark != actual.objects.checkpoint
     {
         return Err(BackupError::Corrupt);
@@ -1605,12 +1622,7 @@ async fn verify_legacy_backup_tables(
         || !actual.validate_legacy(manifest.frontier, manifest.compiler_watermark)
         || legacy.frontier() != manifest.frontier
         || manifest.schema_revision != legacy.profile
-        || manifest.index_generation
-            != if legacy.profile == "L0002" {
-                crate::SEARCH_PROJECTION_GENERATION
-            } else {
-                0
-            }
+        || manifest.index_generation != legacy.index_generation
     {
         return Err(BackupError::Corrupt);
     }
@@ -1848,12 +1860,18 @@ fn validate_manifest(manifest: &BackupManifest) -> Result<(), BackupError> {
         } else {
             !manifest.table_states.validate(manifest.frontier)
         }
-        || manifest.index_generation
-            != if manifest.schema_revision == "L0002" {
-                crate::SEARCH_PROJECTION_GENERATION
-            } else {
-                0
-            }
+        || if manifest.schema_revision == "L0002" {
+            !crate::search::supported_search_input_generation(manifest.index_generation)
+                || (!legacy
+                    && manifest
+                        .table_states
+                        .search
+                        .as_ref()
+                        .and_then(|table| table.projection_generation)
+                        != Some(manifest.index_generation))
+        } else {
+            manifest.index_generation != 0
+        }
         || manifest.compiler_watermark == 0
         || (!legacy && manifest.compiler_watermark != manifest.frontier)
         || manifest.effective_config_hash == [0; 32]

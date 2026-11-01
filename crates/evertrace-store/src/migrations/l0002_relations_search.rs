@@ -75,7 +75,7 @@ impl L0002 {
                 .map_err(|_| StoreError::StoreCorrupt)?
                 .commit_relation_rows(std::slice::from_ref(&checkpoint), &[], &checkpoint)?;
         }
-        let search = open_or_create_search(connection, has_search).await?;
+        let (search, compiler_upgrade) = open_or_create_search(connection, has_search).await?;
 
         let rows = sqlite
             .lock()
@@ -107,7 +107,7 @@ impl L0002 {
             MigrationOutcome::Applied
         } else if base_outcome == MigrationOutcome::RebuiltObjects {
             MigrationOutcome::RebuiltObjects
-        } else if appended || created_relation || !has_search {
+        } else if appended || created_relation || !has_search || compiler_upgrade {
             MigrationOutcome::Reconciled
         } else {
             MigrationOutcome::Noop
@@ -115,7 +115,10 @@ impl L0002 {
     }
 }
 
-async fn open_or_create_search(connection: &Connection, exists: bool) -> Result<Table, StoreError> {
+async fn open_or_create_search(
+    connection: &Connection,
+    exists: bool,
+) -> Result<(Table, bool), StoreError> {
     let table = if exists {
         connection
             .open_table(SEARCH_TABLE)
@@ -149,10 +152,14 @@ async fn open_or_create_search(connection: &Connection, exists: bool) -> Result<
             .execute()
             .await
             .map_err(|_| StoreError::Migration)?;
-    } else {
-        crate::search::read_search_rows(&table).await?;
     }
-    Ok(table)
+    let rows = crate::search::read_search_rows_for_rebuild(&table).await?;
+    let generation = rows
+        .iter()
+        .find(|row| row.row_id == crate::SEARCH_CHECKPOINT_ID)
+        .ok_or(StoreError::StoreCorrupt)?
+        .projection_generation;
+    Ok((table, generation != crate::SEARCH_PROJECTION_GENERATION))
 }
 
 async fn ensure_fts(table: &Table) -> Result<(), StoreError> {

@@ -28,7 +28,10 @@ use crate::{
         build_wiki_relation_rows, build_work_binding_relation_rows,
         build_work_identity_relation_rows,
     },
-    search::{SearchProjectionRow, read_search_rows, search_batch},
+    search::{
+        SEARCH_PROJECTION_GENERATION, SearchProjectionRow, read_search_rows,
+        read_search_rows_for_rebuild, search_batch,
+    },
     sqlite_state::SqliteHandle,
 };
 
@@ -75,6 +78,7 @@ struct L0002Handoff {
     search: Vec<SearchProjectionRow>,
     relation_frontier: u64,
     search_frontier: u64,
+    search_generation: u64,
     versions: [u64; 2],
 }
 
@@ -127,6 +131,23 @@ pub fn object_projection_hash(objects: &ProjectionSnapshot) -> Result<[u8; 32], 
 }
 
 impl L0002ProjectionSnapshot {
+    /// Reproduce the known input compiler only for frozen-artifact validation.
+    /// Live publication always derives the current compiler.
+    pub(crate) fn at_search_generation(mut self, generation: u64) -> Result<Self, StoreError> {
+        if generation == SEARCH_PROJECTION_GENERATION {
+            return Ok(self);
+        }
+        if generation != crate::search::SEARCH_UPGRADE_SOURCE_GENERATION {
+            return Err(StoreError::StoreCorrupt);
+        }
+        self.search
+            .retain(|row| row.object_kind.as_deref() != Some("work_episode"));
+        for row in &mut self.search {
+            row.projection_generation = generation;
+        }
+        Ok(self)
+    }
+
     pub fn relation_hash(&self) -> Result<[u8; 32], StoreError> {
         canonical_hash(
             "evertrace_relations_projection",
@@ -160,7 +181,7 @@ impl L0002ProjectionWorker {
             .lock()
             .map_err(|_| StoreError::StoreCorrupt)?
             .relation_rows()?;
-        let search = read_search_rows(&self.search).await?;
+        let search = read_search_rows_for_rebuild(&self.search).await?;
         commit_relation_rows(&self.sqlite, &relations, &expected.relations)?;
         commit_search_rows(&self.search, &search, &expected.search, false).await?;
         if self
@@ -252,10 +273,14 @@ impl L0002ProjectionWorker {
         let handoff = self.prepare_handoff(frontier, Some(journal_delta)).await?;
         if handoff.relation_frontier == handoff.frontier
             && handoff.search_frontier == handoff.frontier
+            && handoff.search_generation == SEARCH_PROJECTION_GENERATION
         {
             return Ok(handoff.versions);
         }
-        if handoff.relation_frontier != base_frontier || handoff.search_frontier != base_frontier {
+        if handoff.relation_frontier != base_frontier
+            || handoff.search_frontier != base_frontier
+            || handoff.search_generation != SEARCH_PROJECTION_GENERATION
+        {
             return Err(StoreError::StoreCorrupt);
         }
         let relations = update_capture_relations(&handoff.relation_rows, changed_rows, frontier)?;
@@ -286,6 +311,7 @@ impl L0002ProjectionWorker {
             .await?;
         if handoff.relation_frontier == handoff.frontier
             && handoff.search_frontier == handoff.frontier
+            && handoff.search_generation == SEARCH_PROJECTION_GENERATION
         {
             return Ok((
                 L0002ProjectionSnapshot {
@@ -337,7 +363,7 @@ impl L0002ProjectionWorker {
             .version()
             .await
             .map_err(|_| StoreError::LanceDb)?;
-        let search = read_search_rows(&self.search).await?;
+        let search = read_search_rows_for_rebuild(&self.search).await?;
         if self
             .search
             .version()
@@ -348,6 +374,11 @@ impl L0002ProjectionWorker {
             return Err(StoreError::StoreCorrupt);
         }
         let search_frontier = checkpoint_search(&search)?;
+        let search_generation = search
+            .iter()
+            .find(|row| row.row_id == crate::SEARCH_CHECKPOINT_ID)
+            .ok_or(StoreError::StoreCorrupt)?
+            .projection_generation;
         let current_versions = [relations_epoch, search_version];
         let journal_delta = journal_delta.and_then(|delta| delta.at_epoch(journal_epoch));
         let journal_frontier = if let Some(frontier) = journal_delta
@@ -402,6 +433,7 @@ impl L0002ProjectionWorker {
             search,
             relation_frontier,
             search_frontier,
+            search_generation,
             versions: current_versions,
         })
     }
@@ -1004,6 +1036,46 @@ fn derive_l0002_projection_rows(
         }
     }
 
+    let digests_by_id = semantic_digests
+        .iter()
+        .map(|digest| (digest.semantic_digest_id, digest))
+        .collect::<BTreeMap<_, _>>();
+    for row in rows
+        .iter()
+        .filter(|row| row.object_kind.as_deref() == Some("work_episode"))
+    {
+        let payload: JournalPayload = serde_json::from_str(
+            row.payload_json
+                .as_deref()
+                .ok_or(StoreError::StoreCorrupt)?,
+        )
+        .map_err(|_| StoreError::StoreCorrupt)?;
+        let JournalPayload::WorkEpisodeRecorded(episode) = payload else {
+            return Err(StoreError::StoreCorrupt);
+        };
+        if episode.lifecycle_status != evertrace_domain::work::EpisodeLifecycle::Closed {
+            continue;
+        }
+        let digests = episode
+            .semantic_digest_refs
+            .iter()
+            .map(|reference| {
+                let id = reference.parse().map_err(|_| StoreError::StoreCorrupt)?;
+                digests_by_id
+                    .get(&id)
+                    .copied()
+                    .ok_or(StoreError::StoreCorrupt)
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        let is_current = row
+            .object_id
+            .as_ref()
+            .and_then(|id| current_revisions.get(id))
+            .is_some_and(|(_, revision)| row.current_revision_id.as_ref() == Some(revision));
+        let candidate =
+            super::derive::closed_episode_search_row(row, &episode, &digests, is_current)?;
+        exact_rows.insert(candidate.row_id.clone(), candidate);
+    }
     let available_atom_revisions = atoms.keys().copied().collect::<BTreeSet<_>>();
     let available_procedure_revisions = procedures.keys().copied().collect::<BTreeSet<_>>();
     let relation_atoms = all_values(&atoms)
