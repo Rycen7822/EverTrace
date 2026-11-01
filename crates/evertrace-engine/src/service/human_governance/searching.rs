@@ -76,7 +76,167 @@ fn sequence_receipt(
     Some(receipt)
 }
 
+fn canonical_episode_sources(
+    frontier: u64,
+    index: &std::collections::BTreeMap<&str, Vec<&ObjectRow>>,
+    readable: &BTreeSet<String>,
+    references: &[String],
+) -> Result<Vec<evertrace_store::SearchProjectionRow>, HumanGovernanceError> {
+    let mut lineage = std::collections::BTreeMap::new();
+    for reference in references {
+        for row in index.get(reference.as_str()).into_iter().flatten() {
+            if row.object_kind.as_deref() == Some("work_episode") {
+                for ancestor in row
+                    .object_id
+                    .as_deref()
+                    .and_then(|id| index.get(id))
+                    .into_iter()
+                    .flatten()
+                {
+                    if ancestor.object_kind.as_deref() == Some("work_episode") {
+                        lineage.insert(ancestor.row_id.clone(), (*ancestor).clone());
+                    }
+                }
+            }
+        }
+    }
+    let heads = evertrace_store::EpisodeCurrentView::from_rows(
+        frontier,
+        &lineage.into_values().collect::<Vec<_>>(),
+    )
+    .map_err(|_| HumanGovernanceError::Store)?;
+    let mut sources = std::collections::BTreeMap::new();
+    for reference in references {
+        let Some(rows) = index.get(reference.as_str()) else {
+            continue;
+        };
+        for row in rows {
+            if row.object_kind.as_deref() != Some("work_episode")
+                || !row
+                    .current_revision_id
+                    .as_ref()
+                    .is_some_and(|id| readable.contains(id))
+            {
+                continue;
+            }
+            let id = row
+                .object_id
+                .as_deref()
+                .ok_or(HumanGovernanceError::Store)?
+                .parse()
+                .map_err(|_| HumanGovernanceError::Store)?;
+            let head = heads.episodes.get(&id).ok_or(HumanGovernanceError::Store)?;
+            let current =
+                row.current_revision_id.as_deref() == Some(head.revision_id.to_string().as_str());
+            let source = evertrace_store::query::canonical_work_episode_source(row, current)
+                .map_err(|_| HumanGovernanceError::Store)?;
+            sources.insert(source.row_id.clone(), source);
+        }
+    }
+    Ok(sources.into_values().collect())
+}
+
 impl HumanGovernanceService {
+    async fn recall_source_refs(
+        &self,
+        snapshot: &ProjectionSnapshot,
+        index: &std::collections::BTreeMap<&str, Vec<&ObjectRow>>,
+        readable: &BTreeSet<String>,
+        deadline: std::time::Instant,
+    ) -> Result<(BTreeSet<String>, BTreeSet<String>, bool), HumanGovernanceError> {
+        let mut sources = BTreeSet::new();
+        let mut checks = BTreeSet::new();
+        let mut incomplete = false;
+        for row in snapshot
+            .data_rows()
+            .filter(|row| row.object_kind.as_deref() == Some("recall_need"))
+        {
+            if std::time::Instant::now() >= deadline {
+                return Err(HumanGovernanceError::Store);
+            }
+            let need = evertrace_store::projections::recall_need(row)
+                .map_err(|_| HumanGovernanceError::Store)?
+                .ok_or(HumanGovernanceError::Store)?;
+            if need.obligation_state != evertrace_domain::recall::RecallObligationState::Active
+                || !need
+                    .source_revision_ids
+                    .iter()
+                    .all(|id| readable.contains(&id.to_string()))
+            {
+                continue;
+            }
+            let mut dependencies = need
+                .source_revision_ids
+                .iter()
+                .map(ToString::to_string)
+                .collect::<BTreeSet<_>>();
+            dependencies.extend([
+                need.task_id.to_string(),
+                need.workstream_id.to_string(),
+                need.execution_lane_id.to_string(),
+                need.boundary_event_ref.clone(),
+            ]);
+            dependencies.extend(
+                need.trigger_state
+                    .binding_revision_id
+                    .map(|id| id.to_string()),
+            );
+            dependencies.extend(
+                need.trigger_state
+                    .worktree_snapshot_id
+                    .map(|id| id.to_string()),
+            );
+            dependencies.extend(
+                need.trigger_state
+                    .attempt_ids
+                    .iter()
+                    .map(ToString::to_string),
+            );
+            dependencies.extend(
+                need.trigger_state
+                    .scope_effect_refs
+                    .iter()
+                    .map(ToString::to_string),
+            );
+            dependencies.extend(need.recall_plan.supporting_evidence_refs.iter().cloned());
+            let mut available = true;
+            let mut dependency_checks = BTreeSet::new();
+            for reference in &dependencies {
+                let current = index
+                    .get(reference.as_str())
+                    .and_then(|rows| rows.iter().max_by_key(|row| row.source_event_seq));
+                let Some(current) = current else {
+                    available = false;
+                    break;
+                };
+                if self
+                    .readable_indexed_row(snapshot, current, index, deadline)
+                    .await
+                    .is_err()
+                {
+                    available = false;
+                    break;
+                }
+                dependency_checks.insert(current.row_id.clone());
+            }
+            if !available {
+                incomplete = true;
+                continue;
+            }
+            checks.extend(dependency_checks);
+            match crate::recall::revalidate_need(snapshot, &need, now_us()?)
+                .map_err(|_| HumanGovernanceError::Store)?
+            {
+                crate::recall::RecallNeedValidity::Valid => {
+                    sources.extend(need.source_revision_ids.iter().map(ToString::to_string));
+                }
+                crate::recall::RecallNeedValidity::Unavailable => incomplete = true,
+                crate::recall::RecallNeedValidity::Terminal(_) => {}
+            }
+        }
+        Ok((sources, checks, incomplete))
+    }
+
     /// Native read-only entry: no MCP binding, usage, cue, Returned or journal.
     pub async fn search(
         &self,
@@ -109,7 +269,7 @@ impl HumanGovernanceService {
             let mut unavailable = false;
             for row in snapshot.data_rows() {
                 let kind = row.object_kind.as_deref().unwrap_or_default();
-                if kind != "source_observation"
+                if !matches!(kind, "source_observation" | "work_episode")
                     && !evertrace_store::search::is_searchable_object_kind(kind)
                 {
                     continue;
@@ -209,7 +369,21 @@ impl HumanGovernanceService {
             if let Some(scope) = &sequence_scope {
                 checks.insert(scope.source_anchor.to_string());
             }
+            let (recall_sources, recall_checks, recall_incomplete) = self
+                .recall_source_refs(&snapshot, &index, &refs, deadline)
+                .await?;
+            checks.extend(recall_checks);
+            let mut source_references = context.query_facets.target_anchors.clone();
+            source_references.extend(context.query_facets.exact_identifiers.iter().cloned());
+            if index.contains_key(context.protected_query.as_str()) {
+                source_references.push(context.protected_query.clone());
+            }
+            source_references.extend(recall_sources.iter().cloned());
+            let canonical_sources =
+                canonical_episode_sources(snapshot.frontier, &index, &refs, &source_references)?;
             let mut page = crate::search::ProductionSearch::new(search.clone())
+                .with_canonical_sources(snapshot.frontier, canonical_sources)
+                .with_recall_sources(recall_sources)
                 .with_sequence_scope(sequence_scope)
                 .with_semantic_resolution(semantics)
                 .with_validated_frontier(snapshot.frontier)
@@ -276,7 +450,12 @@ impl HumanGovernanceService {
                     .insert("read_access_changed".into());
                 page.grounded_view = None;
             }
-            if unavailable {
+            if recall_incomplete {
+                page.result
+                    .degraded_reasons
+                    .insert("recall_source_context_unavailable".into());
+            }
+            if unavailable || recall_incomplete {
                 page.result
                     .degraded_reasons
                     .insert("some_projection_access_unavailable".into());

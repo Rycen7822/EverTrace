@@ -20,6 +20,7 @@ use lancedb::{
 };
 
 use crate::{StoreError, connection::StoreReadHandle};
+use serde::{Deserialize, Serialize};
 
 pub const SEARCH_TABLE: &str = "evertrace_search";
 pub const SEARCH_CHECKPOINT_ID: &str = "checkpoint:evertrace_search";
@@ -36,6 +37,7 @@ pub struct SearchSnapshot {
     frontier: u64,
     authoritative_frontier: u64,
     readers: StoreReadHandle,
+    canonical_sources: Vec<SearchProjectionRow>,
     // Declared last so the pinned table drops before the read fence and permit.
     _lease: crate::connection::StoreReadLease,
 }
@@ -170,6 +172,7 @@ impl SearchIndex {
                     frontier,
                     authoritative_frontier: after,
                     readers: self.readers.clone(),
+                    canonical_sources: Vec::new(),
                     _lease: lease,
                 });
             }
@@ -294,6 +297,26 @@ impl SearchSnapshot {
         self.authoritative_frontier
     }
 
+    /// Request-local canonical sources are not an FTS projection or an access grant.
+    pub fn with_canonical_sources(
+        mut self,
+        frontier: u64,
+        rows: Vec<SearchProjectionRow>,
+    ) -> Result<Self, StoreError> {
+        if frontier != self.frontier || frontier != self.authoritative_frontier {
+            return Err(StoreError::InvalidInput);
+        }
+        ensure_unique_row_ids(&rows)?;
+        for row in &rows {
+            row.validate_canonical_source()?;
+            if row.source_event_seq > frontier {
+                return Err(StoreError::StoreCorrupt);
+            }
+        }
+        self.canonical_sources = rows;
+        Ok(self)
+    }
+
     pub async fn structured(
         &self,
         identifiers: &[String],
@@ -314,8 +337,56 @@ impl SearchSnapshot {
             })
             .collect::<Vec<_>>()
             .join(" OR ");
-        let filter = combine_filter(filter_sql(filter), Some(format!("({exact})")));
-        query_rows(&self.table, filter, limit, None).await
+        let predicate = combine_filter(filter_sql(filter), Some(format!("({exact})")));
+        let indexed = query_rows(&self.table, predicate, limit, None).await?;
+        if self.canonical_sources.is_empty() {
+            return Ok(indexed);
+        }
+        let predicate = combine_filter(
+            filter_sql_dialect(filter, FilterDialect::Sqlite),
+            Some(format!("({exact})")),
+        )
+        .ok_or(StoreError::InvalidInput)?;
+        let json = serde_json::to_string(&self.canonical_sources)
+            .map_err(|_| StoreError::Serialization)?;
+        let columns = SEARCH_COLUMNS
+            .iter()
+            .map(|column| format!("json_extract(value, '$.{column}') AS {column}"))
+            .collect::<Vec<_>>()
+            .join(", ");
+        let sql = format!(
+            "WITH sources AS (SELECT value AS payload, {columns} FROM json_each(?1)) \
+             SELECT payload FROM sources WHERE {predicate} ORDER BY row_id LIMIT ?2"
+        );
+        let limit_sql = i64::try_from(limit).map_err(|_| StoreError::InvalidInput)?;
+        let canonical = self
+            .readers
+            .lease_read(&self._lease, move |connection, cancel| {
+                cancel.check()?;
+                let mut statement = connection
+                    .prepare(&sql)
+                    .map_err(|_| StoreError::StoreCorrupt)?;
+                let mut cursor = statement
+                    .query(rusqlite::params![json, limit_sql])
+                    .map_err(|_| StoreError::StoreCorrupt)?;
+                let mut rows = Vec::new();
+                while let Some(row) = cursor.next().map_err(|_| StoreError::StoreCorrupt)? {
+                    cancel.check()?;
+                    let payload: String = row.get(0).map_err(|_| StoreError::StoreCorrupt)?;
+                    let source: SearchProjectionRow =
+                        serde_json::from_str(&payload).map_err(|_| StoreError::StoreCorrupt)?;
+                    source.validate_canonical_source()?;
+                    rows.push(source);
+                }
+                Ok(rows)
+            })
+            .await?;
+        let rows = indexed
+            .into_iter()
+            .chain(canonical)
+            .map(|row| (row.row_id.clone(), row))
+            .collect::<std::collections::BTreeMap<_, _>>();
+        Ok(rows.into_values().take(limit).collect())
     }
 
     pub async fn fts(
@@ -499,7 +570,23 @@ fn ensure_unique_row_ids(rows: &[SearchProjectionRow]) -> Result<(), StoreError>
     Ok(())
 }
 
+enum FilterDialect {
+    Lance,
+    Sqlite,
+}
+
 fn filter_sql(filter: &SearchHardFilter) -> Option<String> {
+    filter_sql_dialect(filter, FilterDialect::Lance)
+}
+
+fn filter_sql_dialect(filter: &SearchHardFilter, dialect: FilterDialect) -> Option<String> {
+    let contains = |value: &str| {
+        let literal = sql_literal(value);
+        match dialect {
+            FilterDialect::Sqlite => format!("(instr(text, {literal}) > 0)"),
+            FilterDialect::Lance => format!("contains(text, {literal})"),
+        }
+    };
     let mut clauses = vec!["row_variant != 'checkpoint'".to_owned()];
     if let Some(refs) = &filter.readable_refs {
         if refs.is_empty() {
@@ -516,7 +603,7 @@ fn filter_sql(filter: &SearchHardFilter) -> Option<String> {
     for literal in &filter.condition_literals {
         // Match the native post-read substring check without interpreting the
         // typed literal as a wildcard or query expression.
-        clauses.push(format!("contains(text, {})", sql_literal(literal)));
+        clauses.push(contains(literal));
     }
     if !filter.excluded_identifiers.is_empty() {
         let values = filter
@@ -529,7 +616,7 @@ fn filter_sql(filter: &SearchHardFilter) -> Option<String> {
             "(candidate_id NOT IN ({values}) AND source_ref NOT IN ({values}))"
         ));
         for value in &filter.excluded_identifiers {
-            clauses.push(format!("NOT contains(text, {})", sql_literal(value)));
+            clauses.push(format!("NOT {}", contains(value)));
         }
     }
     let methods = if filter.method_proposal_revisions.is_empty() {
@@ -658,7 +745,8 @@ fn sql_literal(value: &str) -> String {
     format!("'{}'", value.replace('\'', "''"))
 }
 
-#[derive(Clone, Debug, Eq, Ord, PartialEq, PartialOrd)]
+#[derive(Clone, Debug, Deserialize, Eq, Ord, PartialEq, PartialOrd, Serialize)]
+#[serde(deny_unknown_fields)]
 pub struct SearchProjectionRow {
     pub row_id: String,
     pub row_variant: String,
@@ -721,6 +809,17 @@ impl SearchProjectionRow {
     }
 
     pub fn validate(&self) -> Result<(), StoreError> {
+        self.validate_kind(false)
+    }
+
+    fn validate_canonical_source(&self) -> Result<(), StoreError> {
+        if self.row_variant != "object" || self.object_kind.as_deref() != Some("work_episode") {
+            return Err(StoreError::StoreCorrupt);
+        }
+        self.validate_kind(true)
+    }
+
+    fn validate_kind(&self, canonical: bool) -> Result<(), StoreError> {
         if self.row_id.is_empty()
             || self.projection_generation != SEARCH_PROJECTION_GENERATION
             || self.instruction_authority != "none"
@@ -770,10 +869,9 @@ impl SearchProjectionRow {
         } else if self.row_variant == "object" {
             if self.source_kind.as_deref() != Some("object_projection")
                 || self.object_kind.as_deref().is_none_or(str::is_empty)
-                || !self
-                    .object_kind
-                    .as_deref()
-                    .is_some_and(is_searchable_object_kind)
+                || !self.object_kind.as_deref().is_some_and(|kind| {
+                    is_searchable_object_kind(kind) || (canonical && kind == "work_episode")
+                })
                 || !matches!(self.currentness.as_deref(), Some("current" | "historical"))
                 || !matches!(
                     self.lifecycle.as_deref(),

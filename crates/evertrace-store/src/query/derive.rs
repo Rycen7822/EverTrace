@@ -119,9 +119,64 @@ pub(super) fn exact_identifier_row(
     ) else {
         return Ok(None);
     };
+    object_identifier_row(
+        row,
+        &payload,
+        is_current,
+        semantic,
+        event_time_us,
+        source_event_seq,
+    )
+    .map(Some)
+}
+
+/// Structured canonical Work sources are request-local, never an open-Episode FTS row.
+pub fn canonical_work_episode_source(
+    row: &crate::ObjectRow,
+    is_current: bool,
+) -> Result<SearchProjectionRow, StoreError> {
+    row.validate()?;
+    let payload: JournalPayload = serde_json::from_str(
+        row.payload_json
+            .as_deref()
+            .ok_or(StoreError::StoreCorrupt)?,
+    )
+    .map_err(|_| StoreError::StoreCorrupt)?;
+    let JournalPayload::WorkEpisodeRecorded(episode) = &payload else {
+        return Err(StoreError::InvalidInput);
+    };
+    episode.validate().map_err(|_| StoreError::StoreCorrupt)?;
+    if row.object_kind.as_deref() != Some("work_episode")
+        || row.object_id.as_deref() != Some(episode.episode_id.to_string().as_str())
+        || row.current_revision_id.as_deref() != Some(episode.revision_id.to_string().as_str())
+        || row.row_id != format!("object:work:work_episode:{}", episode.revision_id)
+    {
+        return Err(StoreError::StoreCorrupt);
+    }
+    let mut fields = vec![
+        episode.phase_contract.local_goal.clone(),
+        episode.phase_contract.phase_label.clone(),
+        episode.phase_contract.acceptance_boundary.clone(),
+        episode.phase_contract.expected_state_transition.clone(),
+    ];
+    fields.extend(episode.phase_contract.primary_targets.iter().cloned());
+    fields.extend(episode.open_loops.iter().cloned());
+    fields.extend(episode.completed_outcome_refs.iter().cloned());
+    object_identifier_row(row, &payload, is_current, fields, 0, row.source_event_seq)
+}
+
+fn object_identifier_row(
+    row: &crate::ObjectRow,
+    payload: &JournalPayload,
+    is_current: bool,
+    semantic: Vec<String>,
+    event_time_us: i64,
+    source_event_seq: u64,
+) -> Result<SearchProjectionRow, StoreError> {
+    let id = row.object_id.as_ref().ok_or(StoreError::StoreCorrupt)?;
     let text = bounded_search_text(id, &semantic);
     let source_ref = id.clone();
-    let (repository_id, worktree_id) = match &payload {
+    let (repository_id, worktree_id) = match payload {
         JournalPayload::RevisionProposalRecorded(proposal) => match &proposal.payload {
             evertrace_domain::semantic::ProposalPayload::Procedure(value) => {
                 match value.draft().scope {
@@ -142,7 +197,7 @@ pub(super) fn exact_identifier_row(
         },
         _ => (row.repository_id.clone(), row.worktree_id.clone()),
     };
-    Ok(Some(SearchProjectionRow {
+    Ok(SearchProjectionRow {
         row_id: format!("search:object:{}", row.row_id),
         row_variant: "object".into(),
         candidate_id: Some(
@@ -185,7 +240,7 @@ pub(super) fn exact_identifier_row(
         suppression_ref_hash: None,
         source_event_seq,
         projection_generation: 1,
-    }))
+    })
 }
 
 fn allowlisted_object_text(

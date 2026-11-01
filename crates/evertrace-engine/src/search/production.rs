@@ -50,6 +50,8 @@ pub struct ProductionSearch {
     validated_frontier: Option<u64>,
     readable_refs: Option<(u64, BTreeSet<String>)>,
     semantics: Option<super::resolution::SemanticSearchResolution>,
+    canonical_sources: Option<(u64, Vec<SearchProjectionRow>)>,
+    recall_sources: BTreeSet<String>,
 }
 
 impl ProductionSearch {
@@ -62,6 +64,8 @@ impl ProductionSearch {
             validated_frontier: None,
             readable_refs: None,
             semantics: None,
+            canonical_sources: None,
+            recall_sources: BTreeSet::new(),
         }
     }
 
@@ -95,6 +99,20 @@ impl ProductionSearch {
         semantics: super::resolution::SemanticSearchResolution,
     ) -> Self {
         self.semantics = Some(semantics);
+        self
+    }
+
+    pub(crate) fn with_recall_sources(mut self, refs: BTreeSet<String>) -> Self {
+        self.recall_sources = refs;
+        self
+    }
+
+    pub(crate) fn with_canonical_sources(
+        mut self,
+        frontier: u64,
+        rows: Vec<SearchProjectionRow>,
+    ) -> Self {
+        self.canonical_sources = Some((frontier, rows));
         self
     }
 
@@ -192,6 +210,14 @@ impl ProductionSearch {
                     grounded_view: None,
                 });
             }
+        };
+        let snapshot = if let Some((frontier, rows)) = &self.canonical_sources
+            && *frontier == snapshot.frontier()
+            && *frontier == snapshot.authoritative_frontier()
+        {
+            snapshot.with_canonical_sources(*frontier, rows.clone())?
+        } else {
+            snapshot
         };
         let mut objects = self.hard_filter(&context, true);
         objects.global_only = global_only;
@@ -346,6 +372,15 @@ impl ProductionSearch {
         {
             changed_frontiers.insert("read_access_frontier_changed".into());
         }
+        if self
+            .canonical_sources
+            .as_ref()
+            .is_some_and(|(frontier, _)| {
+                *frontier != snapshot.frontier() || *frontier != snapshot.authoritative_frontier()
+            })
+        {
+            changed_frontiers.insert("canonical_source_frontier_changed".into());
+        }
         if context.execution.as_ref().is_some_and(|execution| {
             execution.frontier != snapshot.frontier()
                 || execution.frontier != snapshot.authoritative_frontier()
@@ -429,6 +464,29 @@ impl ProductionSearch {
                 }
             }
         }
+        if !self.recall_sources.is_empty() {
+            let references = self.recall_sources.iter().cloned().collect::<Vec<_>>();
+            match deadline
+                .run(snapshot.structured(&references, &filter, 33))
+                .await
+            {
+                Ok(Ok(mut rows)) => {
+                    if rows.len() > 32 {
+                        omitted_refs
+                            .extend(rows[32..].iter().filter_map(|row| row.candidate_id.clone()));
+                        rows.truncate(32);
+                        degraded_reasons.insert("recall_source_budget_exhausted".into());
+                    }
+                    structured.extend(rows);
+                }
+                Ok(Err(_)) => {
+                    degraded_reasons.insert("recall_source_channel_unavailable".into());
+                }
+                Err(()) => {
+                    degraded_reasons.insert("recall_source_deadline_exhausted".into());
+                }
+            }
+        }
         // Pin object and original-evidence targets before text channels. Both
         // use the existing native filters; neither is a new access grant.
         if !context.query_facets.target_anchors.is_empty() {
@@ -502,15 +560,17 @@ impl ProductionSearch {
             if row.candidate_id.is_none() || !hard_compatible(row, &context)? {
                 continue;
             }
-            let exact = context
-                .query_facets
-                .exact_identifiers
-                .iter()
-                .any(|identifier| {
-                    row.candidate_id.as_deref() == Some(identifier)
-                        || row.source_ref.as_deref() == Some(identifier)
-                        || row.text.contains(identifier)
-                });
+            let exact = row.candidate_id.as_deref() == Some(context.protected_query.as_str())
+                || row.source_ref.as_deref() == Some(context.protected_query.as_str())
+                || context
+                    .query_facets
+                    .exact_identifiers
+                    .iter()
+                    .any(|identifier| {
+                        row.candidate_id.as_deref() == Some(identifier)
+                            || row.source_ref.as_deref() == Some(identifier)
+                            || row.text.contains(identifier)
+                    });
             let stable = row
                 .candidate_id
                 .as_deref()
@@ -526,8 +586,14 @@ impl ProductionSearch {
                 == Some(&evertrace_domain::semantic::SemanticResolution::Normative(
                     evertrace_domain::semantic::NormativeResolutionState::Active,
                 ));
+            let recall = row
+                .candidate_id
+                .as_ref()
+                .is_some_and(|id| self.recall_sources.contains(id));
             let rank = if active {
                 (0, 0)
+            } else if recall {
+                (0, 1)
             } else if let Some(position) = anchor_position {
                 (1, position)
             } else if exact || stable {
@@ -549,12 +615,16 @@ impl ProductionSearch {
         for (row_index, (rank, row, explicit_exact)) in ranked.iter().enumerate() {
             let candidate_id = row.candidate_id.clone().ok_or(SearchError::Corrupt)?;
             let origin = match rank.0 {
-                0 => "normative",
+                0 if rank.1 == 0 => "normative",
+                0 => "recall_source",
                 1 => "target_anchor",
                 2 => "exact",
                 _ => "fts",
             };
             let mut origins = BTreeSet::from([origin.to_owned()]);
+            if self.recall_sources.contains(&candidate_id) {
+                origins.insert("recall_source".into());
+            }
             if rank.0 <= 1 && *explicit_exact {
                 origins.insert("exact".into());
             }
