@@ -1,0 +1,142 @@
+{% macro text_list(title, entries, ordered=false) %}
+<section class="semantic-section">
+  <h3>{{ title }}</h3>
+  {% if entries %}
+    {% if ordered %}<ol>{% else %}<ul>{% endif %}
+    {% for entry in entries %}<li class="memory-prose">{{ entry }}</li>{% endfor %}
+    {% if ordered %}</ol>{% else %}</ul>{% endif %}
+  {% else %}<p class="muted">未记录。</p>{% endif %}
+</section>
+{% endmacro %}
+{% set value = content.value %}
+<div class="semantic-content" data-semantic-kind="{{ content.kind }}">
+{% if content.kind == 'atom' %}
+  <h2>{{ value.value.subject }}</h2>
+  <p class="muted">类型：{{ value.kind }}</p>
+  <div class="memory-prose semantic-body">{{ value.value.text }}</div>
+  <details>
+    <summary>结构化信息与限定</summary>
+    <dl><dt>关系</dt><dd class="memory-prose">{{ value.value.predicate }}</dd>
+      <dt>对象</dt><dd class="memory-prose">{{ value.value.object if value.value.object is not none else '未记录' }}</dd>
+    </dl>
+    {% if value.value.qualifiers %}<dl>{% for qualifier in value.value.qualifiers %}
+      <dt>{{ qualifier.name }}</dt><dd class="memory-prose">{{ qualifier.value }}</dd>
+    {% endfor %}</dl>{% else %}<p class="muted">未记录额外限定。</p>{% endif %}
+    {{ text_list('关键修订引用', value.value.critical_revision_refs) }}
+  </details>
+  <details>
+    <summary>范围、适用条件与有效期</summary>
+    <h3>已存范围</h3><pre>{{ value.scope|pretty }}</pre>
+    <h3>原生适用条件（IR v{{ value.condition_ir_version }}）</h3><pre>{{ value.applicability_expr|pretty }}</pre>
+    <h3>有效期</h3><pre>{{ value.validity_interval|pretty }}</pre>
+    {% if value.get('future_cue_lifecycle_exprs') is not none %}
+    <h3>未来提示生命周期条件</h3><pre>{{ value.future_cue_lifecycle_exprs|pretty }}</pre>
+    {% endif %}
+  </details>
+  <details>
+    <summary>来源、支持与冲突</summary>
+    {{ text_list('来源观察', value.source_observation_refs) }}
+    {{ text_list('证据引用', value.evidence_refs) }}
+    {{ text_list('替代的修订', value.supersedes_revision_refs) }}
+    {{ text_list('支持的修订', value.supports_revision_refs) }}
+    {{ text_list('矛盾修订', value.contradicts_revision_refs) }}
+    <h3>记录的 provenance</h3><pre>{{ value.provenance|pretty }}</pre>
+    {% if value.get('user_authorization_provenance') is not none %}
+    <h3>用户授权来源</h3><pre>{{ value.user_authorization_provenance|pretty }}</pre>{% endif %}
+    {% if value.get('policy_authority_provenance') is not none %}
+    <h3>策略权威来源</h3><pre>{{ value.policy_authority_provenance|pretty }}</pre>{% endif %}
+  </details>
+{% elif content.kind == 'procedure' %}
+  {% set draft = value.draft %}
+  <h2>{{ draft.title }}</h2>
+  <div class="memory-prose semantic-body">{{ draft.summary }}</div>
+  <p class="muted">已存方法：{{ draft.kind }}。是否可用于当前执行仍由原生上下文与权限门决定。</p>
+  {{ text_list('步骤', draft.actions.stages, true) }}
+  {% for branch in draft.actions.branches %}
+  <section class="semantic-section">
+    <h3>分支：{{ branch.label }}</h3>
+    <details><summary>原生分支条件</summary><pre>{{ branch.condition|pretty }}</pre></details>
+    <ol>{% for stage in branch.stages %}<li class="memory-prose">{{ stage }}</li>{% endfor %}</ol>
+  </section>
+  {% else %}<p class="muted">未记录分支。</p>{% endfor %}
+  {{ text_list('应避免的做法', draft.actions.avoid) }}
+  {{ text_list('完成标准', draft.done.success) }}
+  {{ text_list('验证方式', draft.done.verify) }}
+  {{ text_list('中止条件', draft.done.abort) }}
+  {{ text_list('注意事项', draft.pitfalls) }}
+  <details>
+    <summary>适用描述、范围与编译条件</summary>
+    <p>记载的阶段：{{ draft.when.stage }}</p>
+    {{ text_list('目标', draft.when.goals) }}
+    {{ text_list('对象', draft.when.targets) }}
+    {{ text_list('信号', draft.when.signals) }}
+    {{ text_list('前提描述', draft.when.requires) }}
+    {{ text_list('排除描述', draft.when.excludes) }}
+    <h3>已存范围</h3><pre>{{ draft.scope|pretty }}</pre>
+    <h3>适用条件（IR v{{ draft.condition_ir_version }}）</h3><pre>{{ draft.applicability_expr|pretty }}</pre>
+    <h3>避免条件</h3><pre>{{ draft.avoid_expr|pretty }}</pre>
+    <h3>完成条件</h3><pre>{{ draft.completion_expr|pretty }}</pre>
+    {% if draft.get('stage_alignment') is not none %}
+    <h3>步骤对齐条件</h3><pre>{{ draft.stage_alignment|pretty }}</pre>{% endif %}
+  </details>
+  <details><summary>证据与支持</summary>
+    {{ text_list('证据引用', draft.evidence_refs) }}
+    {{ text_list('支持修订', draft.support_revision_refs) }}
+  </details>
+{% elif content.kind == 'digest' %}
+  <h2>{{ '来源摘要' if value.get('source_target') else '工作摘要' }}</h2>
+  <p>整理方式：{{ {
+    'deterministic_only': '确定性汇总', 'llm_enriched': '模型整理', 'rejected_invalid': '生成结果未通过检查'
+  }[value.status] }} · 内容完整度：{{ value.application.completeness }}</p>
+  <p class="muted">摘要是派生内容，不替代原始记录；下面只展示已保存的值，不补写缺失项。</p>
+  {% for title, field in [
+    ('进展', 'progress_delta'), ('决定', 'decision_delta'), ('未走通的路线', 'failed_routes'),
+    ('已解决事项', 'resolved_items'), ('未解决事项', 'open_loops'), ('结果', 'outcome_delta')
+  ] %}
+  <section class="semantic-section">
+    <h3>{{ title }}</h3>
+    {% for delta in value.application[field] %}
+    <div class="semantic-delta">
+      <h4>{{ delta.label }}</h4><div class="memory-prose">{{ delta.value }}</div>
+      <details><summary>此项直接引用</summary><ul>
+        {% for reference in delta.direct_refs %}<li>{{ reference }}</li>{% endfor %}
+      </ul></details>
+    </div>
+    {% else %}<p class="muted">未记录。</p>{% endfor %}
+  </section>
+  {% endfor %}
+  {% if value.application.omissions %}
+  <section class="semantic-section"><h3>未包含的内容</h3>
+    {% for omission in value.application.omissions %}
+    <h4>{{ omission.category }}</h4><p class="memory-prose">{{ omission.reason }}</p>
+    {{ text_list('直接引用', omission.direct_refs) }}
+    {% endfor %}
+  </section>{% endif %}
+  {% if value.application.candidates %}
+  <details><summary>已存候选（不表示已接受）</summary>
+    <p>这些是摘要中的候选结构，不是正式记忆或执行资格。</p>
+    {% for candidate in value.application.candidates %}<pre>{{ candidate|pretty }}</pre>{% endfor %}
+  </details>{% endif %}
+  <details><summary>输入范围与生成记录</summary>
+    <p>输入水位：{{ value.from_watermark }}–{{ value.to_watermark }} · 触发：{{ value.trigger }}</p>
+    <p>模型记录：{{ value.model_id }} · schema v{{ value.schema_version }} · 算法：{{ value.algorithm_revision }}</p>
+    {{ text_list('直接来源引用', value.selected_direct_refs) }}
+    {% if value.get('episode_revision_id') %}<p>输入工作片段修订：{{ value.episode_revision_id }}</p>{% endif %}
+    {% if value.get('source_target') %}<pre>{{ value.source_target|pretty }}</pre>{% endif %}
+  </details>
+{% elif content.kind == 'core_membership' %}
+  <h2>长期规则</h2>
+  <p>这是一份 Core membership，正文来自它指向的原 Atom，不在此复制或生成。</p>
+  <p>记录状态：{{ 'active' if value.active else 'inactive' }}。这不单独代表当前可用于执行。</p>
+  <h3>原 Atom 修订</h3><p>{{ value.atom_revision_id }}</p>
+  <button class="button" type="button" data-link-key="{{ value.atom_revision_id }}"
+    data-revision="{{ value.atom_revision_id }}" data-kind="atom_revision">读取原 Atom 正文</button>
+  <details><summary>规则范围、支持与授权</summary>
+    <h3>已存范围</h3><pre>{{ value.scope_identity|pretty }}</pre>
+    <p>支持合同：{{ value.support_contract_ref }}</p>
+    {{ text_list('授权修订', value.authorization_revision_refs) }}
+    <p>产生此记录的 acceptance：{{ value.created_by_acceptance_ref }}</p>
+    {% if value.supersedes_membership_revision_id %}<p>替代的 membership：{{ value.supersedes_membership_revision_id }}</p>{% endif %}
+  </details>
+{% endif %}
+</div>

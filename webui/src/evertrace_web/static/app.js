@@ -253,6 +253,8 @@ async function detail(item, frontier, controller, scroll = 0) {
     return;
   }
   fragmentInto($("detail-body"), result.html);
+  // Native resolves exact public-ID aliases; keep its identity for subsequent navigation.
+  if (result.selection) state.selected = { ...state.selected, ...result.selection };
   const source = $("detail-body").querySelector(".source-presentation");
   if (source) source.textContent = result.source_preview || "";
   navigationControls();

@@ -1360,6 +1360,31 @@ kbd {
   padding: 7px;
   overflow-y: auto;
 }
+.semantic-content {
+  min-width: 0;
+}
+.semantic-content h2 {
+  margin: 12px 0;
+}
+.semantic-body,
+.semantic-section,
+.semantic-content details {
+  margin: 18px 0;
+}
+.semantic-section li,
+.semantic-content dt {
+  margin: 8px 0;
+}
+.semantic-content dt {
+  font-weight: 500;
+}
+.semantic-content dd {
+  margin: 0 0 14px;
+}
+.semantic-delta {
+  padding-left: 12px;
+  border-left: 2px solid var(--line);
+}
 .overview-section {
   padding: 8px 4px;
   border-top: 1px solid var(--line);
