@@ -1,0 +1,30 @@
+<div class="review-reason">
+{% if reason.kind == 'proposal' %}
+  {% if reason.status == 'validating' %}<p>提案还在校验，不表示已经需要人工决定。</p>
+  {% elif reason.status == 'deferred' %}<p>提案正在等待条件变化；不会按时间自动重新打开。</p>
+  {% elif reason.eligibility == 'manual_required' %}<p>这份提案需要人工决定。</p>
+  {% else %}<p>提案尚未接受。当前资格：{{ reason.eligibility }}；不代表已通过全部检查。</p>{% endif %}
+{% elif reason.kind == 'support' %}
+  {% if reason.state == 'revalidation_pending' %}<p>支持依据还在重新核对，结论未定。</p>
+  {% elif reason.state == 'insufficient' %}<p>当前有效的支持依据不足。</p>
+  {% else %}<p>原支持依据已失效，需要查看对现有记忆的影响。</p>{% endif %}
+{% elif reason.kind == 'negative' %}
+  <p>{{ '负面证据尚未完成复核。' if reason.status == 'pending' else '负面证据已有复核结论，后续处理仍待决定。' }}</p>
+{% elif reason.kind == 'publication_hold' %}<p>方法处于 review_hold，需要复核发布状态。</p>
+{% elif reason.kind == 'segmentation' %}<p>工作片段的边界尚未确认。</p>
+{% elif reason.kind == 'assignment' %}<p>工作归属尚未确定：{{ reason.status }}。</p>
+{% elif reason.kind == 'competition' %}<p>多条尝试尚未确定如何采纳：{{ reason.status }}。</p>
+{% elif reason.kind == 'attempt_resume' %}<p>这次尝试被中断，是否恢复尚未决定。</p>
+{% elif reason.kind == 'lane' %}
+  <p>执行通道仍有生命周期或捕获状态待核对。</p>
+  <p class="reading-origin">状态 {{ reason.status }} · 活性 {{ reason.liveness }} · 覆盖 {{ reason.coverage }}</p>
+  <p class="reading-origin">来源 {{ reason.source }} · 配对 {{ reason.pairing }} · 内容 {{ reason.payload }} · 顺序 {{ reason.ordering }}</p>
+{% elif reason.kind == 'capture' %}
+  <p>捕获记录尚不能证明完整。</p>
+  <p class="reading-origin">覆盖 {{ reason.coverage }} · 来源 {{ reason.source }} · 配对 {{ reason.pairing }}</p>
+  <p class="reading-origin">内容 {{ reason.payload }} · 顺序 {{ reason.ordering }} · 失败可观测性 {{ reason.admission }}</p>
+{% elif reason.kind == 'lineage' %}<p>工作树沿袭关系尚未证明：{{ reason.assessment }}。</p>
+{% elif reason.kind == 'recovery' %}
+  <p>{{ '恢复捕获尚在处理，不表示已经完成。' if reason.status == 'pending' else '恢复捕获只完成了一部分。' }}</p>
+{% endif %}
+</div>

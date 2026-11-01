@@ -53,9 +53,18 @@ impl HumanMemoryPreview {
 impl HumanGovernanceService {
     pub(super) async fn reading_previews(&self, items: &mut [HumanSummary]) {
         for item in items.iter_mut() {
-            item.reading_preview = Some(HumanMemoryPreview::unavailable(State::Unavailable));
+            item.reading_preview = matches!(
+                item.object_kind.as_str(),
+                "semantic_digest"
+                    | "atom_revision"
+                    | "procedure_revision"
+                    | "core_membership"
+                    | "revision_proposal_revision"
+                    | "work_episode"
+            )
+            .then(|| HumanMemoryPreview::unavailable(State::Unavailable));
         }
-        if items.is_empty() {
+        if !items.iter().any(|item| item.reading_preview.is_some()) {
             return;
         }
         let deadline = Instant::now() + presentation::READ_DEADLINE;
@@ -69,6 +78,9 @@ impl HumanGovernanceService {
             return;
         };
         for item in items {
+            if item.reading_preview.is_none() {
+                continue;
+            }
             if Instant::now() > deadline {
                 break;
             }

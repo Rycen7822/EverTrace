@@ -26,6 +26,8 @@ pub struct HumanMemoryOverviewPage {
     pub formal_count: MemoryOverviewCount,
     pub loop_count: MemoryOverviewCount,
     pub review_count: MemoryOverviewCount,
+    pub review_reasons:
+        std::collections::BTreeMap<String, evertrace_domain::query::InboxReviewReason>,
     pub generation: MemoryOverviewGeneration,
 }
 
@@ -93,7 +95,21 @@ impl HumanGovernanceService {
         let summaries = section(context.summaries)?;
         let facts = section(context.facts)?;
         let methods = section(context.methods)?;
-        let reviews = section(context.reviews)?;
+        let review_reasons = context.reviews.reasons;
+        let mut review_page = inbox_page(context.reviews.page)?;
+        for item in &mut review_page.items {
+            item.native_event_time_us = context
+                .reviews
+                .event_times
+                .get(&item.source_event_seq)
+                .copied();
+        }
+        let reviews = Section {
+            items: review_page.items,
+            count: context.reviews.count,
+            complete: context.reviews.complete,
+            available: context.reviews.scope_available,
+        };
         let scope_available = summaries.available
             && facts.available
             && methods.available
@@ -169,9 +185,14 @@ impl HumanGovernanceService {
         let complete = scope_available
             && metadata_complete
             && items.iter().all(|item| {
-                item.reading_preview
-                    .as_ref()
-                    .is_some_and(|preview| preview.state == HumanContentState::Ready)
+                item.reading_preview.as_ref().map_or_else(
+                    || {
+                        review_reasons
+                            .get(&item.stable_key)
+                            .is_some_and(|reason| reason.is_metadata_only())
+                    },
+                    |preview| preview.state == HumanContentState::Ready,
+                )
             });
         let mut items = items.into_iter();
         let mut observations = Vec::new();
@@ -257,8 +278,9 @@ impl HumanGovernanceService {
             review_count: count(
                 reviews.count,
                 reviews.complete,
-                OverviewCountUnit::PendingProposalRevisions,
+                OverviewCountUnit::PendingReviewItems,
             ),
+            review_reasons,
             generation,
         }))
     }

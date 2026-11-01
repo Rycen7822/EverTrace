@@ -1431,7 +1431,10 @@ async fn run_writer(
                     let result = writer
                         .as_ref()
                         .ok_or(WriterActorError::Stopped)?
-                        .memory_overview_context(&query)
+                        .memory_overview_context(
+                            &query,
+                            crate::procedure::inbox_negative_proof_limit(),
+                        )
                         .await
                         .map_err(map_store_error);
                     let fatal = result

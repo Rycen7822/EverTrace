@@ -1492,7 +1492,79 @@ pub enum OverviewCountUnit {
     CurrentSummaryRevisions,
     CurrentFormalRevisions,
     OpenLoopEntries,
-    PendingProposalRevisions,
+    PendingReviewItems,
+}
+
+/// Recorded reasons from the original Inbox selector; not new approval policy.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
+pub enum InboxReviewReason {
+    Proposal {
+        status: crate::semantic::ProposalStatus,
+        eligibility: crate::semantic::ProposalEligibility,
+    },
+    Support {
+        state: crate::semantic::GlobalSupportState,
+    },
+    Negative {
+        status: crate::procedure::ProcedureNegativeReviewStatus,
+    },
+    PublicationHold,
+    Segmentation,
+    Assignment {
+        status: crate::work::AssignmentStatus,
+    },
+    Competition {
+        status: crate::work::CompetingResolutionStatus,
+    },
+    AttemptResume,
+    Lane {
+        status: crate::work::LaneStatus,
+        liveness: crate::work::LivenessState,
+        coverage: crate::work::CoverageLevel,
+        source: crate::work::SourceCoverage,
+        pairing: crate::work::PairingIntegrity,
+        payload: crate::work::PayloadIntegrity,
+        ordering: crate::work::OrderingIntegrity,
+    },
+    Capture {
+        coverage: crate::work::CoverageLevel,
+        source: crate::work::SourceCoverage,
+        pairing: crate::work::PairingIntegrity,
+        payload: crate::work::PayloadIntegrity,
+        ordering: crate::work::OrderingIntegrity,
+        admission: crate::work::AdmissionFailureObservability,
+    },
+    Lineage {
+        assessment: crate::repository::LineageAssessment,
+    },
+    Recovery {
+        status: crate::repository::RecoveryRequestStatus,
+    },
+}
+
+impl InboxReviewReason {
+    /// Textual proposal/work previews still require their original body-read gate.
+    pub fn is_metadata_only(&self) -> bool {
+        !matches!(self, Self::Proposal { .. } | Self::Segmentation)
+    }
+
+    pub fn object_kind(&self) -> &'static str {
+        match self {
+            Self::Proposal { .. } => "revision_proposal_revision",
+            Self::Support { .. } => "global_support_validation",
+            Self::Negative { .. } => "procedure_negative_review",
+            Self::PublicationHold => "procedure_state_event",
+            Self::Segmentation => "work_episode",
+            Self::Assignment { .. } => "work_binding",
+            Self::Competition { .. } => "competing_attempt_group",
+            Self::AttemptResume => "attempt",
+            Self::Lane { .. } => "execution_lane",
+            Self::Capture { .. } => "capture_receipt",
+            Self::Lineage { .. } => "worktree_transition",
+            Self::Recovery { .. } => "recovery_capture_request_revision",
+        }
+    }
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]

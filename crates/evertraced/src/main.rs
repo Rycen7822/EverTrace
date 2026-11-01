@@ -1637,6 +1637,7 @@ fn map_human_overview(
         formal_count: page.formal_count,
         loop_count: page.loop_count,
         review_count: page.review_count,
+        review_reasons: page.review_reasons,
         generation: page.generation,
     }
 }

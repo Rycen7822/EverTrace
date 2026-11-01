@@ -20,7 +20,7 @@
   ('最近摘要', 'summaries', page.summary_count, '条当前摘要修订'),
   ('正式记忆', 'changes', page.formal_count, '条当前正式修订'),
   ('未解决事项', 'unresolved', page.loop_count, '项未解决事项'),
-  ('待审核提案', 'reviews', page.review_count, '条待审核提案修订')
+  ('待处理事项', 'reviews', page.review_count, '条当前待处理事项')
 ] %}
 <section class="overview-section" data-overview-section="{{ key }}">
   <h2>{{ title }}
@@ -29,8 +29,10 @@
     {% endif %}</small>
   </h2>
   {% if key == 'unresolved' %}<p class="muted">按工作片段列出。一个片段可能包含多项未解决事项。</p>{% endif %}
-  {% if key == 'reviews' %}<p class="muted">只列 pending、validating、deferred 提案；其它待处理内容请到“审核”页查看。</p>{% endif %}
-  {% with items=page[key], empty_message='本次读取未列出条目；请结合范围、时间窗和计数判断。' %}
+  {% if key == 'reviews' %}<p class="muted">来自原生审核队列；正在校验、等待条件和需要决定的状态分别列明。</p>{% endif %}
+  {% with items=page[key], review_reasons=page.review_reasons,
+    surface='inbox' if key == 'reviews' else 'explorer',
+    empty_message='本次读取未列出条目；请结合范围、时间窗和计数判断。' %}
     {% include 'list.html' %}
   {% endwith %}
   {% if key == 'summaries' and (page.summary_count.count is none or page.summary_count.count == 0) %}

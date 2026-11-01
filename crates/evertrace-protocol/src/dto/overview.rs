@@ -21,6 +21,8 @@ pub struct HumanMemoryOverviewPage {
     pub formal_count: MemoryOverviewCount,
     pub loop_count: MemoryOverviewCount,
     pub review_count: MemoryOverviewCount,
+    pub review_reasons:
+        std::collections::BTreeMap<String, evertrace_domain::query::InboxReviewReason>,
     pub generation: MemoryOverviewGeneration,
 }
 
@@ -41,19 +43,19 @@ impl HumanMemoryOverviewPage {
             (
                 &self.summaries,
                 &self.summary_count,
-                &["semantic_digest"][..],
+                Some(&["semantic_digest"][..]),
             ),
             (
                 &self.changes,
                 &self.formal_count,
-                &["atom_revision", "procedure_revision", "core_membership"][..],
+                Some(&["atom_revision", "procedure_revision", "core_membership"][..]),
             ),
-            (&self.unresolved, &self.loop_count, &["work_episode"][..]),
             (
-                &self.reviews,
-                &self.review_count,
-                &["revision_proposal_revision"][..],
+                &self.unresolved,
+                &self.loop_count,
+                Some(&["work_episode"][..]),
             ),
+            (&self.reviews, &self.review_count, None),
         ];
         self.query.validate().is_ok()
             && self.observed_at_us >= 0
@@ -66,19 +68,30 @@ impl HumanMemoryOverviewPage {
                 OverviewCountUnit::CurrentFormalRevisions,
             )
             && valid_count(&self.loop_count, OverviewCountUnit::OpenLoopEntries)
-            && valid_count(
-                &self.review_count,
-                OverviewCountUnit::PendingProposalRevisions,
-            )
+            && valid_count(&self.review_count, OverviewCountUnit::PendingReviewItems)
+            && self.review_reasons.len() == self.reviews.len()
             && self.reviews.iter().all(|item| {
-                item.proposal.as_ref().is_some_and(|proposal| {
-                    matches!(
-                        proposal.status,
-                        evertrace_domain::semantic::ProposalStatus::Pending
-                            | evertrace_domain::semantic::ProposalStatus::Validating
-                            | evertrace_domain::semantic::ProposalStatus::Deferred
-                    )
-                })
+                self.review_reasons
+                    .get(&item.stable_key)
+                    .is_some_and(|reason| {
+                        reason.object_kind() == item.object_kind
+                            && match reason {
+                                evertrace_domain::query::InboxReviewReason::Proposal {
+                                    status,
+                                    eligibility,
+                                } => item.proposal.as_ref().is_some_and(|proposal| {
+                                    proposal.status == *status
+                                        && proposal.eligibility == *eligibility
+                                        && matches!(
+                                        status,
+                                        evertrace_domain::semantic::ProposalStatus::Pending
+                                            | evertrace_domain::semantic::ProposalStatus::Validating
+                                            | evertrace_domain::semantic::ProposalStatus::Deferred
+                                    )
+                                }),
+                                _ => item.proposal.is_none(),
+                            }
+                    })
             })
             && (!self.complete || self.scope_available)
             && sections.iter().all(|(items, count, kinds)| {
@@ -86,13 +99,18 @@ impl HumanMemoryOverviewPage {
                     && count.count.is_none_or(|value| value >= items.len() as u64)
                     && items.iter().all(|item| {
                         item.validate()
-                            && kinds.contains(&item.object_kind.as_str())
+                            && kinds.is_none_or(|kinds| kinds.contains(&item.object_kind.as_str()))
                             && item.source_event_seq <= self.frontier
                             && self.rank(item).is_some()
                             && (!self.complete
-                                || item.reading_preview.as_ref().is_some_and(|preview| {
-                                    preview.state == HumanContentState::Ready
-                                }))
+                                || item.reading_preview.as_ref().map_or_else(
+                                    || {
+                                        self.review_reasons
+                                            .get(&item.stable_key)
+                                            .is_some_and(|reason| reason.is_metadata_only())
+                                    },
+                                    |preview| preview.state == HumanContentState::Ready,
+                                ))
                     })
                     && items
                         .iter()

@@ -326,7 +326,6 @@ impl JournalAdmissionState {
         after: Option<&MemoryBrowseCursor>,
         limit: usize,
         has_failed_job: bool,
-        review_pending: bool,
         mut journal_times: Option<&mut crate::sqlite_state::JournalTimeReader<'_>>,
     ) -> Result<MemoryBrowseContext, StoreError> {
         query.validate().map_err(|_| StoreError::InvalidInput)?;
@@ -430,14 +429,6 @@ impl JournalAdmissionState {
             (0_u64, 0_u64, 0_u64);
         for candidate in candidates {
             let candidate = candidate?;
-            if review_pending
-                && !matches!(candidate, MemoriesCandidate::Proposal(value, _) if matches!(value.status,
-                    evertrace_domain::semantic::ProposalStatus::Pending
-                    | evertrace_domain::semantic::ProposalStatus::Validating
-                    | evertrace_domain::semantic::ProposalStatus::Deferred))
-            {
-                continue;
-            }
             if candidate.product_deleted(
                 &deleted.revision_ids,
                 &deleted.atom_ids,
@@ -747,7 +738,7 @@ impl JournalAdmissionState {
 
     // Scope comes from each owning typed record, never from missing SQL columns.
     // In particular, proposals with no base are not silently classified global.
-    fn memory_record_scope(
+    pub(super) fn memory_record_scope(
         &self,
         candidate: MemoriesCandidate<'_>,
     ) -> Option<Vec<evertrace_domain::semantic::AtomScope>> {

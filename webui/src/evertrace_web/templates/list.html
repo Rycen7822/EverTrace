@@ -1,6 +1,10 @@
 {% set kinds = {
   'semantic_digest': '摘要', 'atom_revision': '记忆条目', 'procedure_revision': '方法',
-  'core_membership': '长期规则', 'revision_proposal_revision': '提案参考', 'work_episode': '工作片段'
+  'core_membership': '长期规则', 'revision_proposal_revision': '提案参考', 'work_episode': '工作片段',
+  'global_support_validation': '支持复核', 'procedure_negative_review': '负面证据复核',
+  'procedure_state_event': '方法发布状态', 'work_binding': '工作归属', 'competing_attempt_group': '尝试采纳',
+  'attempt': '中断尝试', 'execution_lane': '执行通道', 'capture_receipt': '捕获完整性',
+  'worktree_transition': '工作树沿袭', 'recovery_capture_request_revision': '恢复捕获'
 } %}
 {% set origins = {
   'stored_value': '已有内容摘录', 'type_fallback': '类型提示', 'digest_deterministic': '确定性汇总',
@@ -9,7 +13,8 @@
 {% for item in items %}
 {% set preview = item.get('reading_preview') %}
 <button class="memory-item" data-key="{{ item.stable_key }}" data-revision="{{ item.revision_ref or '' }}"
-  data-kind="{{ item.object_kind }}" data-object="{{ item.object_ref or '' }}">
+  data-kind="{{ item.object_kind }}" data-object="{{ item.object_ref or '' }}"
+  {% if surface is defined %}data-surface="{{ surface }}"{% endif %}>
   <div class="item-topline">
     <span class="type-pill" title="{{ item.object_kind }}">{{ kinds.get(item.object_kind, item.object_kind) }}</span>
     {% if item.epistemic %}<span class="badge">真值：{{ item.epistemic }}</span>{% endif %}
@@ -27,6 +32,8 @@
   {% elif preview and preview.state == 'unsupported' %}<p class="muted">这类内容暂未提供摘录，可打开条目查看。</p>
   {% elif preview and preview.state == 'missing' %}<p class="muted">原修订内容暂不可用。</p>
   {% elif preview %}<p class="muted">本次未能读取摘录，可稍后重试。</p>{% endif %}
+  {% set reason = review_reasons.get(item.stable_key) if review_reasons is defined else none %}
+  {% if reason %}{% include 'review_reason.html' %}{% endif %}
   {% if item.proposal %}
   <p class="reading-origin">提案操作：{{ item.proposal.operation }} · 当前资格：{{ item.proposal.eligibility }}</p>
   {% endif %}

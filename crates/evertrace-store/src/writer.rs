@@ -1490,12 +1490,11 @@ impl JournalWriter {
                         after,
                         limit,
                         stamp.has_failed_job,
-                        false,
                         Some(times),
                     )
                 })
             } else {
-                state.memory_browse_context(query, after, limit, stamp.has_failed_job, false, None)
+                state.memory_browse_context(query, after, limit, stamp.has_failed_job, None)
             }
         })
         .await
@@ -1504,29 +1503,34 @@ impl JournalWriter {
     pub async fn memory_overview_context(
         &self,
         query: &evertrace_domain::query::MemoryOverviewQuery,
+        proof_limit: usize,
     ) -> Result<crate::projections::MemoryOverviewContext, StoreError> {
         use evertrace_domain::query::MemoryReadingKind as Kind;
         query.validate().map_err(|_| StoreError::InvalidInput)?;
         self.validated_current_read(|state, stamp| {
             let build = |mut times: Option<&mut crate::sqlite_state::JournalTimeReader<'_>>| {
-                let (summaries, facts, methods, reviews) = {
-                    let mut browse = |kind, review_pending| {
+                let (summaries, facts, methods) = {
+                    let mut browse = |kind| {
                         state.memory_browse_context(
                             &query.browse(kind),
                             None,
                             usize::from(query.limit),
                             stamp.has_failed_job,
-                            review_pending,
                             times.as_deref_mut(),
                         )
                     };
                     (
-                        browse(Kind::Summaries, false)?,
-                        browse(Kind::FactsAndConstraints, false)?,
-                        browse(Kind::Methods, false)?,
-                        browse(Kind::References, true)?,
+                        browse(Kind::Summaries)?,
+                        browse(Kind::FactsAndConstraints)?,
+                        browse(Kind::Methods)?,
                     )
                 };
+                let reviews = state.memory_overview_review_context(
+                    query,
+                    proof_limit,
+                    stamp.has_failed_job,
+                    times.as_deref_mut(),
+                )?;
                 let work = state.memory_overview_work_context(query, times)?;
                 Ok(crate::projections::MemoryOverviewContext {
                     frontier: summaries.page.frontier,

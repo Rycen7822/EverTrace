@@ -2915,6 +2915,56 @@ pub fn inbox_payload_actionable(payload: &JournalPayload) -> bool {
     InboxCandidate::from_payload(payload).is_some_and(|value| value.actionable())
 }
 
+pub fn inbox_review_reason(
+    payload: &JournalPayload,
+) -> Option<evertrace_domain::query::InboxReviewReason> {
+    use evertrace_domain::query::InboxReviewReason as Reason;
+    let value = InboxCandidate::from_payload(payload)?;
+    if !value.actionable() {
+        return None;
+    }
+    Some(match value {
+        InboxCandidate::Proposal(v) => Reason::Proposal {
+            status: v.status,
+            eligibility: v.eligibility,
+        },
+        InboxCandidate::Support(v) => Reason::Support { state: v.state },
+        InboxCandidate::Negative(v) => Reason::Negative { status: v.status },
+        InboxCandidate::Publication(_) => Reason::PublicationHold,
+        InboxCandidate::Episode(_) => Reason::Segmentation,
+        InboxCandidate::Binding(v) => Reason::Assignment {
+            status: v.assignment_status,
+        },
+        InboxCandidate::Competing(v) => Reason::Competition {
+            status: v.resolution_status,
+        },
+        InboxCandidate::Attempt(_) => Reason::AttemptResume,
+        InboxCandidate::Lane(v) => Reason::Lane {
+            status: v.status,
+            liveness: v.liveness_state,
+            coverage: v.coverage_level,
+            source: v.source_coverage,
+            pairing: v.pairing_integrity,
+            payload: v.payload_integrity,
+            ordering: v.ordering_integrity,
+        },
+        InboxCandidate::Receipt(v) => Reason::Capture {
+            coverage: v.coverage_level,
+            source: v.source_coverage,
+            pairing: v.pairing_integrity,
+            payload: v.payload_integrity,
+            ordering: v.ordering_integrity,
+            admission: v.admission_failure_observability,
+        },
+        InboxCandidate::Transition(v) => Reason::Lineage {
+            assessment: v.lineage_assessment,
+        },
+        InboxCandidate::Recovery(v) => Reason::Recovery {
+            status: v.request_status,
+        },
+    })
+}
+
 pub fn inbox_boundary_actionable(status: evertrace_domain::work::BoundaryStatus) -> bool {
     status == evertrace_domain::work::BoundaryStatus::Candidate
 }
@@ -5936,18 +5986,9 @@ impl JournalAdmissionState {
         Ok(facts)
     }
 
-    pub(crate) fn inbox_current_context(
-        &self,
-        after: Option<&str>,
-        limit: usize,
-        proof_limit: usize,
-        has_failed_job: bool,
-    ) -> Result<InboxCurrentContext, StoreError> {
-        if limit == 0 || limit > 64 || proof_limit == 0 {
-            return Err(StoreError::InvalidInput);
-        }
+    fn inbox_deleted_products(&self) -> InboxDeletedProducts {
         let ids = product_deletion_ids(&self.deletions);
-        let deleted = InboxDeletedProducts {
+        InboxDeletedProducts {
             negatives: self.procedure.deleted_negative_ids(&ids.revision_ids),
             contracts: if ids.revision_ids.is_empty() {
                 BTreeSet::new()
@@ -5960,14 +6001,20 @@ impl JournalAdmissionState {
                 &ids,
             ),
             ids,
-        };
+        }
+    }
+
+    fn current_inbox_candidates<'a>(
+        &'a self,
+        deleted: &InboxDeletedProducts,
+    ) -> Result<impl Iterator<Item = (String, InboxCandidate<'a>, u64)> + use<'a>, StoreError> {
         // The request retains borrowed current identities, never their payloads.
         // This is O(current identities) temporary metadata and one history scan;
         // the returned context and serialized bodies are limited to this page.
         let mut current = BTreeMap::<String, (u64, String, InboxCandidate<'_>, u64)>::new();
         let mut resumed_sources = BTreeSet::new();
         for (value, seq) in self.inbox_candidates() {
-            if !self.inbox_visible(value, &deleted)? {
+            if !self.inbox_visible(value, deleted)? {
                 continue;
             }
             if let InboxCandidate::Attempt(child) = value
@@ -5988,12 +6035,27 @@ impl JournalAdmissionState {
                 current.insert(key, (rank, row_id, value, seq));
             }
         }
+        Ok(current.into_values().filter_map(move |(_, row_id, value, seq)| {
+            (value.actionable()
+                && !matches!(value, InboxCandidate::Attempt(v) if resumed_sources.contains(&v.attempt_id)))
+                .then_some((row_id, value, seq))
+        }))
+    }
+
+    pub(crate) fn inbox_current_context(
+        &self,
+        after: Option<&str>,
+        limit: usize,
+        proof_limit: usize,
+        has_failed_job: bool,
+    ) -> Result<InboxCurrentContext, StoreError> {
+        if limit == 0 || limit > 64 || proof_limit == 0 {
+            return Err(StoreError::InvalidInput);
+        }
+        let deleted = self.inbox_deleted_products();
         let mut candidates = BTreeMap::new();
-        for (_, row_id, value, seq) in current.into_values() {
-            if !value.actionable()
-                || matches!(value, InboxCandidate::Attempt(v) if resumed_sources.contains(&v.attempt_id))
-                || after.is_some_and(|after| row_id.as_str() <= after)
-            {
+        for (row_id, value, seq) in self.current_inbox_candidates(&deleted)? {
+            if after.is_some_and(|after| row_id.as_str() <= after) {
                 continue;
             }
             candidates.insert(row_id, (value, seq));
@@ -6007,6 +6069,17 @@ impl JournalAdmissionState {
             .collect::<Vec<_>>();
         let next_cursor = (selected.len() > limit).then(|| selected[limit - 1].2.clone());
         selected.truncate(limit);
+        self.materialize_inbox(selected, &deleted, proof_limit, has_failed_job, next_cursor)
+    }
+
+    fn materialize_inbox(
+        &self,
+        selected: Vec<(InboxCandidate<'_>, u64, String)>,
+        deleted: &InboxDeletedProducts,
+        proof_limit: usize,
+        has_failed_job: bool,
+        next_cursor: Option<String>,
+    ) -> Result<InboxCurrentContext, StoreError> {
         let mut items = Vec::with_capacity(selected.len());
         let mut negative_reviews = BTreeMap::new();
         for (value, seq, row_id) in selected {
@@ -6017,7 +6090,7 @@ impl JournalAdmissionState {
             if let InboxCandidate::Negative(review) = value {
                 negative_reviews.insert(
                     review.negative_evidence_id,
-                    self.inbox_negative_facts(review, seq, &deleted, proof_limit)?,
+                    self.inbox_negative_facts(review, seq, deleted, proof_limit)?,
                 );
             }
             items.push(row);
