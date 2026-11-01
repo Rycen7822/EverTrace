@@ -13,6 +13,7 @@ pub(crate) fn from_facts(
     task_id: Option<TaskId>,
     capture_context: Option<&evertrace_domain::query::QueryCaptureContext>,
     related_scope_shards: &[evertrace_domain::query::QueryRelatedScopeShard],
+    experiment_source: Option<&evertrace_domain::query::QueryExperimentSource>,
 ) -> Option<Box<QueryExecution>> {
     if !matches!(
         anchor.binding_strength,
@@ -117,7 +118,7 @@ pub(crate) fn from_facts(
         }
         _ => None,
     }));
-    let execution = QueryExecution {
+    let mut execution = QueryExecution {
         frontier,
         repository_state: primary_repository(facts, episode),
         capture_context: capture_context.cloned().map(Box::new),
@@ -126,9 +127,38 @@ pub(crate) fn from_facts(
         workstream: stream.clone(),
         episode: episode.clone(),
         attempt: attempt.cloned(),
+        experiment: None,
         work_binding: binding.cloned(),
         checkpoint: checkpoint.cloned(),
     };
+    if let Some(binding) = binding
+        && let Some(run) = unique(facts.iter().filter_map(|payload| match payload {
+            JournalPayload::ExperimentRunRecorded(run)
+                if Some(run.run_id) == binding.primary_binding.experiment_run_id =>
+            {
+                Some(run.as_ref())
+            }
+            _ => None,
+        }))
+        && run.workstream_id == stream.workstream_id
+        && run
+            .attempt_id
+            .is_none_or(|id| binding.primary_binding.attempt_id == Some(id))
+    {
+        let source = experiment_source
+            .filter(|source| source.work_binding_revision_id == binding.work_binding_revision_id)
+            .cloned()
+            .unwrap_or(evertrace_domain::query::QueryExperimentSource {
+                work_binding_revision_id: binding.work_binding_revision_id,
+                operation_revision: None,
+                receipt_refs: Vec::new(),
+            });
+        execution.experiment = Some(Box::new(evertrace_domain::query::QueryExperimentState {
+            run: run.clone(),
+            confidence: execution.experiment_confidence(run, &source),
+            source,
+        }));
+    }
     // A valid payload can still fail to prove this caller's active association.
     // Missing/ambiguous work is unknown, never a guessed most-recent context.
     if execution.validate(anchor, task_id).is_err() {

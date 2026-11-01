@@ -39,6 +39,7 @@ impl McpQueryAnchor {
             self.task_id,
             context.capture_context.as_deref(),
             &context.related_scope_shards,
+            context.experiment_source.as_ref(),
         )
     }
 

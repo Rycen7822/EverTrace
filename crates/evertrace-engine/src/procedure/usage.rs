@@ -442,6 +442,16 @@ impl ProcedureUsageCurrentView {
                 });
             }
         }
+        if active_attempt.is_some()
+            && let Some(experiment) = &execution.experiment
+            && experiment.confidence == evertrace_domain::query::QueryStateConfidence::Confirmed
+        {
+            constraints.bindings.push(ConstraintBinding {
+                field: ConstraintField::ExperimentState,
+                value: ConstraintValue::Text(experiment.run.execution_status.as_str().into()),
+            });
+        }
+        constraints.bindings.sort_by_key(|binding| binding.field);
         constraints
             .validate()
             .map_err(|_| SemanticServiceError::InvalidInput)?;

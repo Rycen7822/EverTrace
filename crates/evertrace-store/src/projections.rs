@@ -3148,6 +3148,7 @@ pub struct ScopeCurrentContext {
     pub facts: Vec<JournalPayload>,
     pub capture_context: Option<Box<evertrace_domain::query::QueryCaptureContext>>,
     pub related_scope_shards: Vec<evertrace_domain::query::QueryRelatedScopeShard>,
+    pub experiment_source: Option<evertrace_domain::query::QueryExperimentSource>,
 }
 
 /// One current directory metadata window, never a complete projection.
@@ -4934,6 +4935,7 @@ impl JournalAdmissionState {
         let mut primary_worktree = None;
         let mut capture_context = None;
         let mut related_scope_shards = Vec::new();
+        let mut experiment_source = None;
         if let Some(session) = request.session.as_deref() {
             let mut lanes = Vec::new();
             for (lane, seq) in self.execution_lanes.values().filter(|(lane, _)| {
@@ -5055,6 +5057,7 @@ impl JournalAdmissionState {
                                     }
                                 }
                             }
+                            let mut current_bindings = Vec::new();
                             for (binding, seq) in bindings.values().filter(|(binding, _)| {
                                 binding.primary_binding.task_id == Some(episode.task_id)
                                     && binding.primary_binding.workstream_id
@@ -5066,6 +5069,26 @@ impl JournalAdmissionState {
                                     (*binding).clone(),
                                 ));
                                 if self.scope_fact_visible(&payload, **seq)? {
+                                    if current_bindings.len() < 2 {
+                                        current_bindings.push(*binding);
+                                    }
+                                    facts.push(payload);
+                                }
+                            }
+                            // As in execution materialization: ambiguity is unknown,
+                            // not a reason to load every Run or select a compatible old binding.
+                            if let [binding] = current_bindings.as_slice()
+                                && binding.assignment_status == AssignmentStatus::Resolved
+                                && let Some((run, seq)) = binding
+                                    .primary_binding
+                                    .experiment_run_id
+                                    .and_then(|id| self.experiment_runs.get(&id))
+                            {
+                                let payload =
+                                    JournalPayload::ExperimentRunRecorded(Box::new(run.clone()));
+                                if self.scope_fact_visible(&payload, *seq)? {
+                                    experiment_source =
+                                        Some(self.scope_experiment_source(lane, binding, run)?);
                                     facts.push(payload);
                                 }
                             }
@@ -5145,6 +5168,7 @@ impl JournalAdmissionState {
             facts,
             capture_context,
             related_scope_shards,
+            experiment_source,
         })
     }
 
@@ -5464,6 +5488,11 @@ impl JournalAdmissionState {
                 v.attempt_id.to_string(),
                 v.revision_id.to_string(),
             ),
+            JournalPayload::ExperimentRunRecorded(v) => (
+                "experiment_run",
+                v.run_id.to_string(),
+                v.revision_id.to_string(),
+            ),
             JournalPayload::WorkBindingRecorded(v) => (
                 "work_binding",
                 v.work_binding_revision_id.to_string(),
@@ -5504,6 +5533,22 @@ impl JournalAdmissionState {
                 payload,
                 seq,
             )?,
+            JournalPayload::ExperimentRunRecorded(v) => {
+                let mut row = work_identity_row(
+                    kind,
+                    id,
+                    revision.clone(),
+                    v.execution_status.as_str(),
+                    None,
+                    Some(v.workstream_id.to_string()),
+                    None,
+                    None,
+                    payload,
+                    seq,
+                )?;
+                row.row_id = format!("object:work:experiment_run:{revision}");
+                row
+            }
             JournalPayload::WorkEpisodeRecorded(v) => {
                 let mut row = work_identity_row(
                     kind,
@@ -5523,6 +5568,54 @@ impl JournalAdmissionState {
             _ => physical_object_row(ObjectFamily::Work, kind, id, revision, payload, seq)?,
         };
         Ok(self.capture_product_rows(vec![row])?.pop())
+    }
+
+    fn scope_experiment_source(
+        &self,
+        lane: &ExecutionLane,
+        binding: &WorkBindingRevision,
+        run: &ExperimentRun,
+    ) -> Result<evertrace_domain::query::QueryExperimentSource, StoreError> {
+        let mut source = evertrace_domain::query::QueryExperimentSource {
+            work_binding_revision_id: binding.work_binding_revision_id,
+            operation_revision: None,
+            receipt_refs: Vec::new(),
+        };
+        let Some((operation, _)) = self
+            .operations
+            .get(&binding.operation_id)
+            .filter(|(operation, _)| operation.execution_lane_id == Some(lane.execution_lane_id))
+        else {
+            return Ok(source);
+        };
+        source.operation_revision = Some(operation.operation_revision);
+        if operation.pairing_state != evertrace_domain::evidence::PairingState::Paired {
+            return Ok(source);
+        }
+        let (references, observations) = if run.ended_at_us.is_some() {
+            (
+                &run.terminal_evidence_refs,
+                &operation.result_source_observation_refs,
+            )
+        } else {
+            (
+                &run.source_receipt_refs,
+                &operation.input_source_observation_refs,
+            )
+        };
+        for id in references {
+            if let Some((receipt, seq)) = self.source_receipts.get(id)
+                && receipt.capture_completeness
+                    == evertrace_domain::evidence::CaptureCompleteness::Complete
+                && observations.contains(&receipt.source_observation_id)
+                && !self
+                    .capture_product_rows(vec![source_receipt_row(receipt, *seq)?])?
+                    .is_empty()
+            {
+                source.receipt_refs.push(*id);
+            }
+        }
+        Ok(source)
     }
 
     fn scope_capture_context(

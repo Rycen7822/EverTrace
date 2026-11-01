@@ -856,6 +856,33 @@ impl QueryCaptureContext {
     }
 }
 
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum QueryStateConfidence {
+    Candidate,
+    /// The state operand has qualified observations, not proof of success or APPLY.
+    Confirmed,
+}
+
+/// One canonical Run and the current binding that selected it, not APPLY authority.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct QueryExperimentState {
+    pub run: crate::work::ExperimentRun,
+    pub source: QueryExperimentSource,
+    pub confidence: QueryStateConfidence,
+}
+
+/// Native observation links, without copying protected source bodies into a query.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct QueryExperimentSource {
+    pub work_binding_revision_id: crate::ids::WorkBindingRevisionId,
+    pub operation_revision: Option<u32>,
+    /// Only complete, visible receipts from an exact-physical paired Operation.
+    pub receipt_refs: Vec<crate::ids::SourceReceiptId>,
+}
+
 /// A declared dependency is a reference, never another primary current state.
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
@@ -888,6 +915,7 @@ pub struct QueryExecution {
     pub episode: crate::work::WorkEpisode,
     /// A canonical candidate; execution operands require `resolved_attempt`.
     pub attempt: Option<crate::work::Attempt>,
+    pub experiment: Option<Box<QueryExperimentState>>,
     pub work_binding: Option<crate::work::WorkBindingRevision>,
     pub checkpoint: Option<crate::work::WorkCheckpoint>,
 }
@@ -904,6 +932,44 @@ impl QueryExecution {
             && primary.episode_id == Some(self.episode.episode_id)
             && primary.attempt_id.is_none_or(|id| id == attempt.attempt_id))
         .then_some(attempt)
+    }
+
+    pub fn experiment_confidence(
+        &self,
+        run: &crate::work::ExperimentRun,
+        source: &QueryExperimentSource,
+    ) -> QueryStateConfidence {
+        use crate::work::{
+            AttemptBindingStatus, CoverageLevel, OrderingIntegrity, PairingIntegrity,
+            PayloadIntegrity, RunContractValidity, RunObservability, SourceCoverage,
+        };
+        let captured = self.capture_context.as_ref().is_some_and(|capture| {
+            let summary = &capture.summary;
+            capture.unavailable_lane_ids.is_empty()
+                && capture.unresolved_gap_count == Some(0)
+                && summary.minimum_coverage_level == CoverageLevel::Full
+                && summary.source_coverage_states.as_slice() == [SourceCoverage::Complete]
+                && summary.pairing_integrity_states.as_slice() == [PairingIntegrity::Complete]
+                && summary.payload_integrity_states.as_slice() == [PayloadIntegrity::Complete]
+                && summary.ordering_integrity_states.as_slice() == [OrderingIntegrity::Complete]
+        });
+        if captured
+            && source
+                .operation_revision
+                .is_some_and(|revision| revision > 0)
+            && !source.receipt_refs.is_empty()
+            && self.resolved_attempt().is_some_and(|attempt| {
+                run.attempt_binding_status == AttemptBindingStatus::Resolved
+                    && run.attempt_id == Some(attempt.attempt_id)
+                    && run.strategy_contract_fingerprint == attempt.strategy_contract_fingerprint
+            })
+            && run.observability == RunObservability::Full
+            && run.contract_validity == RunContractValidity::Valid
+        {
+            QueryStateConfidence::Confirmed
+        } else {
+            QueryStateConfidence::Candidate
+        }
     }
 
     pub fn validate(
@@ -994,6 +1060,38 @@ impl QueryExecution {
                         .attempt_id
                         .is_some_and(|id| id != attempt.attempt_id)
                 })
+            {
+                return Err(QueryError::Invalid);
+            }
+        }
+        if let Some(experiment) = &self.experiment {
+            experiment.run.validate().map_err(|_| QueryError::Invalid)?;
+            let binding = self.work_binding.as_ref().ok_or(QueryError::Invalid)?;
+            if experiment.source.work_binding_revision_id != binding.work_binding_revision_id
+                || experiment.source.operation_revision == Some(0)
+                || experiment.source.operation_revision.is_none()
+                    && !experiment.source.receipt_refs.is_empty()
+                || !experiment
+                    .source
+                    .receipt_refs
+                    .windows(2)
+                    .all(|pair| pair[0] < pair[1])
+                || experiment.source.receipt_refs.iter().any(|id| {
+                    let receipts = if experiment.run.ended_at_us.is_some() {
+                        &experiment.run.terminal_evidence_refs
+                    } else {
+                        &experiment.run.source_receipt_refs
+                    };
+                    !receipts.contains(id)
+                })
+                || Some(experiment.run.run_id) != binding.primary_binding.experiment_run_id
+                || experiment.run.workstream_id != self.workstream.workstream_id
+                || experiment
+                    .run
+                    .attempt_id
+                    .is_some_and(|id| binding.primary_binding.attempt_id != Some(id))
+                || experiment.confidence
+                    != self.experiment_confidence(&experiment.run, &experiment.source)
             {
                 return Err(QueryError::Invalid);
             }
