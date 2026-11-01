@@ -12,6 +12,7 @@ pub(crate) fn from_facts(
     anchor: &QueryAnchor,
     task_id: Option<TaskId>,
     capture_context: Option<&evertrace_domain::query::QueryCaptureContext>,
+    related_scope_shards: &[evertrace_domain::query::QueryRelatedScopeShard],
 ) -> Option<Box<QueryExecution>> {
     if !matches!(
         anchor.binding_strength,
@@ -120,6 +121,7 @@ pub(crate) fn from_facts(
         frontier,
         repository_state: primary_repository(facts, episode),
         capture_context: capture_context.cloned().map(Box::new),
+        related_scope_shards: related_scope_shards.to_vec(),
         task: task.clone(),
         workstream: stream.clone(),
         episode: episode.clone(),

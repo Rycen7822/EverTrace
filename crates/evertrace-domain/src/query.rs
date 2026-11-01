@@ -856,6 +856,25 @@ impl QueryCaptureContext {
     }
 }
 
+/// A declared dependency is a reference, never another primary current state.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct QueryRelatedScopeShard {
+    pub workstream_id: WorkstreamId,
+    pub declared_by_revision_id: RevisionId,
+    /// Missing or product-invisible targets retain only the already-declared ID.
+    pub target: Option<QueryRelatedScopeTarget>,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct QueryRelatedScopeTarget {
+    pub workstream_revision_id: RevisionId,
+    pub task_id: TaskId,
+    pub repository_instance_id: Option<RepositoryId>,
+    pub worktree_instance_id: Option<WorktreeId>,
+}
+
 /// Canonical Work revisions pinned to one read, never another state store.
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
@@ -863,6 +882,7 @@ pub struct QueryExecution {
     pub frontier: u64,
     pub repository_state: Option<Box<QueryRepositoryState>>,
     pub capture_context: Option<Box<QueryCaptureContext>>,
+    pub related_scope_shards: Vec<QueryRelatedScopeShard>,
     pub task: crate::work::Task,
     pub workstream: crate::work::Workstream,
     pub episode: crate::work::WorkEpisode,
@@ -898,6 +918,23 @@ impl QueryExecution {
             .validate()
             .map_err(|_| QueryError::Invalid)?;
         self.episode.validate().map_err(|_| QueryError::Invalid)?;
+        if self.related_scope_shards.len() != self.workstream.dependency_workstream_ids.len()
+            || self
+                .related_scope_shards
+                .iter()
+                .zip(&self.workstream.dependency_workstream_ids)
+                .any(|(related, id)| {
+                    related.workstream_id != *id
+                        || related.declared_by_revision_id != self.workstream.revision_id
+                        || related.target.as_ref().is_some_and(|target| {
+                            target.task_id != self.task.task_id
+                                || target.repository_instance_id.is_none()
+                                    && target.worktree_instance_id.is_some()
+                        })
+                })
+        {
+            return Err(QueryError::Invalid);
+        }
         if let Some(repository) = &self.repository_state {
             repository.validate(&self.episode)?;
         }

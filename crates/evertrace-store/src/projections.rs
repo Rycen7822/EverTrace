@@ -3147,6 +3147,7 @@ impl<'a> InboxCandidate<'a> {
 pub struct ScopeCurrentContext {
     pub facts: Vec<JournalPayload>,
     pub capture_context: Option<Box<evertrace_domain::query::QueryCaptureContext>>,
+    pub related_scope_shards: Vec<evertrace_domain::query::QueryRelatedScopeShard>,
 }
 
 /// One current directory metadata window, never a complete projection.
@@ -4932,6 +4933,7 @@ impl JournalAdmissionState {
         worktrees.extend(request.worktree);
         let mut primary_worktree = None;
         let mut capture_context = None;
+        let mut related_scope_shards = Vec::new();
         if let Some(session) = request.session.as_deref() {
             let mut lanes = Vec::new();
             for (lane, seq) in self.execution_lanes.values().filter(|(lane, _)| {
@@ -4967,6 +4969,31 @@ impl JournalAdmissionState {
                     }
                 }
                 if let [stream] = streams.as_slice() {
+                    // Point-read declared references, never merge dependency
+                    // records into primary facts or follow their state closures.
+                    for id in &stream.dependency_workstream_ids {
+                        let target = if let Some((target, seq)) = self.workstreams.get(id) {
+                            let payload =
+                                JournalPayload::WorkstreamRecorded(Box::new(target.clone()));
+                            self.scope_fact_visible(&payload, *seq)?.then_some(
+                                evertrace_domain::query::QueryRelatedScopeTarget {
+                                    workstream_revision_id: target.revision_id,
+                                    task_id: target.task_id,
+                                    repository_instance_id: target.repository_instance_id,
+                                    worktree_instance_id: target.active_worktree_instance_id,
+                                },
+                            )
+                        } else {
+                            None
+                        };
+                        related_scope_shards.push(
+                            evertrace_domain::query::QueryRelatedScopeShard {
+                                workstream_id: *id,
+                                declared_by_revision_id: stream.revision_id,
+                                target,
+                            },
+                        );
+                    }
                     if let Some((task, seq)) = self.tasks.get(&stream.task_id) {
                         let payload = JournalPayload::TaskRecorded(Box::new(task.clone()));
                         if self.scope_fact_visible(&payload, *seq)? {
@@ -5117,6 +5144,7 @@ impl JournalAdmissionState {
         Ok(ScopeCurrentContext {
             facts,
             capture_context,
+            related_scope_shards,
         })
     }
 
