@@ -1495,6 +1495,89 @@ pub enum OverviewCountUnit {
     PendingReviewItems,
 }
 
+/// Current compiler output has provenance watermarks, never an asset revision.
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CompiledProjectionKind {
+    Wiki,
+    Core,
+}
+impl CompiledProjectionKind {
+    pub fn object_kind(self) -> &'static str {
+        match self {
+            Self::Wiki => "wiki_projection",
+            Self::Core => "l3_core_projection",
+        }
+    }
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
+pub enum CompiledProjectionQuery {
+    Directory {
+        selection: MemoryScopeSelection,
+        include_global: bool,
+        projection: CompiledProjectionKind,
+    },
+    Entries {
+        reference: String,
+        selection: MemoryScopeSelection,
+        include_global: bool,
+    },
+}
+impl CompiledProjectionQuery {
+    pub fn validate(&self) -> Result<(), QueryError> {
+        match self {
+            Self::Directory {
+                selection,
+                include_global,
+                ..
+            } => MemoryBrowseQuery {
+                selection: *selection,
+                include_global: *include_global,
+                ..MemoryBrowseQuery::default()
+            }
+            .validate(),
+            Self::Entries {
+                reference,
+                selection,
+                include_global,
+            } => {
+                MemoryBrowseQuery {
+                    selection: *selection,
+                    include_global: *include_global,
+                    ..MemoryBrowseQuery::default()
+                }
+                .validate()?;
+                let valid = reference
+                    .strip_prefix("projection:wiki:")
+                    .is_some_and(|id| id.parse::<crate::ids::WikiProjectionId>().is_ok())
+                    || reference
+                        .strip_prefix("projection:core:")
+                        .is_some_and(|id| id.parse::<crate::ids::CoreProjectionId>().is_ok());
+                if valid {
+                    Ok(())
+                } else {
+                    Err(QueryError::Invalid)
+                }
+            }
+        }
+    }
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct CompiledProjectionMetadata {
+    pub reference: String,
+    pub kind: CompiledProjectionKind,
+    pub compiler_version: Option<u32>,
+    pub source_watermark: u64,
+    /// Original inputs: Atom/episode references, or Core membership-to-Atom pairs.
+    pub source_count: u64,
+    /// Existing compiler identity; this does not assert a materialized CAS body.
+    pub render_identity: Option<crate::ids::CasId>,
+}
+
 /// Recorded reasons from the original Inbox selector; not new approval policy.
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]

@@ -327,6 +327,7 @@ function followRecord(item, restore = null) {
       revision: current.revision,
       object: current.object,
       kind: current.kind,
+      compiled: current.compiled ? { ...current.compiled } : null,
     },
     scroll: $("detail-body").scrollTop,
     links: state.links ? { after: state.links.after, frontier: state.links.frontier } : null,
@@ -504,7 +505,8 @@ async function select(item, restore = null) {
   }
 }
 async function readSelection(item, controller, scroll = 0) {
-  if (item.surface === "inbox" || item.surface === "system")
+  if (item.kind === "compiled_projection") await readCompiledEntries(item, controller, scroll);
+  else if (item.surface === "inbox" || item.surface === "system")
     await detail(item, state.frontier, controller, scroll);
   else if (state.comparison) await readComparison(state.comparison, controller, scroll);
   else if (state.revisions)
@@ -825,6 +827,10 @@ async function refresh() {
       return;
     }
     if (state.route !== "memories") return;
+    if (isCompiledKind(state.query.kind)) {
+      await readCompiledDirectory(controller);
+      return;
+    }
     const page = await api(
       "read",
       {
@@ -944,6 +950,7 @@ function route(name) {
   const label = document.querySelector('[data-route="' + name + '"]')?.textContent.trim() || name;
   $("breadcrumb").textContent = label;
   $("page-title").textContent = label;
+  readingControls();
   $("page-description").textContent =
     "独立 Python Web，只读调用现有 daemon；未接入的页面不使用示例数据。";
   notice(
@@ -960,9 +967,26 @@ $("detail-body").onclick = (event) => {
     [data-content-nav], [data-revisions-open], [data-revisions-next], [data-detail-open],
     [data-revision-key], [data-sources-open], [data-sources-next], [data-link-key],
     [data-nav-back], [data-compare-base], [data-compare-key], [data-compare-side],
-    [data-compare-first], [data-compare-next]`,
+    [data-compare-first], [data-compare-next], [data-compiled-first], [data-compiled-next], [data-compiled-refresh]`,
   );
   if (!button || button.disabled) return;
+  if (button.hasAttribute("data-compiled-refresh")) {
+    state.selected = null;
+    state.after = null;
+    state.frontier = null;
+    refresh();
+    return;
+  }
+  if (button.hasAttribute("data-compiled-first") || button.hasAttribute("data-compiled-next")) {
+    const item = state.selected;
+    if (item?.kind !== "compiled_projection" || !item.compiled) return;
+    const next = button.hasAttribute("data-compiled-next");
+    select({ ...item, compiled: { ...item.compiled,
+      after: next ? item.compiled.next : null,
+      frontier: next ? item.compiled.frontier : state.frontier,
+    } });
+    return;
+  }
   if (button.hasAttribute("data-archive-revisions")) {
     openArchive({ kind: "revisions", source_instance_id: button.dataset.archiveRevisions });
     return;
@@ -1043,6 +1067,14 @@ $("memory-items").onclick = (event) => {
     return;
   }
   const row = event.target.closest(".memory-item");
+  if (row?.dataset.projection) {
+    select({ key: row.dataset.key, kind: "compiled_projection", compiled: {
+      query: { kind: "entries", reference: row.dataset.projection,
+        selection: state.query.selection, include_global: state.query.include_global },
+      after: null, frontier: state.frontier, next: null,
+    } });
+    return;
+  }
   if (row)
     select({
       key: row.dataset.key,
@@ -1198,6 +1230,70 @@ for (const button of document.querySelectorAll("[data-scope-fixed]"))
   button.onclick = () => chooseScope({ kind: button.dataset.scopeFixed });
 $("include-global").onchange = () => changeQuery();
 $("overview-limit").onchange = () => changeQuery();
+function isCompiledKind(kind) {
+  return ["compiled_wiki", "compiled_core"].includes(kind);
+}
+function readingControls() {
+  const compiled = state.route === "memories" && isCompiledKind(state.query.kind);
+  $("browse-order").disabled = compiled;
+  $("time-filter").hidden = !["overview", "memories"].includes(state.route) || compiled;
+}
+async function readCompiledDirectory(controller) {
+  const selected = state.selected;
+  const listScroll = $("memory-items").scrollTop;
+  const detailScroll = $("detail-body").scrollTop;
+  const page = await api("read", {
+    kind: "compiled", query: { kind: "directory", selection: state.query.selection,
+      include_global: state.query.include_global, projection: state.query.kind === "compiled_wiki" ? "wiki" : "core" },
+    expected_frontier: state.after ? state.frontier : null, after: state.after,
+  }, controller.signal);
+  if (state.controller !== controller || document.hidden) return;
+  clear();
+  if (page.conflict) {
+    state.after = null;
+    state.frontier = null;
+    state.selected = null;
+    notice("编译目录水位已变，请从头读取；没有拼接两次结果。");
+    return;
+  }
+  fragmentInto($("memory-items"), page.html);
+  $("memory-items").scrollTop = listScroll;
+  state.frontier = page.frontier;
+  state.next = page.next_cursor;
+  $("next-page").disabled = !state.next;
+  $("page-count").textContent = page.matching_count === null ? "总数未完整计算" : page.matching_count + " 个编译视图";
+  const status = page.scope_available ? (page.complete ? "已读取当前发布的编译目录；打开后按原权限读取来源。" :
+    "目录读取不完整；未把未知数量当成零。") : "所选范围不可用，没有回退到全部范围。";
+  notice(status + "读取水位：" + page.frontier + "；目录按原生引用分页，不使用资产时间排序。");
+  if (selected && page.scope_available) {
+    const visible = [...$("memory-items").querySelectorAll(".memory-item")].some(row => row.dataset.key === selected.key);
+    if (visible || selected.direct) {
+      state.selected = selected;
+      await readSelection(selected, controller, detailScroll);
+      return;
+    }
+  }
+  state.selected = null;
+}
+async function readCompiledEntries(item, controller, scroll = 0) {
+  const view = item.compiled;
+  if (!view) throw new Error("missing compiled selection");
+  const page = await api("read", {
+    kind: "compiled", query: view.query, expected_frontier: view.frontier, after: view.after,
+  }, controller.signal);
+  if (state.controller !== controller || document.hidden) return;
+  $("detail-ref").textContent = item.key;
+  if (page.conflict) {
+    fragmentInto($("detail-body"), `<p>编译视图读取水位已变；未拼接旧来源。</p>
+      <button class="button" type="button" data-compiled-refresh>刷新目录后重新选择</button>
+      <button class="button" type="button" data-nav-back hidden>返回上一条记录</button>`);
+  } else {
+    fragmentInto($("detail-body"), page.html);
+    state.selected = { ...item, compiled: { ...view, frontier: page.frontier, next: page.next_cursor } };
+  }
+  navigationControls();
+  $("detail-body").scrollTop = scroll;
+}
 function changeQuery() {
   cancel();
   clear();
@@ -1222,8 +1318,13 @@ function changeQuery() {
     epistemic_status: $("epistemic-filter").value || null,
     authority: $("authority-filter").value || null,
     atom_lifecycle: $("lifecycle-filter").value || null,
-    time_range: state.query.time_range,
+    time_range: isCompiledKind($("reading-kind").value) ? null : state.query.time_range,
   };
+  if (isCompiledKind(state.query.kind)) {
+    $("time-from").value = "";
+    $("time-until").value = "";
+  }
+  readingControls();
   refresh();
 }
 function displayTime(value) {

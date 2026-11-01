@@ -1,0 +1,18 @@
+{% for item in page['items'] %}
+<button class="memory-item" type="button" data-key="{{ item.reference }}" data-kind="compiled_projection"
+  data-projection="{{ item.reference }}">
+  <div class="item-topline"><span class="type-pill">{{ 'Wiki 编译视图' if item.kind == 'wiki' else 'Core 编译视图' }}</span>
+    <span class="badge">derived · authority=none</span>
+  </div>
+  <h3>{{ item.reference }}</h3>
+  <p class="reading-origin">输入水位：{{ item.source_watermark }}
+    {% if item.compiler_version is not none %} · 编译器版本 {{ item.compiler_version }}{% endif %}</p>
+  <p class="muted">标题和收录内容在打开后按原权限读取。没有独立资产修订，也不授予执行资格。</p>
+</button>
+{% else %}
+<div class="empty">
+  {% if not page.scope_available %}所选范围不可用；未回退到全部范围。
+  {% elif not page.complete %}本次窗口未能完整读取，不能据此断定没有编译视图。
+  {% else %}本页没有可列出的编译视图。{% endif %}
+</div>
+{% endfor %}

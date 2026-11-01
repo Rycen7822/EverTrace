@@ -577,7 +577,7 @@ pub(super) fn semantic_value(
     Ok(Some((content, preview)))
 }
 
-fn present(row: &ObjectRow) -> Result<HumanSemanticDetail, HumanGovernanceError> {
+pub(super) fn present(row: &ObjectRow) -> Result<HumanSemanticDetail, HumanGovernanceError> {
     let Some((content, preview)) = semantic_value(row)? else {
         return Ok(unavailable(
             row.object_id.clone(),

@@ -910,6 +910,18 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
                                         Err(frontier) => HumanGovernanceResponse::Conflict {current_frontier: frontier, current_revision_ref: None},
                                     }
                                 }
+                                HumanReadRequest::CompiledProjections { query, expected_frontier, after, limit } => {
+                                    let result = human_governance.compiled_projections(query, expected_frontier, after.as_deref(), limit)
+                                        .await.map_err(map_human_error)?;
+                                    match result {
+                                        Ok(page) => HumanGovernanceResponse::CompiledProjections {
+                                            page: Box::new(map_human_compiled(page)),
+                                        },
+                                        Err(current_frontier) => HumanGovernanceResponse::Conflict {
+                                            current_revision_ref: None, current_frontier,
+                                        },
+                                    }
+                                }
                                 HumanReadRequest::MemoryOverview { query, expected_frontier } => {
                                     match human_governance.memory_overview(query, expected_frontier).await.map_err(map_human_error)? {
                                         Ok(page) => HumanGovernanceResponse::MemoryOverview { page: Box::new(map_human_overview(page)) },
@@ -1620,6 +1632,65 @@ fn map_semantic_detail(
     }
 }
 
+fn map_human_compiled(
+    page: evertrace_engine::HumanCompiledPage,
+) -> evertrace_protocol::dto::HumanCompiledPage {
+    use evertrace_engine::HumanCompiledPage as E;
+    use evertrace_protocol::dto::{HumanCompiledEntry, HumanCompiledPage as P};
+    match page {
+        E::Directory {
+            frontier,
+            query,
+            items,
+            scope_available,
+            complete,
+            matching_count,
+            next_cursor,
+        } => P::Directory {
+            frontier,
+            query,
+            items,
+            scope_available,
+            complete,
+            matching_count,
+            next_cursor,
+        },
+        E::Entries {
+            frontier,
+            query,
+            metadata,
+            title,
+            state,
+            scope_available,
+            complete,
+            matching_count,
+            entries,
+            next_cursor,
+        } => P::Entries {
+            frontier,
+            query,
+            metadata,
+            title,
+            state,
+            scope_available,
+            complete,
+            matching_count,
+            entries: entries
+                .into_iter()
+                .map(|v| HumanCompiledEntry {
+                    reference: v.reference,
+                    revision_ref: v.revision_ref,
+                    contextual: v.contextual,
+                    membership_revision: v.membership_revision,
+                    state: v.state,
+                    item: v.item.map(|item| Box::new(map_human_item(item))),
+                })
+                .collect(),
+            next_cursor,
+        },
+    }
+}
+
 fn map_human_overview(
     page: evertrace_engine::HumanMemoryOverviewPage,
 ) -> evertrace_protocol::dto::HumanMemoryOverviewPage {
@@ -1670,7 +1741,11 @@ fn map_human_page(page: evertrace_engine::HumanPage) -> HumanGovernanceResponse 
 }
 
 fn map_human_items(items: Vec<evertrace_engine::HumanSummary>) -> Vec<HumanSnapshotItem> {
-    items.into_iter().map(|item| HumanSnapshotItem {
+    items.into_iter().map(map_human_item).collect()
+}
+
+fn map_human_item(item: evertrace_engine::HumanSummary) -> HumanSnapshotItem {
+    HumanSnapshotItem {
                 reading_preview: item.reading_preview.map(|value| evertrace_protocol::dto::HumanMemoryPreview {
                     state: value.state, title: value.title, excerpt: value.excerpt,
                     origin: value.origin, truncated: value.truncated,
@@ -2219,7 +2294,7 @@ fn map_human_items(items: Vec<evertrace_engine::HumanSummary>) -> Vec<HumanSnaps
                 scope_ref: item.scope_ref,
                 native_event_time_us: item.native_event_time_us,
                 source_event_seq: item.source_event_seq,
-            }).collect()
+            }
 }
 
 fn map_diagnostics(

@@ -1476,6 +1476,42 @@ impl JournalWriter {
             .await
     }
 
+    pub async fn compiled_entries_context(
+        &self,
+        query: &evertrace_domain::query::CompiledProjectionQuery,
+        offset: u64,
+        limit: usize,
+    ) -> Result<crate::projections::CompiledEntriesContext, StoreError> {
+        let evertrace_domain::query::CompiledProjectionQuery::Entries { reference, .. } = query
+        else {
+            return Err(StoreError::InvalidInput);
+        };
+        self.validated_current_read(|state, _| {
+            let row = self.lock_sqlite()?.compiled_object(reference)?;
+            state.compiled_entries_context(query, row.as_ref(), offset, limit)
+        })
+        .await
+    }
+
+    pub async fn compiled_directory_context(
+        &self,
+        query: &evertrace_domain::query::CompiledProjectionQuery,
+        after: Option<&str>,
+        limit: usize,
+    ) -> Result<crate::projections::CompiledDirectoryContext, StoreError> {
+        let evertrace_domain::query::CompiledProjectionQuery::Directory { projection, .. } = query
+        else {
+            return Err(StoreError::InvalidInput);
+        };
+        self.validated_current_read(|state, _| {
+            let sqlite = self.lock_sqlite()?;
+            state.compiled_directory_context(query, after, limit, |key| {
+                sqlite.compiled_object_page(*projection, key)
+            })
+        })
+        .await
+    }
+
     pub async fn memory_browse_context(
         &self,
         query: &evertrace_domain::query::MemoryBrowseQuery,

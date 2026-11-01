@@ -66,8 +66,10 @@ use crate::{
 };
 
 mod autoresearch;
+mod compiled;
 mod inventory;
 mod memories;
+pub use compiled::{CompiledDirectoryContext, CompiledEntriesContext, CompiledSourceReference};
 mod overview;
 mod procedure;
 mod procedure_effect;

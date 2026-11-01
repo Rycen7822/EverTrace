@@ -100,6 +100,22 @@ enum WriterRequest {
             Result<evertrace_store::projections::ScopeDirectoryReadContext, WriterActorError>,
         >,
     },
+    CompiledDirectory {
+        query: evertrace_domain::query::CompiledProjectionQuery,
+        after: Option<String>,
+        limit: usize,
+        reply: oneshot::Sender<
+            Result<evertrace_store::projections::CompiledDirectoryContext, WriterActorError>,
+        >,
+    },
+    CompiledEntries {
+        query: evertrace_domain::query::CompiledProjectionQuery,
+        offset: u64,
+        limit: usize,
+        reply: oneshot::Sender<
+            Result<evertrace_store::projections::CompiledEntriesContext, WriterActorError>,
+        >,
+    },
     MemoryOverview {
         query: evertrace_domain::query::MemoryOverviewQuery,
         reply: oneshot::Sender<
@@ -671,6 +687,44 @@ impl WriterHandle {
                 query: query.clone(),
                 after: after.map(str::to_owned),
                 deadline,
+                reply,
+            })
+            .await
+            .map_err(|_| WriterActorError::Stopped)?;
+        response.await.map_err(|_| WriterActorError::Stopped)?
+    }
+
+    pub(crate) async fn compiled_directory_context(
+        &self,
+        query: &evertrace_domain::query::CompiledProjectionQuery,
+        after: Option<String>,
+        limit: usize,
+    ) -> Result<evertrace_store::projections::CompiledDirectoryContext, WriterActorError> {
+        let (reply, response) = oneshot::channel();
+        self.sender
+            .send(WriterRequest::CompiledDirectory {
+                query: query.clone(),
+                after,
+                limit,
+                reply,
+            })
+            .await
+            .map_err(|_| WriterActorError::Stopped)?;
+        response.await.map_err(|_| WriterActorError::Stopped)?
+    }
+
+    pub(crate) async fn compiled_entries_context(
+        &self,
+        query: &evertrace_domain::query::CompiledProjectionQuery,
+        offset: u64,
+        limit: usize,
+    ) -> Result<evertrace_store::projections::CompiledEntriesContext, WriterActorError> {
+        let (reply, response) = oneshot::channel();
+        self.sender
+            .send(WriterRequest::CompiledEntries {
+                query: query.clone(),
+                offset,
+                limit,
                 reply,
             })
             .await
@@ -1419,6 +1473,52 @@ async fn run_writer(
                         .await
                         .map_err(map_store_error);
                     let fatal = result.is_err();
+                    let _ = reply.send(result);
+                    if fatal {
+                        return Err(WriterActorError::Store);
+                    }
+                }
+                WriterRequest::CompiledDirectory {
+                    query,
+                    after,
+                    limit,
+                    reply,
+                } => {
+                    if reply.is_closed() {
+                        continue;
+                    }
+                    let result = writer
+                        .as_ref()
+                        .ok_or(WriterActorError::Stopped)?
+                        .compiled_directory_context(&query, after.as_deref(), limit)
+                        .await
+                        .map_err(map_store_error);
+                    let fatal = result
+                        .as_ref()
+                        .is_err_and(|error| *error != WriterActorError::InvalidInput);
+                    let _ = reply.send(result);
+                    if fatal {
+                        return Err(WriterActorError::Store);
+                    }
+                }
+                WriterRequest::CompiledEntries {
+                    query,
+                    offset,
+                    limit,
+                    reply,
+                } => {
+                    if reply.is_closed() {
+                        continue;
+                    }
+                    let result = writer
+                        .as_ref()
+                        .ok_or(WriterActorError::Stopped)?
+                        .compiled_entries_context(&query, offset, limit)
+                        .await
+                        .map_err(map_store_error);
+                    let fatal = result
+                        .as_ref()
+                        .is_err_and(|error| *error != WriterActorError::InvalidInput);
                     let _ = reply.send(result);
                     if fatal {
                         return Err(WriterActorError::Store);

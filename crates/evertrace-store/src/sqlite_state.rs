@@ -147,6 +147,12 @@ content_hash, causation_id, correlation_id, effective_config_hash, algorithm_rev
 
 const SELECT_OBJECT_ROWS: &str = "SELECT row_id, row_kind, row_class, object_family, object_kind, object_id, current_revision_id, lifecycle, epistemic, authority, publication_state, support_state, project_id, repository_id, worktree_id, task_id, workstream_id, session_id, payload_json, source_event_seq, projection_generation FROM object_rows ORDER BY row_id";
 const SELECT_OBJECT_ROWS_WITHOUT_SOURCE_FACTS: &str = "SELECT row_id, row_kind, row_class, object_family, object_kind, object_id, current_revision_id, lifecycle, epistemic, authority, publication_state, support_state, project_id, repository_id, worktree_id, task_id, workstream_id, session_id, payload_json, source_event_seq, projection_generation FROM object_rows WHERE object_kind IS NULL OR object_kind NOT IN ('source_receipt', 'source_observation', 'evidence_surface') ORDER BY row_id";
+const SELECT_COMPILED_OBJECTS: &str = "\
+SELECT row_id, row_kind, row_class, object_family, object_kind, object_id, current_revision_id, \
+ lifecycle, epistemic, authority, publication_state, support_state, project_id, repository_id, \
+ worktree_id, task_id, workstream_id, session_id, payload_json, source_event_seq, projection_generation \
+FROM object_rows WHERE row_kind = 'data' AND row_class = 'projection' AND object_kind = ?1 \
+AND row_id > ?2 AND row_id < ?3 ORDER BY row_id LIMIT 64";
 const SELECT_OBJECT_CHECKPOINT: &str = "SELECT row_id, row_kind, row_class, object_family, object_kind, object_id, current_revision_id, lifecycle, epistemic, authority, publication_state, support_state, project_id, repository_id, worktree_id, task_id, workstream_id, session_id, payload_json, source_event_seq, projection_generation FROM object_rows WHERE row_id = ?1";
 const SELECT_BATCH_OBJECT_ROWS: &str = "SELECT o.row_id, o.row_kind, o.row_class, o.object_family, o.object_kind, o.object_id, o.current_revision_id, o.lifecycle, o.epistemic, o.authority, o.publication_state, o.support_state, o.project_id, o.repository_id, o.worktree_id, o.task_id, o.workstream_id, o.session_id, o.payload_json, o.source_event_seq, o.projection_generation FROM object_rows o JOIN projection_batch_ids b ON o.row_id = b.row_id";
 const SELECT_BATCH_OBJECT_ROWS_WITHOUT_SOURCE_FACTS: &str = "SELECT o.row_id, o.row_kind, o.row_class, o.object_family, o.object_kind, o.object_id, o.current_revision_id, o.lifecycle, o.epistemic, o.authority, o.publication_state, o.support_state, o.project_id, o.repository_id, o.worktree_id, o.task_id, o.workstream_id, o.session_id, o.payload_json, o.source_event_seq, o.projection_generation FROM object_rows o JOIN projection_batch_ids b ON o.row_id = b.row_id WHERE o.object_kind IS NULL OR o.object_kind NOT IN ('source_receipt', 'source_observation', 'evidence_surface')";
@@ -851,6 +857,50 @@ impl SqliteState {
 
     pub(crate) fn object_rows(&self) -> Result<Vec<ObjectRow>, StoreError> {
         self.with_connection(read_object_rows)
+    }
+
+    pub(crate) fn compiled_object_page(
+        &self,
+        kind: evertrace_domain::query::CompiledProjectionKind,
+        after: &str,
+    ) -> Result<Vec<ObjectRow>, StoreError> {
+        use evertrace_domain::query::CompiledProjectionKind as K;
+        // Bound the existing row-id index to this namespace, not all source rows.
+        // Canonical prefixes end with ASCII ':'; ';' is its exclusive successor.
+        let (start, end) = match kind {
+            K::Wiki => ("projection:wiki:", "projection:wiki;"),
+            K::Core => ("projection:core:", "projection:core;"),
+        };
+        let after = after.max(start);
+        self.with_connection(|connection| {
+            let mut statement = connection
+                .prepare(SELECT_COMPILED_OBJECTS)
+                .map_err(|_| StoreError::StoreCorrupt)?;
+            let mut queried = statement
+                .query(rusqlite::params![kind.object_kind(), after, end])
+                .map_err(|_| StoreError::StoreCorrupt)?;
+            let mut rows = Vec::new();
+            while let Some(row) = queried.next().map_err(|_| StoreError::StoreCorrupt)? {
+                rows.push(object_row_from_sql(row)?);
+            }
+            Ok(rows)
+        })
+    }
+
+    pub(crate) fn compiled_object(&self, reference: &str) -> Result<Option<ObjectRow>, StoreError> {
+        self.with_connection(|connection| {
+            let mut statement = connection
+                .prepare(SELECT_OBJECT_CHECKPOINT)
+                .map_err(|_| StoreError::StoreCorrupt)?;
+            let mut queried = statement
+                .query([reference])
+                .map_err(|_| StoreError::StoreCorrupt)?;
+            queried
+                .next()
+                .map_err(|_| StoreError::StoreCorrupt)?
+                .map(object_row_from_sql)
+                .transpose()
+        })
     }
 
     pub(crate) fn object_rows_without_source_facts(&self) -> Result<Vec<ObjectRow>, StoreError> {

@@ -1,0 +1,48 @@
+<button class="button" type="button" data-nav-back hidden>返回上一条记录</button>
+{% set meta = page.metadata %}
+{% if meta %}
+<section class="semantic-content">
+  <h2>{{ page.title or ('Wiki 编译视图' if meta.kind == 'wiki' else 'Core 编译视图') }}</h2>
+  <p>{{ meta.reference }}</p>
+  <p>输入水位：{{ meta.source_watermark }} · 本次读取水位：{{ page.frontier }}
+    {% if meta.compiler_version is not none %} · 编译器版本 {{ meta.compiler_version }}{% endif %}</p>
+  <p class="muted">这是当前已发布编译视图的收录内容，不是独立资产或执行授权；本次读取不重新编译或生成。</p>
+  <p>编译收录条目总数（非本范围统计）：{{ meta.source_count }}。
+    本范围条目匹配：{{ page.matching_count if page.matching_count is not none else '未完整计算' }}。</p>
+  {% if meta.render_identity %}
+  <details><summary>编译输出标识</summary><p>{{ meta.render_identity }}</p>
+    <p>这是原编译器的 render identity，不声称存在可读取的 CAS 正文。</p>
+  </details>{% endif %}
+  {% if meta.kind == 'wiki' %}
+  <p>下面保留各条原陈述与原修订；不会把存在分歧的来源改写成一个确定结论。上下文引用不是 Wiki 陈述。</p>
+  {% endif %}
+  {% if not page.complete %}<p>本次有内容未读或不可读；未用空正文或另一修订替代。</p>{% endif %}
+  {% for entry in page.entries %}
+  <article class="semantic-section compiled-entry">
+    <p class="reading-origin">{{ '上下文引用' if entry.contextual else '收录来源' }} · {{ entry.revision_ref }}</p>
+    {% if entry.membership_revision %}<p class="reading-origin">membership 修订：{{ entry.membership_revision }}</p>{% endif %}
+    {% set item = entry.item %}
+    {% if entry.contextual %}
+      <p>这是原工作片段的上下文／来源引用，不作为一条独立知识结论。</p>
+    {% elif entry.state == 'ready' and item and item.semantic_detail %}
+      {% with content=item.semantic_detail.content %}{% include 'semantic_content.html' %}{% endwith %}
+    {% else %}
+      <p>原正文状态：{{ entry.state }}。
+        {% if entry.state == 'too_large' %}可打开原修订分段读取。{% else %}没有返回正文。{% endif %}</p>
+    {% endif %}
+    {% if item %}
+    {% if entry.membership_revision %}
+    <button class="button" type="button" data-link-key="{{ entry.membership_revision }}"
+      data-revision="{{ entry.membership_revision }}" data-kind="core_membership" data-object="">打开原 membership</button>
+    {% endif %}
+    <button class="button" type="button" data-link-key="{{ item.stable_key }}" data-revision="{{ item.revision_ref }}"
+      data-kind="{{ item.object_kind }}" data-object="{{ item.object_ref or '' }}">打开原修订</button>
+    {% endif %}
+  </article>
+  {% else %}<p>本次没有可展示的来源条目；请结合状态与范围判断，不能据此认定来源内容为空。</p>{% endfor %}
+  <div class="chunk-controls">
+    <button class="button" type="button" data-compiled-first>从头读取收录内容</button>
+    {% if page.next_cursor %}<button class="button" type="button" data-compiled-next>下一页收录内容</button>{% endif %}
+  </div>
+</section>
+{% else %}<p>原编译视图当前不可用或不存在；没有猜测另一视图。</p>{% endif %}

@@ -1,3 +1,5 @@
+mod compiled;
+pub use compiled::{HumanCompiledEntry, HumanCompiledPage};
 mod overview;
 pub use overview::HumanMemoryOverviewPage;
 
@@ -105,6 +107,12 @@ pub enum HumanRelationKind {
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
 pub enum HumanReadRequest {
+    CompiledProjections {
+        query: evertrace_domain::query::CompiledProjectionQuery,
+        expected_frontier: Option<u64>,
+        after: Option<String>,
+        limit: u16,
+    },
     MemoryOverview {
         query: evertrace_domain::query::MemoryOverviewQuery,
         expected_frontier: Option<u64>,
@@ -944,6 +952,9 @@ pub struct HumanActionResult {
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
 pub enum HumanGovernanceResponse {
+    CompiledProjections {
+        page: Box<HumanCompiledPage>,
+    },
     MemoryOverview {
         page: Box<HumanMemoryOverviewPage>,
     },
@@ -1031,6 +1042,22 @@ impl HumanGovernanceRequest {
 impl HumanReadRequest {
     fn validate(&self) -> bool {
         match self {
+            Self::CompiledProjections {
+                query,
+                expected_frontier,
+                after,
+                limit,
+            } => {
+                query.validate().is_ok()
+                    && (1..=64).contains(limit)
+                    && (!matches!(
+                        query,
+                        evertrace_domain::query::CompiledProjectionQuery::Entries { .. }
+                    ) || *limit <= 8 && expected_frontier.is_some())
+                    && after
+                        .as_ref()
+                        .is_none_or(|v| !v.is_empty() && v.len() <= 4096)
+            }
             Self::MemoryOverview { query, .. } => query.validate().is_ok(),
             Self::Search { query } => query.validate().is_ok(),
             Self::CompareRevisions {
@@ -1371,6 +1398,7 @@ impl HumanDiagnostics {
 impl HumanGovernanceResponse {
     pub fn validate(&self) -> bool {
         match self {
+            Self::CompiledProjections { page } => page.validate(),
             Self::MemoryOverview { page } => page.validate(),
             Self::Search { page } => page.validate(),
             Self::RevisionComparison { comparison } => {

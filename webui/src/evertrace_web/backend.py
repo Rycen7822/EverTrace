@@ -211,6 +211,34 @@ class Backend:
             }
         )
 
+    async def compiled(self, query, expected_frontier=None, after=None):
+        if not isinstance(query, dict) or query.get("kind") not in ("directory", "entries"):
+            raise BackendError("invalid_input")
+        include_global = query.get("include_global", False)
+        if type(include_global) is not bool:
+            raise BackendError("invalid_input")
+        kind = query["kind"]
+        field = "projection" if kind == "directory" else "reference"
+        if set(query) - {"kind", "selection", "include_global", field}:
+            raise BackendError("invalid_input")
+        value = query.get(field)
+        if kind == "directory" and value not in ("wiki", "core"):
+            raise BackendError("invalid_input")
+        if kind == "entries" and (not isinstance(value, str) or not 1 <= len(value) <= 256):
+            raise BackendError("invalid_input")
+        selection = normalize_scope(query.get("selection", {"kind": "all"}))
+        normalized = {"kind": kind}
+        if kind == "entries":
+            normalized["reference"] = value
+        normalized.update(selection=selection, include_global=include_global)
+        if kind == "directory":
+            normalized["projection"] = value
+        return await self._request({
+            "kind": "compiled_projections", "query": normalized,
+            "expected_frontier": expected_frontier, "after": after,
+            "limit": 32 if kind == "directory" else 4,
+        })
+
     async def overview(self, query, expected_frontier=None):
         if not isinstance(query, dict) or set(query) - {
             "selection", "include_global", "time_range", "limit"
@@ -514,6 +542,7 @@ class Backend:
                     "snapshot",
                     "memory_page",
                     "memory_overview",
+                    "compiled_projections",
                     "revision_page",
                     "scope_directory",
                     "source_catalog",

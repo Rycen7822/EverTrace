@@ -41,7 +41,7 @@ pub struct MemoryOverviewRun {
     pub created_at_us: i64,
 }
 
-fn work_scopes(
+pub(super) fn work_scopes(
     task_id: TaskId,
     repository: Option<RepositoryId>,
     trees: &[WorktreeId],

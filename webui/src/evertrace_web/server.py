@@ -259,6 +259,26 @@ class App:
                         "counts_complete": result["counts_complete"],
                         "unresolved_scope_count": str(result["unresolved_scope_count"]),
                     }
+            elif payload.get("kind") == "compiled" and not (
+                set(payload) - {"kind", "query", "expected_frontier", "after"}
+            ):
+                frontier = parse_frontier(payload.get("expected_frontier"), optional=True)
+                after = payload.get("after")
+                if not valid_ref(after, optional=True):
+                    return JSONResponse({"error": "invalid_read"}, 400)
+                result = await self.backend.compiled(payload.get("query"), frontier, after)
+                if result["kind"] == "conflict":
+                    data = {"conflict": True}
+                else:
+                    page = result["page"]
+                    template = "compiled_list.html" if page["kind"] == "directory" else "compiled_entries.html"
+                    data = {
+                        "kind": page["kind"], "html": self.templates.get_template(template).render(page=page),
+                        "frontier": str(page["frontier"]), "query": page["query"],
+                        "scope_available": page["scope_available"], "complete": page["complete"],
+                        "matching_count": str(page["matching_count"]) if page["matching_count"] is not None else None,
+                        "next_cursor": page["next_cursor"],
+                    }
             elif payload.get("kind") == "overview" and not (
                 set(payload) - {"kind", "query", "expected_frontier"}
             ):
