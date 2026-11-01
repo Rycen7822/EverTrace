@@ -53,6 +53,7 @@ pub struct ProductionSearch {
     canonical_sources: Option<(u64, Vec<SearchProjectionRow>)>,
     recall_sources: BTreeSet<String>,
     matched_sources: BTreeSet<String>,
+    matched_contexts: BTreeSet<String>,
 }
 
 impl ProductionSearch {
@@ -68,6 +69,7 @@ impl ProductionSearch {
             canonical_sources: None,
             recall_sources: BTreeSet::new(),
             matched_sources: BTreeSet::new(),
+            matched_contexts: BTreeSet::new(),
         }
     }
 
@@ -104,8 +106,13 @@ impl ProductionSearch {
         self
     }
 
-    pub(crate) fn with_matched_sources(mut self, refs: BTreeSet<String>) -> Self {
+    pub(crate) fn with_matched_sources(
+        mut self,
+        refs: BTreeSet<String>,
+        contexts: BTreeSet<String>,
+    ) -> Self {
         self.matched_sources = refs;
+        self.matched_contexts = contexts;
         self
     }
 
@@ -471,25 +478,32 @@ impl ProductionSearch {
                 }
             }
         }
-        if !self.recall_sources.is_empty() || !self.matched_sources.is_empty() {
-            let references = self
-                .recall_sources
-                .union(&self.matched_sources)
+        let primary_sources = self
+            .recall_sources
+            .union(&self.matched_sources)
+            .cloned()
+            .collect::<BTreeSet<_>>();
+        let mut source_rows = Vec::new();
+        // A matching contract must not be displaced by its supporting Episodes
+        // before fusion. Both groups share one 32-row window and one lookahead.
+        for references in [
+            primary_sources.iter().cloned().collect::<Vec<_>>(),
+            self.matched_contexts
+                .difference(&primary_sources)
                 .cloned()
-                .collect::<Vec<_>>();
+                .collect(),
+        ] {
+            if source_rows.len() == 33 {
+                break;
+            }
+            if references.is_empty() {
+                continue;
+            }
             match deadline
-                .run(snapshot.structured(&references, &filter, 33))
+                .run(snapshot.structured(&references, &filter, 33 - source_rows.len()))
                 .await
             {
-                Ok(Ok(mut rows)) => {
-                    if rows.len() > 32 {
-                        omitted_refs
-                            .extend(rows[32..].iter().filter_map(|row| row.candidate_id.clone()));
-                        rows.truncate(32);
-                        degraded_reasons.insert("recall_source_budget_exhausted".into());
-                    }
-                    structured.extend(rows);
-                }
+                Ok(Ok(rows)) => source_rows.extend(rows),
                 Ok(Err(_)) => {
                     degraded_reasons.insert("recall_source_channel_unavailable".into());
                 }
@@ -498,6 +512,16 @@ impl ProductionSearch {
                 }
             }
         }
+        if source_rows.len() > 32 {
+            omitted_refs.extend(
+                source_rows[32..]
+                    .iter()
+                    .filter_map(|row| row.candidate_id.clone()),
+            );
+            source_rows.truncate(32);
+            degraded_reasons.insert("recall_source_budget_exhausted".into());
+        }
+        structured.extend(source_rows);
         // Pin object and original-evidence targets before text channels. Both
         // use the existing native filters; neither is a new access grant.
         if !context.query_facets.target_anchors.is_empty() {
@@ -604,6 +628,12 @@ impl ProductionSearch {
                 (0, 0)
             } else if recall {
                 (0, 1)
+            } else if row
+                .candidate_id
+                .as_ref()
+                .is_some_and(|id| self.matched_contexts.contains(id))
+            {
+                (0, 2)
             } else if let Some(position) = anchor_position {
                 (1, position)
             } else if exact || stable {
@@ -624,9 +654,11 @@ impl ProductionSearch {
             BTreeMap::<String, ((u8, usize), SearchCandidate, &SearchProjectionRow)>::new();
         for (row_index, (rank, row, explicit_exact)) in ranked.iter().enumerate() {
             let candidate_id = row.candidate_id.clone().ok_or(SearchError::Corrupt)?;
+            let matched = self.matched_sources.contains(&candidate_id)
+                || self.matched_contexts.contains(&candidate_id);
             let origin = match rank.0 {
                 0 if rank.1 == 0 => "normative",
-                0 if self.matched_sources.contains(&candidate_id) => "future_cue_match",
+                0 if matched => "future_cue_match",
                 0 => "recall_source",
                 1 => "target_anchor",
                 2 => "exact",
@@ -636,7 +668,7 @@ impl ProductionSearch {
             if self.recall_sources.contains(&candidate_id) {
                 origins.insert("recall_source".into());
             }
-            if self.matched_sources.contains(&candidate_id) {
+            if matched {
                 origins.insert("future_cue_match".into());
             }
             if rank.0 <= 1 && *explicit_exact {

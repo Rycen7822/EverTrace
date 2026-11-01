@@ -356,11 +356,12 @@ impl WriterHandle {
     pub async fn recall_source_contexts(
         &self,
         episode: evertrace_domain::revision::RevisionId,
+        limit: usize,
     ) -> Result<Vec<RecallCurrentContext>, WriterActorError> {
         let (reply, response) = oneshot::channel();
         self.sender
             .send(WriterRequest::RecallCurrentContexts {
-                limit: 33,
+                limit,
                 source_episode: Some(episode),
                 reply,
             })
@@ -1681,7 +1682,7 @@ async fn run_writer(
                 } => {
                     let writer = writer.as_ref().ok_or(WriterActorError::Stopped)?;
                     let result = match source_episode {
-                        Some(episode) => writer.recall_source_contexts(episode),
+                        Some(episode) => writer.recall_source_contexts(episode, limit),
                         None => writer.recall_current_contexts(limit),
                     }
                     .map_err(map_store_error);

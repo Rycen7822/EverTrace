@@ -9896,9 +9896,13 @@ impl JournalAdmissionState {
         &self,
         frontier: u64,
         episode: RevisionId,
+        limit: usize,
     ) -> Result<Vec<RecallCurrentContext>, StoreError> {
-        // One lookahead distinguishes 32 exact-fit source contexts from overflow.
-        self.recall_contexts(frontier, 33, Some(episode))
+        // The caller includes at most one lookahead in the shared source window.
+        if limit == 0 || limit > 33 {
+            return Err(StoreError::InvalidInput);
+        }
+        self.recall_contexts(frontier, limit, Some(episode))
     }
 
     fn recall_contexts(

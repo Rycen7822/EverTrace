@@ -139,6 +139,7 @@ fn canonical_episode_sources(
 #[derive(Default)]
 struct MatchedSources {
     references: BTreeSet<String>,
+    contexts: BTreeSet<String>,
     checks: BTreeSet<String>,
     omitted: BTreeSet<String>,
     unknown: bool,
@@ -187,8 +188,10 @@ impl HumanGovernanceService {
         }
         let episodes = evertrace_store::EpisodeCurrentView::from_snapshot(snapshot)
             .map_err(|_| HumanGovernanceError::Store)?;
+        let mut remaining = (context.budget.candidates_remaining as usize).min(32);
         for episode in episodes.episodes.values() {
-            if !readable.contains(&episode.revision_id.to_string())
+            if episode.lifecycle_status != evertrace_domain::work::EpisodeLifecycle::Open
+                || !readable.contains(&episode.revision_id.to_string())
                 || context.task_id.is_some_and(|id| id != episode.task_id)
                 || context
                     .repository_id
@@ -203,18 +206,21 @@ impl HumanGovernanceService {
             }
             let read = tokio::time::timeout_at(
                 tokio::time::Instant::from_std(deadline),
-                self.writer.recall_source_contexts(episode.revision_id),
+                self.writer
+                    .recall_source_contexts(episode.revision_id, remaining + 1),
             )
             .await;
             let Ok(Ok(mut contexts)) = read else {
                 result.unknown = true;
                 break;
             };
-            if contexts.len() > 32 {
+            let overflow = contexts.len() > remaining;
+            if overflow {
                 result.checks.insert(episode.revision_id.to_string());
                 result.omitted.insert(episode.revision_id.to_string());
-                contexts.truncate(32);
+                contexts.truncate(remaining);
             }
+            remaining -= contexts.len();
             for source in contexts {
                 if source.frontier != snapshot.frontier {
                     result.unknown = true;
@@ -277,9 +283,12 @@ impl HumanGovernanceService {
                         .references
                         .extend(matches.iter().map(ToString::to_string));
                     result
-                        .references
+                        .contexts
                         .insert(source.episode.revision_id.to_string());
                 }
+            }
+            if overflow {
+                break;
             }
         }
         Ok(result)
@@ -514,13 +523,13 @@ impl HumanGovernanceService {
                 source_references.push(context.protected_query.clone());
             }
             source_references.extend(recall_sources.iter().cloned());
-            source_references.extend(matched.references.iter().cloned());
+            source_references.extend(matched.references.iter().chain(&matched.contexts).cloned());
             let canonical_sources =
                 canonical_episode_sources(snapshot.frontier, &index, &refs, &source_references)?;
             let mut page = crate::search::ProductionSearch::new(search.clone())
                 .with_canonical_sources(snapshot.frontier, canonical_sources)
                 .with_recall_sources(recall_sources)
-                .with_matched_sources(matched.references)
+                .with_matched_sources(matched.references, matched.contexts)
                 .with_sequence_scope(sequence_scope)
                 .with_semantic_resolution(semantics)
                 .with_validated_frontier(snapshot.frontier)

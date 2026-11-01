@@ -736,9 +736,10 @@ impl JournalWriter {
     pub fn recall_source_contexts(
         &self,
         episode: evertrace_domain::revision::RevisionId,
+        limit: usize,
     ) -> Result<Vec<crate::projections::RecallCurrentContext>, StoreError> {
         self.admission_state
-            .recall_source_contexts(self.frontier(), episode)
+            .recall_source_contexts(self.frontier(), episode, limit)
     }
 
     pub fn repository_read_context(
