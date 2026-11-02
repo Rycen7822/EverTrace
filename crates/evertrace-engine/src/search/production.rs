@@ -420,16 +420,21 @@ impl ProductionSearch {
         }
         let mut filter = self.hard_filter(&context, true);
         filter.global_only = global_only;
-        let requested_limit = context
-            .query_facets
-            .quantity_constraints
-            .iter()
-            .map(|constraint| match constraint {
-                QuantityConstraint::ResultLimit { limit } => *limit,
-            })
-            .min()
-            .unwrap_or(context.budget.candidates_remaining)
-            .min(context.budget.candidates_remaining);
+        let requested_limit = if context.query_facets.count_unit().is_some() {
+            context.budget.candidates_remaining
+        } else {
+            context
+                .query_facets
+                .quantity_constraints
+                .iter()
+                .filter_map(|constraint| match constraint {
+                    QuantityConstraint::ResultLimit { limit } => Some(*limit),
+                    QuantityConstraint::DistinctCount { .. } => None,
+                })
+                .min()
+                .unwrap_or(context.budget.candidates_remaining)
+                .min(context.budget.candidates_remaining)
+        };
         let limit = usize::try_from(requested_limit).map_err(|_| SearchError::Unsupported)?;
         let fetch_limit = if limit >= 32 {
             limit

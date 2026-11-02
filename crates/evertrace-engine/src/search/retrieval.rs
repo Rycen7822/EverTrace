@@ -586,6 +586,7 @@ impl NativeRetrieval<'_> {
             .collect();
         let mut active_evidence = Vec::new();
         let mut trace = Vec::new();
+        let mut matching_constraints = BTreeSet::new();
         let mut quoted_candidates = self.result.candidates.iter().collect::<Vec<_>>();
         if self.sequence_timeline_ready() {
             // Timeline is a view of the frozen boundary, not a new ranking or
@@ -621,6 +622,9 @@ impl NativeRetrieval<'_> {
             } else {
                 EvidenceRole::Direct
             };
+            if rule && compatible {
+                matching_constraints.insert(active_evidence.len() as u32);
+            }
             trace.push(GroundedTraceStep {
                 role,
                 statement_index: active_evidence.len() as u32,
@@ -647,7 +651,8 @@ impl NativeRetrieval<'_> {
             });
             active_evidence.push(statement);
         }
-        let view = GroundedEvidenceView {
+        let mut view = GroundedEvidenceView {
+            candidate_count: None,
             evidence_need: EvidenceNeed::from_context(self.context),
             candidate_set: CandidateBoundary {
                 generation: if added.is_empty() { 1 } else { 2 },
@@ -662,6 +667,8 @@ impl NativeRetrieval<'_> {
             completeness: self.result.completeness,
             omitted_refs: self.result.omitted_refs.clone(),
         };
+        view.candidate_count =
+            view.derive_candidate_count(&self.result.candidates, &matching_constraints);
         view.validate_at_frontier(self.result.projection_frontier)?;
         Ok(HumanSearchPage {
             result: self.result,
@@ -678,12 +685,17 @@ impl NativeRetrieval<'_> {
                 .all(|candidate| candidate.source_sequence.is_some())
     }
     fn output_limit(&self) -> usize {
+        if self.context.query_facets.count_unit().is_some() {
+            // Count has one answer; display pagination must not define its operands.
+            return 32;
+        }
         self.context
             .query_facets
             .quantity_constraints
             .iter()
-            .map(|constraint| match constraint {
-                QuantityConstraint::ResultLimit { limit } => *limit as usize,
+            .filter_map(|constraint| match constraint {
+                QuantityConstraint::ResultLimit { limit } => Some(*limit as usize),
+                QuantityConstraint::DistinctCount { .. } => None,
             })
             .min()
             .unwrap_or(32)
@@ -704,6 +716,14 @@ impl NativeRetrieval<'_> {
             });
         }
         let limit = self.output_limit();
+        let count_unit = self.context.query_facets.count_unit();
+        // Quoted text occurs twice in the wire. Reserve one bounded count operator.
+        let text_limit = 2400
+            - if count_unit.is_some() {
+                evertrace_domain::query::MAX_GROUNDED_COUNT_BYTES / 2
+            } else {
+                0
+            };
         let mut bytes = 0;
         let mut kept = Vec::new();
         for mut candidate in std::mem::take(&mut self.result.candidates) {
@@ -716,7 +736,7 @@ impl NativeRetrieval<'_> {
                 candidate.text.push('…');
                 self.degraded("source_snippet_truncated");
             }
-            if kept.len() >= limit || bytes + candidate.text.len() > 2400 {
+            if kept.len() >= limit || bytes + candidate.text.len() > text_limit {
                 self.result.omitted_refs.insert(candidate.candidate_id);
                 self.degraded("answer_pack_budget_exhausted");
             } else {
@@ -736,7 +756,9 @@ impl NativeRetrieval<'_> {
             self.degraded("ordering_provenance_not_verified");
         }
         match self.context.query_facets.answer_shape {
-            Some(AnswerShape::Count) => self.degraded("answer_shape_not_derived"),
+            Some(AnswerShape::Count) if count_unit.is_none() => {
+                self.degraded("count_unit_unspecified")
+            }
             Some(AnswerShape::Timeline) if !self.sequence_timeline_ready() => {
                 self.degraded("timeline_ordering_unavailable");
             }

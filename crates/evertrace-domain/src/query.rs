@@ -217,6 +217,15 @@ fn valid_target(value: &str) -> bool {
 #[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
 pub enum QuantityConstraint {
     ResultLimit { limit: u32 },
+    DistinctCount { unit: CountUnit },
+}
+
+/// A source record is not a physical execution; revisions are not logical objects.
+#[derive(Clone, Copy, Debug, Deserialize, Eq, Ord, PartialEq, PartialOrd, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CountUnit {
+    ObjectRevision,
+    SourceObservation,
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -240,6 +249,15 @@ pub struct QueryFacetSet {
 }
 
 impl QueryFacetSet {
+    pub fn count_unit(&self) -> Option<CountUnit> {
+        self.quantity_constraints
+            .iter()
+            .find_map(|constraint| match constraint {
+                QuantityConstraint::DistinctCount { unit } => Some(*unit),
+                QuantityConstraint::ResultLimit { .. } => None,
+            })
+    }
+
     pub fn validate(&self) -> Result<(), QueryError> {
         for values in [
             &self.target_anchors,
@@ -269,6 +287,16 @@ impl QueryFacetSet {
                 .quantity_constraints
                 .iter()
                 .any(|value| matches!(value, QuantityConstraint::ResultLimit { limit: 0 }))
+        {
+            return Err(QueryError::Invalid);
+        }
+        let count_operands = self
+            .quantity_constraints
+            .iter()
+            .filter(|constraint| matches!(constraint, QuantityConstraint::DistinctCount { .. }))
+            .count();
+        if count_operands > 1
+            || (count_operands == 1 && self.answer_shape != Some(AnswerShape::Count))
         {
             return Err(QueryError::Invalid);
         }
@@ -393,6 +421,8 @@ impl CandidateBoundary {
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct EvidenceNeed {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub count_unit: Option<CountUnit>,
     pub intent: SearchIntent,
     pub target: Vec<String>,
     pub answer_shape: Option<AnswerShape>,
@@ -406,6 +436,7 @@ impl EvidenceNeed {
     pub fn from_context(context: &SearchContext) -> Self {
         let facets = &context.query_facets;
         Self {
+            count_unit: facets.count_unit(),
             intent: context.intent,
             target: facets.target_anchors.clone(),
             answer_shape: facets.answer_shape,
@@ -420,7 +451,8 @@ impl EvidenceNeed {
     }
 
     fn validate(&self) -> Result<(), QueryError> {
-        if self.target.len() > MAX_FACET_ITEMS
+        if (self.count_unit.is_some() && self.answer_shape != Some(AnswerShape::Count))
+            || self.target.len() > MAX_FACET_ITEMS
             || self.target.iter().any(|value| !valid_target(value))
             || self.target.iter().collect::<BTreeSet<_>>().len() != self.target.len()
         {
@@ -515,6 +547,9 @@ pub struct GroundedStatement {
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct GroundedEvidenceView {
+    /// Exact only within candidate_set, never a catalog or physical-event total.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub candidate_count: Option<GroundedCount>,
     pub evidence_need: EvidenceNeed,
     pub candidate_set: CandidateBoundary,
     pub trace: Vec<GroundedTraceStep>,
@@ -525,7 +560,71 @@ pub struct GroundedEvidenceView {
     pub omitted_refs: BTreeSet<String>,
 }
 
+/// Versioned mechanical operator over existing trace slots; no duplicated refs.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct GroundedCount {
+    pub operator_revision: u32,
+    pub value: Option<u32>,
+    pub statement_indices: BTreeSet<u32>,
+}
+
+pub const MAX_GROUNDED_COUNT_BYTES: usize = 256;
+
 impl GroundedEvidenceView {
+    pub fn derive_candidate_count(
+        &self,
+        candidates: &[SearchCandidate],
+        matching_constraints: &BTreeSet<u32>,
+    ) -> Option<GroundedCount> {
+        if self.evidence_need.answer_shape != Some(AnswerShape::Count) {
+            return None;
+        }
+        let unit = self.evidence_need.count_unit?;
+        let mut identities = BTreeSet::new();
+        let mut statement_indices = BTreeSet::new();
+        for step in &self.trace {
+            if step.role == EvidenceRole::ConstraintSupport
+                && !matching_constraints.contains(&step.statement_index)
+            {
+                continue;
+            }
+            let statement = self.active_evidence.get(step.statement_index as usize)?;
+            if statement.derivation_kind != DerivationKind::Quoted {
+                continue;
+            }
+            let candidate = candidates
+                .iter()
+                .find(|candidate| statement.support_refs.contains(&candidate.candidate_id))?;
+            let identity = match unit {
+                CountUnit::ObjectRevision
+                    if candidate.row_variant == SearchCandidateVariant::Object =>
+                {
+                    if candidate.object_kind.as_deref()? == "wiki_projection" {
+                        continue;
+                    }
+                    candidate.candidate_id.as_str()
+                }
+                CountUnit::SourceObservation
+                    if candidate.row_variant == SearchCandidateVariant::EvidenceSurface =>
+                {
+                    candidate.source_ref.parse::<SourceObservationId>().ok()?;
+                    candidate.source_ref.as_str()
+                }
+                _ => continue,
+            };
+            identities.insert(identity);
+            statement_indices.insert(step.statement_index);
+        }
+        Some(GroundedCount {
+            operator_revision: 1,
+            value: (self.completeness == RetrievalCompleteness::Complete)
+                .then(|| u32::try_from(identities.len()).ok())
+                .flatten(),
+            statement_indices,
+        })
+    }
+
     pub fn validate(&self) -> Result<(), QueryError> {
         self.validate_inner(None)
     }
@@ -537,6 +636,24 @@ impl GroundedEvidenceView {
     fn validate_inner(&self, frontier: Option<u64>) -> Result<(), QueryError> {
         self.evidence_need.validate()?;
         self.candidate_set.validate()?;
+        if let Some(count) = &self.candidate_count {
+            if self.evidence_need.answer_shape != Some(AnswerShape::Count)
+                || self.evidence_need.count_unit.is_none()
+                || count.operator_revision != 1
+                || count.value.is_some() != (self.completeness == RetrievalCompleteness::Complete)
+                || count.statement_indices.iter().any(|index| {
+                    self.active_evidence
+                        .get(*index as usize)
+                        .is_none_or(|statement| statement.derivation_kind != DerivationKind::Quoted)
+                })
+                || serde_json::to_vec(count)
+                    .map_err(|_| QueryError::Invalid)?
+                    .len()
+                    > MAX_GROUNDED_COUNT_BYTES
+            {
+                return Err(QueryError::Invalid);
+            }
+        }
         let mut covered = BTreeSet::new();
         for step in &self.trace {
             let index = step.statement_index as usize;
@@ -1339,10 +1456,16 @@ impl HumanSearchQuery {
             || !(1..=32).contains(&self.limit)
             || self.selection == MemoryScopeSelection::Unassigned
             || self.facets.scope_boundary != self.selection.boundary()
-            || self.facets.quantity_constraints
-                != vec![QuantityConstraint::ResultLimit {
-                    limit: u32::from(self.limit),
-                }]
+            || self
+                .facets
+                .quantity_constraints
+                .iter()
+                .filter_map(|constraint| match constraint {
+                    QuantityConstraint::ResultLimit { limit } => Some(*limit),
+                    QuantityConstraint::DistinctCount { .. } => None,
+                })
+                .collect::<Vec<_>>()
+                != vec![u32::from(self.limit)]
             || [
                 &self.facets.exact_identifiers,
                 &self.facets.condition_literals,
@@ -1393,10 +1516,27 @@ impl HumanSearchPage {
                     .is_ok()
                     && view.candidate_set.candidate_refs == refs
                     && view.completeness == self.result.completeness
+                    && self.count_derivation_valid(view)
             })
             && self.quoted_statements_valid()
             && self.timeline_order_valid()
             && self.sequence_positions_valid()
+    }
+
+    fn count_derivation_valid(&self, view: &GroundedEvidenceView) -> bool {
+        if view.evidence_need.count_unit.is_none() {
+            return view.candidate_count.is_none()
+                && (view.evidence_need.answer_shape != Some(AnswerShape::Count)
+                    || view.completeness != RetrievalCompleteness::Complete);
+        }
+        let Some(count) = &view.candidate_count else {
+            return false;
+        };
+        // Ordinary answer evidence is required. Constraint-only matches are
+        // declared by the Native protected-IR predicate, not inferred from prose.
+        view.derive_candidate_count(&self.result.candidates, &count.statement_indices)
+            .as_ref()
+            == Some(count)
     }
 
     fn quoted_statements_valid(&self) -> bool {
