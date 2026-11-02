@@ -3,7 +3,10 @@
 <button class="button" type="button" data-detail-open>返回所选修订详情</button>
 <button class="button" type="button" data-nav-back hidden>返回上一条记录</button>
 <p class="muted">以下是原生返回的精确引用，含来源、支持及范围依赖，不按名称或 scope 猜跳转。投影不是原始归档，关联也不表示内容已核实。</p>
-{% if 'related_references_unavailable' in reasons %}<p>存在缺失或无法唯一定位的引用；此页不是完整来源清单。</p>{% elif status != 'ready' %}<p>读取有降级（{{ reasons|join('、') }}）；这不是完整成功。</p>{% endif %}
+<p class="muted">显式修订保持原版；逻辑对象引用按本次原生读取水位定位当前修订，返回的精确修订显示在记录下方。</p>
+{% if 'related_references_unavailable' in reasons %}
+<p>存在缺失、不可读或无法唯一定位的引用；此页不是完整来源清单。</p>
+{% elif status != 'ready' %}<p>读取有降级（{{ reasons|join('、') }}）；这不是完整成功。</p>{% endif %}
 {% for item in items %}
 <button class="memory-item linked-record" type="button" data-link-key="{{ item.stable_key }}" data-revision="{{ item.revision_ref or '' }}" data-object="{{ item.object_ref or '' }}" data-kind="{{ item.object_kind }}"{% if not item.revision_ref %} disabled{% endif %}>
 <h3>{{ item.object_kind }}</h3><p>{{ item.object_ref or item.stable_key }}</p><p>修订：{{ item.revision_ref or '未提供；不能猜当前版' }}</p>

@@ -1623,6 +1623,11 @@ fn map_semantic_detail(
         state: detail.state,
         content: detail.content.map(|content| match content {
             evertrace_engine::HumanSemanticContent::Digest(value) => Content::Digest(value),
+            evertrace_engine::HumanSemanticContent::Attempt(value) => Content::Attempt(value),
+            evertrace_engine::HumanSemanticContent::OperationBurst(value) => {
+                Content::OperationBurst(value)
+            }
+            evertrace_engine::HumanSemanticContent::Operation(value) => Content::Operation(value),
             evertrace_engine::HumanSemanticContent::WorkEpisode(value) => {
                 Content::WorkEpisode(value)
             }

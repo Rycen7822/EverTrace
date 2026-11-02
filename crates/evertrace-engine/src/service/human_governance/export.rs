@@ -765,6 +765,8 @@ pub(super) fn dependencies_for(row: &ObjectRow, payload: &JournalPayload) -> BTr
             refs.extend(value.evidence_refs.iter().cloned());
         }
         JournalPayload::OperationBurstRecorded(value) => {
+            refs.extend(value.primary_binding.task_id.map(|id| id.to_string()));
+            refs.extend(value.primary_binding.workstream_id.map(|id| id.to_string()));
             refs.extend(
                 value
                     .members

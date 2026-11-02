@@ -12,6 +12,9 @@ pub enum HumanSemanticContent {
     Atom(Box<evertrace_domain::semantic::Atom>),
     Procedure(Box<evertrace_domain::procedure::ProcedureRevision>),
     CoreMembership(Box<evertrace_domain::semantic::CoreMembership>),
+    Attempt(Box<evertrace_domain::work::Attempt>),
+    OperationBurst(Box<evertrace_domain::work::OperationBurst>),
+    Operation(Box<evertrace_domain::evidence::Operation>),
     WorkEpisode(Box<evertrace_domain::work::WorkEpisode>),
     CaptureReceipt(Box<evertrace_domain::work::CaptureReceipt>),
 }
@@ -384,6 +387,9 @@ impl HumanGovernanceService {
                     | "revision_proposal_revision"
                     | "semantic_digest"
                     | "work_episode"
+                    | "attempt"
+                    | "operation_burst"
+                    | "operation"
                     | "capture_receipt"
                     | "capture_receipt_revision"
             )
@@ -406,6 +412,9 @@ impl HumanGovernanceService {
                         | "core_membership"
                         | "revision_proposal_revision"
                         | "work_episode"
+                        | "attempt"
+                        | "operation_burst"
+                        | "operation"
                         | "capture_receipt"
                         | "capture_receipt_revision"
                 )
@@ -570,6 +579,34 @@ pub(super) fn semantic_value(
             let revision = value.membership_revision_id.to_string();
             (
                 HumanSemanticContent::CoreMembership(value),
+                None,
+                object,
+                revision,
+            )
+        }
+        JournalPayload::AttemptRecorded(value) => {
+            value.validate().map_err(|_| HumanGovernanceError::Store)?;
+            let object = value.attempt_id.to_string();
+            let revision = value.revision_id.to_string();
+            (HumanSemanticContent::Attempt(value), None, object, revision)
+        }
+        JournalPayload::OperationBurstRecorded(value) => {
+            value.validate().map_err(|_| HumanGovernanceError::Store)?;
+            let object = value.operation_burst_id.to_string();
+            let revision = value.revision_id.to_string();
+            (
+                HumanSemanticContent::OperationBurst(value),
+                None,
+                object,
+                revision,
+            )
+        }
+        JournalPayload::OperationDerived(value) => {
+            value.validate().map_err(|_| HumanGovernanceError::Store)?;
+            let object = value.operation_id.to_string();
+            let revision = format!("{}@{}", value.operation_id, value.operation_revision);
+            (
+                HumanSemanticContent::Operation(value),
                 None,
                 object,
                 revision,

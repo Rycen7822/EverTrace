@@ -192,6 +192,9 @@ impl HumanGovernanceService {
                     | "source_receipt"
                     | "source_observation"
                     | "work_episode"
+                    | "attempt"
+                    | "operation_burst"
+                    | "operation"
                     | "capture_receipt"
                     | "capture_receipt_revision"
             )

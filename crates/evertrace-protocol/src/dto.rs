@@ -1758,6 +1758,9 @@ pub enum HumanSemanticContent {
     Atom(Box<evertrace_domain::semantic::Atom>),
     Procedure(Box<evertrace_domain::procedure::ProcedureRevision>),
     CoreMembership(Box<evertrace_domain::semantic::CoreMembership>),
+    Attempt(Box<evertrace_domain::work::Attempt>),
+    OperationBurst(Box<evertrace_domain::work::OperationBurst>),
+    Operation(Box<evertrace_domain::evidence::Operation>),
     WorkEpisode(Box<evertrace_domain::work::WorkEpisode>),
     CaptureReceipt(Box<evertrace_domain::work::CaptureReceipt>),
 }
@@ -1933,6 +1936,25 @@ impl HumanSemanticDetail {
                     && self.revision_ref.as_deref()
                         == Some(value.capture_receipt_revision_id.to_string().as_str())
             }
+            HumanSemanticContent::Attempt(value) => {
+                value.validate().is_ok()
+                    && self.object_ref.as_deref() == Some(value.attempt_id.to_string().as_str())
+                    && self.revision_ref.as_deref() == Some(value.revision_id.to_string().as_str())
+            }
+            HumanSemanticContent::OperationBurst(value) => {
+                value.validate().is_ok()
+                    && self.object_ref.as_deref()
+                        == Some(value.operation_burst_id.to_string().as_str())
+                    && self.revision_ref.as_deref() == Some(value.revision_id.to_string().as_str())
+            }
+            HumanSemanticContent::Operation(value) => {
+                value.validate().is_ok()
+                    && self.object_ref.as_deref() == Some(value.operation_id.to_string().as_str())
+                    && self.revision_ref.as_deref()
+                        == Some(
+                            format!("{}@{}", value.operation_id, value.operation_revision).as_str(),
+                        )
+            }
             HumanSemanticContent::WorkEpisode(value) => {
                 value.validate().is_ok()
                     && self.object_ref.as_deref() == Some(value.episode_id.to_string().as_str())
@@ -1988,6 +2010,11 @@ impl HumanSnapshotItem {
                         self.object_kind == "core_membership"
                     }
                     HumanSemanticContent::WorkEpisode(_) => self.object_kind == "work_episode",
+                    HumanSemanticContent::Attempt(_) => self.object_kind == "attempt",
+                    HumanSemanticContent::OperationBurst(_) => {
+                        self.object_kind == "operation_burst"
+                    }
+                    HumanSemanticContent::Operation(_) => self.object_kind == "operation",
                     HumanSemanticContent::CaptureReceipt(value) => {
                         match self.object_kind.as_str() {
                             "capture_receipt" => {

@@ -500,10 +500,13 @@ fn semantic_lines(
             "Read capture receipt content in Web",
             "请在 Web 中阅读采集覆盖凭证"
         )],
-        HumanSemanticContent::WorkEpisode(_) => vec![crate::locale::format!(
+        HumanSemanticContent::WorkEpisode(_)
+        | HumanSemanticContent::Attempt(_)
+        | HumanSemanticContent::OperationBurst(_)
+        | HumanSemanticContent::Operation(_) => vec![crate::locale::format!(
             language,
-            "Read WorkEpisode content in Web",
-            "请在 Web 中阅读工作片段内容"
+            "Read work content in Web",
+            "请在 Web 中阅读工作记录内容"
         )],
         HumanSemanticContent::Digest(digest) => {
             use evertrace_domain::semantic::{SemanticCompleteness, SemanticDigestStatus};
