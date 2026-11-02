@@ -83,7 +83,7 @@ impl DiagnosticSession {
             if !self.work_point() {
                 return Err(SearchError::Unsupported);
             }
-            if !hard_compatible(row, &self.context)? || !relevant(row, &self.context) {
+            if !hard_compatible(row, &self.context, None)? || !relevant(row, &self.context) {
                 continue;
             }
             if self
@@ -133,7 +133,7 @@ impl DiagnosticSession {
             if !self.work_point() {
                 return Err(SearchError::Unsupported);
             }
-            if !hard_compatible(row, &self.context)? {
+            if !hard_compatible(row, &self.context, None)? {
                 continue;
             }
             for reference in [row.source_ref.as_deref(), row.candidate_id.as_deref()]
@@ -184,7 +184,7 @@ impl DiagnosticSession {
                 let Some(row) = by_ref.get(target.as_str()) else {
                     continue;
                 };
-                if !hard_compatible(row, &self.context)? {
+                if !hard_compatible(row, &self.context, None)? {
                     continue;
                 }
                 if self
@@ -233,7 +233,9 @@ impl DiagnosticSession {
             || !self.work_point()
             || matches!(
                 gap.kind,
-                NamedGapKind::AllowlistedRelationSlot | NamedGapKind::ProtectedFacet
+                NamedGapKind::AllowlistedRelationSlot
+                    | NamedGapKind::ProtectedFacet
+                    | NamedGapKind::TemporalEvidence
             )
         {
             return Err(SearchError::Unsupported);
@@ -252,7 +254,9 @@ impl DiagnosticSession {
                         && row.currentness.as_deref() == Some("current")
                         && row.source_ref.as_deref() == Some(gap.identifier.as_str())
                 }
-                NamedGapKind::AllowlistedRelationSlot | NamedGapKind::ProtectedFacet => false,
+                NamedGapKind::AllowlistedRelationSlot
+                | NamedGapKind::ProtectedFacet
+                | NamedGapKind::TemporalEvidence => false,
             } {
                 matches.push(row);
             }
@@ -260,7 +264,7 @@ impl DiagnosticSession {
         let [row] = matches.as_slice() else {
             return Err(SearchError::Unsupported);
         };
-        if !hard_compatible(row, &self.context)? {
+        if !hard_compatible(row, &self.context, None)? {
             return Err(SearchError::Unsupported);
         }
         let candidate_id = row.candidate_id.as_ref().ok_or(SearchError::Corrupt)?;
@@ -472,6 +476,7 @@ fn push_candidate(
         return Ok(());
     }
     result.candidates.push(SearchCandidate {
+        source_time: None,
         source_sequence: None,
         candidate_id,
         source_ref: row.source_ref.clone().ok_or(SearchError::Corrupt)?,

@@ -64,6 +64,7 @@ mod tests {
             authoritative_frontier: frontier,
             candidates: vec![SearchCandidate {
                 source_sequence: None,
+                source_time: None,
                 candidate_id: BASE_REVISION.into(),
                 source_ref: BASE_ENTITY.into(),
                 row_variant: evertrace_domain::query::SearchCandidateVariant::Object,
@@ -330,6 +331,7 @@ mod tests {
             let candidate = format!("01890f47-6a4a-7cc1-98b9-{index:012x}");
             result.candidates.push(SearchCandidate {
                 source_sequence: None,
+                source_time: None,
                 candidate_id: candidate.clone(),
                 source_ref: candidate,
                 row_variant: evertrace_domain::query::SearchCandidateVariant::Object,
@@ -368,11 +370,11 @@ mod tests {
         user.query_facets.source_boundary = Some(SourceBoundary::User);
         let mut object = object_row(BASE_REVISION, BASE_ENTITY, "current", "needle");
         object.authority = Some("user_explicit".into());
-        assert!(hard_compatible(&object, &user).unwrap());
+        assert!(hard_compatible(&object, &user, None).unwrap());
         object.authority = Some("agent_inferred".into());
-        assert!(!hard_compatible(&object, &user).unwrap());
+        assert!(!hard_compatible(&object, &user, None).unwrap());
         let evidence = evidence_row(7, "user");
-        assert!(hard_compatible(&evidence, &user).unwrap());
+        assert!(hard_compatible(&evidence, &user, None).unwrap());
 
         let candidate = a_result(7).candidates.remove(0);
         let mut temporal = context();
@@ -383,6 +385,7 @@ mod tests {
         assert!(temporal_is_partial(
             &[((0, 0), candidate.clone(), &object)],
             &temporal,
+            None,
             &mut reasons
         ));
         assert!(reasons.contains("event_clock_provenance_unverified"));
@@ -390,6 +393,7 @@ mod tests {
         assert!(temporal_is_partial(
             &[((0, 0), candidate, &object)],
             &temporal,
+            None,
             &mut reasons
         ));
     }

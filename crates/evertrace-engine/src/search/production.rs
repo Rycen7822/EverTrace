@@ -42,6 +42,33 @@ impl SourceSequenceScope {
     }
 }
 
+/// Borrow canonical facts at the pinned frontier; do not mirror the source catalogue.
+pub(crate) struct SourceTimeScope<'a> {
+    pub frontier: u64,
+    pub read: &'a (dyn Fn(&str) -> Option<evertrace_domain::query::SourceTimePosition> + Sync),
+    pub readable_refs: Option<&'a BTreeSet<String>>,
+}
+
+impl SourceTimeScope<'_> {
+    pub fn position(
+        &self,
+        row: &SearchProjectionRow,
+    ) -> Result<Option<evertrace_domain::query::SourceTimePosition>, SearchError> {
+        if row.row_variant != "evidence_surface" {
+            return Ok(None);
+        }
+        let position = (self.read)(row.source_ref.as_deref().ok_or(SearchError::Corrupt)?)
+            .ok_or(SearchError::Corrupt)?;
+        if !position.validate()
+            || position.event_time_us != row.event_time_us
+            || position.recorded_at_us != row.recorded_at_us
+        {
+            return Err(SearchError::Corrupt);
+        }
+        Ok(Some(position))
+    }
+}
+
 pub struct ProductionSearch {
     index: SearchIndex,
     sequence_scope: Option<SourceSequenceScope>,
@@ -135,14 +162,22 @@ impl ProductionSearch {
         self
     }
 
-    fn hard_filter(&self, context: &SearchContext, object_only: bool) -> SearchHardFilter {
+    fn hard_filter(
+        &self,
+        context: &SearchContext,
+        object_only: bool,
+        time_scope: Option<&SourceTimeScope<'_>>,
+    ) -> SearchHardFilter {
         let suppressed_hashes = match &context.suppression {
             SuppressionSnapshot::Current { ref_hashes, .. } => ref_hashes.clone(),
             SuppressionSnapshot::Unavailable => unreachable!("handled above"),
         };
         let (source_role, authority) = source_filter(context.query_facets.source_boundary);
         SearchHardFilter {
-            readable_refs: self.readable_refs.as_ref().map(|(_, refs)| refs.clone()),
+            readable_refs: time_scope
+                .and_then(|scope| scope.readable_refs)
+                .cloned()
+                .or_else(|| self.readable_refs.as_ref().map(|(_, refs)| refs.clone())),
             // A is a candidate channel; C owns positive facet compatibility.
             condition_literals: Vec::new(),
             excluded_identifiers: context.query_facets.explicit_exclusions.clone(),
@@ -174,11 +209,15 @@ impl ProductionSearch {
             suppressed_refs: suppressed_hashes.clone(),
             suppressed_hashes,
             event_time_as_of: match context.query_facets.temporal_qualifiers.as_slice() {
-                [TemporalQualifier::EventTimeAsOf { at_us }] => Some(*at_us),
+                [TemporalQualifier::EventTimeAsOf { at_us }] if time_scope.is_none() => {
+                    Some(*at_us)
+                }
                 _ => None,
             },
             event_time_interval: match context.query_facets.temporal_qualifiers.as_slice() {
-                [TemporalQualifier::EventTimeInterval { start_us, end_us }] => {
+                [TemporalQualifier::EventTimeInterval { start_us, end_us }]
+                    if time_scope.is_none() =>
+                {
                     Some((*start_us, *end_us))
                 }
                 _ => None,
@@ -194,6 +233,7 @@ impl ProductionSearch {
         &self,
         context: SearchContext,
         global_only: bool,
+        time_scope: Option<&SourceTimeScope<'_>>,
     ) -> Result<evertrace_domain::query::HumanSearchPage, SearchError> {
         use evertrace_domain::query::{HumanSearchPage, SourceBoundary};
         context.validate()?;
@@ -233,12 +273,12 @@ impl ProductionSearch {
         } else {
             snapshot
         };
-        let mut objects = self.hard_filter(&context, true);
+        let mut objects = self.hard_filter(&context, true, time_scope);
         objects.global_only = global_only;
         let evidence = match context.query_facets.source_boundary {
             Some(SourceBoundary::ProjectPolicy | SourceBoundary::ObjectiveEvidence) => None,
             role => {
-                let mut filter = self.hard_filter(&context, false);
+                let mut filter = self.hard_filter(&context, false, time_scope);
                 filter.global_only = global_only;
                 filter.current_only = false;
                 filter.lifecycle = None;
@@ -272,6 +312,7 @@ impl ProductionSearch {
                 &deadline,
                 global_only,
                 evidence.as_ref(),
+                time_scope,
             )
             .await?;
         super::retrieval::NativeRetrieval {
@@ -283,6 +324,7 @@ impl ProductionSearch {
             deadline: &deadline,
             semantics: self.semantics.as_ref(),
             sequence_scope: self.sequence_scope.as_ref(),
+            time_scope,
         }
         .run()
         .await
@@ -362,6 +404,7 @@ impl ProductionSearch {
             &deadline,
             false,
             None,
+            None,
         )
         .await
     }
@@ -374,6 +417,7 @@ impl ProductionSearch {
         deadline: &RequestDeadline,
         global_only: bool,
         anchor_evidence: Option<&SearchHardFilter>,
+        time_scope: Option<&SourceTimeScope<'_>>,
     ) -> Result<SearchResult, SearchError> {
         let started = deadline.started;
         let mut changed_frontiers = BTreeSet::new();
@@ -406,6 +450,9 @@ impl ProductionSearch {
         {
             changed_frontiers.insert("source_sequence_scope_unresolved".into());
         }
+        if time_scope.is_some_and(|scope| scope.frontier != snapshot.frontier()) {
+            changed_frontiers.insert("source_time_frontier_changed".into());
+        }
         if !changed_frontiers.is_empty() {
             return Ok(SearchResult {
                 layer: RetrievalLayer::A,
@@ -418,7 +465,7 @@ impl ProductionSearch {
                 budget: context.budget,
             });
         }
-        let mut filter = self.hard_filter(&context, true);
+        let mut filter = self.hard_filter(&context, true, time_scope);
         filter.global_only = global_only;
         let requested_limit = if context.query_facets.count_unit().is_some() {
             context.budget.candidates_remaining
@@ -597,7 +644,7 @@ impl ProductionSearch {
         rows.dedup_by(|left, right| left.row_id == right.row_id);
         let mut ranked = Vec::with_capacity(rows.len());
         for row in &rows {
-            if row.candidate_id.is_none() || !hard_compatible(row, &context)? {
+            if row.candidate_id.is_none() || !hard_compatible(row, &context, time_scope)? {
                 continue;
             }
             let exact = row.candidate_id.as_deref() == Some(context.protected_query.as_str())
@@ -693,9 +740,14 @@ impl ProductionSearch {
                 entry.1.retrieval_origins.extend(origins);
                 continue;
             }
+            let source_time = time_scope
+                .map(|scope| scope.position(row))
+                .transpose()?
+                .flatten();
+            let time_bytes = source_time.as_ref().map_or(0, |value| value.wire_bytes());
             if context
                 .budget
-                .consume_candidate_text(row.text.len())
+                .consume_candidate_text(row.text.len().saturating_add(time_bytes))
                 .is_err()
             {
                 omitted_refs.extend(
@@ -727,6 +779,7 @@ impl ProductionSearch {
                 .flatten();
             let candidate = SearchCandidate {
                 source_sequence,
+                source_time,
                 candidate_id: candidate_id.clone(),
                 source_ref: row.source_ref.clone().unwrap_or_default(),
                 row_variant,
@@ -780,7 +833,8 @@ impl ProductionSearch {
             || candidates
                 .iter()
                 .any(|(_, candidate, _)| candidate.conflicted);
-        let temporal_partial = temporal_is_partial(&candidates, &context, &mut degraded_reasons);
+        let temporal_partial =
+            temporal_is_partial(&candidates, &context, time_scope, &mut degraded_reasons);
         let mut completeness = if conflicted {
             RetrievalCompleteness::Conflicted
         } else if temporal_partial
@@ -896,6 +950,7 @@ fn source_filter(boundary: Option<SourceBoundary>) -> (Option<String>, Option<St
 pub(super) fn hard_compatible(
     row: &SearchProjectionRow,
     context: &SearchContext,
+    time_scope: Option<&SourceTimeScope<'_>>,
 ) -> Result<bool, QueryError> {
     if let Some(hash) = row.suppression_ref_hash.as_deref()
         && context.suppression.suppresses(hash)?
@@ -952,7 +1007,7 @@ pub(super) fn hard_compatible(
                     || row.source_ref.as_deref() == Some(value)
                     || row.text.contains(value)
             })
-        || !temporal_compatible(row, context)
+        || !temporal_compatible(row, context, time_scope)?
         || context
             .suppression
             .suppresses(row.candidate_id.as_deref().unwrap_or_default())?
@@ -989,6 +1044,7 @@ fn source_compatible(row: &SearchProjectionRow, boundary: Option<SourceBoundary>
 pub(super) fn temporal_is_partial(
     candidates: &[((u8, usize), SearchCandidate, &SearchProjectionRow)],
     context: &SearchContext,
+    time_scope: Option<&SourceTimeScope<'_>>,
     degraded: &mut BTreeSet<String>,
 ) -> bool {
     let required_domain = match context.query_facets.temporal_qualifiers.as_slice() {
@@ -1004,6 +1060,17 @@ pub(super) fn temporal_is_partial(
             return true;
         }
     };
+    if time_scope.is_some() {
+        let partial = candidates.iter().any(|(_, candidate, _)| {
+            !candidate.source_time.as_ref().is_some_and(|position| {
+                position.temporal_match(&context.query_facets.temporal_qualifiers) == Some(true)
+            })
+        });
+        if partial {
+            degraded.insert("event_clock_provenance_unverified".into());
+        }
+        return partial;
+    }
     if candidates.is_empty()
         || candidates
             .iter()
@@ -1017,8 +1084,28 @@ pub(super) fn temporal_is_partial(
     true
 }
 
-fn temporal_compatible(row: &SearchProjectionRow, context: &SearchContext) -> bool {
-    match context.query_facets.temporal_qualifiers.as_slice() {
+fn temporal_compatible(
+    row: &SearchProjectionRow,
+    context: &SearchContext,
+    time_scope: Option<&SourceTimeScope<'_>>,
+) -> Result<bool, QueryError> {
+    if let Some(scope) = time_scope
+        && matches!(
+            context.query_facets.temporal_qualifiers.as_slice(),
+            [
+                TemporalQualifier::EventTimeAsOf { .. }
+                    | TemporalQualifier::EventTimeInterval { .. }
+            ]
+        )
+    {
+        return Ok(scope
+            .position(row)
+            .map_err(|_| QueryError::Invalid)?
+            .is_none_or(|position| {
+                position.temporal_match(&context.query_facets.temporal_qualifiers) != Some(false)
+            }));
+    }
+    Ok(match context.query_facets.temporal_qualifiers.as_slice() {
         [] => true,
         [TemporalQualifier::EventTimeAsOf { at_us }] => {
             row.time_domain == "event_time" && row.event_time_us <= *at_us
@@ -1032,7 +1119,7 @@ fn temporal_compatible(row: &SearchProjectionRow, context: &SearchContext) -> bo
             row.row_variant == "evidence_surface" && row.source_sequence <= *sequence
         }
         _ => false,
-    }
+    })
 }
 
 fn mark_conservative_conflicts(

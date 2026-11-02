@@ -370,6 +370,7 @@ pub enum NamedGapKind {
     ExactIdentifier,
     AllowlistedRelationSlot,
     ProtectedFacet,
+    TemporalEvidence,
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -1382,11 +1383,153 @@ pub struct SourceSequencePosition {
     pub sequence: u64,
 }
 
+/// Canonical receipt coordinates, never inferred from an indexed nonzero scalar.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct SourceTimePosition {
+    pub event_time_us: i64,
+    pub recorded_at_us: i64,
+    pub provenance: Option<crate::evidence::EventTimeProvenance>,
+}
+
+impl SourceTimePosition {
+    pub fn validate(&self) -> bool {
+        self.event_time_us >= 0
+            && self.recorded_at_us >= 0
+            && self.provenance.is_none_or(|value| {
+                value
+                    .validate(self.event_time_us, self.recorded_at_us)
+                    .is_ok()
+            })
+    }
+
+    fn event_window(&self) -> Option<(i128, i128)> {
+        let crate::evidence::EventTimeProvenance::SourceTimestamp {
+            uncertainty_us: Some(uncertainty),
+            ..
+        } = self.provenance?
+        else {
+            return None;
+        };
+        let point = i128::from(self.event_time_us);
+        Some((
+            point - i128::from(uncertainty),
+            point + i128::from(uncertainty),
+        ))
+    }
+
+    /// None is an unresolved predicate, not false and not zero uncertainty.
+    pub fn temporal_match(&self, qualifiers: &[TemporalQualifier]) -> Option<bool> {
+        if !self.validate() {
+            return None;
+        }
+        if qualifiers.is_empty() {
+            return Some(true);
+        }
+        let (lower, upper) = self.event_window()?;
+        match qualifiers {
+            [TemporalQualifier::EventTimeAsOf { at_us }] => {
+                if upper <= i128::from(*at_us) {
+                    Some(true)
+                } else if lower > i128::from(*at_us) {
+                    Some(false)
+                } else {
+                    None
+                }
+            }
+            [TemporalQualifier::EventTimeInterval { start_us, end_us }] => {
+                let (start, end) = (i128::from(*start_us), i128::from(*end_us));
+                if lower >= start && upper < end {
+                    Some(true)
+                } else if upper < start || lower >= end {
+                    Some(false)
+                } else {
+                    None
+                }
+            }
+            _ => None,
+        }
+    }
+
+    pub fn wire_bytes(&self) -> usize {
+        // Include the enclosing candidate field name and separator, not just its value.
+        serde_json::to_vec(self).map_or(usize::MAX, |bytes| bytes.len() + 15)
+    }
+}
+
+/// This orders a view of a frozen set; it never changes ranking or generation.
+pub fn timeline_order(
+    candidates: &[SearchCandidate],
+) -> Option<(OrderingBasis, Vec<&SearchCandidate>)> {
+    if candidates.is_empty() {
+        return None;
+    }
+    let mut ordered = candidates.iter().collect::<Vec<_>>();
+    if let Some(anchor) = candidates[0]
+        .source_sequence
+        .as_ref()
+        .map(|value| value.source_anchor)
+        && candidates.iter().all(|candidate| {
+            candidate
+                .source_sequence
+                .as_ref()
+                .is_some_and(|value| value.source_anchor == anchor)
+        })
+    {
+        ordered.sort_by_key(|candidate| {
+            (
+                candidate
+                    .source_sequence
+                    .as_ref()
+                    .map(|value| value.sequence),
+                &candidate.candidate_id,
+            )
+        });
+        return Some((OrderingBasis::SourceSequence, ordered));
+    }
+    if !candidates.iter().all(|candidate| {
+        candidate
+            .source_time
+            .as_ref()
+            .is_some_and(SourceTimePosition::validate)
+    }) {
+        return None;
+    }
+    ordered.sort_by_key(|candidate| {
+        (
+            candidate
+                .source_time
+                .as_ref()
+                .map(|value| value.event_time_us),
+            &candidate.candidate_id,
+        )
+    });
+    let windows = ordered
+        .iter()
+        .map(|candidate| candidate.source_time.as_ref()?.event_window())
+        .collect::<Option<Vec<_>>>();
+    if windows.is_some_and(|windows| windows.windows(2).all(|pair| pair[0].1 <= pair[1].0)) {
+        return Some((OrderingBasis::EventTime, ordered));
+    }
+    ordered.sort_by_key(|candidate| {
+        (
+            candidate
+                .source_time
+                .as_ref()
+                .map(|value| value.recorded_at_us),
+            &candidate.candidate_id,
+        )
+    });
+    Some((OrderingBasis::RecordedAtFallback, ordered))
+}
+
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct SearchCandidate {
     pub candidate_id: String,
     pub source_sequence: Option<SourceSequencePosition>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source_time: Option<SourceTimePosition>,
     pub source_ref: String,
     pub row_variant: SearchCandidateVariant,
     pub currentness: Option<SearchCurrentness>,
@@ -1506,7 +1649,9 @@ impl HumanSearchPage {
                     && candidate.instruction_authority == "none"
                     && match candidate.row_variant {
                         SearchCandidateVariant::Object => {
-                            candidate.currentness.is_some() && candidate.source_sequence.is_none()
+                            candidate.currentness.is_some()
+                                && candidate.source_sequence.is_none()
+                                && candidate.source_time.is_none()
                         }
                         SearchCandidateVariant::EvidenceSurface => candidate.currentness.is_none(),
                     }
@@ -1521,6 +1666,7 @@ impl HumanSearchPage {
             && self.quoted_statements_valid()
             && self.timeline_order_valid()
             && self.sequence_positions_valid()
+            && self.time_positions_valid()
     }
 
     fn count_derivation_valid(&self, view: &GroundedEvidenceView) -> bool {
@@ -1559,14 +1705,19 @@ impl HumanSearchPage {
         if view.evidence_need.answer_shape != Some(AnswerShape::Timeline) {
             return true;
         }
-        if view.evidence_need.temporal_scope.mode != TemporalMode::Sequence
-            || self
-                .result
-                .candidates
-                .iter()
-                .any(|candidate| candidate.source_sequence.is_none())
+        let Some((basis, ordered)) = timeline_order(&self.result.candidates) else {
+            return view.completeness != RetrievalCompleteness::Complete
+                && view.active_evidence.iter().all(|statement| {
+                    !matches!(
+                        statement.ordering_basis,
+                        OrderingBasis::EventTime | OrderingBasis::RecordedAtFallback
+                    )
+                });
+        };
+        if basis == OrderingBasis::RecordedAtFallback
+            && view.completeness == RetrievalCompleteness::Complete
         {
-            return view.completeness != RetrievalCompleteness::Complete;
+            return false;
         }
         let mut previous = None;
         for step in &view.trace {
@@ -1576,21 +1727,94 @@ impl HumanSearchPage {
             if statement.derivation_kind != DerivationKind::Quoted {
                 continue;
             }
-            let Some(position) = self
-                .result
-                .candidates
+            let Some(rank) = ordered
                 .iter()
-                .find(|candidate| statement.support_refs.contains(&candidate.candidate_id))
-                .and_then(|candidate| candidate.source_sequence.as_ref())
+                .position(|candidate| statement.support_refs.contains(&candidate.candidate_id))
             else {
                 return false;
             };
-            if previous.is_some_and(|sequence| sequence > position.sequence) {
+            if statement.ordering_basis != basis || previous.is_some_and(|old| old >= rank) {
                 return false;
             }
-            previous = Some(position.sequence);
+            previous = Some(rank);
         }
         true
+    }
+
+    fn time_positions_valid(&self) -> bool {
+        let view = self.grounded_view.as_ref();
+        for candidate in &self.result.candidates {
+            if let Some(position) = &candidate.source_time {
+                if !position.validate()
+                    || candidate.row_variant != SearchCandidateVariant::EvidenceSurface
+                    || view.is_none_or(|view| {
+                        !matches!(
+                            view.evidence_need.temporal_scope.mode,
+                            TemporalMode::AsOf | TemporalMode::Interval
+                        ) && view.evidence_need.answer_shape != Some(AnswerShape::Timeline)
+                    })
+                {
+                    return false;
+                }
+                if view.is_some_and(|view| {
+                    position.temporal_match(&view.evidence_need.temporal_scope.qualifiers)
+                        == Some(false)
+                }) {
+                    return false;
+                }
+            }
+        }
+        let Some(view) = view else {
+            return true;
+        };
+        let temporal = matches!(
+            view.evidence_need.temporal_scope.mode,
+            TemporalMode::AsOf | TemporalMode::Interval
+        );
+        let expected = if temporal {
+            self.result
+                .candidates
+                .iter()
+                .filter(|candidate| {
+                    !candidate.source_time.as_ref().is_some_and(|position| {
+                        position.temporal_match(&view.evidence_need.temporal_scope.qualifiers)
+                            == Some(true)
+                    })
+                })
+                .map(|candidate| candidate.source_ref.as_str())
+                .collect::<BTreeSet<_>>()
+        } else {
+            BTreeSet::new()
+        };
+        let gaps = view
+            .unresolved_gaps
+            .iter()
+            .filter(|gap| gap.kind == NamedGapKind::TemporalEvidence)
+            .collect::<Vec<_>>();
+        if gaps.len() != expected.len()
+            || gaps
+                .iter()
+                .map(|gap| gap.identifier.as_str())
+                .collect::<BTreeSet<_>>()
+                != expected
+        {
+            return false;
+        }
+        if !expected.is_empty() && view.completeness == RetrievalCompleteness::Complete {
+            return false;
+        }
+        view.active_evidence.iter().all(|statement| {
+            !matches!(
+                statement.ordering_basis,
+                OrderingBasis::EventTime | OrderingBasis::RecordedAtFallback
+            ) || (view.evidence_need.answer_shape == Some(AnswerShape::Timeline)
+                && statement.derivation_kind == DerivationKind::Quoted
+                && statement.support_refs.iter().all(|reference| {
+                    self.result.candidates.iter().any(|candidate| {
+                        candidate.candidate_id == *reference && candidate.source_time.is_some()
+                    })
+                }))
+        })
     }
 
     fn sequence_positions_valid(&self) -> bool {

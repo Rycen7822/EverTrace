@@ -19,13 +19,13 @@ fn source_sequence_scope(
     {
         return None;
     }
-    let anchor = sequence_receipt(index, &reference)?;
+    let anchor = source_receipt(index, &reference)?;
     let mut positions = std::collections::BTreeMap::new();
     for reference in readable {
         if std::time::Instant::now() >= deadline {
             return None;
         }
-        let Some(receipt) = sequence_receipt(index, reference) else {
+        let Some(receipt) = source_receipt(index, reference) else {
             continue;
         };
         if receipt.source_instance_id == anchor.source_instance_id
@@ -40,11 +40,19 @@ fn source_sequence_scope(
     })
 }
 
-fn sequence_receipt(
+fn source_receipt(
     index: &std::collections::BTreeMap<&str, Vec<&ObjectRow>>,
     reference: &str,
 ) -> Option<Box<evertrace_domain::evidence::SourceReceipt>> {
-    // Revision aliases also name derived surfaces; resolve the canonical fact.
+    // Resolve stable public source/span identities, not an indexed timestamp.
+    let observation_id = reference
+        .parse::<evertrace_domain::ids::SourceObservationId>()
+        .ok()
+        .or_else(|| {
+            evertrace_domain::evidence::EvidenceSurface::parse_candidate_ref(reference)
+                .map(|value| value.0)
+        })?;
+    let reference = observation_id.to_string();
     let key = format!("object:evidence:source_observation:{reference}");
     let [row] = index.get(key.as_str())?.as_slice() else {
         return None;
@@ -70,6 +78,7 @@ fn sequence_receipt(
         || receipt.source_receipt_id != observation.source_receipt_ref
         || receipt.source_instance_id != observation.source_instance_id
         || receipt.source_revision != observation.source_revision
+        || receipt.validate().is_err()
     {
         return None;
     }
@@ -526,6 +535,43 @@ impl HumanGovernanceService {
             source_references.extend(matched.references.iter().chain(&matched.contexts).cloned());
             let canonical_sources =
                 canonical_episode_sources(snapshot.frontier, &index, &refs, &source_references)?;
+            let time_reader = |reference: &str| {
+                source_receipt(&index, reference).map(|receipt| SourceTimePosition {
+                    event_time_us: receipt.event_time_us,
+                    recorded_at_us: receipt.recorded_at_us,
+                    provenance: receipt.event_time_provenance,
+                })
+            };
+            let time_query = matches!(
+                context.query_facets.temporal_mode,
+                TemporalMode::AsOf | TemporalMode::Interval
+            ) || (context.query_facets.answer_shape
+                == Some(AnswerShape::Timeline)
+                && context.query_facets.temporal_mode != TemporalMode::Sequence);
+            let mut time_refs: Option<BTreeSet<String>> = None;
+            if matches!(
+                context.query_facets.temporal_mode,
+                TemporalMode::AsOf | TemporalMode::Interval
+            ) {
+                for reference in &refs {
+                    if std::time::Instant::now() >= deadline {
+                        return Err(HumanGovernanceError::Store);
+                    }
+                    if time_reader(reference).is_some_and(|position| {
+                        position.temporal_match(&context.query_facets.temporal_qualifiers)
+                            == Some(false)
+                    }) {
+                        time_refs
+                            .get_or_insert_with(|| refs.clone())
+                            .remove(reference);
+                    }
+                }
+            }
+            let time_scope = time_query.then_some(crate::search::SourceTimeScope {
+                frontier: snapshot.frontier,
+                read: &time_reader,
+                readable_refs: time_refs.as_ref(),
+            });
             let mut page = crate::search::ProductionSearch::new(search.clone())
                 .with_canonical_sources(snapshot.frontier, canonical_sources)
                 .with_recall_sources(recall_sources)
@@ -535,7 +581,11 @@ impl HumanGovernanceService {
                 .with_validated_frontier(snapshot.frontier)
                 .with_method_proposals(proposals)
                 .with_readable_refs(snapshot.frontier, refs)
-                .retrieve(context, query.selection == MemoryScopeSelection::Global)
+                .retrieve(
+                    context,
+                    query.selection == MemoryScopeSelection::Global,
+                    time_scope.as_ref(),
+                )
                 .await
                 .map_err(|_| HumanGovernanceError::Store)?;
             if matched.unknown {

@@ -53,6 +53,7 @@ pub(super) struct NativeRetrieval<'a> {
     pub deadline: &'a RequestDeadline,
     pub semantics: Option<&'a super::resolution::SemanticSearchResolution>,
     pub sequence_scope: Option<&'a super::SourceSequenceScope>,
+    pub time_scope: Option<&'a super::SourceTimeScope<'a>>,
 }
 
 impl NativeRetrieval<'_> {
@@ -103,7 +104,7 @@ impl NativeRetrieval<'_> {
     }
     fn admit(&mut self, rows: Vec<SearchProjectionRow>, origin: &str) -> Result<(), SearchError> {
         for row in rows {
-            if !hard_compatible(&row, self.context)? {
+            if !hard_compatible(&row, self.context, self.time_scope)? {
                 continue;
             }
             let id = row.candidate_id.clone().ok_or(SearchError::Corrupt)?;
@@ -120,8 +121,17 @@ impl NativeRetrieval<'_> {
                 self.degraded("retrieval_deadline_exhausted");
                 break;
             }
+            let source_time = self
+                .time_scope
+                .map(|scope| scope.position(&row))
+                .transpose()?
+                .flatten();
+            let time_bytes = source_time.as_ref().map_or(0, |value| value.wire_bytes());
             let mut budget = self.result.budget.clone();
-            if budget.consume_candidate_text(row.text.len()).is_err() {
+            if budget
+                .consume_candidate_text(row.text.len().saturating_add(time_bytes))
+                .is_err()
+            {
                 self.result.omitted_refs.insert(id);
                 self.degraded("retrieval_budget_exhausted");
                 continue;
@@ -148,6 +158,7 @@ impl NativeRetrieval<'_> {
                 .flatten();
             self.result.candidates.push(SearchCandidate {
                 source_sequence,
+                source_time,
                 candidate_id: id,
                 source_ref: row.source_ref.ok_or(SearchError::Corrupt)?,
                 row_variant: if row.row_variant == "object" {
@@ -259,6 +270,28 @@ impl NativeRetrieval<'_> {
                     changes_result: true,
                 });
             }
+        }
+        if matches!(
+            self.context.query_facets.temporal_mode,
+            TemporalMode::AsOf | TemporalMode::Interval
+        ) {
+            let unresolved = self
+                .result
+                .candidates
+                .iter()
+                .filter(|candidate| {
+                    !candidate.source_time.as_ref().is_some_and(|position| {
+                        position.temporal_match(&self.context.query_facets.temporal_qualifiers)
+                            == Some(true)
+                    })
+                })
+                .map(|candidate| candidate.source_ref.clone())
+                .collect::<BTreeSet<_>>();
+            gaps.extend(unresolved.into_iter().map(|identifier| NamedGap {
+                kind: NamedGapKind::TemporalEvidence,
+                identifier,
+                changes_result: true,
+            }));
         }
         gaps
     }
@@ -503,10 +536,15 @@ impl NativeRetrieval<'_> {
         }
         self.pack();
         let still_missing = self.gaps(&witnessed);
-        let gaps = pending_gaps
+        let mut gaps = pending_gaps
             .into_iter()
             .filter(|gap| still_missing.contains(gap))
             .collect::<Vec<_>>();
+        for gap in still_missing {
+            if gap.kind == NamedGapKind::TemporalEvidence && !gaps.contains(&gap) {
+                gaps.push(gap);
+            }
+        }
         let mut projected = Vec::new();
         let mut answer_bytes = self
             .result
@@ -588,18 +626,12 @@ impl NativeRetrieval<'_> {
         let mut trace = Vec::new();
         let mut matching_constraints = BTreeSet::new();
         let mut quoted_candidates = self.result.candidates.iter().collect::<Vec<_>>();
-        if self.sequence_timeline_ready() {
-            // Timeline is a view of the frozen boundary, not a new ranking or
-            // generation: source positions cannot order independent sources.
-            quoted_candidates.sort_by_key(|candidate| {
-                (
-                    candidate
-                        .source_sequence
-                        .as_ref()
-                        .map(|position| position.sequence),
-                    candidate.candidate_id.as_str(),
-                )
-            });
+        let time_order = (self.context.query_facets.answer_shape == Some(AnswerShape::Timeline))
+            .then(|| timeline_order(&self.result.candidates))
+            .flatten();
+        let ordering_basis = time_order.as_ref().map(|(basis, _)| *basis);
+        if let Some((_, ordered)) = time_order {
+            quoted_candidates = ordered;
         }
         for candidate in quoted_candidates {
             let rule = super::resolution::active_rule(candidate);
@@ -634,11 +666,13 @@ impl NativeRetrieval<'_> {
                 statement: candidate.text.clone(),
                 support_refs: BTreeSet::from([candidate.candidate_id.clone()]),
                 derivation_kind: DerivationKind::Quoted,
-                ordering_basis: if candidate.source_sequence.is_some() {
-                    OrderingBasis::SourceSequence
-                } else {
-                    OrderingBasis::Unknown
-                },
+                ordering_basis: ordering_basis.unwrap_or_else(|| {
+                    if candidate.source_sequence.is_some() {
+                        OrderingBasis::SourceSequence
+                    } else {
+                        OrderingBasis::Unknown
+                    }
+                }),
                 content_trust: "untrusted_source_content".into(),
                 instruction_authority: "none".into(),
             });
@@ -674,15 +708,6 @@ impl NativeRetrieval<'_> {
             result: self.result,
             grounded_view: Some(view),
         })
-    }
-    fn sequence_timeline_ready(&self) -> bool {
-        self.context.query_facets.answer_shape == Some(AnswerShape::Timeline)
-            && self.sequence_scope.is_some()
-            && self
-                .result
-                .candidates
-                .iter()
-                .all(|candidate| candidate.source_sequence.is_some())
     }
     fn output_limit(&self) -> usize {
         if self.context.query_facets.count_unit().is_some() {
@@ -724,7 +749,7 @@ impl NativeRetrieval<'_> {
             } else {
                 0
             };
-        let mut bytes = 0;
+        let mut bytes: usize = 0;
         let mut kept = Vec::new();
         for mut candidate in std::mem::take(&mut self.result.candidates) {
             if candidate.text.len() > 512 {
@@ -736,11 +761,16 @@ impl NativeRetrieval<'_> {
                 candidate.text.push('…');
                 self.degraded("source_snippet_truncated");
             }
-            if kept.len() >= limit || bytes + candidate.text.len() > text_limit {
+            let time_bytes = candidate
+                .source_time
+                .as_ref()
+                .map_or(0, |value| value.wire_bytes().div_ceil(2));
+            let candidate_bytes = candidate.text.len().saturating_add(time_bytes);
+            if kept.len() >= limit || bytes.saturating_add(candidate_bytes) > text_limit {
                 self.result.omitted_refs.insert(candidate.candidate_id);
                 self.degraded("answer_pack_budget_exhausted");
             } else {
-                bytes += candidate.text.len();
+                bytes += candidate_bytes;
                 kept.push(candidate);
             }
         }
@@ -748,20 +778,28 @@ impl NativeRetrieval<'_> {
         if self.sequence_scope.is_some() {
             // A per-record receipt does not prove an entire prefix is gap-free.
             self.degraded("source_sequence_coverage_unverified");
-        } else if !matches!(
+        } else if matches!(
             self.context.query_facets.temporal_mode,
-            TemporalMode::Any | TemporalMode::Current
-        ) || !self.context.query_facets.temporal_qualifiers.is_empty()
-        {
-            self.degraded("ordering_provenance_not_verified");
+            TemporalMode::AsOf | TemporalMode::Interval
+        ) && self.result.candidates.iter().any(|candidate| {
+            !candidate.source_time.as_ref().is_some_and(|position| {
+                position.temporal_match(&self.context.query_facets.temporal_qualifiers)
+                    == Some(true)
+            })
+        }) {
+            self.degraded("event_clock_provenance_unverified");
         }
         match self.context.query_facets.answer_shape {
             Some(AnswerShape::Count) if count_unit.is_none() => {
                 self.degraded("count_unit_unspecified")
             }
-            Some(AnswerShape::Timeline) if !self.sequence_timeline_ready() => {
-                self.degraded("timeline_ordering_unavailable");
-            }
+            Some(AnswerShape::Timeline) => match timeline_order(&self.result.candidates) {
+                Some((OrderingBasis::RecordedAtFallback, _)) => {
+                    self.degraded("recorded_at_fallback")
+                }
+                Some(_) => {}
+                None => self.degraded("timeline_ordering_unavailable"),
+            },
             _ => {}
         }
     }
