@@ -54,6 +54,7 @@ fn source_context_fields(
         session: receipt.source_session_ref.clone(),
         event_time_us: receipt.event_time_us,
         recorded_at_us: receipt.recorded_at_us,
+        event_time_provenance: receipt.event_time_provenance,
     }
 }
 

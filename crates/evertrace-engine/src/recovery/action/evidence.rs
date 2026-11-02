@@ -932,6 +932,7 @@ fn action_capture_input(
         parser_revision: 1,
         canonicalization_revision: 1,
         event_time_us: Some(frame.event_time_us),
+        event_time_provenance: None,
         raw_payload: frame.bytes.to_vec(),
     })
 }

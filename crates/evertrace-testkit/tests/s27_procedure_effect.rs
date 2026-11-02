@@ -419,6 +419,7 @@ mod controlled_projection_proof {
             parser_revision: 1,
             canonicalization_revision: 1,
             event_time_us: Some(sequence as i64),
+            event_time_provenance: None,
             raw_payload: payload,
         }
     }

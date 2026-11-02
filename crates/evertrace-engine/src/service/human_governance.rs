@@ -284,6 +284,8 @@ pub struct HumanSourceContext {
     pub session: String,
     pub event_time_us: i64,
     pub recorded_at_us: i64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub event_time_provenance: Option<evertrace_domain::evidence::EventTimeProvenance>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -6386,6 +6388,7 @@ fn acceptance_capture_input(
         parser_revision: 1,
         canonicalization_revision: 1,
         event_time_us: Some(now_us()?),
+        event_time_provenance: None,
         raw_payload: payload.as_bytes().to_vec(),
     })
 }

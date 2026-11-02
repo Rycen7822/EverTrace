@@ -1,3 +1,4 @@
+{% from 'source_time.html' import source_time %}
 <div class="source-archive">
 <div class="detail-actions"><button class="button" type="button" data-archive-up>返回上一页</button><button class="text-button" type="button" data-archive-first>本组首页</button></div>
 {% if page.query.kind == 'revisions' %}
@@ -14,7 +15,7 @@
 <button class="linked-record" type="button" data-archive-record data-link-key="{{ record.stable_key }}" data-revision="{{ record.observation_id }}" data-object="{{ record.observation_id }}" data-kind="source_observation">
 <strong>{{ record.observation_role }} · {{ record.sequence }}</strong>
 <span>{{ record.source_role }} · {{ record.content_trust }} · {{ record.completeness }} · {{ record.archive_mode }}</span>
-<span>event {{ record.event_time_us }} µs · recorded {{ record.recorded_at_us }} µs</span>
+<span>{{ source_time(record) }}</span>
 {% if record.byte_range is not none %}<span>来源字节 [{{ record.byte_range.start }}, {{ record.byte_range.end }})</span>{% endif %}
 {% if record.preview is not none %}<span class="source-record-preview">{{ record.preview }}</span><span>已有 {{ record.presentation }} 的{% if record.preview_truncated %}截短{% endif %}节选，不是完整归档</span>{% elif record.presentation == 'non_text' %}<span>已记录为非文本呈现</span>{% else %}<span>没有保存呈现字段；不补造预览，可按精确引用尝试打开受保护归档。</span>{% endif %}
 <span>observation {{ record.observation_id }} · receipt {{ record.receipt_id }}</span>

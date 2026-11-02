@@ -1857,6 +1857,7 @@ fn capture_input(label: &str, repository_id: RepositoryId, payload: &[u8]) -> Ca
         parser_revision: 1,
         canonicalization_revision: 1,
         event_time_us: Some(1),
+        event_time_provenance: None,
         raw_payload: payload.to_vec(),
     }
 }

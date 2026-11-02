@@ -400,6 +400,7 @@ impl EvidenceIngestor {
             parser_revision: original.body.parser_revision,
             canonicalization_revision: original.body.canonicalization_revision,
             event_time_us: None,
+            event_time_provenance: None,
             raw_payload,
         };
         let Ok(mut runtime) =

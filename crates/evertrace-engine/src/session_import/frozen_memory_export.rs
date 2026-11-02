@@ -485,6 +485,7 @@ impl FrozenMemoryExportCapture<'_> {
                 parser_revision: 1,
                 canonicalization_revision: 1,
                 event_time_us: None,
+                event_time_provenance: None,
                 raw_payload: raw,
             })
             .map_err(|_| FrozenMemoryExportImportError::Persistence)?;

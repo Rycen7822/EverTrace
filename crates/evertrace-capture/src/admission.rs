@@ -78,6 +78,7 @@ pub struct CaptureRecordInput {
     pub parser_revision: u32,
     pub canonicalization_revision: u32,
     pub event_time_us: Option<i64>,
+    pub event_time_provenance: Option<evertrace_domain::evidence::EventTimeProvenance>,
     pub raw_payload: Vec<u8>,
 }
 
@@ -414,6 +415,11 @@ impl CaptureRuntime {
             protection_key_generation: protected.key_generation(),
             event_time_us: input.event_time_us.unwrap_or(recorded_at_us),
             recorded_at_us,
+            event_time_provenance: if input.event_time_us.is_none() {
+                Some(evertrace_domain::evidence::EventTimeProvenance::RecordedAtFallback)
+            } else {
+                input.event_time_provenance
+            },
             recovery_preflight: pending.clone(),
         };
         let body = encode_record_body(&body)?;
@@ -578,6 +584,20 @@ impl From<crate::frame::SpoolFrameError> for CaptureError {
 }
 
 fn validate_input(input: &CaptureRecordInput) -> Result<(), CaptureError> {
+    if let Some(provenance) = input.event_time_provenance {
+        let time = input.event_time_us.ok_or(CaptureError::InvalidInput)?;
+        if !matches!(
+            provenance,
+            evertrace_domain::evidence::EventTimeProvenance::SourceTimestamp { .. }
+        ) || input.source_kind
+            != evertrace_domain::evidence::EvidenceSourceKind::CodexSessionJsonl
+        {
+            return Err(CaptureError::InvalidInput);
+        }
+        provenance
+            .validate(time, time)
+            .map_err(|_| CaptureError::InvalidInput)?;
+    }
     if input
         .spool_record_id
         .as_deref()

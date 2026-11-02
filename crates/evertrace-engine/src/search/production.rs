@@ -1010,10 +1010,11 @@ pub(super) fn temporal_is_partial(
             .any(|(_, _, row)| row.time_domain != required_domain)
     {
         degraded.insert("temporal_domain_incomplete".into());
-        true
     } else {
-        false
+        // An indexed scalar/domain does not attest clock origin or uncertainty.
+        degraded.insert("event_clock_provenance_unverified".into());
     }
+    true
 }
 
 fn temporal_compatible(row: &SearchProjectionRow, context: &SearchContext) -> bool {

@@ -198,6 +198,7 @@ fn capture(snapshot_path: &Path, input: CaptureHookInput, started: Instant) -> R
         parser_revision: 1,
         canonicalization_revision: 1,
         event_time_us: input.event_time_us,
+        event_time_provenance: None,
         raw_payload: input.payload.into_bytes(),
     };
     let recovery_gap_record = (gate == RecoveryGateMode::Active).then(|| record.clone());

@@ -129,6 +129,7 @@ fn input(id: &str, payload: &str) -> CaptureRecordInput {
         parser_revision: 1,
         canonicalization_revision: 1,
         event_time_us: Some(1),
+        event_time_provenance: None,
         raw_payload: payload.as_bytes().to_vec(),
     }
 }
@@ -558,6 +559,7 @@ fn hook_path_is_daemon_independent_secret_safe_and_shadow_only() {
             parser_revision: 1,
             canonicalization_revision: 1,
             event_time_us: parsed.event_time_us,
+            event_time_provenance: None,
             raw_payload: parsed.payload.into_bytes(),
         })
         .unwrap();

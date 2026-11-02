@@ -412,6 +412,8 @@ pub struct SourceReceipt {
     pub protection_key_generation: u64,
     pub event_time_us: i64,
     pub recorded_at_us: i64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub event_time_provenance: Option<EventTimeProvenance>,
     pub lifecycle: Option<crate::work::LaneLifecycleEvidence>,
 }
 
@@ -435,8 +437,53 @@ pub enum ProtectedPresentationUnavailable {
     NonText,
 }
 
+/// Describes the timestamp's origin, not the truth of an external clock.
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
+pub enum EventTimeProvenance {
+    SourceTimestamp {
+        utc_offset_seconds: i32,
+        precision_us: u32,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        uncertainty_us: Option<u64>,
+    },
+    RecordedAtFallback,
+}
+
+impl EventTimeProvenance {
+    pub fn validate(self, event_time_us: i64, recorded_at_us: i64) -> Result<(), EvidenceError> {
+        let valid = event_time_us >= 0
+            && recorded_at_us >= 0
+            && match self {
+                Self::SourceTimestamp {
+                    utc_offset_seconds,
+                    precision_us,
+                    uncertainty_us,
+                } => {
+                    (-86_340..=86_340).contains(&utc_offset_seconds)
+                        && utc_offset_seconds % 60 == 0
+                        && matches!(
+                            precision_us,
+                            1 | 10 | 100 | 1_000 | 10_000 | 100_000 | 1_000_000
+                        )
+                        && event_time_us % i64::from(precision_us) == 0
+                        && uncertainty_us.is_none_or(|value| value <= i64::MAX as u64)
+                }
+                Self::RecordedAtFallback => event_time_us == recorded_at_us,
+            };
+        if valid {
+            Ok(())
+        } else {
+            Err(EvidenceError::Invalid)
+        }
+    }
+}
+
 impl SourceReceipt {
     pub fn validate(&self) -> Result<(), EvidenceError> {
+        if let Some(provenance) = self.event_time_provenance {
+            provenance.validate(self.event_time_us, self.recorded_at_us)?;
+        }
         if let Some(presentation) = &self.protected_presentation {
             let valid = match presentation {
                 ProtectedPresentation::Inline { text } => {
@@ -479,7 +526,7 @@ impl SourceReceipt {
             || self.protection_key_generation == 0
             || self.event_time_us < 0
             || self.recorded_at_us < 0
-            || self.event_time_us > self.recorded_at_us
+            || (self.event_time_us > self.recorded_at_us && self.event_time_provenance.is_none())
             || self
                 .source_sequence_origin
                 .is_some_and(|origin| origin > self.source_sequence)
@@ -1320,7 +1367,7 @@ impl EvidenceSurface {
         if self.instruction_authority != InstructionAuthority::None
             || self.event_time_us < 0
             || self.recorded_at_us < 0
-            || self.event_time_us > self.recorded_at_us
+            // External event clocks may lead the capture clock; the receipt owns provenance validation.
             || self.canonicalization_version == 0
             || self.projection_generation == 0
             || self.protected_text.is_empty()

@@ -1354,6 +1354,7 @@ mod tests {
                 redaction_revision: 1,
                 protection_key_generation: 1,
                 event_time_us: seq as i64,
+                event_time_provenance: None,
                 recorded_at_us: seq as i64,
                 lifecycle: None,
             };

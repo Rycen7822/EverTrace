@@ -586,6 +586,7 @@ fn capture_input(sequence: u64, manifest_ref: &str) -> CaptureRecordInput {
         parser_revision: 1,
         canonicalization_revision: 1,
         event_time_us: Some(sequence as i64),
+        event_time_provenance: None,
         raw_payload: format!("payload-{sequence}").into_bytes(),
     }
 }

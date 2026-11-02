@@ -244,6 +244,7 @@ fn source(
         redaction_revision: 1,
         protection_key_generation: 1,
         event_time_us: 1,
+        event_time_provenance: None,
         recorded_at_us: 1,
         lifecycle: None,
     };
@@ -360,6 +361,7 @@ fn isolated_acceptance_input(
         parser_revision: 1,
         canonicalization_revision: 1,
         event_time_us: None,
+        event_time_provenance: None,
         raw_payload: payload.as_bytes().to_vec(),
     }
 }

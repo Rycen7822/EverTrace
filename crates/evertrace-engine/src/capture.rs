@@ -144,6 +144,19 @@ pub(crate) fn verify_capture_frame_presented(
     {
         return Err(IngestError::CasMismatch);
     }
+    if matches!(
+        body.event_time_provenance,
+        Some(evertrace_domain::evidence::EventTimeProvenance::SourceTimestamp { .. })
+    ) {
+        let timestamp = evertrace_codex::source_time::record_source_timestamp(&protected)
+            .ok_or(IngestError::InvalidRecord)?;
+        if body.source_kind != evertrace_domain::evidence::EvidenceSourceKind::CodexSessionJsonl
+            || timestamp.timestamp_us != body.event_time_us
+            || Some(timestamp.provenance) != body.event_time_provenance
+        {
+            return Err(IngestError::InvalidRecord);
+        }
+    }
     let secret_digest = body
         .protected_secret_digest
         .as_deref()
@@ -201,6 +214,7 @@ pub(crate) fn verify_capture_frame_presented(
         protection_key_generation: body.protection_key_generation,
         event_time_us: body.event_time_us,
         recorded_at_us: body.recorded_at_us,
+        event_time_provenance: body.event_time_provenance,
         lifecycle: body.lifecycle.clone(),
     };
     receipt.validate().map_err(|_| IngestError::InvalidRecord)?;

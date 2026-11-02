@@ -261,6 +261,7 @@ fn capture_input(report: &HostProbeReport) -> CaptureRecordInput {
         parser_revision: 1,
         canonicalization_revision: 1,
         event_time_us: Some(1),
+        event_time_provenance: None,
         raw_payload: b"s29 capture lifecycle".to_vec(),
     }
 }

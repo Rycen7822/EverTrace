@@ -1,0 +1,17 @@
+{% macro source_time(value) -%}
+{% set provenance = value.get('event_time_provenance') %}
+{% if provenance and provenance.kind == 'source_timestamp' %}
+<span>原文时间（UTC，微秒）：{{ value.event_time_us }}</span>
+<span>原时区偏移：{{ provenance.utc_offset_seconds }} 秒；精度：{{ provenance.precision_us }} 微秒。</span>
+{% if provenance.get('uncertainty_us') is none %}
+<span>时钟误差未提供。</span>
+{% else %}
+<span>声明的时钟误差：{{ provenance.uncertainty_us }} 微秒。</span>
+{% endif %}
+{% elif provenance and provenance.kind == 'recorded_at_fallback' %}
+<span>采用记录时间，不代表事件发生时间。</span>
+{% else %}
+<span>原时间值（来源未知，微秒）：{{ value.event_time_us }}</span>
+{% endif %}
+<span>记录时间（微秒）：{{ value.recorded_at_us }}</span>
+{%- endmacro %}

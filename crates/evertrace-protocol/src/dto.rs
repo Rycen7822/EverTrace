@@ -557,6 +557,8 @@ pub struct HumanSourceContext {
     pub session: String,
     pub event_time_us: i64,
     pub recorded_at_us: i64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub event_time_provenance: Option<evertrace_domain::evidence::EventTimeProvenance>,
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -1994,6 +1996,13 @@ impl HumanSnapshotItem {
         self.source_context.as_ref().is_none_or(|context| {
             !context.session.is_empty()
                 && context.session.len() <= 4096
+                && context.event_time_us >= 0
+                && context.recorded_at_us >= 0
+                && context.event_time_provenance.is_none_or(|value| {
+                    value
+                        .validate(context.event_time_us, context.recorded_at_us)
+                        .is_ok()
+                })
                 && context
                     .directory
                     .as_ref()

@@ -292,6 +292,7 @@ fn capture_input(
         parser_revision: 1,
         canonicalization_revision: 1,
         event_time_us: Some(i64::try_from(sequence).unwrap()),
+        event_time_provenance: None,
         raw_payload: format!("needle-s20 {label}").into_bytes(),
     }
 }

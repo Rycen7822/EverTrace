@@ -5,6 +5,7 @@
 {% set item = items[0] %}
 {% set detail = item.get('semantic_detail') %}
 {% set evidence = item.get('evidence_detail') %}
+{% from 'source_time.html' import source_time %}
 {% set source_context = item.get('source_context') %}
 <div class="detail-title">
   <div class="badges">
@@ -61,7 +62,7 @@
   <p>归档保护后长度：{{ evidence.protected_length }} 字节。来源文本 instruction_authority=none，不视为操作指令。</p>
   {% if source_context %}
   <p>目录：{{ source_context.directory or '未提供' }} · 会话：{{ source_context.session }}</p>
-  <p>来源事件时间（微秒）：{{ source_context.event_time_us }} · 记录时间（微秒）：{{ source_context.recorded_at_us }}</p>
+  <p>{{ source_time(source_context) }}</p>
   {% endif %}
   {% set presentation = evidence.protected_presentation %}
   {% if presentation and presentation.kind in ('inline', 'preview') %}

@@ -124,6 +124,7 @@ fn source(label: &str, payload: &str, at: i64) -> (SourceReceipt, SourceObservat
         redaction_revision: 1,
         protection_key_generation: 1,
         event_time_us: 0,
+        event_time_provenance: None,
         recorded_at_us: at,
         lifecycle: None,
     };

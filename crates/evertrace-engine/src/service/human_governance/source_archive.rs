@@ -167,6 +167,7 @@ impl HumanGovernanceService {
                 archive_mode: receipt.archive_mode,
                 event_time_us: receipt.event_time_us,
                 recorded_at_us: receipt.recorded_at_us,
+                event_time_provenance: receipt.event_time_provenance,
                 presentation,
                 preview_truncated: text.is_some_and(|text| text.len() > 512),
                 preview,

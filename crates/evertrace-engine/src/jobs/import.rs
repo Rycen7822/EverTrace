@@ -2066,6 +2066,7 @@ mod tests {
                 SourceRevisionMode::Append,
                 None,
                 RecordVisibility {
+                    source_time: None,
                     role: ObservationRole::Other,
                     unsupported: Some(UnsupportedRecordClassification::UnknownRecordType),
                     surface_eligible: false,
@@ -3334,6 +3335,7 @@ mod tests {
 
 #[derive(Clone, Copy)]
 struct RecordVisibility {
+    source_time: Option<evertrace_codex::source_time::ParsedSourceTimestamp>,
     role: ObservationRole,
     unsupported: Option<UnsupportedRecordClassification>,
     surface_eligible: bool,
@@ -3506,6 +3508,7 @@ fn completed_message_visibility(payload: &serde_json::Value) -> RecordVisibility
                 .any(|AgentText::Text { text }| !text.trim().is_empty()),
         });
     RecordVisibility {
+        source_time: None,
         role: if message {
             ObservationRole::Message
         } else {
@@ -3525,12 +3528,16 @@ fn completed_message_visibility(payload: &serde_json::Value) -> RecordVisibility
 fn classify_record(bytes: &[u8]) -> Result<RecordVisibility, SessionImportError> {
     let record: RecordKind =
         serde_json::from_slice(bytes).map_err(|_| SessionImportError::Unsupported)?;
-    let _ = &record.timestamp;
+    let source_time = record
+        .timestamp
+        .as_deref()
+        .and_then(evertrace_codex::source_time::parse_source_timestamp);
     if record.metadata.is_some() && record.record_type != "response_item" {
         return Err(SessionImportError::Unsupported);
     }
-    Ok(match record.record_type.as_str() {
+    let mut visibility = match record.record_type.as_str() {
         "session_meta" | "turn_context" => RecordVisibility {
+            source_time: None,
             role: ObservationRole::StateProbe,
             unsupported: None,
             surface_eligible: false,
@@ -3542,6 +3549,7 @@ fn classify_record(bytes: &[u8]) -> Result<RecordVisibility, SessionImportError>
             ) =>
         {
             RecordVisibility {
+                source_time: None,
                 role: ObservationRole::Message,
                 unsupported: None,
                 surface_eligible: true,
@@ -3551,6 +3559,7 @@ fn classify_record(bytes: &[u8]) -> Result<RecordVisibility, SessionImportError>
             completed_message_visibility(&record.payload)
         }
         "event_msg" => RecordVisibility {
+            source_time: None,
             role: ObservationRole::Other,
             unsupported: Some(UnsupportedRecordClassification::UnknownRecordType),
             surface_eligible: false,
@@ -3559,6 +3568,7 @@ fn classify_record(bytes: &[u8]) -> Result<RecordVisibility, SessionImportError>
             if record.payload.get("type").and_then(|value| value.as_str()) == Some("reasoning") =>
         {
             RecordVisibility {
+                source_time: None,
                 role: ObservationRole::Other,
                 unsupported: Some(UnsupportedRecordClassification::Reasoning),
                 surface_eligible: false,
@@ -3571,22 +3581,27 @@ fn classify_record(bytes: &[u8]) -> Result<RecordVisibility, SessionImportError>
             ) =>
         {
             RecordVisibility {
+                source_time: None,
                 role: ObservationRole::Other,
                 unsupported: None,
                 surface_eligible: true,
             }
         }
         "response_item" => RecordVisibility {
+            source_time: None,
             role: ObservationRole::Other,
             unsupported: Some(UnsupportedRecordClassification::UnknownRecordType),
             surface_eligible: false,
         },
         _ => RecordVisibility {
+            source_time: None,
             role: ObservationRole::Other,
             unsupported: Some(UnsupportedRecordClassification::UnknownRecordType),
             surface_eligible: false,
         },
-    })
+    };
+    visibility.source_time = source_time;
+    Ok(visibility)
 }
 
 fn import_record_id(current: &SessionImportCurrent, start: u64, end: u64) -> String {
@@ -3677,7 +3692,8 @@ fn capture_input(
         eligible_event_manifest_ref: "codex-session-import-events-v1".into(),
         parser_revision: 1,
         canonicalization_revision: 1,
-        event_time_us: None,
+        event_time_us: visibility.source_time.map(|time| time.timestamp_us),
+        event_time_provenance: visibility.source_time.map(|time| time.provenance),
         raw_payload: line.to_vec(),
     }
 }

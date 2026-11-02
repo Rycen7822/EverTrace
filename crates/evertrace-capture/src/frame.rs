@@ -96,6 +96,8 @@ pub struct CaptureRecordBody {
     pub protection_key_generation: u64,
     pub event_time_us: i64,
     pub recorded_at_us: i64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub event_time_provenance: Option<evertrace_domain::evidence::EventTimeProvenance>,
     #[serde(default)]
     pub recovery_preflight: Option<RecoveryPreflightCandidate>,
 }
@@ -167,6 +169,11 @@ impl CaptureRecordBody {
             }
         }
         let observation_id = self.observation_id()?;
+        if let Some(provenance) = self.event_time_provenance {
+            provenance
+                .validate(self.event_time_us, self.recorded_at_us)
+                .map_err(|_| SpoolFrameError::Invalid)?;
+        }
         if self.body_version != CAPTURE_RECORD_BODY_VERSION
             || self
                 .source_observation_id_hint
@@ -187,7 +194,7 @@ impl CaptureRecordBody {
             || self.protection_key_generation == 0
             || self.event_time_us < 0
             || self.recorded_at_us < 0
-            || self.event_time_us > self.recorded_at_us
+            || (self.event_time_us > self.recorded_at_us && self.event_time_provenance.is_none())
             || self
                 .source_sequence_origin
                 .is_some_and(|origin| origin > self.source_sequence)

@@ -1764,6 +1764,7 @@ fn map_human_item(item: evertrace_engine::HumanSummary) -> HumanSnapshotItem {
                 source_context: item.source_context.map(|value| evertrace_protocol::dto::HumanSourceContext {
                     directory: value.directory, session: value.session,
                     event_time_us: value.event_time_us, recorded_at_us: value.recorded_at_us,
+                    event_time_provenance: value.event_time_provenance,
                 }),
                 semantic_detail: item.semantic_detail.map(map_semantic_detail),
                 proposal_base: item.proposal_base.map(map_semantic_detail),

@@ -123,6 +123,7 @@ fn input(record: &str, payload: &[u8]) -> CaptureRecordInput {
         parser_revision: 1,
         canonicalization_revision: 1,
         event_time_us: Some(1),
+        event_time_provenance: None,
         raw_payload: payload.to_vec(),
     }
 }

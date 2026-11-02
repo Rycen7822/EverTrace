@@ -218,6 +218,7 @@ fn source(
         redaction_revision: 1,
         protection_key_generation: 1,
         event_time_us: at,
+        event_time_provenance: None,
         recorded_at_us: at,
         lifecycle: None,
     };
@@ -5497,6 +5498,7 @@ async fn mcp_generated_alignment_is_returned_only_after_real_stdout() {
         parser_revision: 1,
         canonicalization_revision: 1,
         event_time_us: None,
+        event_time_provenance: None,
         raw_payload: b"session start".to_vec(),
     };
     capture.capture(capture_input.clone()).unwrap();

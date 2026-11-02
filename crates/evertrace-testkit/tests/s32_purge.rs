@@ -174,6 +174,7 @@ fn source(
         redaction_revision: 1,
         protection_key_generation: 1,
         event_time_us: 1,
+        event_time_provenance: None,
         recorded_at_us: 1,
         lifecycle: None,
     };

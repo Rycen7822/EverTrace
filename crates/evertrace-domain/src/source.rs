@@ -267,6 +267,8 @@ pub struct SourceRecordSummary {
     pub archive_mode: crate::evidence::SourceArchiveMode,
     pub event_time_us: i64,
     pub recorded_at_us: i64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub event_time_provenance: Option<crate::evidence::EventTimeProvenance>,
     pub presentation: SourceRecordPresentation,
     pub preview: Option<String>,
     pub preview_truncated: bool,
@@ -280,6 +282,11 @@ impl SourceRecordSummary {
                 .is_none_or(|range| range.end > range.start)
             && self.event_time_us >= 0
             && self.recorded_at_us >= 0
+            && self.event_time_provenance.is_none_or(|value| {
+                value
+                    .validate(self.event_time_us, self.recorded_at_us)
+                    .is_ok()
+            })
             && self.preview.as_ref().is_none_or(|text| text.len() <= 512)
             && (self.preview.is_some()
                 == matches!(

@@ -380,11 +380,12 @@ mod tests {
         temporal.query_facets.temporal_qualifiers =
             vec![TemporalQualifier::EventTimeAsOf { at_us: 8 }];
         let mut reasons = BTreeSet::new();
-        assert!(!temporal_is_partial(
+        assert!(temporal_is_partial(
             &[((0, 0), candidate.clone(), &object)],
             &temporal,
             &mut reasons
         ));
+        assert!(reasons.contains("event_clock_provenance_unverified"));
         object.time_domain = "none".into();
         assert!(temporal_is_partial(
             &[((0, 0), candidate, &object)],

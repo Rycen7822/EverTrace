@@ -92,6 +92,7 @@ impl McpActionService {
             parser_revision: 1,
             canonicalization_revision: 1,
             event_time_us: Some(event_time_us),
+            event_time_provenance: None,
             raw_payload: input.into_bytes(),
         };
         let mut runtime = CaptureRuntime::open(self.runtime_snapshot.clone())

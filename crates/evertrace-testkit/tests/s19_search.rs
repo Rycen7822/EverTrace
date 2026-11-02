@@ -133,6 +133,7 @@ fn input(record: &str, sequence: u64, text: &str, role: SourceRole) -> CaptureRe
         parser_revision: 1,
         canonicalization_revision: 1,
         event_time_us: Some(i64::try_from(sequence).unwrap()),
+        event_time_provenance: None,
         raw_payload: text.as_bytes().to_vec(),
     }
 }
