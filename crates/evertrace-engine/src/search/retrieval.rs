@@ -586,7 +586,21 @@ impl NativeRetrieval<'_> {
             .collect();
         let mut active_evidence = Vec::new();
         let mut trace = Vec::new();
-        for candidate in &self.result.candidates {
+        let mut quoted_candidates = self.result.candidates.iter().collect::<Vec<_>>();
+        if self.sequence_timeline_ready() {
+            // Timeline is a view of the frozen boundary, not a new ranking or
+            // generation: source positions cannot order independent sources.
+            quoted_candidates.sort_by_key(|candidate| {
+                (
+                    candidate
+                        .source_sequence
+                        .as_ref()
+                        .map(|position| position.sequence),
+                    candidate.candidate_id.as_str(),
+                )
+            });
+        }
+        for candidate in quoted_candidates {
             let rule = super::resolution::active_rule(candidate);
             let compatible = !self.context.unverified_hard_constraint()
                 && self
@@ -654,6 +668,15 @@ impl NativeRetrieval<'_> {
             grounded_view: Some(view),
         })
     }
+    fn sequence_timeline_ready(&self) -> bool {
+        self.context.query_facets.answer_shape == Some(AnswerShape::Timeline)
+            && self.sequence_scope.is_some()
+            && self
+                .result
+                .candidates
+                .iter()
+                .all(|candidate| candidate.source_sequence.is_some())
+    }
     fn output_limit(&self) -> usize {
         self.context
             .query_facets
@@ -712,11 +735,12 @@ impl NativeRetrieval<'_> {
         {
             self.degraded("ordering_provenance_not_verified");
         }
-        if matches!(
-            self.context.query_facets.answer_shape,
-            Some(AnswerShape::Count | AnswerShape::Timeline)
-        ) {
-            self.degraded("answer_shape_not_derived");
+        match self.context.query_facets.answer_shape {
+            Some(AnswerShape::Count) => self.degraded("answer_shape_not_derived"),
+            Some(AnswerShape::Timeline) if !self.sequence_timeline_ready() => {
+                self.degraded("timeline_ordering_unavailable");
+            }
+            _ => {}
         }
     }
     fn invalidated(mut self, reason: &str) -> HumanSearchPage {

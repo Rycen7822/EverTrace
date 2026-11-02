@@ -1394,7 +1394,63 @@ impl HumanSearchPage {
                     && view.candidate_set.candidate_refs == refs
                     && view.completeness == self.result.completeness
             })
+            && self.quoted_statements_valid()
+            && self.timeline_order_valid()
             && self.sequence_positions_valid()
+    }
+
+    fn quoted_statements_valid(&self) -> bool {
+        self.grounded_view.as_ref().is_none_or(|view| {
+            view.active_evidence.iter().all(|statement| {
+                statement.derivation_kind != DerivationKind::Quoted
+                    || (statement.support_refs.len() == 1
+                        && self.result.candidates.iter().any(|candidate| {
+                            statement.support_refs.contains(&candidate.candidate_id)
+                                && statement.statement == candidate.text
+                        }))
+            })
+        })
+    }
+
+    fn timeline_order_valid(&self) -> bool {
+        let Some(view) = &self.grounded_view else {
+            return true;
+        };
+        if view.evidence_need.answer_shape != Some(AnswerShape::Timeline) {
+            return true;
+        }
+        if view.evidence_need.temporal_scope.mode != TemporalMode::Sequence
+            || self
+                .result
+                .candidates
+                .iter()
+                .any(|candidate| candidate.source_sequence.is_none())
+        {
+            return view.completeness != RetrievalCompleteness::Complete;
+        }
+        let mut previous = None;
+        for step in &view.trace {
+            let Some(statement) = view.active_evidence.get(step.statement_index as usize) else {
+                return false;
+            };
+            if statement.derivation_kind != DerivationKind::Quoted {
+                continue;
+            }
+            let Some(position) = self
+                .result
+                .candidates
+                .iter()
+                .find(|candidate| statement.support_refs.contains(&candidate.candidate_id))
+                .and_then(|candidate| candidate.source_sequence.as_ref())
+            else {
+                return false;
+            };
+            if previous.is_some_and(|sequence| sequence > position.sequence) {
+                return false;
+            }
+            previous = Some(position.sequence);
+        }
+        true
     }
 
     fn sequence_positions_valid(&self) -> bool {
