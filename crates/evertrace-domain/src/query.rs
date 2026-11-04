@@ -1395,13 +1395,19 @@ impl std::str::FromStr for SearchCurrentness {
     }
 }
 
-/// Position in the source revision identified by a readable request anchor.
+/// Position in a source revision identified by a readable source observation.
 /// It is neither an event clock nor an ordering across independent sources.
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct SourceSequencePosition {
     pub source_anchor: SourceObservationId,
     pub sequence: u64,
+}
+
+impl SourceSequencePosition {
+    pub fn wire_bytes(&self) -> usize {
+        serde_json::to_vec(self).map_or(usize::MAX, |bytes| bytes.len() + 19)
+    }
 }
 
 /// Canonical receipt coordinates, never inferred from an indexed nonzero scalar.
@@ -1510,6 +1516,10 @@ impl SearchCandidate {
             + self.validity_interval.as_ref().map_or(0, |interval| {
                 serde_json::to_vec(interval).map_or(usize::MAX, |bytes| bytes.len() + 21)
             })
+            + self
+                .source_sequence
+                .as_ref()
+                .map_or(0, SourceSequencePosition::wire_bytes)
     }
 }
 
@@ -1949,10 +1959,16 @@ impl HumanSearchPage {
     }
 
     fn sequence_positions_valid(&self) -> bool {
-        let sequence_mode = self
-            .grounded_view
-            .as_ref()
-            .is_some_and(|view| view.evidence_need.temporal_scope.mode == TemporalMode::Sequence);
+        let Some(view) = &self.grounded_view else {
+            return self
+                .result
+                .candidates
+                .iter()
+                .all(|candidate| candidate.source_sequence.is_none());
+        };
+        let sequence_mode = view.evidence_need.temporal_scope.mode == TemporalMode::Sequence;
+        let automatic = view.evidence_need.answer_shape == Some(AnswerShape::Timeline)
+            && view.evidence_need.temporal_scope.qualifiers.is_empty();
         for candidate in &self.result.candidates {
             let Some(position) = &candidate.source_sequence else {
                 if sequence_mode && candidate.row_variant == SearchCandidateVariant::EvidenceSurface
@@ -1961,38 +1977,51 @@ impl HumanSearchPage {
                 }
                 continue;
             };
-            let Some(view) = &self.grounded_view else {
-                return false;
-            };
-            let [
-                TemporalQualifier::SourceSequenceAtMost {
-                    source_ref,
-                    sequence,
-                },
-            ] = view.evidence_need.temporal_scope.qualifiers.as_slice()
-            else {
-                return false;
-            };
-            if view.evidence_need.temporal_scope.mode != TemporalMode::Sequence
-                || position.sequence > *sequence
-                || position.source_anchor != *source_ref
-            {
+            if sequence_mode {
+                let [
+                    TemporalQualifier::SourceSequenceAtMost {
+                        source_ref,
+                        sequence,
+                    },
+                ] = view.evidence_need.temporal_scope.qualifiers.as_slice()
+                else {
+                    return false;
+                };
+                if position.sequence > *sequence || position.source_anchor != *source_ref {
+                    return false;
+                }
+            } else if automatic {
+                let anchor = position.source_anchor.to_string();
+                if !self
+                    .result
+                    .candidates
+                    .iter()
+                    .any(|candidate| candidate.source_ref == anchor)
+                {
+                    return false;
+                }
+            } else {
                 return false;
             }
         }
-        self.grounded_view.as_ref().is_none_or(|view| {
-            view.active_evidence.iter().all(|statement| {
-                let positioned = statement.support_refs.iter().all(|reference| {
-                    self.result.candidates.iter().any(|candidate| {
-                        candidate.candidate_id == *reference && candidate.source_sequence.is_some()
-                    })
-                });
-                if statement.ordering_basis == OrderingBasis::SourceSequence {
-                    positioned && statement.derivation_kind == DerivationKind::Quoted
-                } else {
-                    !positioned || statement.derivation_kind != DerivationKind::Quoted
-                }
-            })
+        let sequence_order = automatic
+            && matches!(
+                timeline_order(&self.result.candidates),
+                Some((OrderingBasis::SourceSequence, _))
+            );
+        view.active_evidence.iter().all(|statement| {
+            let positioned = statement.support_refs.iter().all(|reference| {
+                self.result.candidates.iter().any(|candidate| {
+                    candidate.candidate_id == *reference && candidate.source_sequence.is_some()
+                })
+            });
+            if statement.ordering_basis == OrderingBasis::SourceSequence {
+                (sequence_mode || sequence_order)
+                    && positioned
+                    && statement.derivation_kind == DerivationKind::Quoted
+            } else {
+                !sequence_mode || !positioned || statement.derivation_kind != DerivationKind::Quoted
+            }
         })
     }
 }

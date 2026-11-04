@@ -588,13 +588,7 @@ impl HumanGovernanceService {
                 if validity_query {
                     return None;
                 }
-                source_receipt(&index, reference).map(|receipt| {
-                    crate::search::TemporalPosition::Source(SourceTimePosition {
-                        event_time_us: receipt.event_time_us,
-                        recorded_at_us: receipt.recorded_at_us,
-                        provenance: receipt.event_time_provenance,
-                    })
-                })
+                source_receipt(&index, reference).map(crate::search::TemporalPosition::Source)
             };
             let time_query = matches!(
                 context.query_facets.temporal_mode,

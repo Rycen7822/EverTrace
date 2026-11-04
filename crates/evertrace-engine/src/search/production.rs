@@ -43,7 +43,7 @@ impl SourceSequenceScope {
 }
 /// Canonical metadata only; current resolver state is not recomputed at a historical clock.
 pub(crate) enum TemporalPosition {
-    Source(evertrace_domain::query::SourceTimePosition),
+    Source(Box<evertrace_domain::evidence::SourceReceipt>),
     Atom {
         validity: evertrace_domain::semantic::ValidityInterval,
         contextual: bool,
@@ -53,7 +53,28 @@ pub(crate) enum TemporalPosition {
 impl TemporalPosition {
     pub fn source(&self) -> Option<evertrace_domain::query::SourceTimePosition> {
         match self {
-            Self::Source(value) => Some(value.clone()),
+            Self::Source(value) => Some(evertrace_domain::query::SourceTimePosition {
+                event_time_us: value.event_time_us,
+                recorded_at_us: value.recorded_at_us,
+                provenance: value.event_time_provenance,
+            }),
+            _ => None,
+        }
+    }
+    pub fn sequence(
+        &self,
+        facets: &evertrace_domain::query::QueryFacetSet,
+    ) -> Option<evertrace_domain::query::SourceSequencePosition> {
+        if facets.answer_shape != Some(evertrace_domain::query::AnswerShape::Timeline)
+            || !facets.temporal_qualifiers.is_empty()
+        {
+            return None;
+        }
+        match self {
+            Self::Source(value) => Some(evertrace_domain::query::SourceSequencePosition {
+                source_anchor: value.source_observation_id,
+                sequence: value.source_sequence,
+            }),
             _ => None,
         }
     }
@@ -65,7 +86,9 @@ impl TemporalPosition {
     }
     pub fn matches(&self, qualifiers: &[TemporalQualifier]) -> Option<bool> {
         match self {
-            Self::Source(value) => value.temporal_match(qualifiers),
+            Self::Source(_) => self
+                .source()
+                .and_then(|value| value.temporal_match(qualifiers)),
             Self::Atom { validity, .. } => {
                 evertrace_domain::query::validity_match(validity, qualifiers)
             }
@@ -82,7 +105,7 @@ impl TemporalPosition {
     }
     pub fn wire_bytes(&self) -> usize {
         match self {
-            Self::Source(value) => value.wire_bytes(),
+            Self::Source(_) => self.source().map_or(0, |value| value.wire_bytes()),
             Self::Atom { validity, .. } => {
                 serde_json::to_vec(validity).map_or(usize::MAX, |bytes| bytes.len() + 21)
             }
@@ -111,9 +134,10 @@ impl TemporalReadScope<'_> {
         let position = (self.read)(reference.as_deref().ok_or(SearchError::Corrupt)?);
         match &position {
             Some(TemporalPosition::Source(value)) if row.row_variant == "evidence_surface" => {
-                if !value.validate()
+                if value.validate().is_err()
                     || value.event_time_us != row.event_time_us
                     || value.recorded_at_us != row.recorded_at_us
+                    || value.source_sequence != row.source_sequence
                 {
                     return Err(SearchError::Corrupt);
                 }
@@ -127,6 +151,65 @@ impl TemporalReadScope<'_> {
             _ => return Err(SearchError::Corrupt),
         }
         Ok(position)
+    }
+
+    /// Align only returned coordinates, never filter a broad query to one source.
+    pub(super) fn align_sequence_domain(
+        &self,
+        candidates: &mut [SearchCandidate],
+        deadline: &RequestDeadline,
+    ) -> Result<(), SearchError> {
+        for candidate in candidates.iter_mut() {
+            if let Some(position) = &mut candidate.source_sequence {
+                position.source_anchor = candidate
+                    .source_ref
+                    .parse()
+                    .map_err(|_| SearchError::Corrupt)?;
+            }
+        }
+        let mut domain = None;
+        let mut anchor: Option<evertrace_domain::ids::SourceObservationId> = None;
+        let mut common = !candidates.is_empty();
+        for candidate in candidates.iter() {
+            let Some(position) = &candidate.source_sequence else {
+                common = false;
+                continue;
+            };
+            if deadline.remaining().is_none() {
+                return Ok(());
+            }
+            let Some(TemporalPosition::Source(receipt)) = (self.read)(&candidate.source_ref) else {
+                return Err(SearchError::Corrupt);
+            };
+            if receipt.source_sequence != position.sequence
+                || receipt.source_observation_id != position.source_anchor
+            {
+                return Err(SearchError::Corrupt);
+            }
+            anchor = Some(anchor.map_or(position.source_anchor, |old| {
+                old.min(position.source_anchor)
+            }));
+            match &domain {
+                Some((instance, revision)) => {
+                    common &= *instance == receipt.source_instance_id
+                        && *revision == receipt.source_revision;
+                }
+                None => {
+                    domain = Some((
+                        receipt.source_instance_id.clone(),
+                        receipt.source_revision.clone(),
+                    ))
+                }
+            }
+        }
+        if common && let Some(anchor) = anchor {
+            for candidate in candidates {
+                if let Some(position) = &mut candidate.source_sequence {
+                    position.source_anchor = anchor;
+                }
+            }
+        }
+        Ok(())
     }
 }
 
@@ -807,7 +890,25 @@ impl ProductionSearch {
                 .flatten();
             let source_time = temporal.as_ref().and_then(TemporalPosition::source);
             let validity_interval = temporal.as_ref().and_then(TemporalPosition::validity);
-            let time_bytes = temporal.as_ref().map_or(0, TemporalPosition::wire_bytes);
+            let source_sequence = self
+                .sequence_scope
+                .as_ref()
+                .map(|scope| scope.position(row))
+                .transpose()?
+                .flatten()
+                .or_else(|| {
+                    temporal
+                        .as_ref()
+                        .and_then(|position| position.sequence(&context.query_facets))
+                });
+            let time_bytes = temporal
+                .as_ref()
+                .map_or(0, TemporalPosition::wire_bytes)
+                .saturating_add(
+                    source_sequence
+                        .as_ref()
+                        .map_or(0, |position| position.wire_bytes()),
+                );
             if context
                 .budget
                 .consume_candidate_text(row.text.len().saturating_add(time_bytes))
@@ -834,12 +935,6 @@ impl ProductionSearch {
                 .as_ref()
                 .and_then(|value| value.states.get(&candidate_id))
                 .copied();
-            let source_sequence = self
-                .sequence_scope
-                .as_ref()
-                .map(|scope| scope.position(row))
-                .transpose()?
-                .flatten();
             let candidate = SearchCandidate {
                 source_sequence,
                 source_time,

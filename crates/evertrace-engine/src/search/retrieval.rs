@@ -132,9 +132,24 @@ impl NativeRetrieval<'_> {
             let validity_interval = temporal
                 .as_ref()
                 .and_then(super::production::TemporalPosition::validity);
+            let source_sequence = self
+                .sequence_scope
+                .map(|scope| scope.position(&row))
+                .transpose()?
+                .flatten()
+                .or_else(|| {
+                    temporal
+                        .as_ref()
+                        .and_then(|position| position.sequence(&self.context.query_facets))
+                });
             let time_bytes = temporal
                 .as_ref()
-                .map_or(0, super::production::TemporalPosition::wire_bytes);
+                .map_or(0, super::production::TemporalPosition::wire_bytes)
+                .saturating_add(
+                    source_sequence
+                        .as_ref()
+                        .map_or(0, |position| position.wire_bytes()),
+                );
             let mut budget = self.result.budget.clone();
             if budget
                 .consume_candidate_text(row.text.len().saturating_add(time_bytes))
@@ -159,11 +174,6 @@ impl NativeRetrieval<'_> {
                 .semantics
                 .and_then(|value| value.states.get(&id))
                 .copied();
-            let source_sequence = self
-                .sequence_scope
-                .map(|scope| scope.position(&row))
-                .transpose()?
-                .flatten();
             self.result.candidates.push(SearchCandidate {
                 source_sequence,
                 source_time,
@@ -449,7 +459,7 @@ impl NativeRetrieval<'_> {
         // Required slots refer to original rows, never gaps invented by snippet truncation.
         let pending_gaps = self.gaps(&witnessed);
         // Freeze generation 1 after D, before the one named, result-changing gap.
-        self.pack();
+        self.pack()?;
         let base: BTreeSet<_> = self
             .result
             .candidates
@@ -506,9 +516,35 @@ impl NativeRetrieval<'_> {
                     .result
                     .candidates
                     .iter()
-                    .map(|candidate| candidate.text.len())
+                    .map(|candidate| {
+                        candidate.text.len() + candidate.temporal_wire_bytes().div_ceil(2)
+                    })
                     .sum();
-                if bytes + matches[0].text.len().min(512) <= 2400 {
+                let temporal = self
+                    .time_scope
+                    .map(|scope| scope.position(&matches[0]))
+                    .transpose()?
+                    .flatten();
+                let sequence = self
+                    .sequence_scope
+                    .map(|scope| scope.position(&matches[0]))
+                    .transpose()?
+                    .flatten()
+                    .or_else(|| {
+                        temporal
+                            .as_ref()
+                            .and_then(|position| position.sequence(&self.context.query_facets))
+                    });
+                let metadata_bytes = temporal
+                    .as_ref()
+                    .map_or(0, super::production::TemporalPosition::wire_bytes)
+                    .saturating_add(
+                        sequence
+                            .as_ref()
+                            .map_or(0, SourceSequencePosition::wire_bytes),
+                    );
+                let delta_bytes = matches[0].text.len().min(512) + metadata_bytes.div_ceil(2);
+                if bytes + delta_bytes <= self.answer_text_limit() {
                     self.admit(matches, "named_exact_gap")?;
                     added = self
                         .result
@@ -542,7 +578,8 @@ impl NativeRetrieval<'_> {
                 self.degraded("named_gap_ambiguous");
             }
         }
-        self.pack();
+        self.pack()?;
+        self.check_temporal_completeness();
         let still_missing = self.gaps(&witnessed);
         let mut gaps = pending_gaps
             .into_iter()
@@ -558,8 +595,9 @@ impl NativeRetrieval<'_> {
             .result
             .candidates
             .iter()
-            .map(|candidate| candidate.text.len() * 2)
+            .map(|candidate| candidate.text.len() * 2 + candidate.temporal_wire_bytes())
             .sum::<usize>();
+        let answer_limit = self.answer_text_limit() * 2;
         for (source, target, kind) in relation_links {
             let resolve = |reference: &str| {
                 let mut matches = self.result.candidates.iter().filter(|candidate| {
@@ -577,7 +615,7 @@ impl NativeRetrieval<'_> {
                     frontier: self.result.projection_frontier,
                 })
                 .map_err(|_| SearchError::Corrupt)?;
-                if answer_bytes + statement.len() > 4800 {
+                if answer_bytes + statement.len() > answer_limit {
                     self.degraded("relation_trace_pack_budget_exhausted");
                     continue;
                 }
@@ -683,7 +721,9 @@ impl NativeRetrieval<'_> {
                 support_refs: BTreeSet::from([candidate.candidate_id.clone()]),
                 derivation_kind: DerivationKind::Quoted,
                 ordering_basis: ordering_basis.unwrap_or_else(|| {
-                    if candidate.source_sequence.is_some() {
+                    if self.context.query_facets.temporal_mode == TemporalMode::Sequence
+                        && candidate.source_sequence.is_some()
+                    {
                         OrderingBasis::SourceSequence
                     } else {
                         OrderingBasis::Unknown
@@ -742,7 +782,16 @@ impl NativeRetrieval<'_> {
             .unwrap_or(32)
             .min(32)
     }
-    fn pack(&mut self) {
+    fn answer_text_limit(&self) -> usize {
+        // A quote occurs twice; metadata and the count operator occur once.
+        2400 - if self.context.query_facets.count_unit().is_some() {
+            MAX_GROUNDED_COUNT_BYTES / 2
+        } else {
+            0
+        }
+    }
+
+    fn pack(&mut self) -> Result<(), SearchError> {
         if self.context.unverified_hard_constraint() {
             self.result
                 .candidates
@@ -757,14 +806,7 @@ impl NativeRetrieval<'_> {
             });
         }
         let limit = self.output_limit();
-        let count_unit = self.context.query_facets.count_unit();
-        // Quoted text occurs twice in the wire. Reserve one bounded count operator.
-        let text_limit = 2400
-            - if count_unit.is_some() {
-                evertrace_domain::query::MAX_GROUNDED_COUNT_BYTES / 2
-            } else {
-                0
-            };
+        let text_limit = self.answer_text_limit();
         let mut bytes: usize = 0;
         let mut kept = Vec::new();
         for mut candidate in std::mem::take(&mut self.result.candidates) {
@@ -788,7 +830,23 @@ impl NativeRetrieval<'_> {
             }
         }
         self.result.candidates = kept;
-        if self.sequence_scope.is_some() {
+        if self.sequence_scope.is_none()
+            && self.context.query_facets.answer_shape == Some(AnswerShape::Timeline)
+            && self.context.query_facets.temporal_qualifiers.is_empty()
+            && let Some(scope) = self.time_scope
+        {
+            scope.align_sequence_domain(&mut self.result.candidates, self.deadline)?;
+        }
+        Ok(())
+    }
+
+    fn check_temporal_completeness(&mut self) {
+        let sequence_order = self.context.query_facets.answer_shape == Some(AnswerShape::Timeline)
+            && matches!(
+                timeline_order(&self.result.candidates),
+                Some((OrderingBasis::SourceSequence, _))
+            );
+        if self.sequence_scope.is_some() || sequence_order {
             // A per-record receipt does not prove an entire prefix is gap-free.
             self.degraded("source_sequence_coverage_unverified");
         } else if matches!(
@@ -807,7 +865,7 @@ impl NativeRetrieval<'_> {
             self.degraded(reason);
         }
         match self.context.query_facets.answer_shape {
-            Some(AnswerShape::Count) if count_unit.is_none() => {
+            Some(AnswerShape::Count) if self.context.query_facets.count_unit().is_none() => {
                 self.degraded("count_unit_unspecified")
             }
             Some(AnswerShape::Timeline) => match timeline_order(&self.result.candidates) {
