@@ -53,7 +53,7 @@ pub(super) struct NativeRetrieval<'a> {
     pub deadline: &'a RequestDeadline,
     pub semantics: Option<&'a super::resolution::SemanticSearchResolution>,
     pub sequence_scope: Option<&'a super::SourceSequenceScope>,
-    pub time_scope: Option<&'a super::SourceTimeScope<'a>>,
+    pub time_scope: Option<&'a super::TemporalReadScope<'a>>,
 }
 
 impl NativeRetrieval<'_> {
@@ -121,12 +121,20 @@ impl NativeRetrieval<'_> {
                 self.degraded("retrieval_deadline_exhausted");
                 break;
             }
-            let source_time = self
+            let temporal = self
                 .time_scope
                 .map(|scope| scope.position(&row))
                 .transpose()?
                 .flatten();
-            let time_bytes = source_time.as_ref().map_or(0, |value| value.wire_bytes());
+            let source_time = temporal
+                .as_ref()
+                .and_then(super::production::TemporalPosition::source);
+            let validity_interval = temporal
+                .as_ref()
+                .and_then(super::production::TemporalPosition::validity);
+            let time_bytes = temporal
+                .as_ref()
+                .map_or(0, super::production::TemporalPosition::wire_bytes);
             let mut budget = self.result.budget.clone();
             if budget
                 .consume_candidate_text(row.text.len().saturating_add(time_bytes))
@@ -159,6 +167,7 @@ impl NativeRetrieval<'_> {
             self.result.candidates.push(SearchCandidate {
                 source_sequence,
                 source_time,
+                validity_interval,
                 candidate_id: id,
                 source_ref: row.source_ref.ok_or(SearchError::Corrupt)?,
                 row_variant: if row.row_variant == "object" {
@@ -280,10 +289,9 @@ impl NativeRetrieval<'_> {
                 .candidates
                 .iter()
                 .filter(|candidate| {
-                    !candidate.source_time.as_ref().is_some_and(|position| {
-                        position.temporal_match(&self.context.query_facets.temporal_qualifiers)
-                            == Some(true)
-                    })
+                    candidate
+                        .temporal_match(&self.context.query_facets.temporal_qualifiers)
+                        .is_none()
                 })
                 .map(|candidate| candidate.source_ref.clone())
                 .collect::<BTreeSet<_>>();
@@ -647,6 +655,10 @@ impl NativeRetrieval<'_> {
             }
             let role = if rule {
                 EvidenceRole::ConstraintSupport
+            } else if candidate.temporal_match(&self.context.query_facets.temporal_qualifiers)
+                == Some(false)
+            {
+                EvidenceRole::Contrast
             } else if candidate.retrieval_origins.len() == 1
                 && candidate.retrieval_origins.contains("typed_relation")
             {
@@ -654,7 +666,11 @@ impl NativeRetrieval<'_> {
             } else {
                 EvidenceRole::Direct
             };
-            if rule && compatible {
+            if rule
+                && compatible
+                && candidate.temporal_match(&self.context.query_facets.temporal_qualifiers)
+                    != Some(false)
+            {
                 matching_constraints.insert(active_evidence.len() as u32);
             }
             trace.push(GroundedTraceStep {
@@ -761,10 +777,7 @@ impl NativeRetrieval<'_> {
                 candidate.text.push('…');
                 self.degraded("source_snippet_truncated");
             }
-            let time_bytes = candidate
-                .source_time
-                .as_ref()
-                .map_or(0, |value| value.wire_bytes().div_ceil(2));
+            let time_bytes = candidate.temporal_wire_bytes().div_ceil(2);
             let candidate_bytes = candidate.text.len().saturating_add(time_bytes);
             if kept.len() >= limit || bytes.saturating_add(candidate_bytes) > text_limit {
                 self.result.omitted_refs.insert(candidate.candidate_id);
@@ -782,12 +795,16 @@ impl NativeRetrieval<'_> {
             self.context.query_facets.temporal_mode,
             TemporalMode::AsOf | TemporalMode::Interval
         ) && self.result.candidates.iter().any(|candidate| {
-            !candidate.source_time.as_ref().is_some_and(|position| {
-                position.temporal_match(&self.context.query_facets.temporal_qualifiers)
-                    == Some(true)
-            })
+            candidate
+                .temporal_match(&self.context.query_facets.temporal_qualifiers)
+                .is_none()
         }) {
-            self.degraded("event_clock_provenance_unverified");
+            let reason = if self.time_scope.is_some_and(|scope| !scope.source_domain) {
+                "validity_interval_unverified"
+            } else {
+                "event_clock_provenance_unverified"
+            };
+            self.degraded(reason);
         }
         match self.context.query_facets.answer_shape {
             Some(AnswerShape::Count) if count_unit.is_none() => {

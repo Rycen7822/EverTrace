@@ -1,5 +1,8 @@
 use super::*;
-use evertrace_domain::query::*;
+use evertrace_domain::{
+    query::*,
+    semantic::{NormativeResolutionState, SemanticResolution},
+};
 
 fn source_sequence_scope(
     index: &std::collections::BTreeMap<&str, Vec<&ObjectRow>>,
@@ -83,6 +86,32 @@ fn source_receipt(
         return None;
     }
     Some(receipt)
+}
+
+fn atom_validity(
+    index: &std::collections::BTreeMap<&str, Vec<&ObjectRow>>,
+    reference: &str,
+) -> Option<evertrace_domain::semantic::ValidityInterval> {
+    let mut rows = index.get(reference)?.iter().filter(|row| {
+        row.object_kind.as_deref() == Some("atom_revision")
+            && row.current_revision_id.as_deref() == Some(reference)
+    });
+    let row = rows.next()?;
+    if rows.next().is_some() {
+        return None;
+    }
+    let JournalPayload::AtomRecorded(atom) =
+        serde_json::from_str(row.payload_json.as_deref()?).ok()?
+    else {
+        return None;
+    };
+    if atom.revision_id.to_string() != reference
+        || row.object_id.as_deref() != Some(atom.atom_id.to_string().as_str())
+        || atom.validate().is_err()
+    {
+        return None;
+    }
+    Some(atom.validity_interval)
 }
 
 fn canonical_episode_sources(
@@ -513,6 +542,7 @@ impl HumanGovernanceService {
                 now_us()?,
             )
             .map_err(|_| HumanGovernanceError::Store)?;
+            let semantics = std::sync::Arc::new(semantics);
             let sequence_scope =
                 source_sequence_scope(&index, &refs, &context.query_facets, deadline);
             if let Some(scope) = &sequence_scope {
@@ -535,11 +565,35 @@ impl HumanGovernanceService {
             source_references.extend(matched.references.iter().chain(&matched.contexts).cloned());
             let canonical_sources =
                 canonical_episode_sources(snapshot.frontier, &index, &refs, &source_references)?;
+            let validity_query = matches!(
+                context.query_facets.temporal_qualifiers.as_slice(),
+                [TemporalQualifier::ValidityAsOf { .. }
+                    | TemporalQualifier::ValidityInterval { .. }]
+            );
+            let validity_timeline = context.query_facets.answer_shape
+                == Some(AnswerShape::Timeline)
+                && context.query_facets.temporal_qualifiers.is_empty();
             let time_reader = |reference: &str| {
-                source_receipt(&index, reference).map(|receipt| SourceTimePosition {
-                    event_time_us: receipt.event_time_us,
-                    recorded_at_us: receipt.recorded_at_us,
-                    provenance: receipt.event_time_provenance,
+                if validity_query || validity_timeline {
+                    if let Some(validity) = atom_validity(&index, reference) {
+                        return Some(crate::search::TemporalPosition::Atom {
+                            validity,
+                            contextual: semantics.states.get(reference)
+                                == Some(&SemanticResolution::Normative(
+                                    NormativeResolutionState::Active,
+                                )),
+                        });
+                    }
+                }
+                if validity_query {
+                    return None;
+                }
+                source_receipt(&index, reference).map(|receipt| {
+                    crate::search::TemporalPosition::Source(SourceTimePosition {
+                        event_time_us: receipt.event_time_us,
+                        recorded_at_us: receipt.recorded_at_us,
+                        provenance: receipt.event_time_provenance,
+                    })
                 })
             };
             let time_query = matches!(
@@ -558,8 +612,15 @@ impl HumanGovernanceService {
                         return Err(HumanGovernanceError::Store);
                     }
                     if time_reader(reference).is_some_and(|position| {
-                        position.temporal_match(&context.query_facets.temporal_qualifiers)
-                            == Some(false)
+                        position.matches(&context.query_facets.temporal_qualifiers) == Some(false)
+                            && !position.contextual()
+                            && !context.query_facets.target_anchors.iter().any(|target| {
+                                target == reference
+                                    || index.get(reference.as_str()).is_some_and(|rows| {
+                                        rows.iter()
+                                            .any(|row| row.object_id.as_ref() == Some(target))
+                                    })
+                            })
                     }) {
                         time_refs
                             .get_or_insert_with(|| refs.clone())
@@ -567,17 +628,18 @@ impl HumanGovernanceService {
                     }
                 }
             }
-            let time_scope = time_query.then_some(crate::search::SourceTimeScope {
+            let time_scope = time_query.then_some(crate::search::TemporalReadScope {
                 frontier: snapshot.frontier,
                 read: &time_reader,
                 readable_refs: time_refs.as_ref(),
+                source_domain: !validity_query,
             });
             let mut page = crate::search::ProductionSearch::new(search.clone())
                 .with_canonical_sources(snapshot.frontier, canonical_sources)
                 .with_recall_sources(recall_sources)
                 .with_matched_sources(matched.references, matched.contexts)
                 .with_sequence_scope(sequence_scope)
-                .with_semantic_resolution(semantics)
+                .with_semantic_resolution(std::sync::Arc::clone(&semantics))
                 .with_validated_frontier(snapshot.frontier)
                 .with_method_proposals(proposals)
                 .with_readable_refs(snapshot.frontier, refs)

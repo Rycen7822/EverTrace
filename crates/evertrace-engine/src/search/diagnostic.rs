@@ -477,6 +477,7 @@ fn push_candidate(
     }
     result.candidates.push(SearchCandidate {
         source_time: None,
+        validity_interval: None,
         source_sequence: None,
         candidate_id,
         source_ref: row.source_ref.clone().ok_or(SearchError::Corrupt)?,

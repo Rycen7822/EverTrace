@@ -41,31 +41,92 @@ impl SourceSequenceScope {
         }))
     }
 }
-
-/// Borrow canonical facts at the pinned frontier; do not mirror the source catalogue.
-pub(crate) struct SourceTimeScope<'a> {
-    pub frontier: u64,
-    pub read: &'a (dyn Fn(&str) -> Option<evertrace_domain::query::SourceTimePosition> + Sync),
-    pub readable_refs: Option<&'a BTreeSet<String>>,
+/// Canonical metadata only; current resolver state is not recomputed at a historical clock.
+pub(crate) enum TemporalPosition {
+    Source(evertrace_domain::query::SourceTimePosition),
+    Atom {
+        validity: evertrace_domain::semantic::ValidityInterval,
+        contextual: bool,
+    },
 }
 
-impl SourceTimeScope<'_> {
+impl TemporalPosition {
+    pub fn source(&self) -> Option<evertrace_domain::query::SourceTimePosition> {
+        match self {
+            Self::Source(value) => Some(value.clone()),
+            _ => None,
+        }
+    }
+    pub fn validity(&self) -> Option<evertrace_domain::semantic::ValidityInterval> {
+        match self {
+            Self::Atom { validity, .. } => Some(validity.clone()),
+            _ => None,
+        }
+    }
+    pub fn matches(&self, qualifiers: &[TemporalQualifier]) -> Option<bool> {
+        match self {
+            Self::Source(value) => value.temporal_match(qualifiers),
+            Self::Atom { validity, .. } => {
+                evertrace_domain::query::validity_match(validity, qualifiers)
+            }
+        }
+    }
+    pub fn contextual(&self) -> bool {
+        matches!(
+            self,
+            Self::Atom {
+                contextual: true,
+                ..
+            }
+        )
+    }
+    pub fn wire_bytes(&self) -> usize {
+        match self {
+            Self::Source(value) => value.wire_bytes(),
+            Self::Atom { validity, .. } => {
+                serde_json::to_vec(validity).map_or(usize::MAX, |bytes| bytes.len() + 21)
+            }
+        }
+    }
+}
+
+/// Borrow canonical facts at the pinned frontier; do not mirror a source/authority catalogue.
+pub(crate) struct TemporalReadScope<'a> {
+    pub frontier: u64,
+    pub read: &'a (dyn Fn(&str) -> Option<TemporalPosition> + Sync),
+    pub readable_refs: Option<&'a BTreeSet<String>>,
+    pub source_domain: bool,
+}
+
+impl TemporalReadScope<'_> {
     pub fn position(
         &self,
         row: &SearchProjectionRow,
-    ) -> Result<Option<evertrace_domain::query::SourceTimePosition>, SearchError> {
-        if row.row_variant != "evidence_surface" {
-            return Ok(None);
+    ) -> Result<Option<TemporalPosition>, SearchError> {
+        let reference = if row.row_variant == "evidence_surface" {
+            &row.source_ref
+        } else {
+            &row.candidate_id
+        };
+        let position = (self.read)(reference.as_deref().ok_or(SearchError::Corrupt)?);
+        match &position {
+            Some(TemporalPosition::Source(value)) if row.row_variant == "evidence_surface" => {
+                if !value.validate()
+                    || value.event_time_us != row.event_time_us
+                    || value.recorded_at_us != row.recorded_at_us
+                {
+                    return Err(SearchError::Corrupt);
+                }
+            }
+            Some(TemporalPosition::Atom { validity, .. })
+                if row.object_kind.as_deref() == Some("atom_revision") =>
+            {
+                validity.validate().map_err(|_| SearchError::Corrupt)?;
+            }
+            None if !self.source_domain || row.row_variant != "evidence_surface" => {}
+            _ => return Err(SearchError::Corrupt),
         }
-        let position = (self.read)(row.source_ref.as_deref().ok_or(SearchError::Corrupt)?)
-            .ok_or(SearchError::Corrupt)?;
-        if !position.validate()
-            || position.event_time_us != row.event_time_us
-            || position.recorded_at_us != row.recorded_at_us
-        {
-            return Err(SearchError::Corrupt);
-        }
-        Ok(Some(position))
+        Ok(position)
     }
 }
 
@@ -76,7 +137,7 @@ pub struct ProductionSearch {
     method_proposal_revisions: BTreeSet<String>,
     validated_frontier: Option<u64>,
     readable_refs: Option<(u64, BTreeSet<String>)>,
-    semantics: Option<super::resolution::SemanticSearchResolution>,
+    semantics: Option<std::sync::Arc<super::resolution::SemanticSearchResolution>>,
     canonical_sources: Option<(u64, Vec<SearchProjectionRow>)>,
     recall_sources: BTreeSet<String>,
     matched_sources: BTreeSet<String>,
@@ -127,7 +188,7 @@ impl ProductionSearch {
 
     pub(crate) fn with_semantic_resolution(
         mut self,
-        semantics: super::resolution::SemanticSearchResolution,
+        semantics: std::sync::Arc<super::resolution::SemanticSearchResolution>,
     ) -> Self {
         self.semantics = Some(semantics);
         self
@@ -166,7 +227,7 @@ impl ProductionSearch {
         &self,
         context: &SearchContext,
         object_only: bool,
-        time_scope: Option<&SourceTimeScope<'_>>,
+        time_scope: Option<&TemporalReadScope<'_>>,
     ) -> SearchHardFilter {
         let suppressed_hashes = match &context.suppression {
             SuppressionSnapshot::Current { ref_hashes, .. } => ref_hashes.clone(),
@@ -233,7 +294,7 @@ impl ProductionSearch {
         &self,
         context: SearchContext,
         global_only: bool,
-        time_scope: Option<&SourceTimeScope<'_>>,
+        time_scope: Option<&TemporalReadScope<'_>>,
     ) -> Result<evertrace_domain::query::HumanSearchPage, SearchError> {
         use evertrace_domain::query::{HumanSearchPage, SourceBoundary};
         context.validate()?;
@@ -322,7 +383,7 @@ impl ProductionSearch {
             objects,
             evidence,
             deadline: &deadline,
-            semantics: self.semantics.as_ref(),
+            semantics: self.semantics.as_deref(),
             sequence_scope: self.sequence_scope.as_ref(),
             time_scope,
         }
@@ -417,7 +478,7 @@ impl ProductionSearch {
         deadline: &RequestDeadline,
         global_only: bool,
         anchor_evidence: Option<&SearchHardFilter>,
-        time_scope: Option<&SourceTimeScope<'_>>,
+        time_scope: Option<&TemporalReadScope<'_>>,
     ) -> Result<SearchResult, SearchError> {
         let started = deadline.started;
         let mut changed_frontiers = BTreeSet::new();
@@ -740,11 +801,13 @@ impl ProductionSearch {
                 entry.1.retrieval_origins.extend(origins);
                 continue;
             }
-            let source_time = time_scope
+            let temporal = time_scope
                 .map(|scope| scope.position(row))
                 .transpose()?
                 .flatten();
-            let time_bytes = source_time.as_ref().map_or(0, |value| value.wire_bytes());
+            let source_time = temporal.as_ref().and_then(TemporalPosition::source);
+            let validity_interval = temporal.as_ref().and_then(TemporalPosition::validity);
+            let time_bytes = temporal.as_ref().map_or(0, TemporalPosition::wire_bytes);
             if context
                 .budget
                 .consume_candidate_text(row.text.len().saturating_add(time_bytes))
@@ -780,6 +843,7 @@ impl ProductionSearch {
             let candidate = SearchCandidate {
                 source_sequence,
                 source_time,
+                validity_interval,
                 candidate_id: candidate_id.clone(),
                 source_ref: row.source_ref.clone().unwrap_or_default(),
                 row_variant,
@@ -950,7 +1014,7 @@ fn source_filter(boundary: Option<SourceBoundary>) -> (Option<String>, Option<St
 pub(super) fn hard_compatible(
     row: &SearchProjectionRow,
     context: &SearchContext,
-    time_scope: Option<&SourceTimeScope<'_>>,
+    time_scope: Option<&TemporalReadScope<'_>>,
 ) -> Result<bool, QueryError> {
     if let Some(hash) = row.suppression_ref_hash.as_deref()
         && context.suppression.suppresses(hash)?
@@ -1044,14 +1108,17 @@ fn source_compatible(row: &SearchProjectionRow, boundary: Option<SourceBoundary>
 pub(super) fn temporal_is_partial(
     candidates: &[((u8, usize), SearchCandidate, &SearchProjectionRow)],
     context: &SearchContext,
-    time_scope: Option<&SourceTimeScope<'_>>,
+    time_scope: Option<&TemporalReadScope<'_>>,
     degraded: &mut BTreeSet<String>,
 ) -> bool {
     let required_domain = match context.query_facets.temporal_qualifiers.as_slice() {
         [] => return false,
-        [TemporalQualifier::EventTimeAsOf { .. } | TemporalQualifier::EventTimeInterval { .. }] => {
-            "event_time"
-        }
+        [
+            TemporalQualifier::EventTimeAsOf { .. }
+            | TemporalQualifier::EventTimeInterval { .. }
+            | TemporalQualifier::ValidityAsOf { .. }
+            | TemporalQualifier::ValidityInterval { .. },
+        ] => "event_time",
         // The caller has already pinned a canonical source revision and its
         // readable references. Event timestamps do not invalidate its sequence.
         [TemporalQualifier::SourceSequenceAtMost { .. }] => return false,
@@ -1062,12 +1129,17 @@ pub(super) fn temporal_is_partial(
     };
     if time_scope.is_some() {
         let partial = candidates.iter().any(|(_, candidate, _)| {
-            !candidate.source_time.as_ref().is_some_and(|position| {
-                position.temporal_match(&context.query_facets.temporal_qualifiers) == Some(true)
-            })
+            candidate
+                .temporal_match(&context.query_facets.temporal_qualifiers)
+                .is_none()
         });
         if partial {
-            degraded.insert("event_clock_provenance_unverified".into());
+            let reason = if time_scope.is_some_and(|scope| !scope.source_domain) {
+                "validity_interval_unverified"
+            } else {
+                "event_clock_provenance_unverified"
+            };
+            degraded.insert(reason.into());
         }
         return partial;
     }
@@ -1087,22 +1159,27 @@ pub(super) fn temporal_is_partial(
 fn temporal_compatible(
     row: &SearchProjectionRow,
     context: &SearchContext,
-    time_scope: Option<&SourceTimeScope<'_>>,
+    time_scope: Option<&TemporalReadScope<'_>>,
 ) -> Result<bool, QueryError> {
     if let Some(scope) = time_scope
         && matches!(
             context.query_facets.temporal_qualifiers.as_slice(),
-            [
-                TemporalQualifier::EventTimeAsOf { .. }
-                    | TemporalQualifier::EventTimeInterval { .. }
-            ]
+            [TemporalQualifier::EventTimeAsOf { .. }
+                | TemporalQualifier::EventTimeInterval { .. }
+                | TemporalQualifier::ValidityAsOf { .. }
+                | TemporalQualifier::ValidityInterval { .. }]
         )
     {
         return Ok(scope
             .position(row)
             .map_err(|_| QueryError::Invalid)?
             .is_none_or(|position| {
-                position.temporal_match(&context.query_facets.temporal_qualifiers) != Some(false)
+                position.matches(&context.query_facets.temporal_qualifiers) != Some(false)
+                    || position.contextual()
+                    || context.query_facets.target_anchors.iter().any(|reference| {
+                        row.candidate_id.as_ref() == Some(reference)
+                            || row.source_ref.as_ref() == Some(reference)
+                    })
             }));
     }
     Ok(match context.query_facets.temporal_qualifiers.as_slice() {

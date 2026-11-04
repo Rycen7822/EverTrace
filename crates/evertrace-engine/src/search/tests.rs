@@ -65,6 +65,7 @@ mod tests {
             candidates: vec![SearchCandidate {
                 source_sequence: None,
                 source_time: None,
+                validity_interval: None,
                 candidate_id: BASE_REVISION.into(),
                 source_ref: BASE_ENTITY.into(),
                 row_variant: evertrace_domain::query::SearchCandidateVariant::Object,
@@ -332,6 +333,7 @@ mod tests {
             result.candidates.push(SearchCandidate {
                 source_sequence: None,
                 source_time: None,
+                validity_interval: None,
                 candidate_id: candidate.clone(),
                 source_ref: candidate,
                 row_variant: evertrace_domain::query::SearchCandidateVariant::Object,
