@@ -18,6 +18,7 @@ use thiserror::Error;
 pub(crate) struct SourceSequenceScope {
     pub source_anchor: evertrace_domain::ids::SourceObservationId,
     pub positions: BTreeMap<String, u64>,
+    pub coverage_complete: bool,
 }
 
 impl SourceSequenceScope {
@@ -38,12 +39,16 @@ impl SourceSequenceScope {
         Ok(Some(evertrace_domain::query::SourceSequencePosition {
             source_anchor: self.source_anchor,
             sequence: *sequence,
+            coverage_complete: self.coverage_complete,
         }))
     }
 }
 /// Canonical metadata only; current resolver state is not recomputed at a historical clock.
 pub(crate) enum TemporalPosition {
-    Source(Box<evertrace_domain::evidence::SourceReceipt>),
+    Source {
+        receipt: Box<evertrace_domain::evidence::SourceReceipt>,
+        coverage_complete: bool,
+    },
     Atom {
         validity: evertrace_domain::semantic::ValidityInterval,
         contextual: bool,
@@ -53,11 +58,13 @@ pub(crate) enum TemporalPosition {
 impl TemporalPosition {
     pub fn source(&self) -> Option<evertrace_domain::query::SourceTimePosition> {
         match self {
-            Self::Source(value) => Some(evertrace_domain::query::SourceTimePosition {
-                event_time_us: value.event_time_us,
-                recorded_at_us: value.recorded_at_us,
-                provenance: value.event_time_provenance,
-            }),
+            Self::Source { receipt: value, .. } => {
+                Some(evertrace_domain::query::SourceTimePosition {
+                    event_time_us: value.event_time_us,
+                    recorded_at_us: value.recorded_at_us,
+                    provenance: value.event_time_provenance,
+                })
+            }
             _ => None,
         }
     }
@@ -71,9 +78,13 @@ impl TemporalPosition {
             return None;
         }
         match self {
-            Self::Source(value) => Some(evertrace_domain::query::SourceSequencePosition {
+            Self::Source {
+                receipt: value,
+                coverage_complete,
+            } => Some(evertrace_domain::query::SourceSequencePosition {
                 source_anchor: value.source_observation_id,
                 sequence: value.source_sequence,
+                coverage_complete: *coverage_complete,
             }),
             _ => None,
         }
@@ -86,7 +97,7 @@ impl TemporalPosition {
     }
     pub fn matches(&self, qualifiers: &[TemporalQualifier]) -> Option<bool> {
         match self {
-            Self::Source(_) => self
+            Self::Source { .. } => self
                 .source()
                 .and_then(|value| value.temporal_match(qualifiers)),
             Self::Atom { validity, .. } => {
@@ -105,7 +116,7 @@ impl TemporalPosition {
     }
     pub fn wire_bytes(&self) -> usize {
         match self {
-            Self::Source(_) => self.source().map_or(0, |value| value.wire_bytes()),
+            Self::Source { .. } => self.source().map_or(0, |value| value.wire_bytes()),
             Self::Atom { validity, .. } => {
                 serde_json::to_vec(validity).map_or(usize::MAX, |bytes| bytes.len() + 21)
             }
@@ -133,7 +144,9 @@ impl TemporalReadScope<'_> {
         };
         let position = (self.read)(reference.as_deref().ok_or(SearchError::Corrupt)?);
         match &position {
-            Some(TemporalPosition::Source(value)) if row.row_variant == "evidence_surface" => {
+            Some(TemporalPosition::Source { receipt: value, .. })
+                if row.row_variant == "evidence_surface" =>
+            {
                 if value.validate().is_err()
                     || value.event_time_us != row.event_time_us
                     || value.recorded_at_us != row.recorded_at_us
@@ -178,7 +191,8 @@ impl TemporalReadScope<'_> {
             if deadline.remaining().is_none() {
                 return Ok(());
             }
-            let Some(TemporalPosition::Source(receipt)) = (self.read)(&candidate.source_ref) else {
+            let Some(TemporalPosition::Source { receipt, .. }) = (self.read)(&candidate.source_ref)
+            else {
                 return Err(SearchError::Corrupt);
             };
             if receipt.source_sequence != position.sequence

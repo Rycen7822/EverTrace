@@ -846,8 +846,18 @@ impl NativeRetrieval<'_> {
                 timeline_order(&self.result.candidates),
                 Some((OrderingBasis::SourceSequence, _))
             );
-        if self.sequence_scope.is_some() || sequence_order {
-            // A per-record receipt does not prove an entire prefix is gap-free.
+        let coverage_complete = self.sequence_scope.map_or_else(
+            || {
+                self.result.candidates.iter().all(|candidate| {
+                    candidate
+                        .source_sequence
+                        .as_ref()
+                        .is_some_and(|position| position.coverage_complete)
+                })
+            },
+            |scope| scope.coverage_complete,
+        );
+        if (self.sequence_scope.is_some() || sequence_order) && !coverage_complete {
             self.degraded("source_sequence_coverage_unverified");
         } else if matches!(
             self.context.query_facets.temporal_mode,

@@ -1402,6 +1402,9 @@ impl std::str::FromStr for SearchCurrentness {
 pub struct SourceSequencePosition {
     pub source_anchor: SourceObservationId,
     pub sequence: u64,
+    /// Canonical archive coverage satisfies this request's source window, not global capture recall.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub coverage_complete: bool,
 }
 
 impl SourceSequencePosition {
@@ -2009,6 +2012,17 @@ impl HumanSearchPage {
                 timeline_order(&self.result.candidates),
                 Some((OrderingBasis::SourceSequence, _))
             );
+        if (sequence_mode || sequence_order)
+            && self.result.completeness == RetrievalCompleteness::Complete
+            && self.result.candidates.iter().any(|candidate| {
+                candidate
+                    .source_sequence
+                    .as_ref()
+                    .is_some_and(|position| !position.coverage_complete)
+            })
+        {
+            return false;
+        }
         view.active_evidence.iter().all(|statement| {
             let positioned = statement.support_refs.iter().all(|reference| {
                 self.result.candidates.iter().any(|candidate| {

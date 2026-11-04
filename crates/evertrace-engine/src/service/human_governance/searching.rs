@@ -10,8 +10,12 @@ fn source_sequence_scope(
     facets: &QueryFacetSet,
     deadline: std::time::Instant,
 ) -> Option<crate::search::SourceSequenceScope> {
-    let [TemporalQualifier::SourceSequenceAtMost { source_ref, .. }] =
-        facets.temporal_qualifiers.as_slice()
+    let [
+        TemporalQualifier::SourceSequenceAtMost {
+            source_ref,
+            sequence,
+        },
+    ] = facets.temporal_qualifiers.as_slice()
     else {
         return None;
     };
@@ -40,6 +44,7 @@ fn source_sequence_scope(
     Some(crate::search::SourceSequenceScope {
         source_anchor: *source_ref,
         positions,
+        coverage_complete: source_coverage_complete(index, &anchor, Some(*sequence)),
     })
 }
 
@@ -86,6 +91,81 @@ fn source_receipt(
         return None;
     }
     Some(receipt)
+}
+/// Admission verified each contiguous byte/CAS leg; this reader never computes a second digest.
+fn source_coverage_complete(
+    index: &std::collections::BTreeMap<&str, Vec<&ObjectRow>>,
+    receipt: &evertrace_domain::evidence::SourceReceipt,
+    through: Option<u64>,
+) -> bool {
+    use evertrace_domain::{
+        evidence::EvidenceSourceKind,
+        source::{MetadataState, SessionBodyState},
+    };
+    if receipt.source_kind != EvidenceSourceKind::CodexSessionJsonl
+        || receipt.source_sequence_origin != Some(0)
+        || receipt
+            .source_byte_range
+            .as_ref()
+            .is_none_or(|range| range.end != receipt.source_sequence)
+    {
+        return false;
+    }
+    let key = evertrace_store::SourceIngestWatermark {
+        source_instance_id: receipt.source_instance_id.clone(),
+        source_revision: receipt.source_revision.clone(),
+        source_sequence: 0,
+        confirmed_prefix_digest: None,
+        earlier_prefix: None,
+    }
+    .stable_key();
+    let key = format!("runtime:watermark:source:{key}");
+    let Some([row]) = index.get(key.as_str()).map(Vec::as_slice) else {
+        return false;
+    };
+    let Some(Ok(JournalPayload::SourceIngestWatermark(watermark))) = row
+        .payload_json
+        .as_ref()
+        .map(|json| serde_json::from_str(json))
+    else {
+        return false;
+    };
+    if watermark.source_instance_id != receipt.source_instance_id
+        || watermark.source_revision != receipt.source_revision
+        || receipt.source_sequence > watermark.source_sequence
+        || watermark.confirmed_prefix_digest.is_none()
+    {
+        return false;
+    }
+    // An admitted earlier prefix remains usable even while a later gap is open.
+    let contiguous_through = watermark
+        .earlier_prefix
+        .as_ref()
+        .filter(|prefix| prefix.through_byte < prefix.fence_byte)
+        .map_or(watermark.source_sequence, |prefix| prefix.through_byte);
+    if through.is_some_and(|bound| bound <= contiguous_through) {
+        return true;
+    }
+    if contiguous_through != watermark.source_sequence {
+        return false;
+    }
+    let key = evertrace_store::session_import_row_id(receipt.source_instance_id.as_str());
+    let fallback = evertrace_store::session_import_row_id(&receipt.source_session_ref);
+    let Some([row]) = index
+        .get(key.as_str())
+        .or_else(|| index.get(fallback.as_str()))
+        .map(Vec::as_slice)
+    else {
+        return false;
+    };
+    let Ok(Some(current)) = evertrace_store::session_import::restore_current(row) else {
+        return false;
+    };
+    current.source_instance() == receipt.source_instance_id.as_str()
+        && current.metadata.source_revision == receipt.source_revision
+        && current.body_state == SessionBodyState::Imported
+        && current.metadata.metadata_state == MetadataState::Indexed
+        && watermark.source_sequence == current.metadata.file_size
 }
 
 fn atom_validity(
@@ -588,7 +668,14 @@ impl HumanGovernanceService {
                 if validity_query {
                     return None;
                 }
-                source_receipt(&index, reference).map(crate::search::TemporalPosition::Source)
+                source_receipt(&index, reference).map(|receipt| {
+                    let coverage_complete =
+                        validity_timeline && source_coverage_complete(&index, &receipt, None);
+                    crate::search::TemporalPosition::Source {
+                        receipt,
+                        coverage_complete,
+                    }
+                })
             };
             let time_query = matches!(
                 context.query_facets.temporal_mode,
