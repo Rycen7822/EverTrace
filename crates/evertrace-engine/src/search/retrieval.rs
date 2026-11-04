@@ -132,6 +132,9 @@ impl NativeRetrieval<'_> {
             let validity_interval = temporal
                 .as_ref()
                 .and_then(super::production::TemporalPosition::validity);
+            let revision_order = temporal
+                .as_ref()
+                .and_then(super::production::TemporalPosition::revision_order);
             let source_sequence = self
                 .sequence_scope
                 .map(|scope| scope.position(&row))
@@ -178,6 +181,7 @@ impl NativeRetrieval<'_> {
                 source_sequence,
                 source_time,
                 validity_interval,
+                revision_order,
                 candidate_id: id,
                 source_ref: row.source_ref.ok_or(SearchError::Corrupt)?,
                 row_variant: if row.row_variant == "object" {
@@ -362,10 +366,30 @@ impl NativeRetrieval<'_> {
                         .iter()
                         .all(|literal| candidate.text.contains(literal)))
         };
-        if self.context.query_facets.relation_requirements.is_empty() {
+        let mut kinds = self.context.query_facets.relation_requirements.clone();
+        if self.context.query_facets.answer_shape == Some(AnswerShape::Latest)
+            && self
+                .result
+                .candidates
+                .iter()
+                .any(|candidate| candidate.object_kind.as_deref() == Some("atom_revision"))
+        {
+            // Latest must not ignore an explicit contradiction while choosing an update.
+            for (kind, needed) in [
+                (
+                    "atom_supersedes",
+                    self.context.query_facets.temporal_qualifiers.is_empty(),
+                ),
+                ("atom_contradicts", true),
+            ] {
+                if needed && !kinds.iter().any(|existing| existing == kind) {
+                    kinds.push(kind.into());
+                }
+            }
+        }
+        if kinds.is_empty() {
             self.result.candidates.retain(facet_match);
         }
-        let kinds = self.context.query_facets.relation_requirements.clone();
         if kinds.iter().any(|kind| !relation_allowed(kind)) {
             self.degraded("relation_not_allowlisted");
         }
@@ -743,6 +767,7 @@ impl NativeRetrieval<'_> {
         }
         let mut view = GroundedEvidenceView {
             candidate_count: None,
+            candidate_latest: None,
             evidence_need: EvidenceNeed::from_context(self.context),
             candidate_set: CandidateBoundary {
                 generation: if added.is_empty() { 1 } else { 2 },
@@ -759,6 +784,52 @@ impl NativeRetrieval<'_> {
         };
         view.candidate_count =
             view.derive_candidate_count(&self.result.candidates, &matching_constraints);
+        view.candidate_latest =
+            view.derive_candidate_latest(&self.result.candidates, &matching_constraints);
+        if let Some(latest) = &view.candidate_latest {
+            if latest.statement_indices.is_none() {
+                self.degraded("latest_ordering_unavailable");
+                for index in &latest.operand_indices {
+                    for candidate in &self.result.candidates {
+                        if view.active_evidence[*index as usize]
+                            .support_refs
+                            .contains(&candidate.candidate_id)
+                        {
+                            let gap = NamedGap {
+                                kind: NamedGapKind::TemporalEvidence,
+                                identifier: candidate.source_ref.clone(),
+                                changes_result: true,
+                            };
+                            if !view.unresolved_gaps.contains(&gap) {
+                                view.unresolved_gaps.push(gap);
+                            }
+                        }
+                    }
+                }
+            } else if latest.ordering_basis == OrderingBasis::RecordedAtFallback {
+                self.degraded("recorded_at_fallback");
+            } else if latest.ordering_basis == OrderingBasis::SourceSequence
+                && latest.operand_indices.iter().any(|index| {
+                    self.result.candidates.iter().any(|candidate| {
+                        view.active_evidence[*index as usize]
+                            .support_refs
+                            .contains(&candidate.candidate_id)
+                            && candidate
+                                .source_sequence
+                                .as_ref()
+                                .is_none_or(|position| !position.coverage_complete)
+                    })
+                })
+            {
+                self.degraded("source_sequence_coverage_unverified");
+            }
+            if self.result.completeness == RetrievalCompleteness::Complete
+                && (!self.result.degraded_reasons.is_empty() || !view.unresolved_gaps.is_empty())
+            {
+                self.result.completeness = RetrievalCompleteness::Partial;
+            }
+            view.completeness = self.result.completeness;
+        }
         view.validate_at_frontier(self.result.projection_frontier)?;
         Ok(HumanSearchPage {
             result: self.result,
@@ -766,8 +837,10 @@ impl NativeRetrieval<'_> {
         })
     }
     fn output_limit(&self) -> usize {
-        if self.context.query_facets.count_unit().is_some() {
-            // Count has one answer; display pagination must not define its operands.
+        if self.context.query_facets.count_unit().is_some()
+            || self.context.query_facets.answer_shape == Some(AnswerShape::Latest)
+        {
+            // Operators answer over the bounded set, not display pagination.
             return 32;
         }
         self.context
@@ -783,8 +856,10 @@ impl NativeRetrieval<'_> {
             .min(32)
     }
     fn answer_text_limit(&self) -> usize {
-        // A quote occurs twice; metadata and the count operator occur once.
-        2400 - if self.context.query_facets.count_unit().is_some() {
+        // A quote occurs twice; metadata and the typed operator occur once.
+        2400 - if self.context.query_facets.answer_shape == Some(AnswerShape::Latest) {
+            MAX_GROUNDED_LATEST_BYTES / 2
+        } else if self.context.query_facets.count_unit().is_some() {
             MAX_GROUNDED_COUNT_BYTES / 2
         } else {
             0
@@ -831,7 +906,10 @@ impl NativeRetrieval<'_> {
         }
         self.result.candidates = kept;
         if self.sequence_scope.is_none()
-            && self.context.query_facets.answer_shape == Some(AnswerShape::Timeline)
+            && matches!(
+                self.context.query_facets.answer_shape,
+                Some(AnswerShape::Timeline | AnswerShape::Latest)
+            )
             && self.context.query_facets.temporal_qualifiers.is_empty()
             && let Some(scope) = self.time_scope
         {

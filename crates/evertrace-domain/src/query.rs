@@ -134,6 +134,7 @@ pub enum AnswerShape {
     EntityList,
     Count,
     Timeline,
+    Latest,
 }
 
 #[derive(Clone, Copy, Debug, Deserialize, Eq, Ord, PartialEq, PartialOrd, Serialize)]
@@ -567,6 +568,8 @@ pub struct GroundedEvidenceView {
     /// Exact only within candidate_set, never a catalog or physical-event total.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub candidate_count: Option<GroundedCount>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub candidate_latest: Option<GroundedLatest>,
     pub evidence_need: EvidenceNeed,
     pub candidate_set: CandidateBoundary,
     pub trace: Vec<GroundedTraceStep>,
@@ -587,19 +590,40 @@ pub struct GroundedCount {
 }
 
 pub const MAX_GROUNDED_COUNT_BYTES: usize = 256;
+pub const MAX_GROUNDED_LATEST_BYTES: usize = 512;
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct GroundedLatest {
+    pub operator_revision: u32,
+    pub operand_indices: BTreeSet<u32>,
+    /// None: no proven maximum. Some(empty): no matching operands. Ties remain ties.
+    /// Recorded-at winners are provisional; they cannot make the view complete.
+    pub statement_indices: Option<BTreeSet<u32>>,
+    pub ordering_basis: OrderingBasis,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+/// Canonical admission order within one immutable entity, never a UTC timestamp.
+pub struct RevisionOrderPosition {
+    pub anchor: String,
+    pub sequence: u64,
+}
+
+impl RevisionOrderPosition {
+    pub fn wire_bytes(&self) -> usize {
+        serde_json::to_vec(self).map_or(usize::MAX, |bytes| bytes.len() + 18)
+    }
+}
 
 impl GroundedEvidenceView {
-    pub fn derive_candidate_count(
+    fn quoted_operands<'a>(
         &self,
-        candidates: &[SearchCandidate],
+        candidates: &'a [SearchCandidate],
         matching_constraints: &BTreeSet<u32>,
-    ) -> Option<GroundedCount> {
-        if self.evidence_need.answer_shape != Some(AnswerShape::Count) {
-            return None;
-        }
-        let unit = self.evidence_need.count_unit?;
-        let mut identities = BTreeSet::new();
-        let mut statement_indices = BTreeSet::new();
+    ) -> Option<Vec<(u32, &'a SearchCandidate)>> {
+        let mut operands = Vec::new();
         for step in &self.trace {
             if step.role == EvidenceRole::ConstraintSupport
                 && !matching_constraints.contains(&step.statement_index)
@@ -614,10 +638,26 @@ impl GroundedEvidenceView {
                 .iter()
                 .find(|candidate| statement.support_refs.contains(&candidate.candidate_id))?;
             if candidate.temporal_match(&self.evidence_need.temporal_scope.qualifiers)
-                == Some(false)
+                != Some(false)
             {
-                continue;
+                operands.push((step.statement_index, candidate));
             }
+        }
+        Some(operands)
+    }
+
+    pub fn derive_candidate_count(
+        &self,
+        candidates: &[SearchCandidate],
+        matching_constraints: &BTreeSet<u32>,
+    ) -> Option<GroundedCount> {
+        if self.evidence_need.answer_shape != Some(AnswerShape::Count) {
+            return None;
+        }
+        let unit = self.evidence_need.count_unit?;
+        let mut identities = BTreeSet::new();
+        let mut statement_indices = BTreeSet::new();
+        for (index, candidate) in self.quoted_operands(candidates, matching_constraints)? {
             let identity = match unit {
                 CountUnit::ObjectRevision
                     if candidate.row_variant == SearchCandidateVariant::Object =>
@@ -636,7 +676,7 @@ impl GroundedEvidenceView {
                 _ => continue,
             };
             identities.insert(identity);
-            statement_indices.insert(step.statement_index);
+            statement_indices.insert(index);
         }
         Some(GroundedCount {
             operator_revision: 1,
@@ -655,8 +695,72 @@ impl GroundedEvidenceView {
         self.validate_inner(Some(frontier))
     }
 
+    pub fn derive_candidate_latest(
+        &self,
+        candidates: &[SearchCandidate],
+        matching_constraints: &BTreeSet<u32>,
+    ) -> Option<GroundedLatest> {
+        if self.evidence_need.answer_shape != Some(AnswerShape::Latest) {
+            return None;
+        }
+        let (indices, operands): (Vec<_>, Vec<_>) = self
+            .quoted_operands(candidates, matching_constraints)?
+            .into_iter()
+            .unzip();
+        let relations = self
+            .active_evidence
+            .iter()
+            .filter(|statement| statement.derivation_kind == DerivationKind::DeterministicDerived)
+            .filter_map(|statement| {
+                serde_json::from_str::<GroundedRelationStatement>(&statement.statement).ok()
+            })
+            .collect::<Vec<_>>();
+        let order = self
+            .conflicts
+            .is_empty()
+            .then(|| {
+                latest_order(
+                    &operands,
+                    &self.evidence_need.temporal_scope.qualifiers,
+                    &relations,
+                )
+            })
+            .flatten();
+        Some(GroundedLatest {
+            operator_revision: 1,
+            operand_indices: indices.iter().copied().collect(),
+            statement_indices: order.as_ref().map(|(_, winners)| {
+                indices
+                    .iter()
+                    .zip(&operands)
+                    .filter(|(_, candidate)| winners.contains(candidate.candidate_id.as_str()))
+                    .map(|(index, _)| *index)
+                    .collect()
+            }),
+            ordering_basis: order.map_or(OrderingBasis::Unknown, |(basis, _)| basis),
+        })
+    }
+
     fn validate_inner(&self, frontier: Option<u64>) -> Result<(), QueryError> {
         self.evidence_need.validate()?;
+        if let Some(latest) = &self.candidate_latest {
+            if self.evidence_need.answer_shape != Some(AnswerShape::Latest)
+                || latest.operator_revision != 1
+                || latest.operand_indices.iter().any(|index| {
+                    self.active_evidence
+                        .get(*index as usize)
+                        .is_none_or(|statement| statement.derivation_kind != DerivationKind::Quoted)
+                })
+                || latest
+                    .statement_indices
+                    .as_ref()
+                    .is_some_and(|indices| !indices.is_subset(&latest.operand_indices))
+                || serde_json::to_vec(latest)
+                    .map_or(true, |bytes| bytes.len() > MAX_GROUNDED_LATEST_BYTES)
+            {
+                return Err(QueryError::Invalid);
+            }
+        }
         self.candidate_set.validate()?;
         if let Some(count) = &self.candidate_count {
             if self.evidence_need.answer_shape != Some(AnswerShape::Count)
@@ -1523,7 +1627,166 @@ impl SearchCandidate {
                 .source_sequence
                 .as_ref()
                 .map_or(0, SourceSequencePosition::wire_bytes)
+            + self
+                .revision_order
+                .as_ref()
+                .map_or(0, RevisionOrderPosition::wire_bytes)
     }
+}
+
+fn latest_max<'a>(
+    candidates: &[&'a SearchCandidate],
+    key: impl Fn(&SearchCandidate) -> Option<i128>,
+) -> Option<BTreeSet<&'a str>> {
+    let values = candidates
+        .iter()
+        .map(|candidate| key(candidate))
+        .collect::<Option<Vec<_>>>()?;
+    let maximum = values.iter().max()?;
+    Some(
+        candidates
+            .iter()
+            .zip(&values)
+            .filter(|(_, value)| *value == maximum)
+            .map(|(candidate, _)| candidate.candidate_id.as_str())
+            .collect(),
+    )
+}
+
+fn latest_order<'a>(
+    candidates: &[&'a SearchCandidate],
+    qualifiers: &[TemporalQualifier],
+    relations: &[GroundedRelationStatement],
+) -> Option<(OrderingBasis, BTreeSet<&'a str>)> {
+    if candidates.is_empty() {
+        return Some((OrderingBasis::Unknown, BTreeSet::new()));
+    }
+    if candidates.iter().any(|candidate| candidate.conflicted) {
+        return None;
+    }
+    if matches!(
+        qualifiers,
+        [TemporalQualifier::ValidityAsOf { .. } | TemporalQualifier::ValidityInterval { .. }]
+    ) {
+        return latest_max(candidates, |candidate| {
+            candidate
+                .validity_interval
+                .as_ref()
+                .map(|interval| interval.valid_from_us.into())
+        })
+        .map(|winners| (OrderingBasis::Validity, winners));
+    }
+    let first = candidates[0];
+    if (qualifiers.is_empty()
+        || matches!(qualifiers, [TemporalQualifier::SourceSequenceAtMost { .. }]))
+        && first.source_sequence.is_some()
+        && candidates.iter().all(|candidate| {
+            candidate
+                .source_sequence
+                .as_ref()
+                .zip(first.source_sequence.as_ref())
+                .is_some_and(|(a, b)| a.source_anchor == b.source_anchor)
+        })
+    {
+        return latest_max(candidates, |candidate| {
+            candidate
+                .source_sequence
+                .as_ref()
+                .map(|position| position.sequence.into())
+        })
+        .map(|winners| (OrderingBasis::SourceSequence, winners));
+    }
+    if matches!(qualifiers, [TemporalQualifier::SourceSequenceAtMost { .. }]) {
+        return None;
+    }
+    if !qualifiers.is_empty() {
+        return latest_clock_order(candidates);
+    }
+    if first.revision_order.is_some()
+        && candidates.iter().all(|candidate| {
+            candidate
+                .revision_order
+                .as_ref()
+                .zip(first.revision_order.as_ref())
+                .is_some_and(|(a, b)| a.anchor == b.anchor)
+        })
+    {
+        return latest_max(candidates, |candidate| {
+            candidate
+                .revision_order
+                .as_ref()
+                .map(|position| position.sequence.into())
+        })
+        .map(|winners| (OrderingBasis::Supersession, winners));
+    }
+    // Only explicit, readable edges, with the same two-hop ceiling as D. A cycle
+    // or incomparable roots cannot become a winner through a tie-breaker.
+    let mut roots = BTreeSet::new();
+    for root in candidates {
+        let mut reached = BTreeSet::from([root.candidate_id.as_str()]);
+        let mut frontier = reached.clone();
+        for _ in 0..2 {
+            frontier = relations
+                .iter()
+                .filter(|relation| {
+                    relation.relation_kind == "atom_supersedes"
+                        && frontier.contains(relation.source_ref.as_str())
+                })
+                .map(|relation| relation.target_ref.as_str())
+                .collect();
+            reached.extend(&frontier);
+        }
+        if candidates.len() > 1
+            && candidates
+                .iter()
+                .all(|candidate| reached.contains(candidate.candidate_id.as_str()))
+        {
+            roots.insert(root.candidate_id.as_str());
+        }
+    }
+    if roots.len() == 1 {
+        return Some((OrderingBasis::Supersession, roots));
+    }
+    latest_clock_order(candidates)
+}
+
+fn latest_clock_order<'a>(
+    candidates: &[&'a SearchCandidate],
+) -> Option<(OrderingBasis, BTreeSet<&'a str>)> {
+    let windows = candidates
+        .iter()
+        .map(|candidate| candidate.source_time.as_ref()?.event_window())
+        .collect::<Option<Vec<_>>>();
+    if let Some(windows) = windows {
+        let winners = candidates
+            .iter()
+            .zip(&windows)
+            .enumerate()
+            .filter(|(index, (_, (lower, upper)))| {
+                windows
+                    .iter()
+                    .enumerate()
+                    .all(|(other, (other_lower, other_upper))| {
+                        *index == other
+                            || lower > other_upper
+                            || (lower == upper
+                                && other_lower == other_upper
+                                && lower == other_lower)
+                    })
+            })
+            .map(|(_, (candidate, _))| candidate.candidate_id.as_str())
+            .collect::<BTreeSet<_>>();
+        if !winners.is_empty() {
+            return Some((OrderingBasis::EventTime, winners));
+        }
+    }
+    latest_max(candidates, |candidate| {
+        candidate
+            .source_time
+            .as_ref()
+            .map(|position| position.recorded_at_us.into())
+    })
+    .map(|winners| (OrderingBasis::RecordedAtFallback, winners))
 }
 
 /// This orders a view of a frozen set; it never changes ranking or generation.
@@ -1618,6 +1881,8 @@ pub struct SearchCandidate {
     pub source_time: Option<SourceTimePosition>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub validity_interval: Option<crate::semantic::ValidityInterval>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub revision_order: Option<RevisionOrderPosition>,
     pub source_ref: String,
     pub row_variant: SearchCandidateVariant,
     pub currentness: Option<SearchCurrentness>,
@@ -1742,7 +2007,9 @@ impl HumanSearchPage {
                                 && candidate.source_time.is_none()
                         }
                         SearchCandidateVariant::EvidenceSurface => {
-                            candidate.currentness.is_none() && candidate.validity_interval.is_none()
+                            candidate.currentness.is_none()
+                                && candidate.validity_interval.is_none()
+                                && candidate.revision_order.is_none()
                         }
                     }
             })
@@ -1752,6 +2019,7 @@ impl HumanSearchPage {
                     && view.candidate_set.candidate_refs == refs
                     && view.completeness == self.result.completeness
                     && self.count_derivation_valid(view)
+                    && self.latest_derivation_valid(view)
             })
             && self.quoted_statements_valid()
             && self.timeline_order_valid()
@@ -1773,6 +2041,45 @@ impl HumanSearchPage {
         view.derive_candidate_count(&self.result.candidates, &count.statement_indices)
             .as_ref()
             == Some(count)
+    }
+
+    fn latest_derivation_valid(&self, view: &GroundedEvidenceView) -> bool {
+        if view.evidence_need.answer_shape != Some(AnswerShape::Latest) {
+            return view.candidate_latest.is_none();
+        }
+        let Some(latest) = &view.candidate_latest else {
+            return false;
+        };
+        if view
+            .derive_candidate_latest(&self.result.candidates, &latest.operand_indices)
+            .as_ref()
+            != Some(latest)
+        {
+            return false;
+        }
+        if view.completeness == RetrievalCompleteness::Complete {
+            if latest.statement_indices.is_none()
+                || latest.ordering_basis == OrderingBasis::RecordedAtFallback
+            {
+                return false;
+            }
+            if latest.ordering_basis == OrderingBasis::SourceSequence
+                && latest.operand_indices.iter().any(|index| {
+                    self.result.candidates.iter().any(|candidate| {
+                        view.active_evidence[*index as usize]
+                            .support_refs
+                            .contains(&candidate.candidate_id)
+                            && candidate
+                                .source_sequence
+                                .as_ref()
+                                .is_none_or(|position| !position.coverage_complete)
+                    })
+                })
+            {
+                return false;
+            }
+        }
+        true
     }
 
     fn quoted_statements_valid(&self) -> bool {
@@ -1835,11 +2142,27 @@ impl HumanSearchPage {
 
     fn time_positions_valid(&self) -> bool {
         let view = self.grounded_view.as_ref();
-        let unqualified_timeline = view.is_some_and(|view| {
-            view.evidence_need.answer_shape == Some(AnswerShape::Timeline)
-                && view.evidence_need.temporal_scope.qualifiers.is_empty()
+        let unqualified_chronology = view.is_some_and(|view| {
+            matches!(
+                view.evidence_need.answer_shape,
+                Some(AnswerShape::Timeline | AnswerShape::Latest)
+            ) && view.evidence_need.temporal_scope.qualifiers.is_empty()
         });
         for candidate in &self.result.candidates {
+            if let Some(position) = &candidate.revision_order {
+                if candidate.row_variant != SearchCandidateVariant::Object
+                    || candidate.object_kind.as_deref() == Some("wiki_projection")
+                    || position.anchor != candidate.source_ref
+                    || position.sequence == 0
+                    || position.sequence > self.result.projection_frontier
+                    || view.is_none_or(|view| {
+                        view.evidence_need.answer_shape != Some(AnswerShape::Latest)
+                            || !view.evidence_need.temporal_scope.qualifiers.is_empty()
+                    })
+                {
+                    return false;
+                }
+            }
             if let Some(position) = &candidate.source_time {
                 if !position.validate()
                     || candidate.row_variant != SearchCandidateVariant::EvidenceSurface
@@ -1848,7 +2171,7 @@ impl HumanSearchPage {
                             view.evidence_need.temporal_scope.qualifiers.as_slice(),
                             [TemporalQualifier::EventTimeAsOf { .. }
                                 | TemporalQualifier::EventTimeInterval { .. }]
-                        ) && !unqualified_timeline
+                        ) && !unqualified_chronology
                     })
                 {
                     return false;
@@ -1864,7 +2187,7 @@ impl HumanSearchPage {
                             view.evidence_need.temporal_scope.qualifiers.as_slice(),
                             [TemporalQualifier::ValidityAsOf { .. }
                                 | TemporalQualifier::ValidityInterval { .. }]
-                        ) && !unqualified_timeline
+                        ) && !unqualified_chronology
                     })
                 {
                     return false;
@@ -1910,7 +2233,7 @@ impl HumanSearchPage {
             view.evidence_need.temporal_scope.mode,
             TemporalMode::AsOf | TemporalMode::Interval
         );
-        let expected = if temporal {
+        let mut expected = if temporal {
             self.result
                 .candidates
                 .iter()
@@ -1924,6 +2247,20 @@ impl HumanSearchPage {
         } else {
             BTreeSet::new()
         };
+        if let Some(latest) = &view.candidate_latest
+            && latest.statement_indices.is_none()
+        {
+            for index in &latest.operand_indices {
+                for candidate in &self.result.candidates {
+                    if view.active_evidence[*index as usize]
+                        .support_refs
+                        .contains(&candidate.candidate_id)
+                    {
+                        expected.insert(candidate.source_ref.as_str());
+                    }
+                }
+            }
+        }
         let gaps = view
             .unresolved_gaps
             .iter()
@@ -1970,8 +2307,10 @@ impl HumanSearchPage {
                 .all(|candidate| candidate.source_sequence.is_none());
         };
         let sequence_mode = view.evidence_need.temporal_scope.mode == TemporalMode::Sequence;
-        let automatic = view.evidence_need.answer_shape == Some(AnswerShape::Timeline)
-            && view.evidence_need.temporal_scope.qualifiers.is_empty();
+        let automatic = matches!(
+            view.evidence_need.answer_shape,
+            Some(AnswerShape::Timeline | AnswerShape::Latest)
+        ) && view.evidence_need.temporal_scope.qualifiers.is_empty();
         for candidate in &self.result.candidates {
             let Some(position) = &candidate.source_sequence else {
                 if sequence_mode && candidate.row_variant == SearchCandidateVariant::EvidenceSurface

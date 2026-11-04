@@ -194,6 +194,28 @@ fn atom_validity(
     Some(atom.validity_interval)
 }
 
+fn object_revision_order(
+    index: &std::collections::BTreeMap<&str, Vec<&ObjectRow>>,
+    reference: &str,
+) -> Option<evertrace_domain::query::RevisionOrderPosition> {
+    let mut rows = index.get(reference)?.iter().filter(|row| {
+        row.row_class == Some(ObjectRowClass::Object)
+            && row.current_revision_id.as_deref() == Some(reference)
+            && row
+                .object_kind
+                .as_deref()
+                .is_some_and(evertrace_store::search::is_searchable_object_kind)
+    });
+    let row = rows.next()?;
+    if rows.any(|other| other.row_id != row.row_id) || row.source_event_seq == 0 {
+        return None;
+    }
+    Some(evertrace_domain::query::RevisionOrderPosition {
+        anchor: row.object_id.clone()?,
+        sequence: row.source_event_seq,
+    })
+}
+
 fn canonical_episode_sources(
     frontier: u64,
     index: &std::collections::BTreeMap<&str, Vec<&ObjectRow>>,
@@ -653,36 +675,42 @@ impl HumanGovernanceService {
             let validity_timeline = context.query_facets.answer_shape
                 == Some(AnswerShape::Timeline)
                 && context.query_facets.temporal_qualifiers.is_empty();
+            let latest = context.query_facets.answer_shape == Some(AnswerShape::Latest);
+            let unqualified_latest = latest && context.query_facets.temporal_qualifiers.is_empty();
             let time_reader = |reference: &str| {
-                if validity_query || validity_timeline {
-                    if let Some(validity) = atom_validity(&index, reference) {
-                        return Some(crate::search::TemporalPosition::Atom {
-                            validity,
-                            contextual: semantics.states.get(reference)
-                                == Some(&SemanticResolution::Normative(
-                                    NormativeResolutionState::Active,
-                                )),
-                        });
-                    }
-                }
-                if validity_query {
-                    return None;
-                }
-                source_receipt(&index, reference).map(|receipt| {
-                    let coverage_complete =
-                        validity_timeline && source_coverage_complete(&index, &receipt, None);
-                    crate::search::TemporalPosition::Source {
+                if !validity_query && let Some(receipt) = source_receipt(&index, reference) {
+                    let coverage_complete = (validity_timeline || unqualified_latest)
+                        && source_coverage_complete(&index, &receipt, None);
+                    return Some(crate::search::TemporalPosition::Source {
                         receipt,
                         coverage_complete,
+                    });
+                }
+                let validity = (validity_query || validity_timeline)
+                    .then(|| atom_validity(&index, reference))
+                    .flatten();
+                let revision_order = unqualified_latest
+                    .then(|| object_revision_order(&index, reference))
+                    .flatten();
+                (validity.is_some() || revision_order.is_some()).then(|| {
+                    crate::search::TemporalPosition::Object {
+                        validity,
+                        revision_order,
+                        contextual: semantics.states.get(reference)
+                            == Some(&SemanticResolution::Normative(
+                                NormativeResolutionState::Active,
+                            )),
                     }
                 })
             };
             let time_query = matches!(
                 context.query_facets.temporal_mode,
                 TemporalMode::AsOf | TemporalMode::Interval
-            ) || (context.query_facets.answer_shape
-                == Some(AnswerShape::Timeline)
-                && context.query_facets.temporal_mode != TemporalMode::Sequence);
+            ) || (matches!(
+                context.query_facets.answer_shape,
+                Some(AnswerShape::Timeline | AnswerShape::Latest)
+            ) && context.query_facets.temporal_mode
+                != TemporalMode::Sequence);
             let mut time_refs: Option<BTreeSet<String>> = None;
             if matches!(
                 context.query_facets.temporal_mode,

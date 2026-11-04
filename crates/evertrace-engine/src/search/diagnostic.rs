@@ -358,6 +358,7 @@ impl DiagnosticSession {
             .collect();
         let view = GroundedEvidenceView {
             candidate_count: None,
+            candidate_latest: None,
             evidence_need: EvidenceNeed::from_context(&self.context),
             candidate_set: CandidateBoundary {
                 generation: if self.result.layer == RetrievalLayer::E {
@@ -478,6 +479,7 @@ fn push_candidate(
     result.candidates.push(SearchCandidate {
         source_time: None,
         validity_interval: None,
+        revision_order: None,
         source_sequence: None,
         candidate_id,
         source_ref: row.source_ref.clone().ok_or(SearchError::Corrupt)?,

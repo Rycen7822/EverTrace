@@ -49,8 +49,9 @@ pub(crate) enum TemporalPosition {
         receipt: Box<evertrace_domain::evidence::SourceReceipt>,
         coverage_complete: bool,
     },
-    Atom {
-        validity: evertrace_domain::semantic::ValidityInterval,
+    Object {
+        validity: Option<evertrace_domain::semantic::ValidityInterval>,
+        revision_order: Option<evertrace_domain::query::RevisionOrderPosition>,
         contextual: bool,
     },
 }
@@ -72,8 +73,13 @@ impl TemporalPosition {
         &self,
         facets: &evertrace_domain::query::QueryFacetSet,
     ) -> Option<evertrace_domain::query::SourceSequencePosition> {
-        if facets.answer_shape != Some(evertrace_domain::query::AnswerShape::Timeline)
-            || !facets.temporal_qualifiers.is_empty()
+        if !matches!(
+            facets.answer_shape,
+            Some(
+                evertrace_domain::query::AnswerShape::Timeline
+                    | evertrace_domain::query::AnswerShape::Latest
+            )
+        ) || !facets.temporal_qualifiers.is_empty()
         {
             return None;
         }
@@ -91,7 +97,13 @@ impl TemporalPosition {
     }
     pub fn validity(&self) -> Option<evertrace_domain::semantic::ValidityInterval> {
         match self {
-            Self::Atom { validity, .. } => Some(validity.clone()),
+            Self::Object { validity, .. } => validity.clone(),
+            _ => None,
+        }
+    }
+    pub fn revision_order(&self) -> Option<evertrace_domain::query::RevisionOrderPosition> {
+        match self {
+            Self::Object { revision_order, .. } => revision_order.clone(),
             _ => None,
         }
     }
@@ -100,15 +112,15 @@ impl TemporalPosition {
             Self::Source { .. } => self
                 .source()
                 .and_then(|value| value.temporal_match(qualifiers)),
-            Self::Atom { validity, .. } => {
-                evertrace_domain::query::validity_match(validity, qualifiers)
-            }
+            Self::Object { validity, .. } => validity
+                .as_ref()
+                .and_then(|validity| evertrace_domain::query::validity_match(validity, qualifiers)),
         }
     }
     pub fn contextual(&self) -> bool {
         matches!(
             self,
-            Self::Atom {
+            Self::Object {
                 contextual: true,
                 ..
             }
@@ -117,8 +129,16 @@ impl TemporalPosition {
     pub fn wire_bytes(&self) -> usize {
         match self {
             Self::Source { .. } => self.source().map_or(0, |value| value.wire_bytes()),
-            Self::Atom { validity, .. } => {
-                serde_json::to_vec(validity).map_or(usize::MAX, |bytes| bytes.len() + 21)
+            Self::Object {
+                validity,
+                revision_order,
+                ..
+            } => {
+                validity.as_ref().map_or(0, |value| {
+                    serde_json::to_vec(value).map_or(usize::MAX, |bytes| bytes.len() + 21)
+                }) + revision_order
+                    .as_ref()
+                    .map_or(0, |value| value.wire_bytes())
             }
         }
     }
@@ -155,10 +175,25 @@ impl TemporalReadScope<'_> {
                     return Err(SearchError::Corrupt);
                 }
             }
-            Some(TemporalPosition::Atom { validity, .. })
-                if row.object_kind.as_deref() == Some("atom_revision") =>
-            {
-                validity.validate().map_err(|_| SearchError::Corrupt)?;
+            Some(TemporalPosition::Object {
+                validity,
+                revision_order,
+                ..
+            }) if row.row_variant == "object" => {
+                if let Some(validity) = validity {
+                    if row.object_kind.as_deref() != Some("atom_revision") {
+                        return Err(SearchError::Corrupt);
+                    }
+                    validity.validate().map_err(|_| SearchError::Corrupt)?;
+                }
+                if revision_order.as_ref().is_some_and(|position| {
+                    row.source_ref.as_ref() != Some(&position.anchor)
+                        || row.source_event_seq != position.sequence
+                        || position.sequence == 0
+                        || position.sequence > self.frontier
+                }) {
+                    return Err(SearchError::Corrupt);
+                }
             }
             None if !self.source_domain || row.row_variant != "evidence_surface" => {}
             _ => return Err(SearchError::Corrupt),
@@ -185,7 +220,7 @@ impl TemporalReadScope<'_> {
         let mut common = !candidates.is_empty();
         for candidate in candidates.iter() {
             let Some(position) = &candidate.source_sequence else {
-                common = false;
+                // Object context has no source sequence; it still cannot join a global Timeline order.
                 continue;
             };
             if deadline.remaining().is_none() {
@@ -904,6 +939,7 @@ impl ProductionSearch {
                 .flatten();
             let source_time = temporal.as_ref().and_then(TemporalPosition::source);
             let validity_interval = temporal.as_ref().and_then(TemporalPosition::validity);
+            let revision_order = temporal.as_ref().and_then(TemporalPosition::revision_order);
             let source_sequence = self
                 .sequence_scope
                 .as_ref()
@@ -953,6 +989,7 @@ impl ProductionSearch {
                 source_sequence,
                 source_time,
                 validity_interval,
+                revision_order,
                 candidate_id: candidate_id.clone(),
                 source_ref: row.source_ref.clone().unwrap_or_default(),
                 row_variant,
