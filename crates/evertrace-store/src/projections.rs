@@ -3204,10 +3204,29 @@ pub struct PassiveSourceCurrentItem {
     pub sources: Vec<CaptureCurrentItem>,
 }
 
-#[derive(Clone)]
+#[derive(Clone, Default)]
 struct SourceWatermarks {
-    highest_revision: evertrace_domain::evidence::SourceRevision,
-    revisions: BTreeMap<evertrace_domain::evidence::SourceRevision, SourceIngestWatermark>,
+    revisions: BTreeMap<SourceRevision, SourceIngestWatermark>,
+    revision_admissions: BTreeMap<SourceRevision, u64>,
+}
+
+fn record_import_revision(
+    watermarks: &mut BTreeMap<String, SourceWatermarks>,
+    value: &SourceRevisionRecorded,
+    seq: u64,
+) {
+    if value.mode != SourceRevisionMode::Replacement
+        || !crate::session_import::is_session_import_source(value.source_instance_id.as_str())
+    {
+        return;
+    }
+    watermarks
+        .entry(value.source_instance_id.as_str().to_owned())
+        .or_default()
+        .revision_admissions
+        .entry(value.source_revision.clone())
+        .and_modify(|first| *first = (*first).min(seq))
+        .or_insert(seq);
 }
 
 fn record_source_watermark(
@@ -3217,29 +3236,11 @@ fn record_source_watermark(
     if !crate::session_import::is_session_import_source(value.source_instance_id.as_str()) {
         return;
     }
-    let state = watermarks
+    watermarks
         .entry(value.source_instance_id.as_str().to_owned())
-        .or_insert_with(|| SourceWatermarks {
-            highest_revision: value.source_revision.clone(),
-            revisions: BTreeMap::new(),
-        });
-    if state
+        .or_default()
         .revisions
-        .get(&state.highest_revision)
-        .is_none_or(|old| {
-            old.source_sequence < value.source_sequence
-                || (old.source_sequence == value.source_sequence
-                    && old.confirmed_prefix_digest.is_none()
-                    && value.confirmed_prefix_digest.is_some())
-                || (old.source_sequence == value.source_sequence
-                    && old.confirmed_prefix_digest.is_some()
-                        == value.confirmed_prefix_digest.is_some()
-                    && value.stable_key() < old.stable_key())
-        })
-    {
-        state.highest_revision = value.source_revision.clone();
-    }
-    state.revisions.insert(value.source_revision.clone(), value);
+        .insert(value.source_revision.clone(), value);
 }
 
 fn record_import_job(index: &mut BTreeMap<String, BTreeSet<JobId>>, job: &DurableJob) {
@@ -6765,10 +6766,37 @@ impl JournalAdmissionState {
         let watermark = watermarks
             .and_then(|state| state.revisions.get(&current.metadata.source_revision))
             .cloned();
-        let previous_revision = watermark
-            .is_none()
-            .then(|| watermarks.map(|state| state.highest_revision.clone()))
-            .flatten();
+        let previous_revision = if watermark.is_some() {
+            None
+        } else if let Some(state) = watermarks {
+            // Native replacement rows introduce archive revisions. Their first
+            // admission order selects writer state, not source event chronology.
+            // A later watermark or repeated descriptor must not retarget it.
+            let ordinal = |revision: &SourceRevision| {
+                state
+                    .revision_admissions
+                    .get(revision)
+                    .copied()
+                    .unwrap_or(0)
+            };
+            let last = state
+                .revisions
+                .keys()
+                .map(&ordinal)
+                .max()
+                .ok_or(StoreError::StoreCorrupt)?;
+            let mut latest = state
+                .revisions
+                .keys()
+                .filter(|revision| ordinal(revision) == last);
+            let previous = latest.next().cloned().ok_or(StoreError::StoreCorrupt)?;
+            if latest.next().is_some() {
+                return Err(StoreError::StoreCorrupt);
+            }
+            Some(previous)
+        } else {
+            None
+        };
         let source_ref = source_revision_ref(
             &evertrace_domain::evidence::SourceInstanceId::parse(current.source_instance())
                 .map_err(|_| StoreError::StoreCorrupt)?,
@@ -11458,6 +11486,9 @@ impl JournalAdmissionState {
                 {
                     return Err(StoreError::StoreCorrupt);
                 }
+            }
+            JournalPayload::SourceRevisionRecorded(value) => {
+                record_import_revision(&mut self.source_watermarks, &value, seq);
             }
             JournalPayload::SourceIngestWatermark(value) => {
                 record_source_watermark(&mut self.source_watermarks, value);
@@ -16296,6 +16327,9 @@ impl ReducerState {
             record_import_job(&mut import_jobs, job);
         }
         let mut source_watermarks = BTreeMap::new();
+        for (revision, seq) in self.source_revisions.values() {
+            record_import_revision(&mut source_watermarks, revision, *seq);
+        }
         for (watermark, _) in self.source_watermarks.values() {
             record_source_watermark(&mut source_watermarks, watermark.clone());
         }
