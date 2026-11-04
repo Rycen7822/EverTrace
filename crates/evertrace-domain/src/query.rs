@@ -605,7 +605,8 @@ pub struct GroundedLatest {
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
-/// Canonical admission order within one immutable entity, never a UTC timestamp.
+/// Order within a proven revision domain, never UTC. Objects use admission order;
+/// sources use bounded replacement ranks, then source sequence within each rank.
 pub struct RevisionOrderPosition {
     pub anchor: String,
     pub sequence: u64,
@@ -687,6 +688,36 @@ impl GroundedEvidenceView {
         })
     }
 
+    pub fn latest_source_coverage_complete(&self, candidates: &[SearchCandidate]) -> bool {
+        let Some(latest) = &self.candidate_latest else {
+            return true;
+        };
+        let indices = match latest.ordering_basis {
+            OrderingBasis::SourceSequence => &latest.operand_indices,
+            OrderingBasis::Supersession => match &latest.statement_indices {
+                Some(indices) => indices,
+                None => return false,
+            },
+            _ => return true,
+        };
+        indices.iter().all(|index| {
+            self.active_evidence
+                .get(*index as usize)
+                .is_some_and(|statement| {
+                    candidates
+                        .iter()
+                        .find(|candidate| statement.support_refs.contains(&candidate.candidate_id))
+                        .is_some_and(|candidate| {
+                            candidate.row_variant != SearchCandidateVariant::EvidenceSurface
+                                || candidate
+                                    .source_sequence
+                                    .as_ref()
+                                    .is_some_and(|position| position.coverage_complete)
+                        })
+                })
+        })
+    }
+
     pub fn validate(&self) -> Result<(), QueryError> {
         self.validate_inner(None)
     }
@@ -721,6 +752,7 @@ impl GroundedEvidenceView {
             .then(|| {
                 latest_order(
                     &operands,
+                    candidates,
                     &self.evidence_need.temporal_scope.qualifiers,
                     &relations,
                 )
@@ -1655,8 +1687,9 @@ fn latest_max<'a>(
 
 fn latest_order<'a>(
     candidates: &[&'a SearchCandidate],
+    boundary: &'a [SearchCandidate],
     qualifiers: &[TemporalQualifier],
-    relations: &[GroundedRelationStatement],
+    relations: &'a [GroundedRelationStatement],
 ) -> Option<(OrderingBasis, BTreeSet<&'a str>)> {
     if candidates.is_empty() {
         return Some((OrderingBasis::Unknown, BTreeSet::new()));
@@ -1711,19 +1744,27 @@ fn latest_order<'a>(
                 .is_some_and(|(a, b)| a.anchor == b.anchor)
         })
     {
-        return latest_max(candidates, |candidate| {
-            candidate
-                .revision_order
-                .as_ref()
-                .map(|position| position.sequence.into())
-        })
-        .map(|winners| (OrderingBasis::Supersession, winners));
+        let maximum = candidates
+            .iter()
+            .map(|candidate| revision_order_key(candidate))
+            .collect::<Option<Vec<_>>>()?
+            .into_iter()
+            .max()?;
+        return Some((
+            OrderingBasis::Supersession,
+            candidates
+                .iter()
+                .filter(|candidate| revision_order_key(candidate) == Some(maximum))
+                .map(|candidate| candidate.candidate_id.as_str())
+                .collect(),
+        ));
     }
     // Only explicit, readable edges, with the same two-hop ceiling as D. A cycle
     // or incomparable roots cannot become a winner through a tie-breaker.
     let mut roots = BTreeSet::new();
     for root in candidates {
         let mut reached = BTreeSet::from([root.candidate_id.as_str()]);
+        include_prior_revisions(boundary, &mut reached);
         let mut frontier = reached.clone();
         for _ in 0..2 {
             frontier = relations
@@ -1735,6 +1776,8 @@ fn latest_order<'a>(
                 .map(|relation| relation.target_ref.as_str())
                 .collect();
             reached.extend(&frontier);
+            include_prior_revisions(boundary, &mut reached);
+            frontier = reached.clone();
         }
         if candidates.len() > 1
             && candidates
@@ -1748,6 +1791,37 @@ fn latest_order<'a>(
         return Some((OrderingBasis::Supersession, roots));
     }
     latest_clock_order(candidates)
+}
+
+fn revision_order_key(candidate: &SearchCandidate) -> Option<(u64, u64)> {
+    Some((
+        candidate.revision_order.as_ref()?.sequence,
+        match candidate.row_variant {
+            SearchCandidateVariant::Object => 0,
+            SearchCandidateVariant::EvidenceSurface => candidate.source_sequence.as_ref()?.sequence,
+        },
+    ))
+}
+
+fn include_prior_revisions<'a>(boundary: &'a [SearchCandidate], reached: &mut BTreeSet<&'a str>) {
+    let prior = boundary
+        .iter()
+        .filter(|candidate| {
+            boundary.iter().any(|head| {
+                reached.contains(head.candidate_id.as_str())
+                    && candidate
+                        .revision_order
+                        .as_ref()
+                        .zip(head.revision_order.as_ref())
+                        .is_some_and(|(a, b)| a.anchor == b.anchor)
+                    && revision_order_key(candidate)
+                        .zip(revision_order_key(head))
+                        .is_some_and(|(a, b)| a <= b)
+            })
+        })
+        .map(|candidate| candidate.candidate_id.as_str())
+        .collect::<Vec<_>>();
+    reached.extend(prior);
 }
 
 fn latest_clock_order<'a>(
@@ -1818,6 +1892,18 @@ pub fn timeline_order(
             )
         });
         return Some((OrderingBasis::SourceSequence, ordered));
+    }
+    if candidates[0].revision_order.is_some()
+        && candidates.iter().all(|candidate| {
+            candidate
+                .revision_order
+                .as_ref()
+                .zip(candidates[0].revision_order.as_ref())
+                .is_some_and(|(a, b)| a.anchor == b.anchor)
+        })
+    {
+        ordered.sort_by_key(|candidate| (revision_order_key(candidate), &candidate.candidate_id));
+        return Some((OrderingBasis::Supersession, ordered));
     }
     if candidates.iter().all(|candidate| {
         candidate
@@ -2007,9 +2093,7 @@ impl HumanSearchPage {
                                 && candidate.source_time.is_none()
                         }
                         SearchCandidateVariant::EvidenceSurface => {
-                            candidate.currentness.is_none()
-                                && candidate.validity_interval.is_none()
-                                && candidate.revision_order.is_none()
+                            candidate.currentness.is_none() && candidate.validity_interval.is_none()
                         }
                     }
             })
@@ -2063,19 +2147,7 @@ impl HumanSearchPage {
             {
                 return false;
             }
-            if latest.ordering_basis == OrderingBasis::SourceSequence
-                && latest.operand_indices.iter().any(|index| {
-                    self.result.candidates.iter().any(|candidate| {
-                        view.active_evidence[*index as usize]
-                            .support_refs
-                            .contains(&candidate.candidate_id)
-                            && candidate
-                                .source_sequence
-                                .as_ref()
-                                .is_none_or(|position| !position.coverage_complete)
-                    })
-                })
-            {
+            if !view.latest_source_coverage_complete(&self.result.candidates) {
                 return false;
             }
         }
@@ -2113,8 +2185,16 @@ impl HumanSearchPage {
                     )
                 });
         };
-        if basis == OrderingBasis::RecordedAtFallback
-            && view.completeness == RetrievalCompleteness::Complete
+        if view.completeness == RetrievalCompleteness::Complete
+            && (basis == OrderingBasis::RecordedAtFallback
+                || (basis == OrderingBasis::Supersession
+                    && self.result.candidates.iter().any(|candidate| {
+                        candidate.row_variant == SearchCandidateVariant::EvidenceSurface
+                            && candidate
+                                .source_sequence
+                                .as_ref()
+                                .is_none_or(|position| !position.coverage_complete)
+                    })))
         {
             return false;
         }
@@ -2150,16 +2230,42 @@ impl HumanSearchPage {
         });
         for candidate in &self.result.candidates {
             if let Some(position) = &candidate.revision_order {
-                if candidate.row_variant != SearchCandidateVariant::Object
-                    || candidate.object_kind.as_deref() == Some("wiki_projection")
-                    || position.anchor != candidate.source_ref
-                    || position.sequence == 0
-                    || position.sequence > self.result.projection_frontier
-                    || view.is_none_or(|view| {
-                        view.evidence_need.answer_shape != Some(AnswerShape::Latest)
-                            || !view.evidence_need.temporal_scope.qualifiers.is_empty()
+                let object = candidate.row_variant == SearchCandidateVariant::Object
+                    && candidate.object_kind.as_deref() != Some("wiki_projection")
+                    && position.anchor == candidate.source_ref
+                    && position.sequence > 0
+                    && position.sequence <= self.result.projection_frontier
+                    && view.is_some_and(|view| {
+                        view.evidence_need.answer_shape == Some(AnswerShape::Latest)
+                    });
+                let source = candidate.row_variant == SearchCandidateVariant::EvidenceSurface
+                    && position.sequence
+                        <= 2_u64.saturating_sub(u64::from(self.result.budget.hops_remaining))
+                    && candidate.source_sequence.is_some()
+                    && position.anchor.parse::<SourceObservationId>().is_ok()
+                    && self.result.candidates.iter().any(|value| {
+                        value.row_variant == SearchCandidateVariant::EvidenceSurface
+                            && value.source_ref == position.anchor
                     })
-                {
+                    && self.result.candidates.iter().all(|other| {
+                        let Some(order) = other
+                            .revision_order
+                            .as_ref()
+                            .filter(|order| order.anchor == position.anchor)
+                        else {
+                            return true;
+                        };
+                        other.row_variant == SearchCandidateVariant::EvidenceSurface
+                            && candidate
+                                .source_sequence
+                                .as_ref()
+                                .zip(other.source_sequence.as_ref())
+                                .is_some_and(|(a, b)| {
+                                    (a.source_anchor == b.source_anchor)
+                                        == (position.sequence == order.sequence)
+                                })
+                    });
+                if (!object && !source) || !unqualified_chronology {
                     return false;
                 }
             }

@@ -92,6 +92,42 @@ fn source_receipt(
     }
     Some(receipt)
 }
+fn source_predecessor(
+    index: &std::collections::BTreeMap<&str, Vec<&ObjectRow>>,
+    receipt: &evertrace_domain::evidence::SourceReceipt,
+) -> Option<evertrace_domain::evidence::SourceRevision> {
+    let rows = index.get(receipt.source_revision.as_str())?;
+    if rows.len() > 64 {
+        return None;
+    }
+    let mut previous = None;
+    for row in rows {
+        if row.object_kind.as_deref() != Some("source_revision") {
+            continue;
+        }
+        let JournalPayload::SourceRevisionRecorded(value) =
+            serde_json::from_str(row.payload_json.as_deref()?).ok()?
+        else {
+            continue;
+        };
+        if value.source_instance_id != receipt.source_instance_id
+            || value.source_revision != receipt.source_revision
+        {
+            continue;
+        }
+        if value.mode != evertrace_domain::evidence::SourceRevisionMode::Replacement {
+            return None;
+        }
+        let parent = value.previous_source_revision?;
+        if parent == receipt.source_revision || previous.as_ref().is_some_and(|old| old != &parent)
+        {
+            return None;
+        }
+        previous = Some(parent);
+    }
+    previous
+}
+
 /// Admission verified each contiguous byte/CAS leg; this reader never computes a second digest.
 fn source_coverage_complete(
     index: &std::collections::BTreeMap<&str, Vec<&ObjectRow>>,
@@ -681,9 +717,19 @@ impl HumanGovernanceService {
                 if !validity_query && let Some(receipt) = source_receipt(&index, reference) {
                     let coverage_complete = (validity_timeline || unqualified_latest)
                         && source_coverage_complete(&index, &receipt, None);
+                    let revision_order =
+                        (validity_timeline || unqualified_latest).then(|| RevisionOrderPosition {
+                            anchor: receipt.source_observation_id.to_string(),
+                            sequence: 0,
+                        });
+                    let previous_revision = revision_order
+                        .as_ref()
+                        .and_then(|_| source_predecessor(&index, &receipt));
                     return Some(crate::search::TemporalPosition::Source {
                         receipt,
                         coverage_complete,
+                        previous_revision,
+                        revision_order,
                     });
                 }
                 let validity = (validity_query || validity_timeline)

@@ -603,6 +603,13 @@ impl NativeRetrieval<'_> {
             }
         }
         self.pack()?;
+        if let Some(scope) = self.time_scope {
+            scope.align_revision_domain(
+                &mut self.result.candidates,
+                &mut self.result.budget,
+                &self.deadline,
+            )?;
+        }
         self.check_temporal_completeness();
         let still_missing = self.gaps(&witnessed);
         let mut gaps = pending_gaps
@@ -808,19 +815,7 @@ impl NativeRetrieval<'_> {
                 }
             } else if latest.ordering_basis == OrderingBasis::RecordedAtFallback {
                 self.degraded("recorded_at_fallback");
-            } else if latest.ordering_basis == OrderingBasis::SourceSequence
-                && latest.operand_indices.iter().any(|index| {
-                    self.result.candidates.iter().any(|candidate| {
-                        view.active_evidence[*index as usize]
-                            .support_refs
-                            .contains(&candidate.candidate_id)
-                            && candidate
-                                .source_sequence
-                                .as_ref()
-                                .is_none_or(|position| !position.coverage_complete)
-                    })
-                })
-            {
+            } else if !view.latest_source_coverage_complete(&self.result.candidates) {
                 self.degraded("source_sequence_coverage_unverified");
             }
             if self.result.completeness == RetrievalCompleteness::Complete
@@ -959,6 +954,17 @@ impl NativeRetrieval<'_> {
             Some(AnswerShape::Timeline) => match timeline_order(&self.result.candidates) {
                 Some((OrderingBasis::RecordedAtFallback, _)) => {
                     self.degraded("recorded_at_fallback")
+                }
+                Some((OrderingBasis::Supersession, _))
+                    if self.result.candidates.iter().any(|candidate| {
+                        candidate.row_variant == SearchCandidateVariant::EvidenceSurface
+                            && candidate
+                                .source_sequence
+                                .as_ref()
+                                .is_none_or(|position| !position.coverage_complete)
+                    }) =>
+                {
+                    self.degraded("source_sequence_coverage_unverified")
                 }
                 Some(_) => {}
                 None => self.degraded("timeline_ordering_unavailable"),

@@ -48,6 +48,8 @@ pub(crate) enum TemporalPosition {
     Source {
         receipt: Box<evertrace_domain::evidence::SourceReceipt>,
         coverage_complete: bool,
+        previous_revision: Option<evertrace_domain::evidence::SourceRevision>,
+        revision_order: Option<evertrace_domain::query::RevisionOrderPosition>,
     },
     Object {
         validity: Option<evertrace_domain::semantic::ValidityInterval>,
@@ -87,6 +89,7 @@ impl TemporalPosition {
             Self::Source {
                 receipt: value,
                 coverage_complete,
+                ..
             } => Some(evertrace_domain::query::SourceSequencePosition {
                 source_anchor: value.source_observation_id,
                 sequence: value.source_sequence,
@@ -103,8 +106,9 @@ impl TemporalPosition {
     }
     pub fn revision_order(&self) -> Option<evertrace_domain::query::RevisionOrderPosition> {
         match self {
-            Self::Object { revision_order, .. } => revision_order.clone(),
-            _ => None,
+            Self::Object { revision_order, .. } | Self::Source { revision_order, .. } => {
+                revision_order.clone()
+            }
         }
     }
     pub fn matches(&self, qualifiers: &[TemporalQualifier]) -> Option<bool> {
@@ -128,7 +132,12 @@ impl TemporalPosition {
     }
     pub fn wire_bytes(&self) -> usize {
         match self {
-            Self::Source { .. } => self.source().map_or(0, |value| value.wire_bytes()),
+            Self::Source { revision_order, .. } => {
+                self.source().map_or(0, |value| value.wire_bytes())
+                    + revision_order
+                        .as_ref()
+                        .map_or(0, |value| value.wire_bytes())
+            }
             Self::Object {
                 validity,
                 revision_order,
@@ -215,10 +224,9 @@ impl TemporalReadScope<'_> {
                     .map_err(|_| SearchError::Corrupt)?;
             }
         }
-        let mut domain = None;
-        let mut anchor: Option<evertrace_domain::ids::SourceObservationId> = None;
-        let mut common = !candidates.is_empty();
-        for candidate in candidates.iter() {
+        let mut domains = BTreeMap::new();
+        let mut members = Vec::new();
+        for (index, candidate) in candidates.iter().enumerate() {
             let Some(position) = &candidate.source_sequence else {
                 // Object context has no source sequence; it still cannot join a global Timeline order.
                 continue;
@@ -235,29 +243,111 @@ impl TemporalReadScope<'_> {
             {
                 return Err(SearchError::Corrupt);
             }
-            anchor = Some(anchor.map_or(position.source_anchor, |old| {
-                old.min(position.source_anchor)
+            let domain = (receipt.source_instance_id, receipt.source_revision);
+            let anchor = domains
+                .entry(domain.clone())
+                .or_insert(position.source_anchor);
+            *anchor = (*anchor).min(position.source_anchor);
+            members.push((index, domain));
+        }
+        for (index, domain) in members {
+            if let Some(position) = &mut candidates[index].source_sequence {
+                position.source_anchor = domains[&domain];
+            }
+        }
+        Ok(())
+    }
+
+    pub(super) fn align_revision_domain(
+        &self,
+        candidates: &mut [SearchCandidate],
+        budget: &mut evertrace_domain::query::RetrievalBudget,
+        deadline: &RequestDeadline,
+    ) -> Result<(), SearchError> {
+        let mut instance = None;
+        let mut revisions = BTreeMap::new();
+        let mut members = Vec::new();
+        let mut anchor: Option<evertrace_domain::ids::SourceObservationId> = None;
+        for (index, candidate) in candidates.iter().enumerate() {
+            if candidate.row_variant
+                != evertrace_domain::query::SearchCandidateVariant::EvidenceSurface
+                || candidate.revision_order.is_none()
+            {
+                continue;
+            }
+            if deadline.remaining().is_none() {
+                return Ok(());
+            }
+            let Some(TemporalPosition::Source {
+                receipt,
+                previous_revision,
+                ..
+            }) = (self.read)(&candidate.source_ref)
+            else {
+                return Err(SearchError::Corrupt);
+            };
+            if instance
+                .as_ref()
+                .is_some_and(|value| value != &receipt.source_instance_id)
+            {
+                return Ok(());
+            }
+            instance = Some(receipt.source_instance_id);
+            let revision = receipt.source_revision;
+            if revisions
+                .get(&revision)
+                .is_some_and(|value| value != &previous_revision)
+            {
+                return Err(SearchError::Corrupt);
+            }
+            revisions.insert(revision.clone(), previous_revision);
+            anchor = Some(anchor.map_or(receipt.source_observation_id, |value| {
+                value.min(receipt.source_observation_id)
             }));
-            match &domain {
-                Some((instance, revision)) => {
-                    common &= *instance == receipt.source_instance_id
-                        && *revision == receipt.source_revision;
-                }
-                None => {
-                    domain = Some((
-                        receipt.source_instance_id.clone(),
-                        receipt.source_revision.clone(),
-                    ))
-                }
-            }
+            members.push((index, revision));
         }
-        if common && let Some(anchor) = anchor {
-            for candidate in candidates {
-                if let Some(position) = &mut candidate.source_sequence {
-                    position.source_anchor = anchor;
-                }
-            }
+        if !(2..=3).contains(&revisions.len()) {
+            return Ok(());
         }
+        let mut roots = revisions.iter().filter(|(_, previous)| {
+            previous
+                .as_ref()
+                .is_none_or(|value| !revisions.contains_key(value))
+        });
+        let Some((root, _)) = roots.next() else {
+            return Ok(());
+        };
+        if roots.next().is_some() {
+            return Ok(());
+        }
+        let mut ranks = BTreeMap::from([(root.clone(), 0_u64)]);
+        let mut current = root;
+        for rank in 1..revisions.len() {
+            let mut next = revisions
+                .iter()
+                .filter(|(_, previous)| previous.as_ref() == Some(current));
+            let Some((revision, _)) = next.next() else {
+                return Ok(());
+            };
+            if next.next().is_some() || ranks.contains_key(revision) {
+                return Ok(());
+            }
+            ranks.insert(revision.clone(), rank as u64);
+            current = revision;
+        }
+        let hops = (revisions.len() - 1) as u8;
+        if deadline.remaining().is_none() || budget.hops_remaining < hops {
+            return Ok(());
+        }
+        let anchor = anchor.ok_or(SearchError::Corrupt)?.to_string();
+        for (index, revision) in members {
+            candidates[index].revision_order =
+                Some(evertrace_domain::query::RevisionOrderPosition {
+                    anchor: anchor.clone(),
+                    sequence: ranks[&revision],
+                });
+        }
+        budget.hops_remaining -= hops;
         Ok(())
     }
 }
