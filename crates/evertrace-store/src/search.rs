@@ -74,8 +74,6 @@ pub struct SearchHardFilter {
     pub suppressed_refs: BTreeSet<String>,
     pub event_time_as_of: Option<i64>,
     pub event_time_interval: Option<(i64, i64)>,
-    /// The caller must also pin readable_refs to one canonical source revision.
-    pub source_sequence_at_most: Option<u64>,
 }
 
 impl SearchIndex {
@@ -728,11 +726,6 @@ fn filter_sql_dialect(filter: &SearchHardFilter, dialect: FilterDialect) -> Opti
     if let Some((start_us, end_us)) = filter.event_time_interval {
         clauses.push(format!(
             "time_domain = 'event_time' AND event_time_us >= {start_us} AND event_time_us < {end_us}"
-        ));
-    }
-    if let Some(sequence) = filter.source_sequence_at_most {
-        clauses.push(format!(
-            "row_variant = 'evidence_surface' AND source_sequence <= {sequence}"
         ));
     }
     Some(clauses.join(" AND "))

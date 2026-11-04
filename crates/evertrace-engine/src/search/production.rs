@@ -487,7 +487,11 @@ impl ProductionSearch {
                 TemporalMode::Any | TemporalMode::Unknown => {
                     context.intent != evertrace_domain::query::SearchIntent::HistoryLookup
                 }
-                TemporalMode::AsOf | TemporalMode::Interval | TemporalMode::Sequence => false,
+                TemporalMode::AsOf
+                | TemporalMode::Interval
+                | TemporalMode::Sequence
+                | TemporalMode::Before
+                | TemporalMode::After => false,
             },
             suppressed_refs: suppressed_hashes.clone(),
             suppressed_hashes,
@@ -503,10 +507,6 @@ impl ProductionSearch {
                 {
                     Some((*start_us, *end_us))
                 }
-                _ => None,
-            },
-            source_sequence_at_most: match context.query_facets.temporal_qualifiers.as_slice() {
-                [TemporalQualifier::SourceSequenceAtMost { sequence, .. }] => Some(*sequence),
                 _ => None,
             },
         }
@@ -728,7 +728,11 @@ impl ProductionSearch {
         }) {
             changed_frontiers.insert("execution_context_frontier_changed".into());
         }
-        if context.query_facets.temporal_mode == TemporalMode::Sequence
+        if context
+            .query_facets
+            .temporal_qualifiers
+            .iter()
+            .any(|qualifier| qualifier.source_sequence_ref().is_some())
             && self.sequence_scope.is_none()
         {
             changed_frontiers.insert("source_sequence_scope_unresolved".into());
@@ -1349,15 +1353,10 @@ pub(super) fn temporal_is_partial(
 ) -> bool {
     let required_domain = match context.query_facets.temporal_qualifiers.as_slice() {
         [] => return false,
-        [
-            TemporalQualifier::EventTimeAsOf { .. }
-            | TemporalQualifier::EventTimeInterval { .. }
-            | TemporalQualifier::ValidityAsOf { .. }
-            | TemporalQualifier::ValidityInterval { .. },
-        ] => "event_time",
+        [qualifier] if qualifier.is_event_time() || qualifier.is_validity() => "event_time",
         // The caller has already pinned a canonical source revision and its
         // readable references. Event timestamps do not invalidate its sequence.
-        [TemporalQualifier::SourceSequenceAtMost { .. }] => return false,
+        [qualifier] if qualifier.source_sequence_ref().is_some() => return false,
         _ => {
             degraded.insert("temporal_qualifier_unknown".into());
             return true;
@@ -1397,13 +1396,24 @@ fn temporal_compatible(
     context: &SearchContext,
     time_scope: Option<&TemporalReadScope<'_>>,
 ) -> Result<bool, QueryError> {
+    if row.row_variant == "object"
+        && context
+            .query_facets
+            .temporal_qualifiers
+            .iter()
+            .any(|qualifier| qualifier.source_sequence_ref().is_some())
+    {
+        return time_scope.map_or(Ok(false), |scope| {
+            scope
+                .position(row)
+                .map_err(|_| QueryError::Invalid)
+                .map(|position| position.is_some_and(|position| position.contextual()))
+        });
+    }
     if let Some(scope) = time_scope
         && matches!(
             context.query_facets.temporal_qualifiers.as_slice(),
-            [TemporalQualifier::EventTimeAsOf { .. }
-                | TemporalQualifier::EventTimeInterval { .. }
-                | TemporalQualifier::ValidityAsOf { .. }
-                | TemporalQualifier::ValidityInterval { .. }]
+            [qualifier] if qualifier.is_event_time() || qualifier.is_validity()
         )
     {
         return Ok(scope
@@ -1428,8 +1438,9 @@ fn temporal_compatible(
                 && row.event_time_us >= *start_us
                 && row.event_time_us < *end_us
         }
-        [TemporalQualifier::SourceSequenceAtMost { sequence, .. }] => {
-            row.row_variant == "evidence_surface" && row.source_sequence <= *sequence
+        [qualifier] if qualifier.source_sequence_ref().is_some() => {
+            row.row_variant == "evidence_surface"
+                && qualifier.matches_sequence(row.source_sequence) == Some(true)
         }
         _ => false,
     })

@@ -294,10 +294,18 @@ impl NativeRetrieval<'_> {
                 });
             }
         }
-        if matches!(
-            self.context.query_facets.temporal_mode,
-            TemporalMode::AsOf | TemporalMode::Interval
-        ) {
+        if self
+            .context
+            .query_facets
+            .temporal_mode
+            .has_temporal_predicate()
+            && !self
+                .context
+                .query_facets
+                .temporal_qualifiers
+                .iter()
+                .any(|qualifier| qualifier.source_sequence_ref().is_some())
+        {
             let unresolved = self
                 .result
                 .candidates
@@ -752,7 +760,12 @@ impl NativeRetrieval<'_> {
                 support_refs: BTreeSet::from([candidate.candidate_id.clone()]),
                 derivation_kind: DerivationKind::Quoted,
                 ordering_basis: ordering_basis.unwrap_or_else(|| {
-                    if self.context.query_facets.temporal_mode == TemporalMode::Sequence
+                    if self
+                        .context
+                        .query_facets
+                        .temporal_qualifiers
+                        .iter()
+                        .any(|qualifier| qualifier.source_sequence_ref().is_some())
                         && candidate.source_sequence.is_some()
                     {
                         OrderingBasis::SourceSequence
@@ -791,6 +804,26 @@ impl NativeRetrieval<'_> {
         };
         view.candidate_count =
             view.derive_candidate_count(&self.result.candidates, &matching_constraints);
+        let count_gaps = view.count_temporal_gaps(&self.result.candidates);
+        if !count_gaps.is_empty() {
+            self.degraded("count_temporal_evidence_unverified");
+            for identifier in count_gaps {
+                let gap = NamedGap {
+                    kind: NamedGapKind::TemporalEvidence,
+                    identifier,
+                    changes_result: true,
+                };
+                if !view.unresolved_gaps.contains(&gap) {
+                    view.unresolved_gaps.push(gap);
+                }
+            }
+            if self.result.completeness == RetrievalCompleteness::Complete {
+                self.result.completeness = RetrievalCompleteness::Partial;
+            }
+            view.completeness = self.result.completeness;
+            view.candidate_count =
+                view.derive_candidate_count(&self.result.candidates, &matching_constraints);
+        }
         view.candidate_latest =
             view.derive_candidate_latest(&self.result.candidates, &matching_constraints);
         if let Some(latest) = &view.candidate_latest {
@@ -932,14 +965,23 @@ impl NativeRetrieval<'_> {
         );
         if (self.sequence_scope.is_some() || sequence_order) && !coverage_complete {
             self.degraded("source_sequence_coverage_unverified");
-        } else if matches!(
-            self.context.query_facets.temporal_mode,
-            TemporalMode::AsOf | TemporalMode::Interval
-        ) && self.result.candidates.iter().any(|candidate| {
-            candidate
-                .temporal_match(&self.context.query_facets.temporal_qualifiers)
-                .is_none()
-        }) {
+        } else if self
+            .context
+            .query_facets
+            .temporal_mode
+            .has_temporal_predicate()
+            && !self
+                .context
+                .query_facets
+                .temporal_qualifiers
+                .iter()
+                .any(|qualifier| qualifier.source_sequence_ref().is_some())
+            && self.result.candidates.iter().any(|candidate| {
+                candidate
+                    .temporal_match(&self.context.query_facets.temporal_qualifiers)
+                    .is_none()
+            })
+        {
             let reason = if self.time_scope.is_some_and(|scope| !scope.source_domain) {
                 "validity_interval_unverified"
             } else {

@@ -10,20 +10,12 @@ fn source_sequence_scope(
     facets: &QueryFacetSet,
     deadline: std::time::Instant,
 ) -> Option<crate::search::SourceSequenceScope> {
-    let [
-        TemporalQualifier::SourceSequenceAtMost {
-            source_ref,
-            sequence,
-        },
-    ] = facets.temporal_qualifiers.as_slice()
-    else {
+    let [qualifier] = facets.temporal_qualifiers.as_slice() else {
         return None;
     };
+    let source_ref = qualifier.source_sequence_ref()?;
     let reference = source_ref.to_string();
-    if facets.temporal_mode != TemporalMode::Sequence
-        || !readable.contains(&reference)
-        || std::time::Instant::now() >= deadline
-    {
+    if !readable.contains(&reference) || std::time::Instant::now() >= deadline {
         return None;
     }
     let anchor = source_receipt(index, &reference)?;
@@ -37,14 +29,23 @@ fn source_sequence_scope(
         };
         if receipt.source_instance_id == anchor.source_instance_id
             && receipt.source_revision == anchor.source_revision
+            && qualifier.matches_sequence(receipt.source_sequence) == Some(true)
         {
             positions.insert(reference.clone(), receipt.source_sequence);
         }
     }
+    let through = match qualifier {
+        TemporalQualifier::SourceSequenceAtMost { sequence, .. } => Some(*sequence),
+        TemporalQualifier::SourceSequenceBefore { sequence, .. } => {
+            Some(sequence.saturating_sub(1))
+        }
+        TemporalQualifier::SourceSequenceAfter { .. } => None,
+        _ => return None,
+    };
     Some(crate::search::SourceSequenceScope {
-        source_anchor: *source_ref,
+        source_anchor: source_ref,
         positions,
-        coverage_complete: source_coverage_complete(index, &anchor, Some(*sequence)),
+        coverage_complete: source_coverage_complete(index, &anchor, through),
     })
 }
 
@@ -703,17 +704,29 @@ impl HumanGovernanceService {
             source_references.extend(matched.references.iter().chain(&matched.contexts).cloned());
             let canonical_sources =
                 canonical_episode_sources(snapshot.frontier, &index, &refs, &source_references)?;
-            let validity_query = matches!(
-                context.query_facets.temporal_qualifiers.as_slice(),
-                [TemporalQualifier::ValidityAsOf { .. }
-                    | TemporalQualifier::ValidityInterval { .. }]
-            );
+            let validity_query = matches!(context.query_facets.temporal_qualifiers.as_slice(), [qualifier] if qualifier.is_validity());
             let validity_timeline = context.query_facets.answer_shape
                 == Some(AnswerShape::Timeline)
                 && context.query_facets.temporal_qualifiers.is_empty();
             let latest = context.query_facets.answer_shape == Some(AnswerShape::Latest);
             let unqualified_latest = latest && context.query_facets.temporal_qualifiers.is_empty();
+            let sequence_query = context
+                .query_facets
+                .temporal_qualifiers
+                .iter()
+                .any(|qualifier| qualifier.source_sequence_ref().is_some());
             let time_reader = |reference: &str| {
+                let contextual = semantics.states.get(reference)
+                    == Some(&SemanticResolution::Normative(
+                        NormativeResolutionState::Active,
+                    ));
+                if sequence_query {
+                    return contextual.then_some(crate::search::TemporalPosition::Object {
+                        validity: None,
+                        revision_order: None,
+                        contextual,
+                    });
+                }
                 if !validity_query && let Some(receipt) = source_receipt(&index, reference) {
                     let coverage_complete = (validity_timeline || unqualified_latest)
                         && source_coverage_complete(&index, &receipt, None);
@@ -742,26 +755,18 @@ impl HumanGovernanceService {
                     crate::search::TemporalPosition::Object {
                         validity,
                         revision_order,
-                        contextual: semantics.states.get(reference)
-                            == Some(&SemanticResolution::Normative(
-                                NormativeResolutionState::Active,
-                            )),
+                        contextual,
                     }
                 })
             };
-            let time_query = matches!(
-                context.query_facets.temporal_mode,
-                TemporalMode::AsOf | TemporalMode::Interval
-            ) || (matches!(
-                context.query_facets.answer_shape,
-                Some(AnswerShape::Timeline | AnswerShape::Latest)
-            ) && context.query_facets.temporal_mode
-                != TemporalMode::Sequence);
+            let time_query = sequence_query
+                || context.query_facets.temporal_mode.has_temporal_predicate()
+                || matches!(
+                    context.query_facets.answer_shape,
+                    Some(AnswerShape::Timeline | AnswerShape::Latest)
+                );
             let mut time_refs: Option<BTreeSet<String>> = None;
-            if matches!(
-                context.query_facets.temporal_mode,
-                TemporalMode::AsOf | TemporalMode::Interval
-            ) {
+            if context.query_facets.temporal_mode.has_temporal_predicate() && !sequence_query {
                 for reference in &refs {
                     if std::time::Instant::now() >= deadline {
                         return Err(HumanGovernanceError::Store);
@@ -787,7 +792,7 @@ impl HumanGovernanceService {
                 frontier: snapshot.frontier,
                 read: &time_reader,
                 readable_refs: time_refs.as_ref(),
-                source_domain: !validity_query,
+                source_domain: !validity_query && !sequence_query,
             });
             let mut page = crate::search::ProductionSearch::new(search.clone())
                 .with_canonical_sources(snapshot.frontier, canonical_sources)

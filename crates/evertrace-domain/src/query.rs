@@ -77,6 +77,8 @@ pub enum TemporalMode {
     Current,
     AsOf,
     Interval,
+    Before,
+    After,
     Sequence,
     Any,
     Unknown,
@@ -163,11 +165,23 @@ pub enum TemporalQualifier {
     EventTimeAsOf {
         at_us: i64,
     },
+    EventTimeBefore {
+        at_us: i64,
+    },
+    EventTimeAfter {
+        at_us: i64,
+    },
     EventTimeInterval {
         start_us: i64,
         end_us: i64,
     },
     ValidityAsOf {
+        at_us: i64,
+    },
+    ValidityStartsBefore {
+        at_us: i64,
+    },
+    ValidityStartsAfter {
         at_us: i64,
     },
     ValidityInterval {
@@ -178,6 +192,63 @@ pub enum TemporalQualifier {
         source_ref: SourceObservationId,
         sequence: u64,
     },
+    SourceSequenceBefore {
+        source_ref: SourceObservationId,
+        sequence: u64,
+    },
+    SourceSequenceAfter {
+        source_ref: SourceObservationId,
+        sequence: u64,
+    },
+}
+
+impl TemporalQualifier {
+    pub fn source_sequence_ref(&self) -> Option<SourceObservationId> {
+        match self {
+            Self::SourceSequenceAtMost { source_ref, .. }
+            | Self::SourceSequenceBefore { source_ref, .. }
+            | Self::SourceSequenceAfter { source_ref, .. } => Some(*source_ref),
+            _ => None,
+        }
+    }
+
+    pub fn matches_sequence(&self, value: u64) -> Option<bool> {
+        match self {
+            Self::SourceSequenceAtMost { sequence, .. } => Some(value <= *sequence),
+            Self::SourceSequenceBefore { sequence, .. } => Some(value < *sequence),
+            Self::SourceSequenceAfter { sequence, .. } => Some(value > *sequence),
+            _ => None,
+        }
+    }
+
+    pub fn is_validity(&self) -> bool {
+        matches!(
+            self,
+            Self::ValidityAsOf { .. }
+                | Self::ValidityInterval { .. }
+                | Self::ValidityStartsBefore { .. }
+                | Self::ValidityStartsAfter { .. }
+        )
+    }
+
+    pub fn is_event_time(&self) -> bool {
+        matches!(
+            self,
+            Self::EventTimeAsOf { .. }
+                | Self::EventTimeInterval { .. }
+                | Self::EventTimeBefore { .. }
+                | Self::EventTimeAfter { .. }
+        )
+    }
+}
+
+impl TemporalMode {
+    pub fn has_temporal_predicate(self) -> bool {
+        matches!(
+            self,
+            Self::AsOf | Self::Interval | Self::Before | Self::After
+        )
+    }
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -213,6 +284,22 @@ impl TemporalScope {
                 ],
             ) => *start_us >= 0 && end_us > start_us,
             (TemporalMode::Sequence, [TemporalQualifier::SourceSequenceAtMost { .. }]) => true,
+            (
+                TemporalMode::Before,
+                [
+                    TemporalQualifier::EventTimeBefore { at_us }
+                    | TemporalQualifier::ValidityStartsBefore { at_us },
+                ],
+            )
+            | (
+                TemporalMode::After,
+                [
+                    TemporalQualifier::EventTimeAfter { at_us }
+                    | TemporalQualifier::ValidityStartsAfter { at_us },
+                ],
+            ) => *at_us >= 0,
+            (TemporalMode::Before, [TemporalQualifier::SourceSequenceBefore { .. }])
+            | (TemporalMode::After, [TemporalQualifier::SourceSequenceAfter { .. }]) => true,
             _ => false,
         };
         if valid {
@@ -686,6 +773,29 @@ impl GroundedEvidenceView {
                 .flatten(),
             statement_indices,
         })
+    }
+
+    pub fn count_temporal_gaps(&self, candidates: &[SearchCandidate]) -> BTreeSet<String> {
+        let mut gaps = BTreeSet::new();
+        if self.evidence_need.temporal_scope.qualifiers.is_empty() {
+            return gaps;
+        }
+        if let Some(count) = &self.candidate_count {
+            for index in &count.statement_indices {
+                if let Some(statement) = self.active_evidence.get(*index as usize) {
+                    for candidate in candidates {
+                        if statement.support_refs.contains(&candidate.candidate_id)
+                            && candidate
+                                .temporal_match(&self.evidence_need.temporal_scope.qualifiers)
+                                .is_none()
+                        {
+                            gaps.insert(candidate.source_ref.clone());
+                        }
+                    }
+                }
+            }
+        }
+        gaps
     }
 
     pub fn latest_source_coverage_complete(&self, candidates: &[SearchCandidate]) -> bool {
@@ -1603,6 +1713,24 @@ impl SourceTimePosition {
                     None
                 }
             }
+            [TemporalQualifier::EventTimeBefore { at_us }] => {
+                if upper < i128::from(*at_us) {
+                    Some(true)
+                } else if lower >= i128::from(*at_us) {
+                    Some(false)
+                } else {
+                    None
+                }
+            }
+            [TemporalQualifier::EventTimeAfter { at_us }] => {
+                if lower > i128::from(*at_us) {
+                    Some(true)
+                } else if upper <= i128::from(*at_us) {
+                    Some(false)
+                } else {
+                    None
+                }
+            }
             [TemporalQualifier::EventTimeInterval { start_us, end_us }] => {
                 let (start, end) = (i128::from(*start_us), i128::from(*end_us));
                 if lower >= start && upper < end {
@@ -1630,6 +1758,10 @@ pub fn validity_match(
     interval.validate().ok()?;
     match qualifiers {
         [TemporalQualifier::ValidityAsOf { at_us }] => Some(interval.contains(*at_us)),
+        [TemporalQualifier::ValidityStartsBefore { at_us }] => {
+            Some(interval.valid_from_us < *at_us)
+        }
+        [TemporalQualifier::ValidityStartsAfter { at_us }] => Some(interval.valid_from_us > *at_us),
         [TemporalQualifier::ValidityInterval { start_us, end_us }] => Some(
             interval.valid_from_us < *end_us
                 && interval.valid_until_us.is_none_or(|end| end > *start_us),
@@ -1641,9 +1773,12 @@ pub fn validity_match(
 impl SearchCandidate {
     pub fn temporal_match(&self, qualifiers: &[TemporalQualifier]) -> Option<bool> {
         match qualifiers {
-            [
-                TemporalQualifier::ValidityAsOf { .. } | TemporalQualifier::ValidityInterval { .. },
-            ] => validity_match(self.validity_interval.as_ref()?, qualifiers),
+            [qualifier] if qualifier.is_validity() => {
+                validity_match(self.validity_interval.as_ref()?, qualifiers)
+            }
+            [qualifier] if qualifier.source_sequence_ref().is_some() => {
+                qualifier.matches_sequence(self.source_sequence.as_ref()?.sequence)
+            }
             _ => self.source_time.as_ref()?.temporal_match(qualifiers),
         }
     }
@@ -1697,10 +1832,7 @@ fn latest_order<'a>(
     if candidates.iter().any(|candidate| candidate.conflicted) {
         return None;
     }
-    if matches!(
-        qualifiers,
-        [TemporalQualifier::ValidityAsOf { .. } | TemporalQualifier::ValidityInterval { .. }]
-    ) {
+    if matches!(qualifiers, [qualifier] if qualifier.is_validity()) {
         return latest_max(candidates, |candidate| {
             candidate
                 .validity_interval
@@ -1711,7 +1843,7 @@ fn latest_order<'a>(
     }
     let first = candidates[0];
     if (qualifiers.is_empty()
-        || matches!(qualifiers, [TemporalQualifier::SourceSequenceAtMost { .. }]))
+        || matches!(qualifiers, [qualifier] if qualifier.source_sequence_ref().is_some()))
         && first.source_sequence.is_some()
         && candidates.iter().all(|candidate| {
             candidate
@@ -1729,7 +1861,7 @@ fn latest_order<'a>(
         })
         .map(|winners| (OrderingBasis::SourceSequence, winners));
     }
-    if matches!(qualifiers, [TemporalQualifier::SourceSequenceAtMost { .. }]) {
+    if matches!(qualifiers, [qualifier] if qualifier.source_sequence_ref().is_some()) {
         return None;
     }
     if !qualifiers.is_empty() {
@@ -2120,6 +2252,11 @@ impl HumanSearchPage {
         let Some(count) = &view.candidate_count else {
             return false;
         };
+        if view.completeness == RetrievalCompleteness::Complete
+            && !view.count_temporal_gaps(&self.result.candidates).is_empty()
+        {
+            return false;
+        }
         // Ordinary answer evidence is required. Constraint-only matches are
         // declared by the Native protected-IR predicate, not inferred from prose.
         view.derive_candidate_count(&self.result.candidates, &count.statement_indices)
@@ -2275,8 +2412,7 @@ impl HumanSearchPage {
                     || view.is_none_or(|view| {
                         !matches!(
                             view.evidence_need.temporal_scope.qualifiers.as_slice(),
-                            [TemporalQualifier::EventTimeAsOf { .. }
-                                | TemporalQualifier::EventTimeInterval { .. }]
+                            [qualifier] if qualifier.is_event_time()
                         ) && !unqualified_chronology
                     })
                 {
@@ -2291,8 +2427,7 @@ impl HumanSearchPage {
                     || view.is_none_or(|view| {
                         !matches!(
                             view.evidence_need.temporal_scope.qualifiers.as_slice(),
-                            [TemporalQualifier::ValidityAsOf { .. }
-                                | TemporalQualifier::ValidityInterval { .. }]
+                            [qualifier] if qualifier.is_validity()
                         ) && !unqualified_chronology
                     })
                 {
@@ -2335,10 +2470,17 @@ impl HumanSearchPage {
         let Some(view) = view else {
             return true;
         };
-        let temporal = matches!(
-            view.evidence_need.temporal_scope.mode,
-            TemporalMode::AsOf | TemporalMode::Interval
-        );
+        let temporal = view
+            .evidence_need
+            .temporal_scope
+            .mode
+            .has_temporal_predicate()
+            && !view
+                .evidence_need
+                .temporal_scope
+                .qualifiers
+                .iter()
+                .any(|qualifier| qualifier.source_sequence_ref().is_some());
         let mut expected = if temporal {
             self.result
                 .candidates
@@ -2348,11 +2490,12 @@ impl HumanSearchPage {
                         .temporal_match(&view.evidence_need.temporal_scope.qualifiers)
                         .is_none()
                 })
-                .map(|candidate| candidate.source_ref.as_str())
+                .map(|candidate| candidate.source_ref.clone())
                 .collect::<BTreeSet<_>>()
         } else {
             BTreeSet::new()
         };
+        expected.extend(view.count_temporal_gaps(&self.result.candidates));
         if let Some(latest) = &view.candidate_latest
             && latest.statement_indices.is_none()
         {
@@ -2362,7 +2505,7 @@ impl HumanSearchPage {
                         .support_refs
                         .contains(&candidate.candidate_id)
                     {
-                        expected.insert(candidate.source_ref.as_str());
+                        expected.insert(candidate.source_ref.clone());
                     }
                 }
             }
@@ -2375,7 +2518,7 @@ impl HumanSearchPage {
         if gaps.len() != expected.len()
             || gaps
                 .iter()
-                .map(|gap| gap.identifier.as_str())
+                .map(|gap| gap.identifier.clone())
                 .collect::<BTreeSet<_>>()
                 != expected
         {
@@ -2412,7 +2555,13 @@ impl HumanSearchPage {
                 .iter()
                 .all(|candidate| candidate.source_sequence.is_none());
         };
-        let sequence_mode = view.evidence_need.temporal_scope.mode == TemporalMode::Sequence;
+        let sequence = view
+            .evidence_need
+            .temporal_scope
+            .qualifiers
+            .first()
+            .filter(|qualifier| qualifier.source_sequence_ref().is_some());
+        let sequence_mode = sequence.is_some();
         let automatic = matches!(
             view.evidence_need.answer_shape,
             Some(AnswerShape::Timeline | AnswerShape::Latest)
@@ -2426,16 +2575,12 @@ impl HumanSearchPage {
                 continue;
             };
             if sequence_mode {
-                let [
-                    TemporalQualifier::SourceSequenceAtMost {
-                        source_ref,
-                        sequence,
-                    },
-                ] = view.evidence_need.temporal_scope.qualifiers.as_slice()
-                else {
+                let Some(qualifier) = sequence else {
                     return false;
                 };
-                if position.sequence > *sequence || position.source_anchor != *source_ref {
+                if qualifier.matches_sequence(position.sequence) != Some(true)
+                    || Some(position.source_anchor) != qualifier.source_sequence_ref()
+                {
                     return false;
                 }
             } else if automatic {
