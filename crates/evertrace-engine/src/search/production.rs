@@ -5,6 +5,7 @@ use std::{
     time::{Duration, Instant},
 };
 
+use evertrace_domain::evidence::SourceRevision;
 use evertrace_domain::query::{
     FacetParseStatus, LifecycleBoundary, Polarity, QuantityConstraint, QueryError,
     RetrievalCompleteness, RetrievalLayer, ScopeBoundary, SearchCandidate, SearchContext,
@@ -75,17 +76,14 @@ impl TemporalPosition {
         &self,
         facets: &evertrace_domain::query::QueryFacetSet,
     ) -> Option<evertrace_domain::query::SourceSequencePosition> {
-        if !matches!(
-            facets.answer_shape,
-            Some(
-                evertrace_domain::query::AnswerShape::Timeline
-                    | evertrace_domain::query::AnswerShape::Latest
-            )
-        ) || (!facets.temporal_qualifiers.is_empty()
-            && !matches!(
-                requested_ordering(&facets.temporal_qualifiers),
-                Some(TemporalOrdering::SourceSequence | TemporalOrdering::Supersession)
-            ))
+        if !facets
+            .answer_shape
+            .is_some_and(evertrace_domain::query::AnswerShape::uses_temporal_order)
+            || (!facets.temporal_qualifiers.is_empty()
+                && !matches!(
+                    requested_ordering(&facets.temporal_qualifiers),
+                    Some(TemporalOrdering::SourceSequence | TemporalOrdering::Supersession)
+                ))
         {
             return None;
         }
@@ -265,13 +263,51 @@ impl TemporalReadScope<'_> {
     pub(super) fn align_revision_domain(
         &self,
         candidates: &mut [SearchCandidate],
+        facets: &evertrace_domain::query::QueryFacetSet,
         budget: &mut evertrace_domain::query::RetrievalBudget,
         deadline: &RequestDeadline,
     ) -> Result<(), SearchError> {
+        let comparison =
+            facets.answer_shape == Some(evertrace_domain::query::AnswerShape::TemporalComparison);
         let mut instance = None;
+        let mut targets = BTreeSet::new();
+        if comparison {
+            if requested_ordering(&facets.temporal_qualifiers)
+                != Some(TemporalOrdering::Supersession)
+            {
+                return Ok(());
+            }
+            for candidate in candidates.iter().filter(|candidate| {
+                facets
+                    .target_anchors
+                    .iter()
+                    .any(|target| candidate.matches_reference(target))
+            }) {
+                if deadline.remaining().is_none() {
+                    return Ok(());
+                }
+                if candidate.revision_order.is_none() {
+                    continue;
+                }
+                if let Some(TemporalPosition::Source { receipt, .. }) =
+                    (self.read)(&candidate.source_ref)
+                {
+                    if instance
+                        .as_ref()
+                        .is_some_and(|value| value != &receipt.source_instance_id)
+                    {
+                        return Ok(());
+                    }
+                    instance = Some(receipt.source_instance_id);
+                    targets.insert(receipt.source_revision);
+                }
+            }
+            if targets.is_empty() {
+                return Ok(());
+            }
+        }
         let mut revisions = BTreeMap::new();
         let mut members = Vec::new();
-        let mut anchor: Option<evertrace_domain::ids::SourceObservationId> = None;
         for (index, candidate) in candidates.iter().enumerate() {
             if candidate.row_variant
                 != evertrace_domain::query::SearchCandidateVariant::EvidenceSurface
@@ -294,6 +330,9 @@ impl TemporalReadScope<'_> {
                 .as_ref()
                 .is_some_and(|value| value != &receipt.source_instance_id)
             {
+                if comparison {
+                    continue;
+                }
                 return Ok(());
             }
             instance = Some(receipt.source_instance_id);
@@ -305,10 +344,13 @@ impl TemporalReadScope<'_> {
                 return Err(SearchError::Corrupt);
             }
             revisions.insert(revision.clone(), previous_revision);
-            anchor = Some(anchor.map_or(receipt.source_observation_id, |value| {
-                value.min(receipt.source_observation_id)
-            }));
-            members.push((index, revision));
+            members.push((index, revision, receipt.source_observation_id));
+        }
+        if comparison {
+            let Some(path) = comparison_revision_path(&revisions, &targets) else {
+                return Ok(());
+            };
+            revisions.retain(|revision, _| path.contains(revision));
         }
         if !(1..=3).contains(&revisions.len()) {
             return Ok(());
@@ -343,17 +385,60 @@ impl TemporalReadScope<'_> {
         if deadline.remaining().is_none() || budget.hops_remaining < hops {
             return Ok(());
         }
-        let anchor = anchor.ok_or(SearchError::Corrupt)?.to_string();
-        for (index, revision) in members {
-            candidates[index].revision_order =
-                Some(evertrace_domain::query::RevisionOrderPosition {
-                    anchor: anchor.clone(),
-                    sequence: ranks[&revision],
-                });
+        let anchor = members
+            .iter()
+            .filter(|(_, revision, _)| ranks.contains_key(revision))
+            .map(|(_, _, observation)| *observation)
+            .min()
+            .ok_or(SearchError::Corrupt)?
+            .to_string();
+        for (index, revision, _) in members {
+            if let Some(rank) = ranks.get(&revision) {
+                candidates[index].revision_order =
+                    Some(evertrace_domain::query::RevisionOrderPosition {
+                        anchor: anchor.clone(),
+                        sequence: *rank,
+                    });
+            }
         }
         budget.hops_remaining -= hops;
         Ok(())
     }
+}
+
+// Only paths already present in the frozen candidate cohort can bridge two targets.
+fn comparison_revision_path(
+    revisions: &BTreeMap<SourceRevision, Option<SourceRevision>>,
+    targets: &BTreeSet<SourceRevision>,
+) -> Option<BTreeSet<SourceRevision>> {
+    if !(1..=2).contains(&targets.len()) {
+        return None;
+    }
+    let mut selected = None;
+    for head in targets {
+        let mut current = head;
+        let mut path = BTreeSet::from([head.clone()]);
+        for depth in 0..=2 {
+            if targets.is_subset(&path) {
+                if selected.is_some() {
+                    return None;
+                }
+                selected = Some(path);
+                break;
+            }
+            if depth == 2 {
+                break;
+            }
+            let Some(previous) = revisions.get(current).and_then(Option::as_ref) else {
+                break;
+            };
+            if !revisions.contains_key(previous) || !path.insert(previous.clone()) {
+                break;
+            }
+            current = previous;
+        }
+    }
+    selected
 }
 
 pub struct ProductionSearch {
@@ -758,7 +843,10 @@ impl ProductionSearch {
         }
         let mut filter = self.hard_filter(&context, true, time_scope);
         filter.global_only = global_only;
-        let requested_limit = if context.query_facets.count_unit().is_some() {
+        let requested_limit = if context.query_facets.count_unit().is_some()
+            || context.query_facets.answer_shape
+                == Some(evertrace_domain::query::AnswerShape::TemporalComparison)
+        {
             context.budget.candidates_remaining
         } else {
             context

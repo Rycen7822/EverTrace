@@ -375,12 +375,14 @@ impl NativeRetrieval<'_> {
                         .all(|literal| candidate.text.contains(literal)))
         };
         let mut kinds = self.context.query_facets.relation_requirements.clone();
-        if self.context.query_facets.answer_shape == Some(AnswerShape::Latest)
-            && self
-                .result
-                .candidates
-                .iter()
-                .any(|candidate| candidate.object_kind.as_deref() == Some("atom_revision"))
+        if matches!(
+            self.context.query_facets.answer_shape,
+            Some(AnswerShape::Latest | AnswerShape::TemporalComparison)
+        ) && self
+            .result
+            .candidates
+            .iter()
+            .any(|candidate| candidate.object_kind.as_deref() == Some("atom_revision"))
         {
             // Latest must not ignore an explicit contradiction while choosing an update.
             for (kind, needed) in [
@@ -616,6 +618,7 @@ impl NativeRetrieval<'_> {
         if let Some(scope) = self.time_scope {
             scope.align_revision_domain(
                 &mut self.result.candidates,
+                &self.context.query_facets,
                 &mut self.result.budget,
                 &self.deadline,
             )?;
@@ -795,6 +798,7 @@ impl NativeRetrieval<'_> {
         let mut view = GroundedEvidenceView {
             candidate_count: None,
             candidate_latest: None,
+            candidate_comparison: None,
             evidence_need: EvidenceNeed::from_context(self.context),
             candidate_set: CandidateBoundary {
                 generation: if added.is_empty() { 1 } else { 2 },
@@ -848,6 +852,15 @@ impl NativeRetrieval<'_> {
             }
             view.completeness = self.result.completeness;
         }
+        view.candidate_comparison =
+            view.derive_candidate_comparison(&self.result.candidates, &matching_constraints);
+        if view
+            .candidate_comparison
+            .as_ref()
+            .is_some_and(|comparison| comparison.relation == TemporalComparisonRelation::Unknown)
+        {
+            self.degraded("temporal_comparison_unverified");
+        }
         let ordering_gaps = view.ordering_temporal_gaps(&self.result.candidates);
         if !ordering_gaps.is_empty() {
             self.degraded("temporal_ordering_unverified");
@@ -874,7 +887,10 @@ impl NativeRetrieval<'_> {
     }
     fn output_limit(&self) -> usize {
         if self.context.query_facets.count_unit().is_some()
-            || self.context.query_facets.answer_shape == Some(AnswerShape::Latest)
+            || matches!(
+                self.context.query_facets.answer_shape,
+                Some(AnswerShape::Latest | AnswerShape::TemporalComparison)
+            )
         {
             // Operators answer over the bounded set, not display pagination.
             return 32;
@@ -893,7 +909,9 @@ impl NativeRetrieval<'_> {
     }
     fn answer_text_limit(&self) -> usize {
         // A quote occurs twice; metadata and the typed operator occur once.
-        2400 - if self.context.query_facets.answer_shape == Some(AnswerShape::Latest) {
+        2400 - if self.context.query_facets.answer_shape == Some(AnswerShape::TemporalComparison) {
+            MAX_GROUNDED_COMPARISON_BYTES / 2
+        } else if self.context.query_facets.answer_shape == Some(AnswerShape::Latest) {
             MAX_GROUNDED_LATEST_BYTES / 2
         } else if self.context.query_facets.count_unit().is_some() {
             MAX_GROUNDED_COUNT_BYTES / 2
@@ -942,10 +960,11 @@ impl NativeRetrieval<'_> {
         }
         self.result.candidates = kept;
         if self.sequence_scope.is_none()
-            && matches!(
-                self.context.query_facets.answer_shape,
-                Some(AnswerShape::Timeline | AnswerShape::Latest)
-            )
+            && self
+                .context
+                .query_facets
+                .answer_shape
+                .is_some_and(AnswerShape::uses_temporal_order)
             && (self.context.query_facets.temporal_qualifiers.is_empty()
                 || matches!(
                     requested_ordering(&self.context.query_facets.temporal_qualifiers),

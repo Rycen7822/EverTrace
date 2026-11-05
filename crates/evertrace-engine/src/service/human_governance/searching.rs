@@ -769,10 +769,10 @@ impl HumanGovernanceService {
             };
             let time_query = sequence_query
                 || context.query_facets.temporal_mode.has_temporal_predicate()
-                || matches!(
-                    context.query_facets.answer_shape,
-                    Some(AnswerShape::Timeline | AnswerShape::Latest)
-                );
+                || context
+                    .query_facets
+                    .answer_shape
+                    .is_some_and(AnswerShape::uses_temporal_order);
             let mut time_refs: Option<BTreeSet<String>> = None;
             if context.query_facets.temporal_mode.has_temporal_predicate() && !sequence_query {
                 for reference in &refs {

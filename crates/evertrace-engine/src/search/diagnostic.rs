@@ -359,6 +359,7 @@ impl DiagnosticSession {
         let view = GroundedEvidenceView {
             candidate_count: None,
             candidate_latest: None,
+            candidate_comparison: None,
             evidence_need: EvidenceNeed::from_context(&self.context),
             candidate_set: CandidateBoundary {
                 generation: if self.result.layer == RetrievalLayer::E {

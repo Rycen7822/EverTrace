@@ -137,6 +137,16 @@ pub enum AnswerShape {
     Count,
     Timeline,
     Latest,
+    TemporalComparison,
+}
+
+impl AnswerShape {
+    pub const fn uses_temporal_order(self) -> bool {
+        matches!(
+            self,
+            Self::Timeline | Self::Latest | Self::TemporalComparison
+        )
+    }
 }
 
 #[derive(Clone, Copy, Debug, Deserialize, Eq, Ord, PartialEq, PartialOrd, Serialize)]
@@ -442,10 +452,12 @@ impl QueryFacetSet {
         if count_operands > 1
             || (count_operands == 1 && self.answer_shape != Some(AnswerShape::Count))
             || (requested_ordering(&self.temporal_qualifiers).is_some()
-                && !matches!(
-                    self.answer_shape,
-                    Some(AnswerShape::Timeline | AnswerShape::Latest)
-                ))
+                && !self
+                    .answer_shape
+                    .is_some_and(AnswerShape::uses_temporal_order))
+            || (self.answer_shape == Some(AnswerShape::TemporalComparison)
+                && (self.target_anchors.len() != 2
+                    || requested_ordering(&self.temporal_qualifiers).is_none()))
         {
             return Err(QueryError::Invalid);
         }
@@ -603,10 +615,12 @@ impl EvidenceNeed {
     fn validate(&self) -> Result<(), QueryError> {
         if (self.count_unit.is_some() && self.answer_shape != Some(AnswerShape::Count))
             || (requested_ordering(&self.temporal_scope.qualifiers).is_some()
-                && !matches!(
-                    self.answer_shape,
-                    Some(AnswerShape::Timeline | AnswerShape::Latest)
-                ))
+                && !self
+                    .answer_shape
+                    .is_some_and(AnswerShape::uses_temporal_order))
+            || (self.answer_shape == Some(AnswerShape::TemporalComparison)
+                && (self.target.len() != 2
+                    || requested_ordering(&self.temporal_scope.qualifiers).is_none()))
             || self.target.len() > MAX_FACET_ITEMS
             || self.target.iter().any(|value| !valid_target(value))
             || self.target.iter().collect::<BTreeSet<_>>().len() != self.target.len()
@@ -707,6 +721,8 @@ pub struct GroundedEvidenceView {
     pub candidate_count: Option<GroundedCount>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub candidate_latest: Option<GroundedLatest>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub candidate_comparison: Option<GroundedTemporalComparison>,
     pub evidence_need: EvidenceNeed,
     pub candidate_set: CandidateBoundary,
     pub trace: Vec<GroundedTraceStep>,
@@ -728,6 +744,107 @@ pub struct GroundedCount {
 
 pub const MAX_GROUNDED_COUNT_BYTES: usize = 256;
 pub const MAX_GROUNDED_LATEST_BYTES: usize = 512;
+pub const MAX_GROUNDED_COMPARISON_BYTES: usize = 512;
+
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum TemporalComparisonRelation {
+    Before,
+    Equal,
+    After,
+    Unknown,
+}
+
+/// Signed exact decimals avoid JSON/JavaScript precision loss; bounds use i128 arithmetic.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct TemporalDeltaMicros {
+    pub minimum: String,
+    pub maximum: String,
+}
+
+impl TemporalDeltaMicros {
+    fn bounds(&self) -> Option<(i128, i128)> {
+        let minimum = self.minimum.parse::<i128>().ok()?;
+        let maximum = self.maximum.parse::<i128>().ok()?;
+        (minimum <= maximum
+            && self.minimum == minimum.to_string()
+            && self.maximum == maximum.to_string())
+        .then_some((minimum, maximum))
+    }
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct GroundedTemporalComparison {
+    pub operator_revision: u32,
+    /// Slots bind evidence_need.target[0] and [1], never an inferred pair.
+    pub operand_indices: [Option<u32>; 2],
+    pub relation: TemporalComparisonRelation,
+    pub ordering_basis: OrderingBasis,
+    /// None for sequence/revision coordinates or unknown clocks, never ordinal-to-time conversion.
+    pub right_minus_left_us: Option<TemporalDeltaMicros>,
+}
+
+fn delta_relation(minimum: i128, maximum: i128) -> TemporalComparisonRelation {
+    if minimum > 0 {
+        TemporalComparisonRelation::Before
+    } else if maximum < 0 {
+        TemporalComparisonRelation::After
+    } else if minimum == 0 && maximum == 0 {
+        TemporalComparisonRelation::Equal
+    } else {
+        TemporalComparisonRelation::Unknown
+    }
+}
+
+impl GroundedTemporalComparison {
+    fn validate(
+        &self,
+        need: &EvidenceNeed,
+        statements: &[GroundedStatement],
+    ) -> Result<(), QueryError> {
+        if need.answer_shape != Some(AnswerShape::TemporalComparison)
+            || self.operator_revision != 1
+            || self.operand_indices.iter().flatten().any(|index| {
+                statements
+                    .get(*index as usize)
+                    .is_none_or(|statement| statement.derivation_kind != DerivationKind::Quoted)
+            })
+            || serde_json::to_vec(self)
+                .map_or(true, |bytes| bytes.len() > MAX_GROUNDED_COMPARISON_BYTES)
+        {
+            return Err(QueryError::Invalid);
+        }
+        let domain =
+            requested_ordering(&need.temporal_scope.qualifiers).ok_or(QueryError::Invalid)?;
+        let resolved = self.operand_indices.iter().all(Option::is_some);
+        let relation = match self.ordering_basis {
+            OrderingBasis::Unknown if self.right_minus_left_us.is_none() => {
+                Some(TemporalComparisonRelation::Unknown)
+            }
+            OrderingBasis::EventTime | OrderingBasis::Validity => self
+                .right_minus_left_us
+                .as_ref()
+                .and_then(TemporalDeltaMicros::bounds)
+                .map(|(minimum, maximum)| delta_relation(minimum, maximum)),
+            OrderingBasis::SourceSequence | OrderingBasis::Supersession
+                if self.right_minus_left_us.is_none()
+                    && self.relation != TemporalComparisonRelation::Unknown =>
+            {
+                Some(self.relation)
+            }
+            _ => None,
+        };
+        if relation != Some(self.relation)
+            || (self.ordering_basis != OrderingBasis::Unknown
+                && (!resolved || self.ordering_basis != domain.basis()))
+        {
+            return Err(QueryError::Invalid);
+        }
+        Ok(())
+    }
+}
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
@@ -849,6 +966,13 @@ impl GroundedEvidenceView {
     }
 
     pub fn ordering_temporal_gaps(&self, candidates: &[SearchCandidate]) -> BTreeSet<String> {
+        if self
+            .candidate_comparison
+            .as_ref()
+            .is_some_and(|comparison| comparison.relation == TemporalComparisonRelation::Unknown)
+        {
+            return self.evidence_need.target.iter().cloned().collect();
+        }
         if self.evidence_need.answer_shape == Some(AnswerShape::Timeline)
             && requested_ordering(&self.evidence_need.temporal_scope.qualifiers).is_some()
             && timeline_order(candidates, &self.evidence_need.temporal_scope.qualifiers)
@@ -920,6 +1044,145 @@ impl GroundedEvidenceView {
         self.validate_inner(Some(frontier))
     }
 
+    fn relation_clauses(&self) -> Vec<GroundedRelationStatement> {
+        self.active_evidence
+            .iter()
+            .filter(|statement| statement.derivation_kind == DerivationKind::DeterministicDerived)
+            .filter_map(|statement| serde_json::from_str(&statement.statement).ok())
+            .collect()
+    }
+
+    pub fn derive_candidate_comparison(
+        &self,
+        candidates: &[SearchCandidate],
+        matching_constraints: &BTreeSet<u32>,
+    ) -> Option<GroundedTemporalComparison> {
+        if self.evidence_need.answer_shape != Some(AnswerShape::TemporalComparison)
+            || self.evidence_need.target.len() != 2
+        {
+            return None;
+        }
+        let domain = requested_ordering(&self.evidence_need.temporal_scope.qualifiers)?;
+        let operands = self.quoted_operands(candidates, matching_constraints)?;
+        let selected: [Option<(u32, &SearchCandidate)>; 2] = std::array::from_fn(|index| {
+            let mut matches = operands.iter().filter(|(_, candidate)| {
+                candidate.matches_reference(&self.evidence_need.target[index])
+            });
+            let selected = matches.next().copied()?;
+            matches.next().is_none().then_some(selected)
+        });
+        let mut comparison = GroundedTemporalComparison {
+            operator_revision: 1,
+            operand_indices: selected.map(|operand| operand.map(|(index, _)| index)),
+            relation: TemporalComparisonRelation::Unknown,
+            ordering_basis: OrderingBasis::Unknown,
+            right_minus_left_us: None,
+        };
+        let [Some((left_index, left)), Some((right_index, right))] = selected else {
+            return Some(comparison);
+        };
+        if !self.conflicts.is_empty() || left.conflicted || right.conflicted {
+            return Some(comparison);
+        }
+        if left_index == right_index {
+            let known = match domain {
+                TemporalOrdering::SourceSequence => left.source_sequence.is_some(),
+                TemporalOrdering::Supersession => left.revision_order.is_some(),
+                TemporalOrdering::ValidityStart => left
+                    .validity_interval
+                    .as_ref()
+                    .is_some_and(|validity| validity.validate().is_ok()),
+                TemporalOrdering::EventTime => left.source_time.as_ref().is_some_and(|position| {
+                    position.validate()
+                        && matches!(
+                            position.provenance,
+                            Some(crate::evidence::EventTimeProvenance::SourceTimestamp { .. })
+                        )
+                }),
+            };
+            if known {
+                comparison.ordering_basis = domain.basis();
+                comparison.relation = TemporalComparisonRelation::Equal;
+                // Both slots cite one immutable coordinate; no clock accuracy is invented.
+                if matches!(
+                    domain,
+                    TemporalOrdering::EventTime | TemporalOrdering::ValidityStart
+                ) {
+                    comparison.right_minus_left_us = Some(TemporalDeltaMicros {
+                        minimum: "0".into(),
+                        maximum: "0".into(),
+                    });
+                }
+            }
+            return Some(comparison);
+        }
+        match domain {
+            TemporalOrdering::SourceSequence => {
+                if let Some((left, right)) = left
+                    .source_sequence
+                    .as_ref()
+                    .zip(right.source_sequence.as_ref())
+                    && left.source_anchor == right.source_anchor
+                {
+                    comparison.ordering_basis = OrderingBasis::SourceSequence;
+                    comparison.relation = match left.sequence.cmp(&right.sequence) {
+                        std::cmp::Ordering::Less => TemporalComparisonRelation::Before,
+                        std::cmp::Ordering::Equal => TemporalComparisonRelation::Equal,
+                        std::cmp::Ordering::Greater => TemporalComparisonRelation::After,
+                    };
+                }
+            }
+            TemporalOrdering::Supersession => {
+                if let Some((basis, winners)) = latest_order(
+                    &[left, right],
+                    candidates,
+                    &self.evidence_need.temporal_scope.qualifiers,
+                    &self.relation_clauses(),
+                ) {
+                    comparison.ordering_basis = basis;
+                    comparison.relation = if winners.len() == 2 {
+                        TemporalComparisonRelation::Equal
+                    } else if winners.contains(left.candidate_id.as_str()) {
+                        TemporalComparisonRelation::After
+                    } else {
+                        TemporalComparisonRelation::Before
+                    };
+                }
+            }
+            TemporalOrdering::EventTime | TemporalOrdering::ValidityStart => {
+                let window = |candidate: &SearchCandidate| match domain {
+                    TemporalOrdering::EventTime => candidate
+                        .source_time
+                        .as_ref()
+                        .filter(|position| position.validate())?
+                        .event_window(),
+                    TemporalOrdering::ValidityStart => {
+                        let validity = candidate.validity_interval.as_ref()?;
+                        validity.validate().ok()?;
+                        Some((
+                            i128::from(validity.valid_from_us),
+                            i128::from(validity.valid_from_us),
+                        ))
+                    }
+                    _ => None,
+                };
+                if let Some(((left_min, left_max), (right_min, right_max))) =
+                    window(left).zip(window(right))
+                {
+                    let minimum = right_min - left_max;
+                    let maximum = right_max - left_min;
+                    comparison.ordering_basis = domain.basis();
+                    comparison.relation = delta_relation(minimum, maximum);
+                    comparison.right_minus_left_us = Some(TemporalDeltaMicros {
+                        minimum: minimum.to_string(),
+                        maximum: maximum.to_string(),
+                    });
+                }
+            }
+        }
+        Some(comparison)
+    }
+
     pub fn derive_candidate_latest(
         &self,
         candidates: &[SearchCandidate],
@@ -932,14 +1195,7 @@ impl GroundedEvidenceView {
             .quoted_operands(candidates, matching_constraints)?
             .into_iter()
             .unzip();
-        let relations = self
-            .active_evidence
-            .iter()
-            .filter(|statement| statement.derivation_kind == DerivationKind::DeterministicDerived)
-            .filter_map(|statement| {
-                serde_json::from_str::<GroundedRelationStatement>(&statement.statement).ok()
-            })
-            .collect::<Vec<_>>();
+        let relations = self.relation_clauses();
         let order = self
             .conflicts
             .is_empty()
@@ -969,6 +1225,9 @@ impl GroundedEvidenceView {
 
     fn validate_inner(&self, frontier: Option<u64>) -> Result<(), QueryError> {
         self.evidence_need.validate()?;
+        if let Some(comparison) = &self.candidate_comparison {
+            comparison.validate(&self.evidence_need, &self.active_evidence)?;
+        }
         if let Some(latest) = &self.candidate_latest {
             if self.evidence_need.answer_shape != Some(AnswerShape::Latest)
                 || latest.operator_revision != 1
@@ -1855,6 +2114,13 @@ pub fn validity_match(
 }
 
 impl SearchCandidate {
+    pub fn matches_reference(&self, reference: &str) -> bool {
+        self.candidate_id == reference
+            || (self.source_ref == reference
+                && (self.row_variant == SearchCandidateVariant::EvidenceSurface
+                    || self.currentness == Some(SearchCurrentness::Current)))
+    }
+
     pub fn temporal_match(&self, qualifiers: &[TemporalQualifier]) -> Option<bool> {
         if requested_ordering(qualifiers).is_some() {
             return Some(true);
@@ -2339,6 +2605,7 @@ impl HumanSearchPage {
                     && view.completeness == self.result.completeness
                     && self.count_derivation_valid(view)
                     && self.latest_derivation_valid(view)
+                    && self.comparison_derivation_valid(view)
             })
             && self.quoted_statements_valid()
             && self.timeline_order_valid()
@@ -2392,6 +2659,26 @@ impl HumanSearchPage {
             }
         }
         true
+    }
+
+    fn comparison_derivation_valid(&self, view: &GroundedEvidenceView) -> bool {
+        if view.evidence_need.answer_shape != Some(AnswerShape::TemporalComparison) {
+            return view.candidate_comparison.is_none();
+        }
+        let Some(comparison) = &view.candidate_comparison else {
+            return false;
+        };
+        let operands = comparison
+            .operand_indices
+            .iter()
+            .flatten()
+            .copied()
+            .collect();
+        view.derive_candidate_comparison(&self.result.candidates, &operands)
+            .as_ref()
+            == Some(comparison)
+            && (view.completeness != RetrievalCompleteness::Complete
+                || comparison.relation != TemporalComparisonRelation::Unknown)
     }
 
     fn quoted_statements_valid(&self) -> bool {
@@ -2467,11 +2754,11 @@ impl HumanSearchPage {
     fn time_positions_valid(&self) -> bool {
         let view = self.grounded_view.as_ref();
         let chronology = view.is_some_and(|view| {
-            matches!(
-                view.evidence_need.answer_shape,
-                Some(AnswerShape::Timeline | AnswerShape::Latest)
-            ) && (view.evidence_need.temporal_scope.qualifiers.is_empty()
-                || requested_ordering(&view.evidence_need.temporal_scope.qualifiers).is_some())
+            view.evidence_need
+                .answer_shape
+                .is_some_and(AnswerShape::uses_temporal_order)
+                && (view.evidence_need.temporal_scope.qualifiers.is_empty()
+                    || requested_ordering(&view.evidence_need.temporal_scope.qualifiers).is_some())
         });
         for candidate in &self.result.candidates {
             if let Some(position) = &candidate.revision_order {
@@ -2481,9 +2768,11 @@ impl HumanSearchPage {
                     && position.sequence > 0
                     && position.sequence <= self.result.projection_frontier
                     && view.is_some_and(|view| {
-                        view.evidence_need.answer_shape == Some(AnswerShape::Latest)
-                            || requested_ordering(&view.evidence_need.temporal_scope.qualifiers)
-                                == Some(TemporalOrdering::Supersession)
+                        matches!(
+                            view.evidence_need.answer_shape,
+                            Some(AnswerShape::Latest | AnswerShape::TemporalComparison)
+                        ) || requested_ordering(&view.evidence_need.temporal_scope.qualifiers)
+                            == Some(TemporalOrdering::Supersession)
                     });
                 let source = candidate.row_variant == SearchCandidateVariant::EvidenceSurface
                     && position.sequence
@@ -2659,14 +2948,15 @@ impl HumanSearchPage {
             .first()
             .filter(|qualifier| qualifier.source_sequence_ref().is_some());
         let sequence_mode = sequence.is_some();
-        let automatic = matches!(
-            view.evidence_need.answer_shape,
-            Some(AnswerShape::Timeline | AnswerShape::Latest)
-        ) && (view.evidence_need.temporal_scope.qualifiers.is_empty()
-            || matches!(
-                requested_ordering(&view.evidence_need.temporal_scope.qualifiers),
-                Some(TemporalOrdering::SourceSequence | TemporalOrdering::Supersession)
-            ));
+        let automatic = view
+            .evidence_need
+            .answer_shape
+            .is_some_and(AnswerShape::uses_temporal_order)
+            && (view.evidence_need.temporal_scope.qualifiers.is_empty()
+                || matches!(
+                    requested_ordering(&view.evidence_need.temporal_scope.qualifiers),
+                    Some(TemporalOrdering::SourceSequence | TemporalOrdering::Supersession)
+                ));
         for candidate in &self.result.candidates {
             let Some(position) = &candidate.source_sequence else {
                 if sequence_mode && candidate.row_variant == SearchCandidateVariant::EvidenceSurface
@@ -2699,6 +2989,7 @@ impl HumanSearchPage {
             }
         }
         let sequence_order = automatic
+            && view.evidence_need.answer_shape != Some(AnswerShape::TemporalComparison)
             && matches!(
                 timeline_order(
                     &self.result.candidates,
