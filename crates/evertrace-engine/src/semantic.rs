@@ -1,6 +1,7 @@
 use thiserror::Error;
 
 mod emission;
+pub(crate) mod human_acceptance;
 mod proposal;
 mod resolver;
 mod scenario_core;
@@ -10,6 +11,7 @@ pub use emission::{
     SparseAtomSignal, SparseNoDeltaReason, VerifiedTuiAcceptance, exact_task_constraint_draft,
     materialize_atom,
 };
+pub use human_acceptance::HumanAcceptanceService;
 pub use proposal::{
     AcceptedProposalCommand, AtomAcceptanceContext, DeletionAwareProposalResolution,
     ProposalCommandContext, ProposalResolution, RevisionProposalService, SubmitProposalRequest,

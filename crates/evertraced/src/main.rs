@@ -274,16 +274,14 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
             runtime_snapshot.clone(),
             Arc::clone(&current_session_catalog_report),
         )?;
-        let human_governance = HumanGovernanceService::with_acceptance(
+        evertrace_engine::semantic::HumanAcceptanceService::new(
             writer_handle.as_ref().ok_or("writer unavailable")?.clone(),
             runtime_snapshot.effective_config_hash,
-            runtime_snapshot.clone(),
+            Some(runtime_snapshot.clone()),
             engine.effective_config().config().global_promotion.clone(),
         )
-        .with_session_report(Arc::clone(&current_session_catalog_report))
-        .with_inventory_bindings(mcp_bindings.clone())
-        .with_summary_policy(&engine.effective_config().config().llm);
-        human_governance.reconcile_reserved_once().await?;
+        .reconcile_reserved_once()
+        .await?;
         let (session_import_wakeup_tx, session_import_wakeup_rx) = watch::channel(0_u64);
         let (session_import_shutdown_tx, session_import_shutdown_rx) = watch::channel(false);
         let (backup_request_tx, backup_request_rx) = mpsc::channel(1);
@@ -353,7 +351,6 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
             mcp_bindings,
             host_canary,
             session_import_admin,
-            human_governance,
             session_import_wakeup_tx,
             session_import_wakeup_rx,
             session_import_shutdown_tx,
@@ -378,7 +375,6 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
         mcp_bindings,
         host_canary,
         session_import_admin,
-        human_governance,
         session_import_wakeup_tx,
         session_import_wakeup_rx,
         session_import_shutdown_tx,
@@ -399,9 +395,10 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
             return Err(error);
         }
     };
+    let runtime_snapshot = Arc::new(runtime_snapshot);
     let mut recall_worker = Some(spawn_recall_worker_with_config(
         writer_handle.as_ref().ok_or("writer unavailable")?.clone(),
-        runtime_snapshot.clone(),
+        runtime_snapshot.as_ref().clone(),
         data_dir.clone(),
         Some(Arc::clone(&config_reload)),
         Some(Arc::clone(&current_session_catalog_report)),
@@ -422,7 +419,8 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
     let handler_session_catalog_report = Arc::clone(&current_session_catalog_report);
     let handler_session_catalog = handler_session_catalog_service;
     let handler_session_import_admin = session_import_admin;
-    let handler_human_governance = human_governance;
+    let handler_writer = writer_handle.as_ref().ok_or("writer unavailable")?.clone();
+    let handler_runtime_snapshot = Arc::clone(&runtime_snapshot);
     let handler_session_import_wakeup = session_import_wakeup_tx.clone();
     let handler_maintenance_active = Arc::clone(&maintenance_active);
     let handler_dispatch_gate = Arc::clone(&dispatch_gate);
@@ -443,7 +441,8 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
             let session_catalog_report = Arc::clone(&handler_session_catalog_report);
             let session_catalog = handler_session_catalog.clone();
             let session_import_admin = handler_session_import_admin.clone();
-            let human_governance = handler_human_governance.clone();
+            let writer = handler_writer.clone();
+            let runtime_snapshot = Arc::clone(&handler_runtime_snapshot);
             let session_import_wakeup = handler_session_import_wakeup.clone();
             let maintenance_active = Arc::clone(&handler_maintenance_active);
             let dispatch_gate = Arc::clone(&handler_dispatch_gate);
@@ -512,7 +511,6 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
                 }
                 .map_err(|_| ErrorCode::MaintenanceMode)?;
                 let mcp_service = mcp_service.for_config(&config_snapshot).map_err(|_| ErrorCode::Internal)?;
-                let human_governance = human_governance.for_config(&config_snapshot).map_err(|_| ErrorCode::Internal)?;
                 let recovery_service = recovery_service.for_config(&config_snapshot).map_err(|_| ErrorCode::Internal)?;
                 let recovery_action_service = recovery_action_service.for_config(&config_snapshot).map_err(|_| ErrorCode::Internal)?;
                 let recall_cue_service = recall_cue_service.for_config(&config_snapshot);
@@ -841,6 +839,17 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
                         if !command.validate() {
                             return Err(ErrorCode::InvalidInput);
                         }
+                        let human_governance = HumanGovernanceService::with_acceptance(
+                            writer,
+                            runtime_snapshot.effective_config_hash,
+                            runtime_snapshot.as_ref().clone(),
+                            config_snapshot.config().global_promotion.clone(),
+                        )
+                        .with_session_report(Arc::clone(&session_catalog_report))
+                        .with_inventory_bindings(mcp_bindings.clone())
+                        .with_summary_policy(&config_snapshot.config().llm)
+                        .for_config(&config_snapshot)
+                        .map_err(|_| ErrorCode::Internal)?;
                         let response = match command {
                             HumanGovernanceRequest::Export { selections } => {
                                 let result = human_governance.export(selections.into_iter().map(|item| evertrace_engine::HumanExportSelection {
@@ -1429,7 +1438,7 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
                 };
                 recall_worker = Some(spawn_recall_worker_with_config(
                     handle.clone(),
-                    runtime_snapshot.clone(),
+                    runtime_snapshot.as_ref().clone(),
                     data_dir.clone(),
                     Some(Arc::clone(&config_reload)),
                     Some(Arc::clone(&current_session_catalog_report)),
