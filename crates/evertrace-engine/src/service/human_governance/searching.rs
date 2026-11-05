@@ -129,6 +129,78 @@ fn source_predecessor(
     previous
 }
 
+/// Find one revision's canonical witnesses; Native selects only after every request hard gate.
+fn source_revision_bridge(
+    index: &std::collections::BTreeMap<&str, Vec<&ObjectRow>>,
+    readable: &BTreeSet<String>,
+    facets: &QueryFacetSet,
+    deadline: std::time::Instant,
+) -> Option<(String, BTreeSet<String>)> {
+    use evertrace_domain::evidence::EvidenceSurface;
+
+    if facets.answer_shape != Some(AnswerShape::TemporalComparison)
+        || requested_ordering(&facets.temporal_qualifiers) != Some(TemporalOrdering::Supersession)
+        || facets.target_anchors.len() != 2
+    {
+        return None;
+    }
+    let targets = facets
+        .target_anchors
+        .iter()
+        .map(|target| {
+            let reference = EvidenceSurface::parse_candidate_ref(target)
+                .map_or_else(|| target.clone(), |(id, _, _)| id.to_string());
+            readable
+                .contains(&reference)
+                .then(|| source_receipt(index, &reference))
+                .flatten()
+        })
+        .collect::<Option<Vec<_>>>()?;
+    if targets[0].source_instance_id != targets[1].source_instance_id
+        || targets[0].source_revision == targets[1].source_revision
+    {
+        return None;
+    }
+    let parents = targets
+        .iter()
+        .map(|receipt| source_predecessor(index, receipt))
+        .collect::<Vec<_>>();
+    if parents.iter().all(Option::is_none)
+        || parents
+            .iter()
+            .enumerate()
+            .any(|(i, parent)| parent.as_ref() == Some(&targets[1 - i].source_revision))
+    {
+        return None;
+    }
+    let mut witnesses: [BTreeSet<String>; 2] = Default::default();
+    for reference in readable {
+        if std::time::Instant::now() >= deadline {
+            return None;
+        }
+        let Some(receipt) = source_receipt(index, reference) else {
+            continue;
+        };
+        for i in 0..2 {
+            if receipt.source_instance_id == targets[i].source_instance_id
+                && Some(&receipt.source_revision) == parents[i].as_ref()
+            {
+                witnesses[i].insert(receipt.source_observation_id.to_string());
+            }
+        }
+    }
+    let mut plans = witnesses
+        .into_iter()
+        .enumerate()
+        .filter_map(|(i, witnesses)| {
+            let receipt = source_receipt(index, witnesses.first()?)?;
+            (source_predecessor(index, &receipt).as_ref() == Some(&targets[1 - i].source_revision))
+                .then(|| (facets.target_anchors[i].clone(), witnesses))
+        })
+        .collect::<Vec<_>>();
+    if plans.len() == 1 { plans.pop() } else { None }
+}
+
 /// Admission verified each contiguous byte/CAS leg; this reader never computes a second digest.
 fn source_coverage_complete(
     index: &std::collections::BTreeMap<&str, Vec<&ObjectRow>>,
@@ -796,7 +868,12 @@ impl HumanGovernanceService {
                     }
                 }
             }
+            let revision_bridge =
+                source_revision_bridge(&index, &refs, &context.query_facets, deadline);
             let time_scope = time_query.then_some(crate::search::TemporalReadScope {
+                revision_bridge: revision_bridge
+                    .as_ref()
+                    .map(|(anchor, witnesses)| (anchor.as_str(), witnesses)),
                 frontier: snapshot.frontier,
                 read: &time_reader,
                 readable_refs: time_refs.as_ref(),

@@ -157,6 +157,8 @@ impl TemporalPosition {
 
 /// Borrow canonical facts at the pinned frontier; do not mirror a source/authority catalogue.
 pub(crate) struct TemporalReadScope<'a> {
+    /// Original endpoint and same-revision witnesses, not grants or prequalified rows.
+    pub revision_bridge: Option<(&'a str, &'a BTreeSet<String>)>,
     pub frontier: u64,
     pub read: &'a (dyn Fn(&str) -> Option<TemporalPosition> + Sync),
     pub readable_refs: Option<&'a BTreeSet<String>>,
@@ -210,6 +212,33 @@ impl TemporalReadScope<'_> {
             _ => return Err(SearchError::Corrupt),
         }
         Ok(position)
+    }
+
+    pub(super) fn missing_revision_bridge(
+        &self,
+        candidates: &[SearchCandidate],
+        deadline: &RequestDeadline,
+    ) -> Option<(&str, &BTreeSet<String>)> {
+        let plan = self.revision_bridge?;
+        let TemporalPosition::Source {
+            receipt: bridge, ..
+        } = (self.read)(plan.1.first()?)?
+        else {
+            return None;
+        };
+        for candidate in candidates {
+            if deadline.remaining().is_none() {
+                return None;
+            }
+            if let Some(TemporalPosition::Source { receipt, .. }) =
+                (self.read)(&candidate.source_ref)
+                && receipt.source_instance_id == bridge.source_instance_id
+                && receipt.source_revision == bridge.source_revision
+            {
+                return None;
+            }
+        }
+        Some(plan)
     }
 
     /// Align only returned coordinates, never filter a broad query to one source.

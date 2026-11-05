@@ -323,6 +323,15 @@ impl NativeRetrieval<'_> {
                 changes_result: true,
             }));
         }
+        if let Some((endpoint, _)) = self.time_scope.and_then(|scope| {
+            scope.missing_revision_bridge(&self.result.candidates, &self.deadline)
+        }) {
+            gaps.push(NamedGap {
+                kind: NamedGapKind::TemporalEvidence,
+                identifier: endpoint.to_owned(),
+                changes_result: true,
+            });
+        }
         gaps
     }
     pub(super) async fn run(mut self) -> Result<HumanSearchPage, SearchError> {
@@ -494,6 +503,9 @@ impl NativeRetrieval<'_> {
         }
         // Required slots refer to original rows, never gaps invented by snippet truncation.
         let pending_gaps = self.gaps(&witnessed);
+        let revision_bridge = self.time_scope.and_then(|scope| {
+            scope.missing_revision_bridge(&self.result.candidates, &self.deadline)
+        });
         // Freeze generation 1 after D, before the one named, result-changing gap.
         self.pack()?;
         let base: BTreeSet<_> = self
@@ -504,30 +516,54 @@ impl NativeRetrieval<'_> {
             .collect();
         let mut added = BTreeSet::new();
         if let [gap] = pending_gaps.as_slice()
-            && gap.kind == NamedGapKind::ExactIdentifier
+            && (gap.kind == NamedGapKind::ExactIdentifier
+                || (gap.kind == NamedGapKind::TemporalEvidence
+                    && revision_bridge.is_some_and(|(endpoint, _)| endpoint == gap.identifier)
+                    && self.result.budget.hops_remaining >= 2))
             && self.result.budget.follow_ups_remaining > 0
-            && self.remaining() >= (if self.evidence.is_some() { 4 } else { 2 })
+            && self.remaining()
+                >= (if gap.kind == NamedGapKind::ExactIdentifier && self.evidence.is_some() {
+                    4
+                } else {
+                    2
+                })
             && self.result.candidates.len() < self.output_limit()
         {
             self.result.budget.follow_ups_remaining -= 1;
+            let revision_witnesses = (gap.kind == NamedGapKind::TemporalEvidence)
+                .then(|| revision_bridge.map(|(_, witnesses)| witnesses))
+                .flatten();
+            let identifiers =
+                revision_witnesses.map(|witnesses| witnesses.iter().cloned().collect::<Vec<_>>());
             let mut matches = Vec::new();
-            let mut filters = vec![self.objects.clone()];
+            let mut filters = Vec::new();
+            if revision_witnesses.is_none() {
+                filters.push(self.objects.clone());
+            }
             if let Some(filter) = &self.evidence {
                 filters.push(filter.clone());
             }
             for mut filter in filters {
-                filter
-                    .condition_literals
-                    .extend(self.context.query_facets.condition_literals.iter().cloned());
-                filter.condition_literals.push(gap.identifier.clone());
-                match self
-                    .deadline
-                    .run(
-                        self.snapshot
-                            .fts(&gap.identifier, &filter, self.remaining().min(2)),
-                    )
-                    .await
-                {
+                if identifiers.is_none() {
+                    filter
+                        .condition_literals
+                        .extend(self.context.query_facets.condition_literals.iter().cloned());
+                    filter.condition_literals.push(gap.identifier.clone());
+                }
+                // These refs attest one immutable revision, not competing fact entities.
+                let limit = if identifiers.is_some() {
+                    1
+                } else {
+                    self.remaining().min(2)
+                };
+                let lookup = async {
+                    if let Some(identifiers) = &identifiers {
+                        self.snapshot.structured(identifiers, &filter, limit).await
+                    } else {
+                        self.snapshot.fts(&gap.identifier, &filter, limit).await
+                    }
+                };
+                match self.deadline.run(lookup).await {
                     Ok(Ok(rows)) => matches.extend(rows),
                     Ok(Err(_)) => self.degraded("named_gap_channel_unavailable"),
                     Err(()) => self.degraded("retrieval_deadline_exhausted"),
@@ -539,12 +575,17 @@ impl NativeRetrieval<'_> {
                 row.candidate_id
                     .as_ref()
                     .is_some_and(|id| !base.contains(id))
-                    && self
-                        .context
-                        .query_facets
-                        .condition_literals
-                        .iter()
-                        .all(|literal| row.text.contains(literal))
+                    && if let Some(witnesses) = revision_witnesses {
+                        row.source_ref
+                            .as_ref()
+                            .is_some_and(|reference| witnesses.contains(reference))
+                    } else {
+                        self.context
+                            .query_facets
+                            .condition_literals
+                            .iter()
+                            .all(|literal| row.text.contains(literal))
+                    }
             });
             if matches.len() == 1 {
                 // Do not admit a candidate if packaging would alter the frozen base.
@@ -737,7 +778,12 @@ impl NativeRetrieval<'_> {
                     .condition_literals
                     .iter()
                     .all(|literal| candidate.text.contains(literal));
-            if !rule && !compatible {
+            let revision_bridge = !self.context.unverified_hard_constraint()
+                && self
+                    .time_scope
+                    .and_then(|scope| scope.revision_bridge)
+                    .is_some_and(|(_, witnesses)| witnesses.contains(&candidate.source_ref));
+            if !rule && !compatible && !revision_bridge {
                 continue;
             }
             let role = if rule {
@@ -746,8 +792,9 @@ impl NativeRetrieval<'_> {
                 == Some(false)
             {
                 EvidenceRole::Contrast
-            } else if candidate.retrieval_origins.len() == 1
-                && candidate.retrieval_origins.contains("typed_relation")
+            } else if revision_bridge
+                || (candidate.retrieval_origins.len() == 1
+                    && candidate.retrieval_origins.contains("typed_relation"))
             {
                 EvidenceRole::Bridge
             } else {
