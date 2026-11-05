@@ -8,8 +8,8 @@ use std::{
 use evertrace_domain::query::{
     FacetParseStatus, LifecycleBoundary, Polarity, QuantityConstraint, QueryError,
     RetrievalCompleteness, RetrievalLayer, ScopeBoundary, SearchCandidate, SearchContext,
-    SearchResult, SourceBoundary, SuppressionSnapshot, TemporalMode, TemporalQualifier,
-    production_retrieval_layer,
+    SearchResult, SourceBoundary, SuppressionSnapshot, TemporalMode, TemporalOrdering,
+    TemporalQualifier, production_retrieval_layer, requested_ordering,
 };
 use evertrace_store::{SearchHardFilter, SearchIndex, SearchProjectionRow, StoreError};
 use thiserror::Error;
@@ -81,7 +81,11 @@ impl TemporalPosition {
                 evertrace_domain::query::AnswerShape::Timeline
                     | evertrace_domain::query::AnswerShape::Latest
             )
-        ) || !facets.temporal_qualifiers.is_empty()
+        ) || (!facets.temporal_qualifiers.is_empty()
+            && !matches!(
+                requested_ordering(&facets.temporal_qualifiers),
+                Some(TemporalOrdering::SourceSequence | TemporalOrdering::Supersession)
+            ))
         {
             return None;
         }
@@ -306,7 +310,7 @@ impl TemporalReadScope<'_> {
             }));
             members.push((index, revision));
         }
-        if !(2..=3).contains(&revisions.len()) {
+        if !(1..=3).contains(&revisions.len()) {
             return Ok(());
         }
         let mut roots = revisions.iter().filter(|(_, previous)| {
@@ -1353,6 +1357,7 @@ pub(super) fn temporal_is_partial(
 ) -> bool {
     let required_domain = match context.query_facets.temporal_qualifiers.as_slice() {
         [] => return false,
+        [TemporalQualifier::OrderBy { .. }] => return false,
         [qualifier] if qualifier.is_event_time() || qualifier.is_validity() => "event_time",
         // The caller has already pinned a canonical source revision and its
         // readable references. Event timestamps do not invalidate its sequence.
@@ -1429,7 +1434,7 @@ fn temporal_compatible(
             }));
     }
     Ok(match context.query_facets.temporal_qualifiers.as_slice() {
-        [] => true,
+        [] | [TemporalQualifier::OrderBy { .. }] => true,
         [TemporalQualifier::EventTimeAsOf { at_us }] => {
             row.time_domain == "event_time" && row.event_time_us <= *at_us
         }

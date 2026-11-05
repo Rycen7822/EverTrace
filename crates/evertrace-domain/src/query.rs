@@ -162,6 +162,9 @@ pub enum LifecycleBoundary {
 #[derive(Clone, Copy, Debug, Deserialize, Eq, Ord, PartialEq, PartialOrd, Serialize)]
 #[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
 pub enum TemporalQualifier {
+    OrderBy {
+        domain: TemporalOrdering,
+    },
     EventTimeAsOf {
         at_us: i64,
     },
@@ -202,6 +205,34 @@ pub enum TemporalQualifier {
     },
 }
 
+/// The requested coordinate, never an authorization or a claim of clock accuracy.
+#[derive(Clone, Copy, Debug, Deserialize, Eq, Ord, PartialEq, PartialOrd, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum TemporalOrdering {
+    EventTime,
+    SourceSequence,
+    ValidityStart,
+    Supersession,
+}
+
+impl TemporalOrdering {
+    fn basis(self) -> OrderingBasis {
+        match self {
+            Self::EventTime => OrderingBasis::EventTime,
+            Self::SourceSequence => OrderingBasis::SourceSequence,
+            Self::ValidityStart => OrderingBasis::Validity,
+            Self::Supersession => OrderingBasis::Supersession,
+        }
+    }
+}
+
+pub fn requested_ordering(qualifiers: &[TemporalQualifier]) -> Option<TemporalOrdering> {
+    match qualifiers {
+        [TemporalQualifier::OrderBy { domain }] => Some(*domain),
+        _ => None,
+    }
+}
+
 impl TemporalQualifier {
     pub fn source_sequence_ref(&self) -> Option<SourceObservationId> {
         match self {
@@ -228,6 +259,9 @@ impl TemporalQualifier {
                 | Self::ValidityInterval { .. }
                 | Self::ValidityStartsBefore { .. }
                 | Self::ValidityStartsAfter { .. }
+                | Self::OrderBy {
+                    domain: TemporalOrdering::ValidityStart
+                }
         )
     }
 
@@ -238,6 +272,9 @@ impl TemporalQualifier {
                 | Self::EventTimeInterval { .. }
                 | Self::EventTimeBefore { .. }
                 | Self::EventTimeAfter { .. }
+                | Self::OrderBy {
+                    domain: TemporalOrdering::EventTime
+                }
         )
     }
 }
@@ -268,7 +305,10 @@ impl TemporalScope {
         qualifiers: &[TemporalQualifier],
     ) -> Result<(), QueryError> {
         let valid = match (mode, qualifiers) {
-            (TemporalMode::Current | TemporalMode::Any | TemporalMode::Unknown, []) => true,
+            (TemporalMode::Current | TemporalMode::Any | TemporalMode::Unknown, [])
+            | (TemporalMode::Current | TemporalMode::Any, [TemporalQualifier::OrderBy { .. }]) => {
+                true
+            }
             (
                 TemporalMode::AsOf,
                 [
@@ -401,6 +441,11 @@ impl QueryFacetSet {
             .count();
         if count_operands > 1
             || (count_operands == 1 && self.answer_shape != Some(AnswerShape::Count))
+            || (requested_ordering(&self.temporal_qualifiers).is_some()
+                && !matches!(
+                    self.answer_shape,
+                    Some(AnswerShape::Timeline | AnswerShape::Latest)
+                ))
         {
             return Err(QueryError::Invalid);
         }
@@ -557,6 +602,11 @@ impl EvidenceNeed {
 
     fn validate(&self) -> Result<(), QueryError> {
         if (self.count_unit.is_some() && self.answer_shape != Some(AnswerShape::Count))
+            || (requested_ordering(&self.temporal_scope.qualifiers).is_some()
+                && !matches!(
+                    self.answer_shape,
+                    Some(AnswerShape::Timeline | AnswerShape::Latest)
+                ))
             || self.target.len() > MAX_FACET_ITEMS
             || self.target.iter().any(|value| !valid_target(value))
             || self.target.iter().collect::<BTreeSet<_>>().len() != self.target.len()
@@ -791,6 +841,40 @@ impl GroundedEvidenceView {
                         {
                             gaps.insert(candidate.source_ref.clone());
                         }
+                    }
+                }
+            }
+        }
+        gaps
+    }
+
+    pub fn ordering_temporal_gaps(&self, candidates: &[SearchCandidate]) -> BTreeSet<String> {
+        if self.evidence_need.answer_shape == Some(AnswerShape::Timeline)
+            && requested_ordering(&self.evidence_need.temporal_scope.qualifiers).is_some()
+            && timeline_order(candidates, &self.evidence_need.temporal_scope.qualifiers)
+                .is_none_or(|(basis, _)| basis == OrderingBasis::RecordedAtFallback)
+        {
+            return candidates
+                .iter()
+                .map(|candidate| candidate.source_ref.clone())
+                .collect();
+        }
+        let mut gaps = BTreeSet::new();
+        if let Some(latest) = &self.candidate_latest
+            && (latest.statement_indices.is_none()
+                || (latest.ordering_basis == OrderingBasis::RecordedAtFallback
+                    && requested_ordering(&self.evidence_need.temporal_scope.qualifiers).is_some()))
+        {
+            for index in &latest.operand_indices {
+                for candidate in candidates {
+                    if self
+                        .active_evidence
+                        .get(*index as usize)
+                        .is_some_and(|statement| {
+                            statement.support_refs.contains(&candidate.candidate_id)
+                        })
+                    {
+                        gaps.insert(candidate.source_ref.clone());
                     }
                 }
             }
@@ -1699,7 +1783,7 @@ impl SourceTimePosition {
         if !self.validate() {
             return None;
         }
-        if qualifiers.is_empty() {
+        if qualifiers.is_empty() || requested_ordering(qualifiers).is_some() {
             return Some(true);
         }
         let (lower, upper) = self.event_window()?;
@@ -1772,6 +1856,9 @@ pub fn validity_match(
 
 impl SearchCandidate {
     pub fn temporal_match(&self, qualifiers: &[TemporalQualifier]) -> Option<bool> {
+        if requested_ordering(qualifiers).is_some() {
+            return Some(true);
+        }
         match qualifiers {
             [qualifier] if qualifier.is_validity() => {
                 validity_match(self.validity_interval.as_ref()?, qualifiers)
@@ -1842,7 +1929,9 @@ fn latest_order<'a>(
         .map(|winners| (OrderingBasis::Validity, winners));
     }
     let first = candidates[0];
+    let requested = requested_ordering(qualifiers);
     if (qualifiers.is_empty()
+        || requested == Some(TemporalOrdering::SourceSequence)
         || matches!(qualifiers, [qualifier] if qualifier.source_sequence_ref().is_some()))
         && first.source_sequence.is_some()
         && candidates.iter().all(|candidate| {
@@ -1861,10 +1950,12 @@ fn latest_order<'a>(
         })
         .map(|winners| (OrderingBasis::SourceSequence, winners));
     }
-    if matches!(qualifiers, [qualifier] if qualifier.source_sequence_ref().is_some()) {
+    if requested == Some(TemporalOrdering::SourceSequence)
+        || matches!(qualifiers, [qualifier] if qualifier.source_sequence_ref().is_some())
+    {
         return None;
     }
-    if !qualifiers.is_empty() {
+    if !qualifiers.is_empty() && requested != Some(TemporalOrdering::Supersession) {
         return latest_clock_order(candidates);
     }
     if first.revision_order.is_some()
@@ -1921,6 +2012,9 @@ fn latest_order<'a>(
     }
     if roots.len() == 1 {
         return Some((OrderingBasis::Supersession, roots));
+    }
+    if requested == Some(TemporalOrdering::Supersession) {
+        return None;
     }
     latest_clock_order(candidates)
 }
@@ -1996,17 +2090,21 @@ fn latest_clock_order<'a>(
 }
 
 /// This orders a view of a frozen set; it never changes ranking or generation.
-pub fn timeline_order(
-    candidates: &[SearchCandidate],
-) -> Option<(OrderingBasis, Vec<&SearchCandidate>)> {
+pub fn timeline_order<'a>(
+    candidates: &'a [SearchCandidate],
+    qualifiers: &[TemporalQualifier],
+) -> Option<(OrderingBasis, Vec<&'a SearchCandidate>)> {
+    let requested = requested_ordering(qualifiers);
+    let allows = |basis| requested.is_none_or(|domain| domain.basis() == basis);
     if candidates.is_empty() {
         return None;
     }
     let mut ordered = candidates.iter().collect::<Vec<_>>();
-    if let Some(anchor) = candidates[0]
-        .source_sequence
-        .as_ref()
-        .map(|value| value.source_anchor)
+    if allows(OrderingBasis::SourceSequence)
+        && let Some(anchor) = candidates[0]
+            .source_sequence
+            .as_ref()
+            .map(|value| value.source_anchor)
         && candidates.iter().all(|candidate| {
             candidate
                 .source_sequence
@@ -2025,7 +2123,8 @@ pub fn timeline_order(
         });
         return Some((OrderingBasis::SourceSequence, ordered));
     }
-    if candidates[0].revision_order.is_some()
+    if allows(OrderingBasis::Supersession)
+        && candidates[0].revision_order.is_some()
         && candidates.iter().all(|candidate| {
             candidate
                 .revision_order
@@ -2037,12 +2136,14 @@ pub fn timeline_order(
         ordered.sort_by_key(|candidate| (revision_order_key(candidate), &candidate.candidate_id));
         return Some((OrderingBasis::Supersession, ordered));
     }
-    if candidates.iter().all(|candidate| {
-        candidate
-            .validity_interval
-            .as_ref()
-            .is_some_and(|interval| interval.validate().is_ok())
-    }) {
+    if allows(OrderingBasis::Validity)
+        && candidates.iter().all(|candidate| {
+            candidate
+                .validity_interval
+                .as_ref()
+                .is_some_and(|interval| interval.validate().is_ok())
+        })
+    {
         ordered.sort_by_key(|candidate| {
             (
                 candidate
@@ -2054,12 +2155,14 @@ pub fn timeline_order(
         });
         return Some((OrderingBasis::Validity, ordered));
     }
-    if !candidates.iter().all(|candidate| {
-        candidate
-            .source_time
-            .as_ref()
-            .is_some_and(SourceTimePosition::validate)
-    }) {
+    if !allows(OrderingBasis::EventTime)
+        || !candidates.iter().all(|candidate| {
+            candidate
+                .source_time
+                .as_ref()
+                .is_some_and(SourceTimePosition::validate)
+        })
+    {
         return None;
     }
     ordered.sort_by_key(|candidate| {
@@ -2311,7 +2414,10 @@ impl HumanSearchPage {
         if view.evidence_need.answer_shape != Some(AnswerShape::Timeline) {
             return true;
         }
-        let Some((basis, ordered)) = timeline_order(&self.result.candidates) else {
+        let Some((basis, ordered)) = timeline_order(
+            &self.result.candidates,
+            &view.evidence_need.temporal_scope.qualifiers,
+        ) else {
             return view.completeness != RetrievalCompleteness::Complete
                 && view.active_evidence.iter().all(|statement| {
                     !matches!(
@@ -2319,7 +2425,8 @@ impl HumanSearchPage {
                         OrderingBasis::EventTime
                             | OrderingBasis::RecordedAtFallback
                             | OrderingBasis::Validity
-                    )
+                    ) && (statement.derivation_kind != DerivationKind::Quoted
+                        || statement.ordering_basis == OrderingBasis::Unknown)
                 });
         };
         if view.completeness == RetrievalCompleteness::Complete
@@ -2359,11 +2466,12 @@ impl HumanSearchPage {
 
     fn time_positions_valid(&self) -> bool {
         let view = self.grounded_view.as_ref();
-        let unqualified_chronology = view.is_some_and(|view| {
+        let chronology = view.is_some_and(|view| {
             matches!(
                 view.evidence_need.answer_shape,
                 Some(AnswerShape::Timeline | AnswerShape::Latest)
-            ) && view.evidence_need.temporal_scope.qualifiers.is_empty()
+            ) && (view.evidence_need.temporal_scope.qualifiers.is_empty()
+                || requested_ordering(&view.evidence_need.temporal_scope.qualifiers).is_some())
         });
         for candidate in &self.result.candidates {
             if let Some(position) = &candidate.revision_order {
@@ -2374,6 +2482,8 @@ impl HumanSearchPage {
                     && position.sequence <= self.result.projection_frontier
                     && view.is_some_and(|view| {
                         view.evidence_need.answer_shape == Some(AnswerShape::Latest)
+                            || requested_ordering(&view.evidence_need.temporal_scope.qualifiers)
+                                == Some(TemporalOrdering::Supersession)
                     });
                 let source = candidate.row_variant == SearchCandidateVariant::EvidenceSurface
                     && position.sequence
@@ -2402,7 +2512,7 @@ impl HumanSearchPage {
                                         == (position.sequence == order.sequence)
                                 })
                     });
-                if (!object && !source) || !unqualified_chronology {
+                if (!object && !source) || !chronology {
                     return false;
                 }
             }
@@ -2413,7 +2523,7 @@ impl HumanSearchPage {
                         !matches!(
                             view.evidence_need.temporal_scope.qualifiers.as_slice(),
                             [qualifier] if qualifier.is_event_time()
-                        ) && !unqualified_chronology
+                        ) && !chronology
                     })
                 {
                     return false;
@@ -2428,7 +2538,7 @@ impl HumanSearchPage {
                         !matches!(
                             view.evidence_need.temporal_scope.qualifiers.as_slice(),
                             [qualifier] if qualifier.is_validity()
-                        ) && !unqualified_chronology
+                        ) && !chronology
                     })
                 {
                     return false;
@@ -2496,20 +2606,7 @@ impl HumanSearchPage {
             BTreeSet::new()
         };
         expected.extend(view.count_temporal_gaps(&self.result.candidates));
-        if let Some(latest) = &view.candidate_latest
-            && latest.statement_indices.is_none()
-        {
-            for index in &latest.operand_indices {
-                for candidate in &self.result.candidates {
-                    if view.active_evidence[*index as usize]
-                        .support_refs
-                        .contains(&candidate.candidate_id)
-                    {
-                        expected.insert(candidate.source_ref.clone());
-                    }
-                }
-            }
-        }
+        expected.extend(view.ordering_temporal_gaps(&self.result.candidates));
         let gaps = view
             .unresolved_gaps
             .iter()
@@ -2565,7 +2662,11 @@ impl HumanSearchPage {
         let automatic = matches!(
             view.evidence_need.answer_shape,
             Some(AnswerShape::Timeline | AnswerShape::Latest)
-        ) && view.evidence_need.temporal_scope.qualifiers.is_empty();
+        ) && (view.evidence_need.temporal_scope.qualifiers.is_empty()
+            || matches!(
+                requested_ordering(&view.evidence_need.temporal_scope.qualifiers),
+                Some(TemporalOrdering::SourceSequence | TemporalOrdering::Supersession)
+            ));
         for candidate in &self.result.candidates {
             let Some(position) = &candidate.source_sequence else {
                 if sequence_mode && candidate.row_variant == SearchCandidateVariant::EvidenceSurface
@@ -2599,7 +2700,10 @@ impl HumanSearchPage {
         }
         let sequence_order = automatic
             && matches!(
-                timeline_order(&self.result.candidates),
+                timeline_order(
+                    &self.result.candidates,
+                    &view.evidence_need.temporal_scope.qualifiers
+                ),
                 Some((OrderingBasis::SourceSequence, _))
             );
         if (sequence_mode || sequence_order)

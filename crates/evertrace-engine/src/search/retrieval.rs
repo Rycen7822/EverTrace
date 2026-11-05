@@ -386,7 +386,9 @@ impl NativeRetrieval<'_> {
             for (kind, needed) in [
                 (
                     "atom_supersedes",
-                    self.context.query_facets.temporal_qualifiers.is_empty(),
+                    self.context.query_facets.temporal_qualifiers.is_empty()
+                        || requested_ordering(&self.context.query_facets.temporal_qualifiers)
+                            == Some(TemporalOrdering::Supersession),
                 ),
                 ("atom_contradicts", true),
             ] {
@@ -712,7 +714,12 @@ impl NativeRetrieval<'_> {
         let mut matching_constraints = BTreeSet::new();
         let mut quoted_candidates = self.result.candidates.iter().collect::<Vec<_>>();
         let time_order = (self.context.query_facets.answer_shape == Some(AnswerShape::Timeline))
-            .then(|| timeline_order(&self.result.candidates))
+            .then(|| {
+                timeline_order(
+                    &self.result.candidates,
+                    &self.context.query_facets.temporal_qualifiers,
+                )
+            })
             .flatten();
         let ordering_basis = time_order.as_ref().map(|(basis, _)| *basis);
         if let Some((_, ordered)) = time_order {
@@ -829,23 +836,6 @@ impl NativeRetrieval<'_> {
         if let Some(latest) = &view.candidate_latest {
             if latest.statement_indices.is_none() {
                 self.degraded("latest_ordering_unavailable");
-                for index in &latest.operand_indices {
-                    for candidate in &self.result.candidates {
-                        if view.active_evidence[*index as usize]
-                            .support_refs
-                            .contains(&candidate.candidate_id)
-                        {
-                            let gap = NamedGap {
-                                kind: NamedGapKind::TemporalEvidence,
-                                identifier: candidate.source_ref.clone(),
-                                changes_result: true,
-                            };
-                            if !view.unresolved_gaps.contains(&gap) {
-                                view.unresolved_gaps.push(gap);
-                            }
-                        }
-                    }
-                }
             } else if latest.ordering_basis == OrderingBasis::RecordedAtFallback {
                 self.degraded("recorded_at_fallback");
             } else if !view.latest_source_coverage_complete(&self.result.candidates) {
@@ -854,6 +844,24 @@ impl NativeRetrieval<'_> {
             if self.result.completeness == RetrievalCompleteness::Complete
                 && (!self.result.degraded_reasons.is_empty() || !view.unresolved_gaps.is_empty())
             {
+                self.result.completeness = RetrievalCompleteness::Partial;
+            }
+            view.completeness = self.result.completeness;
+        }
+        let ordering_gaps = view.ordering_temporal_gaps(&self.result.candidates);
+        if !ordering_gaps.is_empty() {
+            self.degraded("temporal_ordering_unverified");
+            for identifier in ordering_gaps {
+                let gap = NamedGap {
+                    kind: NamedGapKind::TemporalEvidence,
+                    identifier,
+                    changes_result: true,
+                };
+                if !view.unresolved_gaps.contains(&gap) {
+                    view.unresolved_gaps.push(gap);
+                }
+            }
+            if self.result.completeness == RetrievalCompleteness::Complete {
                 self.result.completeness = RetrievalCompleteness::Partial;
             }
             view.completeness = self.result.completeness;
@@ -938,7 +946,11 @@ impl NativeRetrieval<'_> {
                 self.context.query_facets.answer_shape,
                 Some(AnswerShape::Timeline | AnswerShape::Latest)
             )
-            && self.context.query_facets.temporal_qualifiers.is_empty()
+            && (self.context.query_facets.temporal_qualifiers.is_empty()
+                || matches!(
+                    requested_ordering(&self.context.query_facets.temporal_qualifiers),
+                    Some(TemporalOrdering::SourceSequence | TemporalOrdering::Supersession)
+                ))
             && let Some(scope) = self.time_scope
         {
             scope.align_sequence_domain(&mut self.result.candidates, self.deadline)?;
@@ -949,7 +961,10 @@ impl NativeRetrieval<'_> {
     fn check_temporal_completeness(&mut self) {
         let sequence_order = self.context.query_facets.answer_shape == Some(AnswerShape::Timeline)
             && matches!(
-                timeline_order(&self.result.candidates),
+                timeline_order(
+                    &self.result.candidates,
+                    &self.context.query_facets.temporal_qualifiers
+                ),
                 Some((OrderingBasis::SourceSequence, _))
             );
         let coverage_complete = self.sequence_scope.map_or_else(
@@ -993,7 +1008,10 @@ impl NativeRetrieval<'_> {
             Some(AnswerShape::Count) if self.context.query_facets.count_unit().is_none() => {
                 self.degraded("count_unit_unspecified")
             }
-            Some(AnswerShape::Timeline) => match timeline_order(&self.result.candidates) {
+            Some(AnswerShape::Timeline) => match timeline_order(
+                &self.result.candidates,
+                &self.context.query_facets.temporal_qualifiers,
+            ) {
                 Some((OrderingBasis::RecordedAtFallback, _)) => {
                     self.degraded("recorded_at_fallback")
                 }

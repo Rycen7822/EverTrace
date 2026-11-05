@@ -710,6 +710,9 @@ impl HumanGovernanceService {
                 && context.query_facets.temporal_qualifiers.is_empty();
             let latest = context.query_facets.answer_shape == Some(AnswerShape::Latest);
             let unqualified_latest = latest && context.query_facets.temporal_qualifiers.is_empty();
+            let ordering = requested_ordering(&context.query_facets.temporal_qualifiers);
+            let supersession_order = ordering == Some(TemporalOrdering::Supersession);
+            let sequence_order = ordering == Some(TemporalOrdering::SourceSequence);
             let sequence_query = context
                 .query_facets
                 .temporal_qualifiers
@@ -728,10 +731,15 @@ impl HumanGovernanceService {
                     });
                 }
                 if !validity_query && let Some(receipt) = source_receipt(&index, reference) {
-                    let coverage_complete = (validity_timeline || unqualified_latest)
+                    let coverage_complete = (validity_timeline
+                        || unqualified_latest
+                        || supersession_order
+                        || sequence_order)
                         && source_coverage_complete(&index, &receipt, None);
-                    let revision_order =
-                        (validity_timeline || unqualified_latest).then(|| RevisionOrderPosition {
+                    let revision_order = (validity_timeline
+                        || unqualified_latest
+                        || supersession_order)
+                        .then(|| RevisionOrderPosition {
                             anchor: receipt.source_observation_id.to_string(),
                             sequence: 0,
                         });
@@ -748,7 +756,7 @@ impl HumanGovernanceService {
                 let validity = (validity_query || validity_timeline)
                     .then(|| atom_validity(&index, reference))
                     .flatten();
-                let revision_order = unqualified_latest
+                let revision_order = (unqualified_latest || supersession_order)
                     .then(|| object_revision_order(&index, reference))
                     .flatten();
                 (validity.is_some() || revision_order.is_some()).then(|| {
