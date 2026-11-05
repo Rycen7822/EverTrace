@@ -6,7 +6,6 @@ use std::sync::Arc;
 use std::{
     collections::BTreeSet,
     path::{Path, PathBuf},
-    str::FromStr,
 };
 
 use arrow_array::{
@@ -24,11 +23,10 @@ use serde::{Deserialize, Serialize};
 
 pub const SEARCH_TABLE: &str = "evertrace_search";
 pub const SEARCH_CHECKPOINT_ID: &str = "checkpoint:evertrace_search";
-pub const SEARCH_PROJECTION_GENERATION: u64 = 2;
-pub(crate) const SEARCH_UPGRADE_SOURCE_GENERATION: u64 = 1;
+pub const SEARCH_PROJECTION_GENERATION: u64 = 3;
 
 pub(crate) fn supported_search_input_generation(generation: u64) -> bool {
-    generation == SEARCH_PROJECTION_GENERATION || generation == SEARCH_UPGRADE_SOURCE_GENERATION
+    matches!(generation, 1..=SEARCH_PROJECTION_GENERATION)
 }
 
 #[derive(Clone)]
@@ -873,8 +871,11 @@ impl SearchProjectionRow {
                     .is_some_and(is_searchable_object_kind)
                 || (self.object_kind.as_deref() == Some("work_episode")
                     && !canonical
-                    && (generation != SEARCH_PROJECTION_GENERATION
-                        || self.lifecycle.as_deref() != Some("terminal")))
+                    && (generation < 2 || self.lifecycle.as_deref() != Some("terminal")))
+                || (matches!(
+                    self.object_kind.as_deref(),
+                    Some("operation" | "scope_effect")
+                ) && generation < 3)
                 || !matches!(self.currentness.as_deref(), Some("current" | "historical"))
                 || !matches!(
                     self.lifecycle.as_deref(),
@@ -889,6 +890,7 @@ impl SearchProjectionRow {
                     .source_ref
                     .as_deref()
                     .is_none_or(|value| !valid_entity_ref(value))
+                || !valid_physical_reference(self)
                 || self.source_role.is_some()
                 || self.content_trust.is_some()
                 || self.capture_completeness.is_some()
@@ -951,11 +953,6 @@ fn is_hex_64(value: &str) -> bool {
     value.len() == 64 && value.bytes().all(|byte| byte.is_ascii_hexdigit())
 }
 
-fn valid_uuid(value: &str) -> bool {
-    evertrace_domain::revision::RevisionId::from_str(value).is_ok()
-        || evertrace_domain::ids::AnyPublicId::from_str(value).is_ok()
-}
-
 pub fn is_searchable_object_kind(kind: &str) -> bool {
     matches!(
         kind,
@@ -964,6 +961,8 @@ pub fn is_searchable_object_kind(kind: &str) -> bool {
             | "task"
             | "workstream"
             | "attempt"
+            | "operation"
+            | "scope_effect"
             | "experiment_run"
             | "result_evidence"
             | "work_artifact"
@@ -979,7 +978,23 @@ pub fn is_searchable_object_kind(kind: &str) -> bool {
 }
 
 fn valid_entity_ref(value: &str) -> bool {
-    valid_uuid(value)
+    evertrace_domain::query::valid_object_reference(value)
+}
+
+fn valid_physical_reference(row: &SearchProjectionRow) -> bool {
+    let id = row.candidate_id.as_deref().unwrap_or_default();
+    let source = row.source_ref.as_deref().unwrap_or_default();
+    match row.object_kind.as_deref() {
+        Some("operation") => evertrace_domain::query::parse_operation_revision(id)
+            .is_some_and(|(operation, _)| operation.to_string() == source),
+        Some("scope_effect") => {
+            id == source
+                && source
+                    .parse::<evertrace_domain::ids::ScopeEffectId>()
+                    .is_ok()
+        }
+        _ => true,
+    }
 }
 
 fn valid_object_metadata(row: &SearchProjectionRow) -> bool {

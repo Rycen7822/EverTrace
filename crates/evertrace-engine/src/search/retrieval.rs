@@ -96,11 +96,14 @@ impl NativeRetrieval<'_> {
         Ok(())
     }
     fn references(&self) -> BTreeSet<String> {
-        self.result
-            .candidates
-            .iter()
-            .flat_map(|candidate| [candidate.candidate_id.clone(), candidate.source_ref.clone()])
-            .collect()
+        let mut references = BTreeSet::new();
+        for candidate in &self.result.candidates {
+            references.insert(candidate.candidate_id.clone());
+            if candidate.matches_reference(&candidate.source_ref) {
+                references.insert(candidate.source_ref.clone());
+            }
+        }
+        references
     }
     fn admit(&mut self, rows: Vec<SearchProjectionRow>, origin: &str) -> Result<(), SearchError> {
         for row in rows {
@@ -685,9 +688,11 @@ impl NativeRetrieval<'_> {
         let answer_limit = self.answer_text_limit() * 2;
         for (source, target, kind) in relation_links {
             let resolve = |reference: &str| {
-                let mut matches = self.result.candidates.iter().filter(|candidate| {
-                    candidate.candidate_id == reference || candidate.source_ref == reference
-                });
+                let mut matches = self
+                    .result
+                    .candidates
+                    .iter()
+                    .filter(|candidate| candidate.matches_reference(reference));
                 let first = matches.next()?;
                 matches.next().is_none().then(|| first.candidate_id.clone())
             };

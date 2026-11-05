@@ -244,6 +244,10 @@ fn object_identifier_row(
     let text = bounded_search_text(id, &semantic);
     let source_ref = id.clone();
     let (repository_id, worktree_id) = match payload {
+        JournalPayload::ScopeEffectDerived(value) => (
+            value.repository_instance_id.map(|id| id.to_string()),
+            value.worktree_instance_id.map(|id| id.to_string()),
+        ),
         JournalPayload::RevisionProposalRecorded(proposal) => match &proposal.payload {
             evertrace_domain::semantic::ProposalPayload::Procedure(value) => {
                 match value.draft().scope {
@@ -358,6 +362,23 @@ fn allowlisted_object_text(
                 &value.environment_fingerprint,
             ),
             value.created_at_us,
+        )),
+        JournalPayload::OperationDerived(value) => Some((
+            vec![serde_json::json!({
+                "operation_kind": value.operation_kind,
+                "pairing_state": value.pairing_state,
+                "source_local_pairing": value.source_local_pairing.as_ref().map(|pairing| &pairing.state),
+            })
+            .to_string()],
+            0,
+        )),
+        JournalPayload::ScopeEffectDerived(value) => Some((
+            vec![serde_json::json!({
+                "effect_role": value.effect_role,
+                "operation_id": value.operation_id,
+            })
+            .to_string()],
+            0,
         )),
         JournalPayload::ResultEvidenceRecorded(value) => Some((Vec::new(), value.created_at_us)),
         JournalPayload::WorkArtifactRecorded(value) => Some((

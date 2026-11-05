@@ -137,11 +137,14 @@ impl L0002ProjectionSnapshot {
         if generation == SEARCH_PROJECTION_GENERATION {
             return Ok(self);
         }
-        if generation != crate::search::SEARCH_UPGRADE_SOURCE_GENERATION {
+        if !crate::search::supported_search_input_generation(generation) {
             return Err(StoreError::StoreCorrupt);
         }
-        self.search
-            .retain(|row| row.object_kind.as_deref() != Some("work_episode"));
+        self.search.retain(|row| match row.object_kind.as_deref() {
+            Some("operation" | "scope_effect") => generation >= 3,
+            Some("work_episode") => generation >= 2,
+            _ => true,
+        });
         for row in &mut self.search {
             row.projection_generation = generation;
         }

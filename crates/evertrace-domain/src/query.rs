@@ -8,8 +8,8 @@ use thiserror::Error;
 use crate::{
     evidence::EvidenceSurface,
     ids::{
-        AnyPublicId, ExecutionLaneId, RepositoryId, SourceObservationId, TaskId, WorkEpisodeId,
-        WorkstreamId, WorktreeId,
+        AnyPublicId, ExecutionLaneId, OperationId, RepositoryId, SourceObservationId, TaskId,
+        WorkEpisodeId, WorkstreamId, WorktreeId,
     },
     revision::RevisionId,
     semantic::SemanticResolution,
@@ -360,11 +360,23 @@ impl TemporalScope {
     }
 }
 
+/// Existing immutable Operation coordinates are `<public ID>@<positive revision>`.
+pub fn parse_operation_revision(value: &str) -> Option<(OperationId, u32)> {
+    let (id, revision) = value.rsplit_once('@')?;
+    let id = id.parse::<OperationId>().ok()?;
+    let revision = revision.parse::<u32>().ok().filter(|value| *value > 0)?;
+    (value == format!("{id}@{revision}")).then_some((id, revision))
+}
+
+pub fn valid_object_reference(value: &str) -> bool {
+    value.parse::<AnyPublicId>().is_ok()
+        || value.parse::<RevisionId>().is_ok()
+        || parse_operation_revision(value).is_some()
+}
+
 fn valid_target(value: &str) -> bool {
     value.len() <= 512
-        && (value.parse::<AnyPublicId>().is_ok()
-            || value.parse::<RevisionId>().is_ok()
-            || EvidenceSurface::parse_candidate_ref(value).is_some())
+        && (valid_object_reference(value) || EvidenceSurface::parse_candidate_ref(value).is_some())
 }
 
 #[derive(Clone, Copy, Debug, Deserialize, Eq, Ord, PartialEq, PartialOrd, Serialize)]
