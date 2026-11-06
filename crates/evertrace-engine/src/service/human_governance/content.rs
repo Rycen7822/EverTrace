@@ -87,32 +87,42 @@ impl HumanGovernanceService {
             .cas_dir
             .clone();
         let deadline = std::time::Instant::now() + presentation::READ_DEADLINE;
-        // The existing native envelope reader verifies the entire archive. The
-        // bounded reply does not claim streaming decode/constant-RSS CAS access.
-        tokio::task::spawn_blocking(move || {
-            export::check_deadline(deadline).map_err(|_| HumanContentState::Unavailable)?;
-            let cas = evertrace_capture::CasStore::open_existing(cas_dir)
-                .map_err(|_| HumanContentState::Unavailable)?;
-            let digest = evertrace_capture::CasStore::parse_digest(&receipt.cas_ref)
-                .map_err(|_| HumanContentState::Unavailable)?;
-            let (bytes, _) = cas
-                .read_bounded(
-                    &digest,
-                    export::MAX_ENCODED_BYTES,
-                    export::MAX_DECODED_BYTES,
-                )
-                .map_err(|_| HumanContentState::Unavailable)?;
-            export::validate_source_archive(&receipt, &observation, &bytes)
-                .map_err(|_| HumanContentState::Unavailable)?;
-            export::check_deadline(deadline).map_err(|_| HumanContentState::Unavailable)?;
-            let text = String::from_utf8(bytes).map_err(|_| HumanContentState::Unsupported)?;
-            if text.contains('\0') {
-                return Err(HumanContentState::Unsupported);
-            }
-            Ok(text)
-        })
-        .await
-        .map_err(|_| HumanContentState::Unavailable)?
+        // Verify the entire archive under the actual reader fence. Cancellation
+        // covers encoded reads, decompression and hashing, not just the reply.
+        // This still retains the archive; it is not a constant-RSS range reader.
+        self.writer
+            .read_handle()
+            .read_blocking(move |cancel| {
+                let check = || {
+                    cancel.check()?;
+                    export::check_deadline(deadline).map_err(|_| evertrace_store::StoreError::Io)
+                };
+                check()?;
+                let cas = evertrace_capture::CasStore::open_existing(cas_dir)
+                    .map_err(|_| evertrace_store::StoreError::Io)?;
+                let digest = evertrace_capture::CasStore::parse_digest(&receipt.cas_ref)
+                    .map_err(|_| evertrace_store::StoreError::StoreCorrupt)?;
+                let (bytes, _) = cas
+                    .read_bounded_checked(
+                        &digest,
+                        export::MAX_ENCODED_BYTES,
+                        export::MAX_DECODED_BYTES,
+                        || check().map_err(|_| evertrace_capture::CasError::ReadCancelled),
+                    )
+                    .map_err(|_| evertrace_store::StoreError::Io)?;
+                check()?;
+                export::validate_source_archive(&receipt, &observation, &bytes)
+                    .map_err(|_| evertrace_store::StoreError::StoreCorrupt)?;
+                check()?;
+                let text = match String::from_utf8(bytes) {
+                    Ok(text) if !text.contains('\0') => Ok(text),
+                    _ => Err(HumanContentState::Unsupported),
+                };
+                check()?;
+                Ok(text)
+            })
+            .await
+            .map_err(|_| HumanContentState::Unavailable)?
     }
 
     pub async fn content(

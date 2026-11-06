@@ -508,6 +508,19 @@ impl CasStore {
         max_encoded: u64,
         max_decoded: u64,
     ) -> Result<(Vec<u8>, u64), CasError> {
+        self.read_bounded_checked(digest, max_encoded, max_decoded, || Ok(()))
+    }
+
+    /// The caller's checkpoint covers file reads, decompression and hashing.
+    /// Byte budgets are unchanged; decoded bytes are still retained in full.
+    pub fn read_bounded_checked(
+        &self,
+        digest: &CasDigest,
+        max_encoded: u64,
+        max_decoded: u64,
+        mut check: impl FnMut() -> Result<(), CasError>,
+    ) -> Result<(Vec<u8>, u64), CasError> {
+        check()?;
         self.validate_root()?;
         let path = self.blob_path(digest);
         let before = fs::symlink_metadata(&path).map_err(|error| {
@@ -550,9 +563,13 @@ impl CasStore {
         }
         let compressed_length =
             usize::try_from(decoded.compressed_length).map_err(|_| CasError::StoreCorrupt)?;
+        check()?;
         let mut compressed = vec![0_u8; compressed_length];
-        file.read_exact(&mut compressed)
-            .map_err(|_| CasError::StoreCorrupt)?;
+        for chunk in compressed.chunks_mut(64 * 1024) {
+            check()?;
+            file.read_exact(chunk).map_err(|_| CasError::StoreCorrupt)?;
+        }
+        check()?;
         let expected_length =
             usize::try_from(decoded.uncompressed_length).map_err(|_| CasError::StoreCorrupt)?;
         let decoder = zstd::stream::read::Decoder::new(compressed.as_slice())
@@ -561,14 +578,25 @@ impl CasStore {
             .ok()
             .and_then(|length| length.checked_add(1))
             .ok_or(CasError::StoreCorrupt)?;
+        let mut decoder = decoder.take(limit);
         let mut protected = Vec::with_capacity(expected_length.min(1024 * 1024));
-        decoder
-            .take(limit)
-            .read_to_end(&mut protected)
-            .map_err(|_| CasError::StoreCorrupt)?;
-        if protected.len() != expected_length
-            || CasDigest::for_protected_bytes(&protected) != *digest
-        {
+        let mut checksum = Sha256::new();
+        let mut buffer = [0_u8; 64 * 1024];
+        loop {
+            check()?;
+            let read = decoder
+                .read(&mut buffer)
+                .map_err(|_| CasError::StoreCorrupt)?;
+            if read == 0 {
+                break;
+            }
+            check()?;
+            checksum.update(&buffer[..read]);
+            protected.extend_from_slice(&buffer[..read]);
+        }
+        check()?;
+        let actual: [u8; 32] = checksum.finalize().into();
+        if protected.len() != expected_length || actual != *digest.as_bytes() {
             return Err(CasError::StoreCorrupt);
         }
         Ok((protected, before.len()))
@@ -862,6 +890,8 @@ struct DecodedHeader {
 
 #[derive(Clone, Copy, Debug, Eq, Error, PartialEq)]
 pub enum CasError {
+    #[error("CAS read was cancelled or exceeded its deadline")]
+    ReadCancelled,
     #[error("CAS read byte budget was exceeded")]
     ReadBudgetExceeded,
     #[error("CAS path is invalid")]

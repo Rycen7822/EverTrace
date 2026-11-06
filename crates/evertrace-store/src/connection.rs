@@ -419,6 +419,34 @@ impl StoreReadHandle {
             + Send
             + 'static,
     {
+        let data_dir = self.inner.data_dir.clone();
+        let path = sqlite_path(&data_dir);
+        self.read_blocking_bound(move |cancel, identity| {
+            let connection = open_read_connection(&data_dir, &path)?;
+            install_cancel(&connection, &cancel.0)?;
+            let result = read(&connection, cancel, identity);
+            drop(connection);
+            result
+        })
+        .await
+    }
+
+    /// A blocking file/CAS read shares the SQL reader budget and maintenance
+    /// fence, but opens no SQL connection. The closure owns both until exit.
+    pub async fn read_blocking<T, F>(&self, read: F) -> Result<T, crate::StoreError>
+    where
+        T: Send + 'static,
+        F: FnOnce(&ReadCancel) -> Result<T, crate::StoreError> + Send + 'static,
+    {
+        self.read_blocking_bound(move |cancel, _| read(cancel))
+            .await
+    }
+
+    async fn read_blocking_bound<T, F>(&self, read: F) -> Result<T, crate::StoreError>
+    where
+        T: Send + 'static,
+        F: FnOnce(&ReadCancel, &BoundIdentity) -> Result<T, crate::StoreError> + Send + 'static,
+    {
         // Fixed lock order: the fair maintenance fence first, then the short
         // SQL permit, then a brief writer-state check. Permit-first could
         // deadlock a fair maintenance write against a reader that still waits
@@ -433,18 +461,14 @@ impl StoreReadHandle {
         let cancel = Arc::new(AtomicBool::new(false));
         let guard = CancelOnDrop(Arc::clone(&cancel));
         let inner = Arc::clone(&self.inner);
-        let path = sqlite_path(&self.inner.data_dir);
         let task_identity = identity.clone();
         let joined = tokio::task::spawn_blocking(move || {
-            let _permit = permit;
             let _fence = fence;
+            let _permit = permit;
+            let token = ReadCancel(cancel);
+            token.check()?;
             validate_read_path(&inner.data_dir, &task_identity)?;
-            let connection = open_read_connection(&inner.data_dir, &path)?;
-            install_cancel(&connection, &cancel)?;
-            let token = ReadCancel(Arc::clone(&cancel));
-            let result = read(&connection, &token, &task_identity);
-            drop(connection);
-            result
+            read(&token, &task_identity)
         });
         let result = joined.await.map_err(|_| crate::StoreError::Io)?;
         drop(guard);
