@@ -273,6 +273,16 @@ class Backend:
             }
         )
 
+    async def read_exact(self, revision_ref):
+        if not isinstance(revision_ref, str) or not revision_ref or len(revision_ref.encode()) > 2048:
+            raise BackendError("invalid_input")
+        result = await self._request({"kind": "read_exact", "query": {"revision_ref": revision_ref}})
+        if result["kind"] != "stored_fields":
+            raise BackendError("invalid_read_response")
+        if result["page"]["state"]["effective_config_hash"] != self.config_hash:
+            raise BackendError("inactive_configuration")
+        return result
+
     async def read_batch(self, items, expected_frontier=None, expected_data_identity=None):
         """Closed metadata only; no content, search, action or raw native command."""
         frontier, identity = _read_boundary(expected_frontier, expected_data_identity)
@@ -649,6 +659,7 @@ class Backend:
                     "state",
                     "jobs",
                     "metadata_batch",
+                    "stored_fields",
                     "snapshot",
                     "memory_page",
                     "memory_overview",

@@ -2718,6 +2718,18 @@ pub(crate) struct SourceFactsRef<'facts> {
     evidence_surfaces: &'facts EvidenceSurfaceFacts,
 }
 
+pub const READ_DEPENDENCY_LIMIT: usize = 4096;
+pub const READ_DEPENDENCY_BYTES: u64 = 64 * 1024 * 1024;
+
+/// Exact immutable root plus its finite authority inputs; no UI model or whole-library snapshot.
+#[derive(Debug, PartialEq)]
+pub struct StoredFieldsContext {
+    pub state: evertrace_domain::query::ObjectReadState,
+    pub selected: Option<ObjectRow>,
+    pub rows: Vec<ObjectRow>,
+    pub source_suppressed: bool,
+}
+
 /// A bounded current read, not a complete projection or a reusable reader.
 #[derive(Debug)]
 pub struct CaptureCurrentContext {
@@ -3348,6 +3360,205 @@ fn select_recall_binding<'a>(
         selected = Some((candidate, candidate_seq));
     }
     Ok(selected.map(|(binding, _)| binding))
+}
+
+pub fn read_dependencies_for(row: &ObjectRow, payload: &JournalPayload) -> BTreeSet<String> {
+    let mut refs = [
+        row.task_id.clone(),
+        row.worktree_id.clone(),
+        row.repository_id.clone(),
+    ]
+    .into_iter()
+    .flatten()
+    .collect::<BTreeSet<_>>();
+    match payload {
+        JournalPayload::OperationDerived(value) => {
+            refs.insert(value.host_occurrence_id.to_string());
+            refs.extend(value.execution_lane_id.map(|id| id.to_string()));
+            refs.extend(
+                value
+                    .input_source_observation_refs
+                    .iter()
+                    .chain(&value.result_source_observation_refs)
+                    .map(ToString::to_string),
+            );
+            refs.extend(value.scope_effect_ids.iter().map(ToString::to_string));
+            refs.extend(value.artifact_refs.iter().map(ToString::to_string));
+        }
+        JournalPayload::ScopeEffectDerived(value) => {
+            refs.insert(value.operation_id.to_string());
+            refs.extend(value.repository_instance_id.map(|id| id.to_string()));
+            refs.extend(value.worktree_instance_id.map(|id| id.to_string()));
+            refs.extend(
+                value
+                    .pre_snapshot_id
+                    .into_iter()
+                    .chain(value.post_snapshot_id)
+                    .map(|id| id.to_string()),
+            );
+            refs.extend(value.experiment_run_ids.iter().map(ToString::to_string));
+            refs.extend(value.artifact_refs.iter().map(ToString::to_string));
+            refs.extend(value.evidence_refs.iter().map(ToString::to_string));
+        }
+        JournalPayload::WorktreeInstanceRecorded(value) => {
+            refs.insert(value.repository_instance_id.to_string());
+            refs.extend(value.current_snapshot_id.map(|id| id.to_string()));
+        }
+        JournalPayload::WorktreeSnapshotRecorded(value) => {
+            refs.insert(value.worktree_instance_id.to_string());
+            refs.extend(value.evidence_refs.iter().cloned());
+        }
+        JournalPayload::WorktreeTransitionRecorded(value) => {
+            refs.insert(value.from_worktree_instance_id.to_string());
+            refs.insert(value.to_worktree_instance_id.to_string());
+            refs.extend(
+                value
+                    .from_snapshot_id
+                    .into_iter()
+                    .chain(value.to_snapshot_id)
+                    .map(|id| id.to_string()),
+            );
+            refs.extend(value.evidence_refs.iter().cloned());
+        }
+        JournalPayload::IntegrationEventRecorded(value) => {
+            refs.insert(value.repository_instance_id.to_string());
+            refs.insert(value.source_worktree_instance_id.to_string());
+            refs.insert(value.destination_worktree_instance_id.to_string());
+            refs.insert(value.source_snapshot_id.to_string());
+            refs.insert(value.destination_snapshot_id.to_string());
+            refs.extend(value.integrated_attempt_ids.iter().map(ToString::to_string));
+            refs.extend(value.revalidated_anchor_refs.iter().cloned());
+            refs.extend(value.evidence_refs.iter().cloned());
+        }
+        JournalPayload::SegmentationCorrectionRecorded(value) => {
+            refs.extend(value.predecessor_revision_id.map(|id| id.to_string()));
+            refs.extend(
+                value
+                    .source_episode_ids
+                    .iter()
+                    .chain(&value.replacement_episode_ids)
+                    .map(ToString::to_string),
+            );
+            refs.extend(value.evidence_refs.iter().cloned());
+        }
+        JournalPayload::SourceReceiptRecorded(value) => {
+            refs.insert(value.source_observation_id.to_string());
+        }
+        JournalPayload::SourceObservationRecorded(value) => {
+            refs.insert(value.source_receipt_ref.to_string());
+        }
+        JournalPayload::EvidenceSurfaceRecorded(value) => {
+            refs.insert(value.source_observation_revision_ref.to_string());
+        }
+        JournalPayload::AtomRecorded(value) => {
+            refs.extend(
+                value
+                    .source_observation_refs
+                    .iter()
+                    .map(ToString::to_string),
+            );
+            refs.extend(value.evidence_refs.iter().cloned());
+            refs.extend(value.supports_revision_refs.iter().map(ToString::to_string));
+        }
+        JournalPayload::ProcedureRevisionRecorded(value) => {
+            refs.extend(value.draft.evidence_refs.iter().cloned());
+            refs.extend(
+                value
+                    .draft
+                    .support_revision_refs
+                    .iter()
+                    .map(ToString::to_string),
+            );
+        }
+        JournalPayload::RevisionProposalRecorded(value) => {
+            refs.extend(value.evidence_refs.iter().cloned());
+            refs.extend(value.source_cohort_refs.iter().cloned());
+        }
+        JournalPayload::CoreMembershipRecorded(value) => {
+            refs.insert(value.atom_revision_id.to_string());
+            refs.insert(value.support_contract_ref.to_string());
+            refs.extend(
+                value
+                    .authorization_revision_refs
+                    .iter()
+                    .map(ToString::to_string),
+            );
+        }
+        JournalPayload::GlobalSupportContractRecorded(value) => {
+            refs.extend(value.support_revision_refs.iter().map(ToString::to_string));
+            refs.extend(
+                value
+                    .authorization_revision_refs
+                    .iter()
+                    .map(ToString::to_string),
+            );
+        }
+        JournalPayload::SemanticDigestRecorded(value) => {
+            refs.extend(value.selected_direct_refs.iter().cloned());
+            refs.extend(value.episode_revision_id.map(|id| id.to_string()));
+        }
+        JournalPayload::TaskRecorded(value) => {
+            refs.extend(value.request_root_refs.iter().cloned());
+        }
+        JournalPayload::WorkBindingRecorded(value) => {
+            refs.insert(value.operation_id.to_string());
+            refs.extend(value.evidence_refs.iter().cloned());
+        }
+        JournalPayload::OperationBurstRecorded(value) => {
+            refs.extend(value.primary_binding.task_id.map(|id| id.to_string()));
+            refs.extend(value.primary_binding.workstream_id.map(|id| id.to_string()));
+            refs.extend(
+                value
+                    .members
+                    .iter()
+                    .flat_map(|member| member.source_observation_refs.iter())
+                    .map(ToString::to_string),
+            );
+        }
+        JournalPayload::WorkEpisodeRecorded(value) => {
+            refs.extend(
+                value
+                    .capture_receipt_revision_ids
+                    .iter()
+                    .map(ToString::to_string),
+            );
+            refs.extend(value.operation_burst_refs.iter().map(ToString::to_string));
+            refs.extend(value.semantic_digest_refs.iter().cloned());
+            refs.extend(value.verification_refs.iter().cloned());
+            refs.extend(value.failure_refs.iter().cloned());
+            refs.extend(
+                value
+                    .boundary_candidate
+                    .iter()
+                    .flat_map(|candidate| candidate.evidence_refs.iter())
+                    .map(ToString::to_string),
+            );
+        }
+        JournalPayload::AttemptRecorded(value) => {
+            refs.extend(
+                value
+                    .local_outcome_refs
+                    .iter()
+                    .chain(&value.parent_verification_refs)
+                    .chain(&value.outcome_refs)
+                    .chain(&value.interruption_refs)
+                    .chain(&value.explicit_abandon_refs)
+                    .chain(&value.supersede_evidence_refs)
+                    .cloned(),
+            );
+        }
+        JournalPayload::WorkArtifactRecorded(value) => {
+            refs.extend(
+                value
+                    .revision
+                    .source_observation_refs
+                    .iter()
+                    .map(ToString::to_string),
+            );
+        }
+        _ => {}
+    }
+    refs
 }
 
 fn atom_deletion_refs(atom: &Atom) -> Vec<String> {
@@ -5321,6 +5532,19 @@ impl JournalAdmissionState {
         references: &BTreeSet<String>,
         include_derived_candidate_rows: bool,
     ) -> Result<Vec<ObjectRow>, StoreError> {
+        filter_product_rows(
+            self.reference_rows_unfiltered(references, include_derived_candidate_rows)?,
+            &self.deletions,
+            &self.scope_purges,
+            self.repository_closures.values(),
+        )
+    }
+
+    fn reference_rows_unfiltered(
+        &self,
+        references: &BTreeSet<String>,
+        include_derived_candidate_rows: bool,
+    ) -> Result<Vec<ObjectRow>, StoreError> {
         if references.is_empty() {
             return Ok(Vec::new());
         }
@@ -5499,11 +5723,6 @@ impl JournalAdmissionState {
             }
         }
 
-        let repository_closures = self
-            .repository_closures
-            .values()
-            .cloned()
-            .collect::<Vec<_>>();
         if include_derived_candidate_rows {
             // A small set of legal normal-Search object families are rendered
             // only by their owning reducers. Keep that existing reduction for
@@ -5529,7 +5748,7 @@ impl JournalAdmissionState {
                 derived,
                 &self.deletions,
                 &self.scope_purges,
-                repository_closures.iter(),
+                self.repository_closures.values(),
             )? {
                 if normal_search_row_matches(&row, references) {
                     rows.push(row);
@@ -5537,12 +5756,383 @@ impl JournalAdmissionState {
             }
         }
 
-        filter_product_rows(
-            rows,
+        Ok(rows)
+    }
+
+    /// Exact typed facts in the existing authority graph, without building derived views or a global row index.
+    fn stored_reference_rows(&self, reference: &str) -> Result<Vec<ObjectRow>, StoreError> {
+        let refs = BTreeSet::from([reference.to_owned()]);
+        let mut rows = self.reference_rows_unfiltered(&refs, false)?;
+        let burst_row = |value: &OperationBurst, seq| -> Result<ObjectRow, StoreError> {
+            let mut row = work_identity_row(
+                "operation_burst",
+                value.operation_burst_id.to_string(),
+                value.revision_id.to_string(),
+                value.lifecycle.as_str(),
+                None,
+                None,
+                None,
+                None,
+                &JournalPayload::OperationBurstRecorded(Box::new(value.clone())),
+                seq,
+            )?;
+            row.row_id = format!("object:work:operation_burst:{}", value.revision_id);
+            Ok(row)
+        };
+        let deleted = product_deletion_ids(&self.deletions);
+        let contracts = self
+            .scenario_core
+            .deletion_owned_contracts(&deleted.revision_ids, &deleted.membership_ids);
+        if let Ok(id) = reference.parse::<evertrace_domain::ids::CoreMembershipId>()
+            && let Some(value) = self.scenario_core.current_membership(id)
+            && let Some((value, seq)) = self
+                .scenario_core
+                .membership_revision_entry(value.membership_revision_id)
+        {
+            rows.push(
+                self.memory_candidate_row(MemoriesCandidate::Membership(value, seq), &contracts)?,
+            );
+        }
+        if let Ok(id) = reference.parse::<ProcedureId>()
+            && let Some(value) = self.procedure.current_revision(id)
+            && let Some((value, seq)) = self.procedure.revision_entry(value.revision_id)
+        {
+            rows.push(
+                self.memory_candidate_row(MemoriesCandidate::Procedure(value, seq), &contracts)?,
+            );
+        }
+        if let Ok(id) = reference.parse::<RevisionProposalId>()
+            && let Some((value, seq)) = self.proposals.get(&id)
+        {
+            rows.push(semantic_proposal_row(
+                value,
+                &JournalPayload::RevisionProposalRecorded(Box::new(value.clone())),
+                *seq,
+            )?);
+        }
+        if let Ok(revision) = reference.parse::<RevisionId>() {
+            if let Some((value, seq)) = self.procedure.revision_entry(revision) {
+                rows.push(
+                    self.memory_candidate_row(
+                        MemoriesCandidate::Procedure(value, seq),
+                        &contracts,
+                    )?,
+                );
+            }
+            if let Some((value, seq)) = self.proposal_revisions.get(&revision) {
+                rows.push(
+                    self.memory_candidate_row(
+                        MemoriesCandidate::Proposal(value, *seq),
+                        &contracts,
+                    )?,
+                );
+            }
+            if let Some((value, seq)) = self.scenario_core.membership_revision_entry(revision) {
+                rows.push(
+                    self.memory_candidate_row(
+                        MemoriesCandidate::Membership(value, seq),
+                        &contracts,
+                    )?,
+                );
+            }
+            if let Some((value, seq)) = self.scenario_core.contract_entry(revision) {
+                rows.push(physical_object_row(
+                    ObjectFamily::Atom,
+                    "global_support_contract",
+                    reference.into(),
+                    reference.into(),
+                    &JournalPayload::GlobalSupportContractRecorded(Box::new(value.clone())),
+                    seq,
+                )?);
+            }
+            if let Some((value, seq)) = self.episode_revisions.get(&revision) {
+                rows.push(inbox_work_row(
+                    &JournalPayload::WorkEpisodeRecorded(Box::new(value.clone())),
+                    *seq,
+                )?);
+            }
+            if let Some((value, seq)) = self.operation_burst_revisions.get(&revision) {
+                rows.push(burst_row(value, *seq)?);
+            }
+            if let Some((value, seq)) = self.competing_group_revisions.get(&revision) {
+                rows.push(inbox_work_row(
+                    &JournalPayload::CompetingAttemptGroupRecorded(Box::new(value.clone())),
+                    *seq,
+                )?);
+            }
+            if let Some((value, seq)) = self.corrections.get(&revision) {
+                rows.push(physical_object_row(
+                    ObjectFamily::Work,
+                    "segmentation_correction",
+                    reference.into(),
+                    reference.into(),
+                    &JournalPayload::SegmentationCorrectionRecorded(Box::new(value.clone())),
+                    *seq,
+                )?);
+            }
+        }
+        macro_rules! exact_fact {
+            ($id:ty, $map:ident, $variant:ident, $family:expr, $kind:literal) => {
+                if let Ok(id) = reference.parse::<$id>() {
+                    if let Some((value, seq)) = self.$map.get(&id) {
+                        rows.push(physical_object_row(
+                            $family,
+                            $kind,
+                            reference.into(),
+                            reference.into(),
+                            &JournalPayload::$variant(Box::new(value.clone())),
+                            *seq,
+                        )?);
+                    }
+                }
+            };
+        }
+        exact_fact!(
+            WorktreeSnapshotId,
+            worktree_snapshots,
+            WorktreeSnapshotRecorded,
+            ObjectFamily::Work,
+            "worktree_snapshot"
+        );
+        if let Ok(id) = reference.parse::<WorktreeTransitionId>()
+            && let Some((value, seq)) = self.worktree_transitions.get(&id)
+        {
+            rows.push(physical_object_row(
+                ObjectFamily::Work,
+                "worktree_transition",
+                id.to_string(),
+                format!("{}@{}", id, value.transition_revision),
+                &JournalPayload::WorktreeTransitionRecorded(Box::new(value.clone())),
+                *seq,
+            )?);
+        }
+        exact_fact!(
+            IntegrationEventId,
+            integration_events,
+            IntegrationEventRecorded,
+            ObjectFamily::Work,
+            "integration_event"
+        );
+        if let Ok(id) = reference.parse::<WorkBindingRevisionId>()
+            && let Some((value, seq)) = self.work_bindings.get(&id)
+        {
+            rows.push(inbox_work_row(
+                &JournalPayload::WorkBindingRecorded(Box::new(value.clone())),
+                *seq,
+            )?);
+        }
+        exact_fact!(
+            ScopeEffectId,
+            scope_effects,
+            ScopeEffectDerived,
+            ObjectFamily::Work,
+            "scope_effect"
+        );
+        if let Ok(id) = reference.parse::<HostOccurrenceId>()
+            && let Some((value, seq)) = self.host_occurrences.get(&id)
+        {
+            rows.push(physical_object_row(
+                ObjectFamily::Evidence,
+                "host_occurrence",
+                id.to_string(),
+                format!("{}@{}", id, value.normalization_revision),
+                &JournalPayload::HostOccurrenceNormalized(Box::new(value.clone())),
+                *seq,
+            )?);
+        }
+        if let Ok(id) = reference.parse::<evertrace_domain::ids::CaptureReceiptId>()
+            && let Some((value, seq)) = self.capture_receipt_revisions.get(&id)
+        {
+            rows.push(inbox_work_row(
+                &JournalPayload::CaptureReceiptRecorded(Box::new(value.clone())),
+                *seq,
+            )?);
+        }
+        if let Ok(id) = reference.parse::<ExecutionLaneId>()
+            && let Some((value, seq)) = self.execution_lanes.get(&id)
+        {
+            rows.push(inbox_work_row(
+                &JournalPayload::ExecutionLaneRecorded(Box::new(value.clone())),
+                *seq,
+            )?);
+        }
+        if let Some((id, revision)) = evertrace_domain::query::parse_operation_revision(reference) {
+            if let Some((value, seq)) = self.operation_revisions.get(&(id, revision)) {
+                rows.push(physical_object_row(
+                    ObjectFamily::Work,
+                    "operation",
+                    id.to_string(),
+                    reference.into(),
+                    &JournalPayload::OperationDerived(Box::new(value.clone())),
+                    *seq,
+                )?);
+            }
+        } else if let Ok(id) = reference.parse::<OperationId>()
+            && let Some((value, seq)) = self.operations.get(&id)
+        {
+            rows.push(physical_object_row(
+                ObjectFamily::Work,
+                "operation",
+                reference.into(),
+                format!("{}@{}", value.operation_id, value.operation_revision),
+                &JournalPayload::OperationDerived(Box::new(value.clone())),
+                *seq,
+            )?);
+        }
+        if let Ok(id) = reference.parse::<OperationBurstId>()
+            && let Some((value, seq)) = self.operation_bursts.get(&id)
+        {
+            rows.push(burst_row(value, *seq)?);
+        }
+        if let Ok(id) = reference.parse::<WorkEpisodeId>()
+            && let Some((value, seq)) = self.episodes.get(&id)
+        {
+            rows.push(inbox_work_row(
+                &JournalPayload::WorkEpisodeRecorded(Box::new(value.clone())),
+                *seq,
+            )?);
+        }
+        if let Some((value, seq)) = self.checkpoints.get(reference) {
+            if let Some(row) = self.scope_fact_row(
+                &JournalPayload::WorkCheckpointRecorded(Box::new(value.clone())),
+                *seq,
+            )? {
+                rows.push(row);
+            }
+        }
+        // These immutable primary facts use the revision, not their public identity, as the canonical row key.
+        for row in &mut rows {
+            if matches!(
+                row.object_kind.as_deref(),
+                Some("host_occurrence" | "operation")
+            ) {
+                row.row_id = format!(
+                    "object:{}:{}:{}",
+                    row.object_family.ok_or(StoreError::StoreCorrupt)?.as_str(),
+                    row.object_kind.as_deref().ok_or(StoreError::StoreCorrupt)?,
+                    row.current_revision_id
+                        .as_deref()
+                        .ok_or(StoreError::StoreCorrupt)?
+                );
+            }
+        }
+        Ok(rows)
+    }
+
+    pub(crate) fn stored_fields_context(
+        &self,
+        query: &evertrace_domain::query::ExactFieldsQuery,
+        state: evertrace_domain::query::ObjectReadState,
+        cancelled: &std::sync::atomic::AtomicBool,
+        deadline: std::time::Instant,
+    ) -> Result<evertrace_domain::query::MetadataReadOutcome<StoredFieldsContext>, StoreError> {
+        use evertrace_domain::query::MetadataReadOutcome as Outcome;
+        if !query.validate() {
+            return Err(StoreError::InvalidInput);
+        }
+        let selected = self
+            .stored_reference_rows(&query.revision_ref)?
+            .into_iter()
+            .filter(|row| {
+                row.current_revision_id.as_deref() == Some(query.revision_ref.as_str())
+                    && matches!(
+                        row.object_kind.as_deref(),
+                        Some(
+                            "atom_revision"
+                                | "core_membership"
+                                | "procedure_revision"
+                                | "revision_proposal_revision"
+                                | "semantic_digest"
+                                | "work_episode"
+                        )
+                    )
+            })
+            .collect::<Vec<_>>();
+        if selected.len() > 1 {
+            return Err(StoreError::StoreCorrupt);
+        }
+        let mut context = StoredFieldsContext {
+            state,
+            selected: None,
+            rows: Vec::new(),
+            source_suppressed: false,
+        };
+        let Some(root) = selected.into_iter().next() else {
+            return Ok(Outcome::Page(Box::new(context)));
+        };
+        let root_id = root.row_id.clone();
+        let payload: JournalPayload = serde_json::from_str(
+            root.payload_json
+                .as_deref()
+                .ok_or(StoreError::StoreCorrupt)?,
+        )
+        .map_err(|_| StoreError::StoreCorrupt)?;
+        let mut pending = read_dependencies_for(&root, &payload);
+        let mut visited = BTreeSet::new();
+        let mut rows = BTreeMap::from([(root_id.clone(), root)]);
+        let mut bytes = rows
+            .values()
+            .map(|row| row.payload_json.as_ref().map_or(0, |v| v.len()) as u64)
+            .sum::<u64>();
+        if bytes > READ_DEPENDENCY_BYTES {
+            return Ok(Outcome::TooLarge);
+        }
+        while let Some(reference) = pending.pop_first() {
+            if cancelled.load(std::sync::atomic::Ordering::SeqCst)
+                || std::time::Instant::now() >= deadline
+            {
+                return Err(StoreError::Io);
+            }
+            if !visited.insert(reference.clone()) {
+                continue;
+            }
+            if visited.len() + pending.len() >= READ_DEPENDENCY_LIMIT
+                || bytes > READ_DEPENDENCY_BYTES
+            {
+                return Ok(Outcome::TooLarge);
+            }
+            for row in self.stored_reference_rows(&reference)? {
+                if rows.contains_key(&row.row_id) {
+                    continue;
+                }
+                let payload: JournalPayload = serde_json::from_str(
+                    row.payload_json
+                        .as_deref()
+                        .ok_or(StoreError::StoreCorrupt)?,
+                )
+                .map_err(|_| StoreError::StoreCorrupt)?;
+                pending.extend(read_dependencies_for(&row, &payload));
+                bytes += row.payload_json.as_ref().map_or(0, |v| v.len()) as u64;
+                if rows.len() >= READ_DEPENDENCY_LIMIT || bytes > READ_DEPENDENCY_BYTES {
+                    return Ok(Outcome::TooLarge);
+                }
+                rows.insert(row.row_id.clone(), row);
+            }
+        }
+        let lookup = CandidateSourceLookup::Current {
+            observations: &self.source_observations,
+            receipts: &self.source_receipts,
+            surfaces: &self.evidence_surfaces,
+        };
+        for reference in &visited {
+            if let Ok(id) = reference.parse::<SourceObservationId>() {
+                let hashes = lookup.suppression_refs(id)?;
+                context.source_suppressed |=
+                    source_suppressed(self.deletions.events(), hashes.as_ref());
+            }
+        }
+        context.rows = filter_product_rows(
+            rows.into_values().collect(),
             &self.deletions,
             &self.scope_purges,
-            repository_closures.iter(),
-        )
+            self.repository_closures.values(),
+        )?;
+        context.selected = context
+            .rows
+            .iter()
+            .find(|row| row.row_id == root_id)
+            .cloned();
+        Ok(Outcome::Page(Box::new(context)))
     }
 
     fn scope_fact_visible(&self, payload: &JournalPayload, seq: u64) -> Result<bool, StoreError> {

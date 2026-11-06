@@ -6,6 +6,7 @@ use std::{
     os::unix::fs::{DirBuilderExt, MetadataExt, OpenOptionsExt, PermissionsExt},
     path::{Component, Path, PathBuf},
     sync::{Arc, Mutex, MutexGuard},
+    time::Instant,
 };
 
 use fs2::FileExt;
@@ -1537,6 +1538,24 @@ impl JournalWriter {
         }
         let (before, state) = self.metadata_read_boundary(effective_config_hash)?;
         let result = self.admission_state.read_jobs(query, state, cancelled)?;
+        self.finish_metadata_read(before, cancelled)?;
+        Ok(result)
+    }
+
+    pub fn stored_fields_context(
+        &self,
+        query: &evertrace_domain::query::ExactFieldsQuery,
+        cancelled: &std::sync::atomic::AtomicBool,
+        deadline: Instant,
+        effective_config_hash: [u8; 32],
+    ) -> Result<
+        evertrace_domain::query::MetadataReadOutcome<crate::projections::StoredFieldsContext>,
+        StoreError,
+    > {
+        let (before, state) = self.metadata_read_boundary(effective_config_hash)?;
+        let result = self
+            .admission_state
+            .stored_fields_context(query, state, cancelled, deadline)?;
         self.finish_metadata_read(before, cancelled)?;
         Ok(result)
     }

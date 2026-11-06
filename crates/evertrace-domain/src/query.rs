@@ -2604,6 +2604,67 @@ impl ObjectReadJobs {
     }
 }
 
+/// An immutable stored record needed by the Python reading surfaces, not a path or query expression.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct ExactFieldsQuery {
+    pub revision_ref: String,
+}
+
+impl ExactFieldsQuery {
+    pub fn validate(&self) -> bool {
+        self.revision_ref.parse::<RevisionId>().is_ok()
+            || self
+                .revision_ref
+                .parse::<crate::ids::SemanticDigestId>()
+                .is_ok()
+    }
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct ExactFieldIdentity {
+    pub object_kind: String,
+    pub object_ref: String,
+    pub revision_ref: String,
+    pub source_event_seq: u64,
+}
+
+/// No field or source reference is disclosed when the access state is not ready.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct ExactStoredFields {
+    pub state: ObjectReadState,
+    pub selection: Option<ExactFieldIdentity>,
+    pub content_state: HumanContentState,
+    pub fields: Option<serde_json::Value>,
+    pub fields_complete: bool,
+    pub truncated_fields: Vec<String>,
+    pub source_observation_refs: Vec<String>,
+}
+
+impl ExactStoredFields {
+    pub fn validate(&self) -> bool {
+        self.state.validate()
+            && match self.content_state {
+                HumanContentState::Ready => {
+                    self.selection.is_some()
+                        && (self.fields_complete == self.truncated_fields.is_empty())
+                        && self.fields.as_ref().is_some_and(|fields| {
+                            serde_json::to_vec(fields)
+                                .is_ok_and(|bytes| bytes.len() <= usize::from(HUMAN_CONTENT_LIMIT))
+                        })
+                }
+                _ => {
+                    self.fields.is_none()
+                        && !self.fields_complete
+                        && self.truncated_fields.is_empty()
+                        && self.source_observation_refs.is_empty()
+                }
+            }
+    }
+}
+
 /// Closed metadata reads used by the Python memory lists and Jobs observer.
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]

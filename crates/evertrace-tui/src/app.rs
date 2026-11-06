@@ -486,7 +486,8 @@ impl App {
                     }
                     (
                         _,
-                        HumanGovernanceResponse::MetadataBatch { .. }
+                        HumanGovernanceResponse::StoredFields { .. }
+                        | HumanGovernanceResponse::MetadataBatch { .. }
                         | HumanGovernanceResponse::Jobs { .. }
                         | HumanGovernanceResponse::State { .. }
                         | HumanGovernanceResponse::Action { .. }
@@ -528,7 +529,8 @@ impl App {
                         audit_event_ref: None,
                         reason: Some("optimistic_conflict".into()),
                     },
-                    HumanGovernanceResponse::MetadataBatch { .. }
+                    HumanGovernanceResponse::StoredFields { .. }
+                    | HumanGovernanceResponse::MetadataBatch { .. }
                     | HumanGovernanceResponse::Jobs { .. }
                     | HumanGovernanceResponse::State { .. }
                     | HumanGovernanceResponse::Snapshot { .. }

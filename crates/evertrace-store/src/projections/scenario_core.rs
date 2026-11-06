@@ -339,6 +339,16 @@ impl ScenarioCoreState {
             .filter(move |value| value.core_membership_id == membership_id)
     }
 
+    /// Exact immutable contract facts; never materialize the reducer's complete row set for a read.
+    pub(super) fn contract_entry(
+        &self,
+        revision: RevisionId,
+    ) -> Option<(&GlobalSuccessorSupportContract, u64)> {
+        self.contracts
+            .get(&revision)
+            .map(|(value, seq)| (value, *seq))
+    }
+
     pub(super) fn membership_revision_entry(
         &self,
         id: RevisionId,

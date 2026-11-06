@@ -110,6 +110,9 @@ pub enum HumanRelationKind {
 #[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
 pub enum HumanReadRequest {
     State,
+    ReadExact {
+        query: Box<evertrace_domain::query::ExactFieldsQuery>,
+    },
     ReadBatch {
         query: Box<evertrace_domain::query::MetadataBatchQuery>,
     },
@@ -963,6 +966,9 @@ pub struct HumanActionResult {
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
 pub enum HumanGovernanceResponse {
+    StoredFields {
+        page: Box<evertrace_domain::query::ExactStoredFields>,
+    },
     MetadataBatch {
         page: Box<evertrace_domain::query::ObjectReadBatch>,
     },
@@ -1063,6 +1069,7 @@ impl HumanReadRequest {
     fn validate(&self) -> bool {
         match self {
             Self::State => true,
+            Self::ReadExact { query } => query.validate(),
             Self::ReadBatch { query } => query.validate(),
             Self::Jobs { query } => query.validate(),
             Self::CompiledProjections {
@@ -1421,6 +1428,7 @@ impl HumanDiagnostics {
 impl HumanGovernanceResponse {
     pub fn validate(&self) -> bool {
         match self {
+            Self::StoredFields { page } => page.validate(),
             Self::MetadataBatch { page } => page.validate(),
             Self::Jobs { page } => page.validate(),
             Self::State { state } => state.validate(),

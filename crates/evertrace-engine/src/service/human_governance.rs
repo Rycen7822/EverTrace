@@ -3883,7 +3883,7 @@ fn related_page<'a>(
 // Navigation is not the export/permission closure. Every target is independently
 // checked before pagination, so an Episode does not authorize all its Attempts.
 fn source_link_refs(row: &ObjectRow, payload: &JournalPayload) -> BTreeSet<String> {
-    let mut refs = export::dependencies_for(row, payload);
+    let mut refs = evertrace_store::projections::read_dependencies_for(row, payload);
     match payload {
         JournalPayload::WorkEpisodeRecorded(value) => {
             refs.insert(value.workstream_id.to_string());

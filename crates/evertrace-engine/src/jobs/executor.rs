@@ -122,6 +122,20 @@ enum WriterRequest {
             Result<evertrace_store::projections::MemoryOverviewContext, WriterActorError>,
         >,
     },
+    ReadStoredFields {
+        query: Box<evertrace_domain::query::ExactFieldsQuery>,
+        cancelled: std::sync::Arc<std::sync::atomic::AtomicBool>,
+        deadline: Instant,
+        config_hash: [u8; 32],
+        reply: oneshot::Sender<
+            Result<
+                evertrace_domain::query::MetadataReadOutcome<
+                    evertrace_store::projections::StoredFieldsContext,
+                >,
+                WriterActorError,
+            >,
+        >,
+    },
     ReadMetadataBatch {
         query: Box<evertrace_domain::query::MetadataBatchQuery>,
         cancelled: std::sync::Arc<std::sync::atomic::AtomicBool>,
@@ -809,6 +823,32 @@ impl WriterHandle {
             .send(WriterRequest::ReadJobs {
                 query,
                 cancelled,
+                config_hash,
+                reply,
+            })
+            .await
+            .map_err(|_| WriterActorError::Stopped)?;
+        response.await.map_err(|_| WriterActorError::Stopped)?
+    }
+
+    pub(crate) async fn read_stored_fields_context(
+        &self,
+        query: Box<evertrace_domain::query::ExactFieldsQuery>,
+        cancelled: std::sync::Arc<std::sync::atomic::AtomicBool>,
+        deadline: Instant,
+        config_hash: [u8; 32],
+    ) -> Result<
+        evertrace_domain::query::MetadataReadOutcome<
+            evertrace_store::projections::StoredFieldsContext,
+        >,
+        WriterActorError,
+    > {
+        let (reply, response) = oneshot::channel();
+        self.sender
+            .send(WriterRequest::ReadStoredFields {
+                query,
+                cancelled,
+                deadline,
                 config_hash,
                 reply,
             })
@@ -1636,6 +1676,24 @@ async fn run_writer(
                     if fatal {
                         return Err(WriterActorError::Store);
                     }
+                }
+                WriterRequest::ReadStoredFields {
+                    query,
+                    cancelled,
+                    deadline,
+                    config_hash,
+                    reply,
+                } => {
+                    if reply.is_closed() {
+                        continue;
+                    }
+                    let result = match writer.as_ref() {
+                        Some(writer) => writer
+                            .stored_fields_context(&query, &cancelled, deadline, config_hash)
+                            .map_err(map_store_error),
+                        None => Err(WriterActorError::Stopped),
+                    };
+                    let _ = reply.send(result);
                 }
                 WriterRequest::ReadMetadataBatch {
                     query,

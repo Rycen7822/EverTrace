@@ -847,6 +847,12 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
                                 state: Box::new(state),
                             }));
                         }
+                        if let HumanGovernanceRequest::Read { request: HumanReadRequest::ReadExact { query } } = &command {
+                            let page = EngineService::read_exact_fields(
+                                writer.clone(), query.clone(), config_snapshot.hash(), Arc::clone(&session_catalog_report),
+                            ).await?;
+                            return Ok(Response::HumanGovernance(HumanGovernanceResponse::StoredFields { page: Box::new(page) }));
+                        }
                         if let HumanGovernanceRequest::Read { request: HumanReadRequest::ReadBatch { query } } = &command {
                             let outcome = EngineService::read_metadata_batch(
                                 writer.clone(), query.clone(), config_snapshot.hash(),
@@ -910,7 +916,8 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
                             HumanGovernanceRequest::Read { request } => match request {
                                 // Kernel reads are dispatched before constructing the facade.
                                 HumanReadRequest::State | HumanReadRequest::Jobs { .. }
-                                    | HumanReadRequest::ReadBatch { .. } => return Err(ErrorCode::Internal),
+                                    | HumanReadRequest::ReadBatch { .. } | HumanReadRequest::ReadExact { .. }
+                                        => return Err(ErrorCode::Internal),
                                 HumanReadRequest::Search {query} => {
                                     let page = human_governance.search(query).await.map_err(map_human_error)?;
                                     HumanGovernanceResponse::Search {page: Box::new(page)}

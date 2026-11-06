@@ -9,8 +9,9 @@ use std::{
 };
 
 const MAX_SELECTIONS: usize = 64;
-const MAX_DEPENDENCIES: usize = 4096;
-const MAX_METADATA_BYTES: u64 = 64 * 1024 * 1024;
+use evertrace_store::projections::{
+    READ_DEPENDENCY_BYTES as MAX_METADATA_BYTES, READ_DEPENDENCY_LIMIT as MAX_DEPENDENCIES,
+};
 pub(super) const MAX_ENCODED_BYTES: u64 = 64 * 1024 * 1024;
 pub(super) const MAX_DECODED_BYTES: u64 = 128 * 1024 * 1024;
 const MAX_OUTPUT_BYTES: u64 = 160 * 1024 * 1024;
@@ -210,40 +211,19 @@ impl HumanGovernanceService {
             Some(report) => report.read().await.clone(),
             None => None,
         };
-        for chunk in rows.chunks(MAX_SELECTIONS) {
-            check_deadline(deadline)?;
-            if !crate::session_import::source_rows_read_assessment(
-                &self.writer,
-                report.as_ref(),
-                all_rows,
-                chunk,
-                None,
-                Some(deadline),
-            )
-            .await
-            .map_err(|_| Failure::Corrupt)?
-            .0
-            .is_empty()
-            {
-                return Err(Failure::Denied);
-            }
-        }
-        let scopes = crate::repository::row_repository_contexts_from_scopes(all_rows.iter(), rows)
-            .map_err(|_| Failure::Corrupt)?;
-        if !crate::repository::repository_read_assessment(
+        super::super::object_read::check_source_access(
             &self.writer,
-            scopes.values().flatten().copied().collect(),
             report.as_ref(),
+            all_rows,
+            rows,
             deadline,
         )
         .await
-        .map_err(|_| Failure::Corrupt)?
-        .0
-        .is_empty()
-        {
-            return Err(Failure::Denied);
-        }
-        check_deadline(deadline)
+        .map_err(|code| match code {
+            evertrace_domain::error::ErrorCode::Untrusted => Failure::Denied,
+            evertrace_domain::error::ErrorCode::ResourceExhausted => Failure::Limit,
+            _ => Failure::Corrupt,
+        })
     }
 
     // A Human detail may select an immutable historical row. Reuse the export
@@ -622,204 +602,7 @@ fn selected_current_revision(
     }
 }
 
-pub(super) fn dependencies_for(row: &ObjectRow, payload: &JournalPayload) -> BTreeSet<String> {
-    let mut refs = [
-        row.task_id.clone(),
-        row.worktree_id.clone(),
-        row.repository_id.clone(),
-    ]
-    .into_iter()
-    .flatten()
-    .collect::<BTreeSet<_>>();
-    match payload {
-        JournalPayload::OperationDerived(value) => {
-            refs.insert(value.host_occurrence_id.to_string());
-            refs.extend(value.execution_lane_id.map(|id| id.to_string()));
-            refs.extend(
-                value
-                    .input_source_observation_refs
-                    .iter()
-                    .chain(&value.result_source_observation_refs)
-                    .map(ToString::to_string),
-            );
-            refs.extend(value.scope_effect_ids.iter().map(ToString::to_string));
-            refs.extend(value.artifact_refs.iter().map(ToString::to_string));
-        }
-        JournalPayload::ScopeEffectDerived(value) => {
-            refs.insert(value.operation_id.to_string());
-            refs.extend(value.repository_instance_id.map(|id| id.to_string()));
-            refs.extend(value.worktree_instance_id.map(|id| id.to_string()));
-            refs.extend(
-                value
-                    .pre_snapshot_id
-                    .into_iter()
-                    .chain(value.post_snapshot_id)
-                    .map(|id| id.to_string()),
-            );
-            refs.extend(value.experiment_run_ids.iter().map(ToString::to_string));
-            refs.extend(value.artifact_refs.iter().map(ToString::to_string));
-            refs.extend(value.evidence_refs.iter().map(ToString::to_string));
-        }
-        JournalPayload::WorktreeInstanceRecorded(value) => {
-            refs.insert(value.repository_instance_id.to_string());
-            refs.extend(value.current_snapshot_id.map(|id| id.to_string()));
-        }
-        JournalPayload::WorktreeSnapshotRecorded(value) => {
-            refs.insert(value.worktree_instance_id.to_string());
-            refs.extend(value.evidence_refs.iter().cloned());
-        }
-        JournalPayload::WorktreeTransitionRecorded(value) => {
-            refs.insert(value.from_worktree_instance_id.to_string());
-            refs.insert(value.to_worktree_instance_id.to_string());
-            refs.extend(
-                value
-                    .from_snapshot_id
-                    .into_iter()
-                    .chain(value.to_snapshot_id)
-                    .map(|id| id.to_string()),
-            );
-            refs.extend(value.evidence_refs.iter().cloned());
-        }
-        JournalPayload::IntegrationEventRecorded(value) => {
-            refs.insert(value.repository_instance_id.to_string());
-            refs.insert(value.source_worktree_instance_id.to_string());
-            refs.insert(value.destination_worktree_instance_id.to_string());
-            refs.insert(value.source_snapshot_id.to_string());
-            refs.insert(value.destination_snapshot_id.to_string());
-            refs.extend(value.integrated_attempt_ids.iter().map(ToString::to_string));
-            refs.extend(value.revalidated_anchor_refs.iter().cloned());
-            refs.extend(value.evidence_refs.iter().cloned());
-        }
-        JournalPayload::SegmentationCorrectionRecorded(value) => {
-            refs.extend(value.predecessor_revision_id.map(|id| id.to_string()));
-            refs.extend(
-                value
-                    .source_episode_ids
-                    .iter()
-                    .chain(&value.replacement_episode_ids)
-                    .map(ToString::to_string),
-            );
-            refs.extend(value.evidence_refs.iter().cloned());
-        }
-        JournalPayload::SourceReceiptRecorded(value) => {
-            refs.insert(value.source_observation_id.to_string());
-        }
-        JournalPayload::SourceObservationRecorded(value) => {
-            refs.insert(value.source_receipt_ref.to_string());
-        }
-        JournalPayload::EvidenceSurfaceRecorded(value) => {
-            refs.insert(value.source_observation_revision_ref.to_string());
-        }
-        JournalPayload::AtomRecorded(value) => {
-            refs.extend(
-                value
-                    .source_observation_refs
-                    .iter()
-                    .map(ToString::to_string),
-            );
-            refs.extend(value.evidence_refs.iter().cloned());
-            refs.extend(value.supports_revision_refs.iter().map(ToString::to_string));
-        }
-        JournalPayload::ProcedureRevisionRecorded(value) => {
-            refs.extend(value.draft.evidence_refs.iter().cloned());
-            refs.extend(
-                value
-                    .draft
-                    .support_revision_refs
-                    .iter()
-                    .map(ToString::to_string),
-            );
-        }
-        JournalPayload::RevisionProposalRecorded(value) => {
-            refs.extend(value.evidence_refs.iter().cloned());
-            refs.extend(value.source_cohort_refs.iter().cloned());
-        }
-        JournalPayload::CoreMembershipRecorded(value) => {
-            refs.insert(value.atom_revision_id.to_string());
-            refs.insert(value.support_contract_ref.to_string());
-            refs.extend(
-                value
-                    .authorization_revision_refs
-                    .iter()
-                    .map(ToString::to_string),
-            );
-        }
-        JournalPayload::GlobalSupportContractRecorded(value) => {
-            refs.extend(value.support_revision_refs.iter().map(ToString::to_string));
-            refs.extend(
-                value
-                    .authorization_revision_refs
-                    .iter()
-                    .map(ToString::to_string),
-            );
-        }
-        JournalPayload::SemanticDigestRecorded(value) => {
-            refs.extend(value.selected_direct_refs.iter().cloned());
-            refs.extend(value.episode_revision_id.map(|id| id.to_string()));
-        }
-        JournalPayload::TaskRecorded(value) => {
-            refs.extend(value.request_root_refs.iter().cloned());
-        }
-        JournalPayload::WorkBindingRecorded(value) => {
-            refs.insert(value.operation_id.to_string());
-            refs.extend(value.evidence_refs.iter().cloned());
-        }
-        JournalPayload::OperationBurstRecorded(value) => {
-            refs.extend(value.primary_binding.task_id.map(|id| id.to_string()));
-            refs.extend(value.primary_binding.workstream_id.map(|id| id.to_string()));
-            refs.extend(
-                value
-                    .members
-                    .iter()
-                    .flat_map(|member| member.source_observation_refs.iter())
-                    .map(ToString::to_string),
-            );
-        }
-        JournalPayload::WorkEpisodeRecorded(value) => {
-            refs.extend(
-                value
-                    .capture_receipt_revision_ids
-                    .iter()
-                    .map(ToString::to_string),
-            );
-            refs.extend(value.operation_burst_refs.iter().map(ToString::to_string));
-            refs.extend(value.semantic_digest_refs.iter().cloned());
-            refs.extend(value.verification_refs.iter().cloned());
-            refs.extend(value.failure_refs.iter().cloned());
-            refs.extend(
-                value
-                    .boundary_candidate
-                    .iter()
-                    .flat_map(|candidate| candidate.evidence_refs.iter())
-                    .map(ToString::to_string),
-            );
-        }
-        JournalPayload::AttemptRecorded(value) => {
-            refs.extend(
-                value
-                    .local_outcome_refs
-                    .iter()
-                    .chain(&value.parent_verification_refs)
-                    .chain(&value.outcome_refs)
-                    .chain(&value.interruption_refs)
-                    .chain(&value.explicit_abandon_refs)
-                    .chain(&value.supersede_evidence_refs)
-                    .cloned(),
-            );
-        }
-        JournalPayload::WorkArtifactRecorded(value) => {
-            refs.extend(
-                value
-                    .revision
-                    .source_observation_refs
-                    .iter()
-                    .map(ToString::to_string),
-            );
-        }
-        _ => {}
-    }
-    refs
-}
+use evertrace_store::projections::read_dependencies_for as dependencies_for;
 
 struct Stage {
     parent: ConfinedRoot,

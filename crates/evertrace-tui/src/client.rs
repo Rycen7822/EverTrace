@@ -114,6 +114,7 @@ async fn send_human(
             HumanReadRequest::State
             | HumanReadRequest::Jobs { .. }
             | HumanReadRequest::ReadBatch { .. }
+            | HumanReadRequest::ReadExact { .. }
             | HumanReadRequest::CompiledProjections { .. }
             | HumanReadRequest::MemoryOverview { .. }
             | HumanReadRequest::Search { .. }

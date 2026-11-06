@@ -544,6 +544,7 @@ where
                 &dispatched,
                 Response::HumanGovernance(
                     dto::HumanGovernanceResponse::Jobs { .. }
+                        | dto::HumanGovernanceResponse::StoredFields { .. }
                         | dto::HumanGovernanceResponse::MetadataBatch { .. }
                         | dto::HumanGovernanceResponse::State { .. }
                 )
