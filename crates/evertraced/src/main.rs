@@ -847,6 +847,12 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
                                 state: Box::new(state),
                             }));
                         }
+                        if let HumanGovernanceRequest::Read { request: HumanReadRequest::ReadRevisionPair { query } } = &command {
+                            let page = EngineService::read_revision_pair(
+                                writer.clone(), query.clone(), config_snapshot.hash(), Arc::clone(&session_catalog_report),
+                            ).await?;
+                            return Ok(Response::HumanGovernance(HumanGovernanceResponse::RevisionPair { page: Box::new(page) }));
+                        }
                         if let HumanGovernanceRequest::Read { request: HumanReadRequest::ReadExact { query } } = &command {
                             let page = EngineService::read_exact_fields(
                                 writer.clone(), query.clone(), config_snapshot.hash(), Arc::clone(&session_catalog_report),
@@ -916,6 +922,7 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
                                 // Kernel reads are dispatched before constructing the facade.
                                 HumanReadRequest::State | HumanReadRequest::Jobs { .. }
                                     | HumanReadRequest::ReadBatch { .. } | HumanReadRequest::ReadExact { .. }
+                                    | HumanReadRequest::ReadRevisionPair { .. }
                                         => return Err(ErrorCode::Internal),
                                 HumanReadRequest::Search {query} => {
                                     let page = human_governance.search(query).await.map_err(map_human_error)?;

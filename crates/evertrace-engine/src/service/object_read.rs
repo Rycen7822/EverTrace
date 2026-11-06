@@ -184,6 +184,63 @@ fn bounded_stored_fields(
     Ok((serde_json::Value::Object(window), truncated))
 }
 
+fn fields_metadata(
+    context: &evertrace_store::projections::StoredFieldsContext,
+) -> Result<evertrace_domain::query::ExactStoredFields, ErrorCode> {
+    use evertrace_domain::query::{ExactFieldIdentity, ExactStoredFields, HumanContentState};
+    let selection = context
+        .selected
+        .as_ref()
+        .map(|root| {
+            Ok(ExactFieldIdentity {
+                object_kind: root.object_kind.clone().ok_or(ErrorCode::StoreCorrupt)?,
+                object_ref: root.object_id.clone().ok_or(ErrorCode::StoreCorrupt)?,
+                revision_ref: root
+                    .current_revision_id
+                    .clone()
+                    .ok_or(ErrorCode::StoreCorrupt)?,
+                source_event_seq: root.source_event_seq,
+            })
+        })
+        .transpose()?;
+    Ok(ExactStoredFields {
+        state: context.state.clone(),
+        selection,
+        content_state: HumanContentState::Missing,
+        fields: None,
+        fields_complete: false,
+        truncated_fields: Vec::new(),
+        source_observation_refs: Vec::new(),
+    })
+}
+
+async fn fields_access(
+    writer: &crate::WriterHandle,
+    context: &evertrace_store::projections::StoredFieldsContext,
+    report: &std::sync::Arc<tokio::sync::RwLock<Option<evertrace_codex::HostProbeReport>>>,
+    deadline: Instant,
+) -> Result<(), ErrorCode> {
+    if context.source_suppressed {
+        return Err(ErrorCode::Untrusted);
+    }
+    let references = context.rows.iter().collect::<Vec<_>>();
+    let host = report.read().await.clone();
+    check_source_access(writer, host.as_ref(), &context.rows, &references, deadline).await
+}
+
+fn denied_fields(result: &mut evertrace_domain::query::ExactStoredFields, code: ErrorCode) {
+    use evertrace_domain::query::HumanContentState as State;
+    result.content_state = if code == ErrorCode::Untrusted {
+        State::AccessDenied
+    } else {
+        State::Unavailable
+    };
+    result.fields = None;
+    result.fields_complete = false;
+    result.truncated_fields.clear();
+    result.source_observation_refs.clear();
+}
+
 impl EngineService {
     /// Immutable stored fields only. Recheck the same finite dependency closure before disclosure.
     pub async fn read_exact_fields(
@@ -192,9 +249,7 @@ impl EngineService {
         effective_config_hash: [u8; 32],
         report: std::sync::Arc<tokio::sync::RwLock<Option<evertrace_codex::HostProbeReport>>>,
     ) -> Result<evertrace_domain::query::ExactStoredFields, ErrorCode> {
-        use evertrace_domain::query::{
-            ExactFieldIdentity, ExactStoredFields, HumanContentState as State, MetadataReadOutcome,
-        };
+        use evertrace_domain::query::{HumanContentState as State, MetadataReadOutcome};
         let deadline = Instant::now() + std::time::Duration::from_secs(2);
         let (cancelled, _cancel_on_drop) = evertrace_store::StoreReadHandle::cancellation_scope();
         let context = writer
@@ -209,41 +264,12 @@ impl EngineService {
         let MetadataReadOutcome::Page(context) = context else {
             return Err(ErrorCode::ResourceExhausted);
         };
-        let mut result = ExactStoredFields {
-            state: context.state.clone(),
-            selection: None,
-            content_state: State::Missing,
-            fields: None,
-            fields_complete: false,
-            truncated_fields: Vec::new(),
-            source_observation_refs: Vec::new(),
-        };
+        let mut result = fields_metadata(&context)?;
         let Some(root) = &context.selected else {
             return Ok(result);
         };
-        result.selection = Some(ExactFieldIdentity {
-            object_kind: root.object_kind.clone().ok_or(ErrorCode::StoreCorrupt)?,
-            object_ref: root.object_id.clone().ok_or(ErrorCode::StoreCorrupt)?,
-            revision_ref: root
-                .current_revision_id
-                .clone()
-                .ok_or(ErrorCode::StoreCorrupt)?,
-            source_event_seq: root.source_event_seq,
-        });
-        if context.source_suppressed {
-            result.content_state = State::AccessDenied;
-            return Ok(result);
-        }
-        let references = context.rows.iter().collect::<Vec<_>>();
-        let host = report.read().await.clone();
-        if let Err(code) =
-            check_source_access(&writer, host.as_ref(), &context.rows, &references, deadline).await
-        {
-            result.content_state = if code == ErrorCode::Untrusted {
-                State::AccessDenied
-            } else {
-                State::Unavailable
-            };
+        if let Err(code) = fields_access(&writer, &context, &report, deadline).await {
+            denied_fields(&mut result, code);
             return Ok(result);
         }
         let payload: evertrace_store::JournalPayload = serde_json::from_str(
@@ -291,16 +317,8 @@ impl EngineService {
             result.content_state = State::Unavailable;
             return Ok(result);
         }
-        let references = current.rows.iter().collect::<Vec<_>>();
-        let host = report.read().await.clone();
-        if let Err(code) =
-            check_source_access(&writer, host.as_ref(), &current.rows, &references, deadline).await
-        {
-            result.content_state = if code == ErrorCode::Untrusted {
-                State::AccessDenied
-            } else {
-                State::Unavailable
-            };
+        if let Err(code) = fields_access(&writer, &current, &report, deadline).await {
+            denied_fields(&mut result, code);
             return Ok(result);
         }
         result.state = current.state;
@@ -314,6 +332,145 @@ impl EngineService {
             .filter(|row| row.object_kind.as_deref() == Some("source_observation"))
             .filter_map(|row| row.object_id.clone())
             .collect();
+        Ok(result)
+    }
+
+    /// Same-binding exact pair and original access gates only; field comparison belongs to Python.
+    pub async fn read_revision_pair(
+        writer: crate::WriterHandle,
+        query: Box<evertrace_domain::query::RevisionCompareQuery>,
+        effective_config_hash: [u8; 32],
+        report: std::sync::Arc<tokio::sync::RwLock<Option<evertrace_codex::HostProbeReport>>>,
+    ) -> Result<evertrace_domain::query::RevisionPairFields, ErrorCode> {
+        use evertrace_domain::query::{
+            ExactFieldsQuery, HumanContentState as State, MetadataReadOutcome as Outcome,
+        };
+        use evertrace_domain::query::{HumanRevisionKind as Kind, RevisionPairFields};
+        for reference in [&query.left, &query.right] {
+            if !(ExactFieldsQuery {
+                revision_ref: reference.revision_ref.clone(),
+            })
+            .validate()
+            {
+                return Err(ErrorCode::InvalidInput);
+            }
+        }
+        let deadline = Instant::now() + std::time::Duration::from_secs(2);
+        let (cancelled, _cancel_on_drop) = evertrace_store::StoreReadHandle::cancellation_scope();
+        let before = writer
+            .read_stored_pair_context(
+                query.clone(),
+                cancelled.clone(),
+                deadline,
+                effective_config_hash,
+            )
+            .await
+            .map_err(|_| ErrorCode::Internal)?;
+        let Outcome::Page(before) = before else {
+            return Err(ErrorCode::ResourceExhausted);
+        };
+        if before.len() != 2 {
+            return Err(ErrorCode::StoreCorrupt);
+        }
+        let mut sides = Vec::with_capacity(2);
+        for (context, reference) in before.iter().zip([&query.left, &query.right]) {
+            let mut side = fields_metadata(context)?;
+            if let Some(root) = &context.selected {
+                if root.row_id != reference.stable_key {
+                    side.content_state = State::Unavailable;
+                } else if let Err(code) = fields_access(&writer, context, &report, deadline).await {
+                    denied_fields(&mut side, code);
+                } else {
+                    let payload: evertrace_store::JournalPayload = serde_json::from_str(
+                        root.payload_json
+                            .as_deref()
+                            .ok_or(ErrorCode::StoreCorrupt)?,
+                    )
+                    .map_err(|_| ErrorCode::StoreCorrupt)?;
+                    use evertrace_store::JournalPayload as P;
+                    let value = match payload {
+                        P::AtomRecorded(value) => Some(serde_json::to_value(value)),
+                        P::ProcedureRevisionRecorded(value) => Some(serde_json::to_value(value)),
+                        P::CoreMembershipRecorded(value) => Some(serde_json::to_value(value)),
+                        P::RevisionProposalRecorded(value) => Some(serde_json::to_value(value)),
+                        P::SemanticDigestRecorded(value) => Some(serde_json::to_value(value)),
+                        _ => None,
+                    };
+                    if let Some(value) = value {
+                        let (fields, truncated) =
+                            bounded_stored_fields(value.map_err(|_| ErrorCode::StoreCorrupt)?)?;
+                        side.content_state = State::Ready;
+                        side.fields = Some(fields);
+                        side.fields_complete = truncated.is_empty();
+                        side.truncated_fields = truncated;
+                    } else {
+                        side.content_state = State::Unsupported;
+                    }
+                }
+            }
+            sides.push(side);
+        }
+        let after = writer
+            .read_stored_pair_context(query.clone(), cancelled, deadline, effective_config_hash)
+            .await
+            .map_err(|_| ErrorCode::Internal)?;
+        let Outcome::Page(after) = after else {
+            return Err(ErrorCode::ResourceExhausted);
+        };
+        if after.len() != 2 {
+            return Err(ErrorCode::StoreCorrupt);
+        }
+        for ((old, current), side) in before.iter().zip(after.iter()).zip(&mut sides) {
+            side.state = current.state.clone();
+            if old.state.data_identity != current.state.data_identity
+                || old.selected != current.selected
+                || old.rows != current.rows
+                || old.source_suppressed != current.source_suppressed
+            {
+                denied_fields(side, ErrorCode::Internal);
+            } else if side.content_state == State::Ready {
+                if let Err(code) = fields_access(&writer, current, &report, deadline).await {
+                    denied_fields(side, code);
+                } else {
+                    side.source_observation_refs = current
+                        .rows
+                        .iter()
+                        .filter(|row| row.object_kind.as_deref() == Some("source_observation"))
+                        .filter_map(|row| row.object_id.clone())
+                        .collect();
+                }
+            }
+        }
+        let mut sides = sides.into_iter();
+        let left = sides.next().ok_or(ErrorCode::StoreCorrupt)?;
+        let right = sides.next().ok_or(ErrorCode::StoreCorrupt)?;
+        let object_kind =
+            if left.content_state == State::Ready && right.content_state == State::Ready {
+                let a = left.selection.as_ref().ok_or(ErrorCode::StoreCorrupt)?;
+                let b = right.selection.as_ref().ok_or(ErrorCode::StoreCorrupt)?;
+                if a.object_kind != b.object_kind || a.object_ref != b.object_ref {
+                    return Err(ErrorCode::InvalidInput);
+                }
+                Some(match a.object_kind.as_str() {
+                    "atom_revision" => Kind::Atom,
+                    "procedure_revision" => Kind::Procedure,
+                    "core_membership" => Kind::CoreMembership,
+                    "revision_proposal_revision" => Kind::Proposal,
+                    "semantic_digest" => Kind::Digest,
+                    _ => return Err(ErrorCode::InvalidInput),
+                })
+            } else {
+                None
+            };
+        let result = RevisionPairFields {
+            query: *query,
+            object_kind,
+            left,
+            right,
+        };
+        if !result.validate() {
+            return Err(ErrorCode::ResourceExhausted);
+        }
         Ok(result)
     }
 

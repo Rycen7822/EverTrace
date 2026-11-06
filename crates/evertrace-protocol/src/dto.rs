@@ -111,6 +111,9 @@ pub enum HumanReadRequest {
     ReadExact {
         query: Box<evertrace_domain::query::ExactFieldsQuery>,
     },
+    ReadRevisionPair {
+        query: Box<evertrace_domain::query::RevisionCompareQuery>,
+    },
     ReadBatch {
         query: Box<evertrace_domain::query::MetadataBatchQuery>,
     },
@@ -963,6 +966,9 @@ pub enum HumanGovernanceResponse {
     StoredFields {
         page: Box<evertrace_domain::query::ExactStoredFields>,
     },
+    RevisionPair {
+        page: Box<evertrace_domain::query::RevisionPairFields>,
+    },
     MetadataBatch {
         page: Box<evertrace_domain::query::ObjectReadBatch>,
     },
@@ -1061,6 +1067,7 @@ impl HumanReadRequest {
         match self {
             Self::State => true,
             Self::ReadExact { query } => query.validate(),
+            Self::ReadRevisionPair { query } => query.validate().is_ok(),
             Self::ReadBatch { query } => query.validate(),
             Self::Jobs { query } => query.validate(),
             Self::CompiledProjections {
@@ -1419,6 +1426,7 @@ impl HumanGovernanceResponse {
     pub fn validate(&self) -> bool {
         match self {
             Self::StoredFields { page } => page.validate(),
+            Self::RevisionPair { page } => page.validate(),
             Self::MetadataBatch { page } => page.validate(),
             Self::Jobs { page } => page.validate(),
             Self::State { state } => state.validate(),

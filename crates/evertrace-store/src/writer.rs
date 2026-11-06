@@ -1560,6 +1560,24 @@ impl JournalWriter {
         Ok(result)
     }
 
+    pub fn stored_fields_pair_context(
+        &self,
+        query: &evertrace_domain::query::RevisionCompareQuery,
+        cancelled: &std::sync::atomic::AtomicBool,
+        deadline: Instant,
+        effective_config_hash: [u8; 32],
+    ) -> Result<
+        evertrace_domain::query::MetadataReadOutcome<Vec<crate::projections::StoredFieldsContext>>,
+        StoreError,
+    > {
+        let (before, state) = self.metadata_read_boundary(effective_config_hash)?;
+        let result = self
+            .admission_state
+            .stored_fields_pair_context(query, state, cancelled, deadline)?;
+        self.finish_metadata_read(before, cancelled)?;
+        Ok(result)
+    }
+
     fn metadata_read_boundary(
         &self,
         effective_config_hash: [u8; 32],

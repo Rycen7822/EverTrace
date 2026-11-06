@@ -487,6 +487,7 @@ impl App {
                     (
                         _,
                         HumanGovernanceResponse::StoredFields { .. }
+                        | HumanGovernanceResponse::RevisionPair { .. }
                         | HumanGovernanceResponse::MetadataBatch { .. }
                         | HumanGovernanceResponse::Jobs { .. }
                         | HumanGovernanceResponse::State { .. }
@@ -529,6 +530,7 @@ impl App {
                         reason: Some("optimistic_conflict".into()),
                     },
                     HumanGovernanceResponse::StoredFields { .. }
+                    | HumanGovernanceResponse::RevisionPair { .. }
                     | HumanGovernanceResponse::MetadataBatch { .. }
                     | HumanGovernanceResponse::Jobs { .. }
                     | HumanGovernanceResponse::State { .. }

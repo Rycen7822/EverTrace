@@ -2721,6 +2721,13 @@ pub(crate) struct SourceFactsRef<'facts> {
 pub const READ_DEPENDENCY_LIMIT: usize = 4096;
 pub const READ_DEPENDENCY_BYTES: u64 = 64 * 1024 * 1024;
 
+#[derive(Default)]
+struct ReadDependencyBudget {
+    references: usize,
+    rows: usize,
+    bytes: u64,
+}
+
 /// Exact immutable root plus its finite authority inputs; no UI model or whole-library snapshot.
 #[derive(Debug, PartialEq)]
 pub struct StoredFieldsContext {
@@ -6026,6 +6033,54 @@ impl JournalAdmissionState {
         cancelled: &std::sync::atomic::AtomicBool,
         deadline: std::time::Instant,
     ) -> Result<evertrace_domain::query::MetadataReadOutcome<StoredFieldsContext>, StoreError> {
+        self.stored_fields_context_with_budget(
+            query,
+            state,
+            cancelled,
+            deadline,
+            &mut ReadDependencyBudget::default(),
+        )
+    }
+
+    pub(crate) fn stored_fields_pair_context(
+        &self,
+        query: &evertrace_domain::query::RevisionCompareQuery,
+        state: evertrace_domain::query::ObjectReadState,
+        cancelled: &std::sync::atomic::AtomicBool,
+        deadline: std::time::Instant,
+    ) -> Result<evertrace_domain::query::MetadataReadOutcome<Vec<StoredFieldsContext>>, StoreError>
+    {
+        use evertrace_domain::query::{ExactFieldsQuery, MetadataReadOutcome as Outcome};
+        query.validate().map_err(|_| StoreError::InvalidInput)?;
+        let mut budget = ReadDependencyBudget::default();
+        let mut sides = Vec::with_capacity(2);
+        for reference in [&query.left, &query.right] {
+            let exact = ExactFieldsQuery {
+                revision_ref: reference.revision_ref.clone(),
+            };
+            match self.stored_fields_context_with_budget(
+                &exact,
+                state.clone(),
+                cancelled,
+                deadline,
+                &mut budget,
+            )? {
+                Outcome::Page(context) => sides.push(*context),
+                Outcome::TooLarge => return Ok(Outcome::TooLarge),
+                Outcome::Conflict(frontier) => return Ok(Outcome::Conflict(frontier)),
+            }
+        }
+        Ok(Outcome::Page(Box::new(sides)))
+    }
+
+    fn stored_fields_context_with_budget(
+        &self,
+        query: &evertrace_domain::query::ExactFieldsQuery,
+        state: evertrace_domain::query::ObjectReadState,
+        cancelled: &std::sync::atomic::AtomicBool,
+        deadline: std::time::Instant,
+        budget: &mut ReadDependencyBudget,
+    ) -> Result<evertrace_domain::query::MetadataReadOutcome<StoredFieldsContext>, StoreError> {
         use evertrace_domain::query::MetadataReadOutcome as Outcome;
         if !query.validate() {
             return Err(StoreError::InvalidInput);
@@ -6070,11 +6125,12 @@ impl JournalAdmissionState {
         let mut pending = read_dependencies_for(&root, &payload);
         let mut visited = BTreeSet::new();
         let mut rows = BTreeMap::from([(root_id.clone(), root)]);
-        let mut bytes = rows
+        budget.rows += 1;
+        budget.bytes += rows
             .values()
             .map(|row| row.payload_json.as_ref().map_or(0, |v| v.len()) as u64)
             .sum::<u64>();
-        if bytes > READ_DEPENDENCY_BYTES {
+        if budget.rows > READ_DEPENDENCY_LIMIT || budget.bytes > READ_DEPENDENCY_BYTES {
             return Ok(Outcome::TooLarge);
         }
         while let Some(reference) = pending.pop_first() {
@@ -6086,8 +6142,9 @@ impl JournalAdmissionState {
             if !visited.insert(reference.clone()) {
                 continue;
             }
-            if visited.len() + pending.len() >= READ_DEPENDENCY_LIMIT
-                || bytes > READ_DEPENDENCY_BYTES
+            budget.references += 1;
+            if budget.references + pending.len() >= READ_DEPENDENCY_LIMIT
+                || budget.bytes > READ_DEPENDENCY_BYTES
             {
                 return Ok(Outcome::TooLarge);
             }
@@ -6102,8 +6159,9 @@ impl JournalAdmissionState {
                 )
                 .map_err(|_| StoreError::StoreCorrupt)?;
                 pending.extend(read_dependencies_for(&row, &payload));
-                bytes += row.payload_json.as_ref().map_or(0, |v| v.len()) as u64;
-                if rows.len() >= READ_DEPENDENCY_LIMIT || bytes > READ_DEPENDENCY_BYTES {
+                budget.rows += 1;
+                budget.bytes += row.payload_json.as_ref().map_or(0, |v| v.len()) as u64;
+                if budget.rows >= READ_DEPENDENCY_LIMIT || budget.bytes > READ_DEPENDENCY_BYTES {
                     return Ok(Outcome::TooLarge);
                 }
                 rows.insert(row.row_id.clone(), row);

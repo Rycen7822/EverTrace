@@ -494,7 +494,8 @@ class Backend:
         # inferred current job. The native Detail owner revalidates the record.
         return await self.detail(f"runtime:job:{job_id}", frontier, None, "system")
 
-    async def compare(self, query, frontier, after=None):
+    @staticmethod
+    def _comparison_query(query):
         if (
             not isinstance(query, dict)
             or set(query) != {"left", "right"}
@@ -509,15 +510,20 @@ class Backend:
             )
         ):
             raise BackendError("invalid_input")
-        return await self._request(
-            {
-                "kind": "compare_revisions",
-                "query": query,
-                "expected_frontier": frontier,
-                "after": after,
-                "limit": 8,
-            }
-        )
+        return query
+
+    async def read_pair(self, query):
+        result = await self._request({"kind": "read_revision_pair", "query": self._comparison_query(query)})
+        if result["kind"] != "revision_pair":
+            raise BackendError("invalid_read_response")
+        page = result["page"]
+        if page["query"] != query:
+            raise BackendError("invalid_read_response")
+        if page["left"]["state"]["effective_config_hash"] != self.config_hash:
+            raise BackendError("inactive_configuration")
+        if page["right"]["state"] != page["left"]["state"]:
+            raise BackendError("invalid_read_response")
+        return page
 
     async def sources(self, reference, frontier, revision, after=None):
         return await self._request(
@@ -649,6 +655,7 @@ class Backend:
                     "jobs",
                     "metadata_batch",
                     "stored_fields",
+                    "revision_pair",
                     "snapshot",
                     "memory_page",
                     "compiled_projections",

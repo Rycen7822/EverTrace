@@ -115,6 +115,7 @@ async fn send_human(
             | HumanReadRequest::Jobs { .. }
             | HumanReadRequest::ReadBatch { .. }
             | HumanReadRequest::ReadExact { .. }
+            | HumanReadRequest::ReadRevisionPair { .. }
             | HumanReadRequest::CompiledProjections { .. }
             | HumanReadRequest::Search { .. }
             | HumanReadRequest::CompareRevisions { .. }

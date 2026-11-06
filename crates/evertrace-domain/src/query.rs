@@ -2665,6 +2665,29 @@ impl ExactStoredFields {
     }
 }
 
+/// Two individually gated immutable values selected under one Native data binding; no field diff.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct RevisionPairFields {
+    pub query: RevisionCompareQuery,
+    pub object_kind: Option<HumanRevisionKind>,
+    pub left: ExactStoredFields,
+    pub right: ExactStoredFields,
+}
+
+impl RevisionPairFields {
+    pub fn validate(&self) -> bool {
+        self.query.validate().is_ok()
+            && self.left.validate()
+            && self.right.validate()
+            && self.left.state == self.right.state
+            && ((self.left.content_state == HumanContentState::Ready
+                && self.right.content_state == HumanContentState::Ready)
+                == self.object_kind.is_some())
+            && serde_json::to_vec(self).is_ok_and(|bytes| bytes.len() <= METADATA_REPLY_BYTES)
+    }
+}
+
 /// Closed metadata reads of current memory, work, review and job facts.
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
