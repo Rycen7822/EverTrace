@@ -2954,7 +2954,11 @@ pub(crate) async fn preflight_import_context(
     {
         job.state = JobStatus::Failed;
         job.lease_until_us = None;
-        job.terminal = Some(Box::new(JobTerminalAudit { outcome: JobTerminalOutcome::Failed, reason: JobTerminalReason::SourceUnavailable, result_ref: Some(format!("session_import:{}", current.source_key())) }));
+        job.terminal = Some(Box::new(JobTerminalAudit {
+            outcome: JobTerminalOutcome::Failed,
+            reason: JobTerminalReason::SourceUnavailable,
+            result_ref: Some(format!("session_import:{}", current.source_key())),
+        }));
         payloads.push(JournalPayload::JobState(job));
     }
     let command = command(
@@ -3139,35 +3143,15 @@ pub(crate) async fn blocked_source_rows(
     report: Option<&HostProbeReport>,
     snapshot: &evertrace_store::ProjectionSnapshot,
     rows: &[&evertrace_store::ObjectRow],
-    config_hash: [u8; 32],
 ) -> Result<std::collections::BTreeSet<String>, SessionImportServiceError> {
     if rows.len() > 64 {
         return Err(SessionImportServiceError::Unavailable);
     }
-    blocked_source_rows_before(writer, report, snapshot, rows, config_hash, None, None).await
-}
-
-/// Request-scoped batch entry: one borrowed projection index, one permission
-/// decision per source, and no deadline renewal for individual candidates.
-pub(crate) async fn blocked_source_rows_before(
-    writer: &WriterHandle,
-    report: Option<&HostProbeReport>,
-    snapshot: &evertrace_store::ProjectionSnapshot,
-    rows: &[&evertrace_store::ObjectRow],
-    config_hash: [u8; 32],
-    lookup: Option<&BTreeMap<&str, &evertrace_store::ObjectRow>>,
-    deadline: Option<Instant>,
-) -> Result<std::collections::BTreeSet<String>, SessionImportServiceError> {
-    blocked_source_rows_from_rows_before(
-        writer,
-        report,
-        &snapshot.rows,
-        rows,
-        config_hash,
-        lookup,
-        deadline,
+    Ok(
+        source_rows_read_assessment(writer, report, &snapshot.rows, rows, None, None)
+            .await?
+            .0,
     )
-    .await
 }
 
 /// Typed background admission for a bounded source observation cohort. Search
@@ -3352,7 +3336,7 @@ pub(crate) async fn blocked_source_instances(
     Ok(blocked)
 }
 
-async fn source_instance_read_assessment(
+pub(crate) async fn source_instance_read_assessment(
     writer: &WriterHandle,
     report: Option<&HostProbeReport>,
     sources: BTreeMap<String, String>,
@@ -4941,7 +4925,7 @@ mod tests {
             .await
             .unwrap();
         let snapshot = writer.project().await.unwrap();
-        let rows = blocked_source_rows(&writer, None, &snapshot, &[], [0; 32])
+        let rows = blocked_source_rows(&writer, None, &snapshot, &[])
             .await
             .unwrap();
         assert_eq!(typed, rows);

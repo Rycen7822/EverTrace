@@ -267,23 +267,6 @@ pub(crate) async fn repository_read_assessment(
 
 /// Current finite assets are read from protected CAS only after matching the
 /// original verified context and the repository's current restoration boundary.
-pub(crate) async fn read_inventory(
-    writer: &crate::WriterHandle,
-    bindings: &crate::McpBindingAuthority,
-    runtime: &evertrace_capture::RuntimeSnapshot,
-    fact: &evertrace_domain::inventory::CapabilityInventoryRecorded,
-) -> Result<Option<evertrace_domain::inventory::CapabilityInventorySnapshot>, crate::WriterActorError>
-{
-    read_inventory_before(
-        writer,
-        bindings,
-        runtime,
-        fact,
-        Instant::now() + Duration::from_millis(250),
-    )
-    .await
-}
-
 pub(crate) async fn read_inventory_before(
     writer: &crate::WriterHandle,
     bindings: &crate::McpBindingAuthority,
@@ -292,44 +275,81 @@ pub(crate) async fn read_inventory_before(
     deadline: Instant,
 ) -> Result<Option<evertrace_domain::inventory::CapabilityInventorySnapshot>, crate::WriterActorError>
 {
+    let assessment = assess_inventory_before(writer, bindings, runtime, fact, deadline).await?;
+    record_trust_revocations(writer, assessment.revoked, runtime.effective_config_hash).await?;
+    if assessment.stale {
+        bindings.inventory_context_stale(&fact.context);
+    }
+    Ok(assessment.snapshot)
+}
+
+/// Management reads enforce current authorization but do not observe or schedule.
+pub(crate) async fn inventory_read_assessment(
+    writer: &crate::WriterHandle,
+    bindings: &crate::McpBindingAuthority,
+    runtime: &evertrace_capture::RuntimeSnapshot,
+    fact: &evertrace_domain::inventory::CapabilityInventoryRecorded,
+    deadline: Instant,
+) -> Result<Option<evertrace_domain::inventory::CapabilityInventorySnapshot>, crate::WriterActorError>
+{
+    Ok(
+        assess_inventory_before(writer, bindings, runtime, fact, deadline)
+            .await?
+            .snapshot,
+    )
+}
+
+#[derive(Default)]
+struct InventoryReadAssessment {
+    snapshot: Option<evertrace_domain::inventory::CapabilityInventorySnapshot>,
+    revoked: Vec<evertrace_domain::repository::RepositoryInstance>,
+    stale: bool,
+}
+
+async fn assess_inventory_before(
+    writer: &crate::WriterHandle,
+    bindings: &crate::McpBindingAuthority,
+    runtime: &evertrace_capture::RuntimeSnapshot,
+    fact: &evertrace_domain::inventory::CapabilityInventoryRecorded,
+    deadline: Instant,
+) -> Result<InventoryReadAssessment, crate::WriterActorError> {
+    let mut assessment = InventoryReadAssessment::default();
     let context = writer.inventory_context(&fact.context, None).await?;
     let completion = context.post_restoration_completion();
     if completion.is_none_or(|current| current.job_id != fact.job_id) {
-        // Inspecting a historical fact must not repeatedly rescan a context
-        // that already has a valid newer completion. A closed user/revocation
-        // gate also waits for the explicit enable operation, not a read.
-        if completion.is_none()
+        // A historical fact must not rescan a newer completion. Closed user or
+        // revocation gates still wait for the explicit enable operation.
+        assessment.stale = completion.is_none()
             && context.repository.as_ref().is_some_and(|repository| {
                 repository_read_gate(repository, context.purge_pending_or_purged)
-            })
-        {
-            bindings.inventory_context_stale(&fact.context);
-        }
-        return Ok(None);
+            });
+        return Ok(assessment);
     }
-    let Some(host) =
-        inventory_read_gate(writer, bindings, runtime, &fact.context, deadline).await?
-    else {
-        return Ok(None);
+    let (host, revoked) =
+        inventory_read_assessment_gate(writer, bindings, &fact.context, deadline).await?;
+    assessment.revoked = revoked;
+    let Some(host) = host else {
+        return Ok(assessment);
     };
     let snapshot = read_inventory_snapshot(&runtime.cas_dir, fact)?;
     if !host.current_before(deadline)
         || !crate::jobs::inventory_snapshot_current(&snapshot, deadline)
     {
-        bindings.inventory_context_stale(&fact.context);
-        return Ok(None);
+        assessment.stale = true;
+        return Ok(assessment);
     }
-    if inventory_read_gate(writer, bindings, runtime, &fact.context, deadline)
-        .await?
-        .is_none()
-    {
-        return Ok(None);
+    let (host_after, revoked) =
+        inventory_read_assessment_gate(writer, bindings, &fact.context, deadline).await?;
+    assessment.revoked.extend(revoked);
+    if host_after.is_none() {
+        return Ok(assessment);
     }
     let final_context = writer.inventory_context(&fact.context, None).await?;
     if final_context.post_restoration_completion() != Some(fact) || !host.current_before(deadline) {
-        return Ok(None);
+        return Ok(assessment);
     }
-    Ok(Some(snapshot))
+    assessment.snapshot = Some(snapshot);
+    Ok(assessment)
 }
 
 // Live authorization only: old CAS must not trigger a second scan of current
@@ -341,6 +361,24 @@ async fn inventory_read_gate(
     context: &evertrace_domain::inventory::InventoryContext,
     deadline: Instant,
 ) -> Result<Option<std::sync::Arc<super::NativeHostContext>>, crate::WriterActorError> {
+    let (host, revoked) =
+        inventory_read_assessment_gate(writer, bindings, context, deadline).await?;
+    record_trust_revocations(writer, revoked, runtime.effective_config_hash).await?;
+    Ok(host)
+}
+
+async fn inventory_read_assessment_gate(
+    writer: &crate::WriterHandle,
+    bindings: &crate::McpBindingAuthority,
+    context: &evertrace_domain::inventory::InventoryContext,
+    deadline: Instant,
+) -> Result<
+    (
+        Option<std::sync::Arc<super::NativeHostContext>>,
+        Vec<evertrace_domain::repository::RepositoryInstance>,
+    ),
+    crate::WriterActorError,
+> {
     if Instant::now() >= deadline
         || writer
             .inventory_context(context, None)
@@ -348,7 +386,7 @@ async fn inventory_read_gate(
             .post_restoration_completion()
             .is_none()
     {
-        return Ok(None);
+        return Ok((None, Vec::new()));
     }
     let observed = bindings
         .active_inventory_contexts()
@@ -364,21 +402,17 @@ async fn inventory_read_gate(
                 && host.current_before(deadline)
         });
     let Some((host, report)) = observed else {
-        return Ok(None);
+        return Ok((None, Vec::new()));
     };
-    if !blocked_repositories_before(
+    let (blocked, revoked) = repository_read_assessment(
         writer,
         [context.repository_id].into_iter().collect(),
         Some(&report),
-        runtime.effective_config_hash,
         deadline,
     )
-    .await?
-    .is_empty()
-    {
-        return Ok(None);
-    }
-    Ok((Instant::now() < deadline).then_some(host))
+    .await?;
+    let host = (blocked.is_empty() && Instant::now() < deadline).then_some(host);
+    Ok((host, revoked))
 }
 
 /// Read an already committed session-time completion. Current authorization

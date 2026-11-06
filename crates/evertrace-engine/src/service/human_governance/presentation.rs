@@ -153,7 +153,7 @@ impl HumanGovernanceService {
                     );
                 }
             }
-            let blocked = crate::session_import::blocked_source_instances(
+            let (blocked, _) = crate::session_import::source_instance_read_assessment(
                 &self.writer,
                 report.as_ref(),
                 sources
@@ -161,7 +161,6 @@ impl HumanGovernanceService {
                     .map(|source| (current.selected.row_id.clone(), source.clone()))
                     .into_iter()
                     .collect(),
-                self.effective_config_hash,
                 None,
             )
             .await
@@ -173,11 +172,11 @@ impl HumanGovernanceService {
                 &selected_rows,
             )
             .map_err(|_| HumanGovernanceError::Store)?;
-            let selected_repositories = crate::repository::blocked_repositories(
+            let (selected_repositories, _) = crate::repository::repository_read_assessment(
                 &self.writer,
                 selected_scopes.values().flatten().copied().collect(),
                 report.as_ref(),
-                self.effective_config_hash,
+                std::time::Instant::now() + crate::repository::SESSION_ROOT_PROBE_BUDGET,
             )
             .await
             .map_err(|_| HumanGovernanceError::Store)?;
@@ -199,11 +198,10 @@ impl HumanGovernanceService {
                     Some(report) => report.read().await.clone(),
                     None => None,
                 };
-                let blocked = crate::session_import::blocked_source_instances(
+                let (blocked, _) = crate::session_import::source_instance_read_assessment(
                     &self.writer,
                     report.as_ref(),
                     sources,
-                    self.effective_config_hash,
                     None,
                 )
                 .await
@@ -219,11 +217,11 @@ impl HumanGovernanceService {
                     &rows,
                 )
                 .map_err(|_| HumanGovernanceError::Store)?;
-                let repositories = crate::repository::blocked_repositories(
+                let (repositories, _) = crate::repository::repository_read_assessment(
                     &self.writer,
                     scopes.values().flatten().copied().collect(),
                     report.as_ref(),
-                    self.effective_config_hash,
+                    std::time::Instant::now() + crate::repository::SESSION_ROOT_PROBE_BUDGET,
                 )
                 .await
                 .map_err(|_| HumanGovernanceError::Store)?;

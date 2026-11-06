@@ -789,10 +789,15 @@ impl HumanGovernanceService {
             else {
                 continue;
             };
-            if let Some(body) =
-                crate::repository::read_inventory(&self.writer, bindings, runtime, &fact)
-                    .await
-                    .map_err(|_| HumanGovernanceError::Store)?
+            if let Some(body) = crate::repository::inventory_read_assessment(
+                &self.writer,
+                bindings,
+                runtime,
+                &fact,
+                std::time::Instant::now() + crate::repository::SESSION_ROOT_PROBE_BUDGET,
+            )
+            .await
+            .map_err(|_| HumanGovernanceError::Store)?
             {
                 *state = "ready".into();
                 *source_count = Some(
@@ -876,18 +881,17 @@ impl HumanGovernanceService {
             report.as_ref(),
             snapshot,
             &rows,
-            self.effective_config_hash,
         )
         .await
         .map_err(|_| HumanGovernanceError::Store)?;
         let scopes = crate::repository::row_repository_contexts(snapshot, &rows)
             .map_err(|_| HumanGovernanceError::Store)?;
         let ids = scopes.values().flatten().copied().collect();
-        let repositories = crate::repository::blocked_repositories(
+        let (repositories, _) = crate::repository::repository_read_assessment(
             &self.writer,
             ids,
             report.as_ref(),
-            self.effective_config_hash,
+            std::time::Instant::now() + crate::repository::SESSION_ROOT_PROBE_BUDGET,
         )
         .await
         .map_err(|_| HumanGovernanceError::Store)?;

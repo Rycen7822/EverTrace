@@ -106,15 +106,11 @@ struct McpPinnedCwd {
     inventory_report: Option<Arc<evertrace_codex::HostProbeReport>>,
     inventory_session: Option<String>,
     inventory_pending: bool,
-    inventory_wakeup: bool,
 }
 
 impl McpPinnedCwd {
     fn request_inventory_rescan(&mut self) {
-        if !self.inventory_pending {
-            self.inventory_pending = true;
-            self.inventory_wakeup = true;
-        }
+        self.inventory_pending = true;
     }
 }
 
@@ -276,7 +272,6 @@ impl McpBindingAuthority {
                 inventory_report: None,
                 inventory_session: None,
                 inventory_pending: false,
-                inventory_wakeup: false,
             },
         );
         Ok(())
@@ -310,7 +305,6 @@ impl McpBindingAuthority {
         let entry = state.client_cwds.get_mut(connection_id)?;
         if cached != observed {
             entry.inventory_pending = observed.is_some();
-            entry.inventory_wakeup = observed.is_some();
         }
         entry.inventory_host = observed.clone();
         observed
@@ -338,7 +332,6 @@ impl McpBindingAuthority {
                         .and_then(|report| report.inventory_host())
             {
                 entry.inventory_pending = true;
-                entry.inventory_wakeup = true;
             }
             entry.inventory_session = session;
             entry.inventory_report = scope
@@ -383,26 +376,7 @@ impl McpBindingAuthority {
             && let Some(entry) = state.client_cwds.get_mut(connection)
         {
             entry.inventory_pending = false;
-            entry.inventory_wakeup = false;
         }
-    }
-
-    /// A read can discover a stale finite inventory without a journal write.
-    /// Consume each new request once for the existing scheduler wake channel.
-    /// Repeated pages cannot re-probe an unresolved pending context, and a
-    /// missing Host/report supplies no independently runnable work.
-    pub fn take_inventory_wakeup(&self) -> bool {
-        let Ok(mut state) = self.state.lock() else {
-            return false;
-        };
-        let mut wake = false;
-        for entry in state.client_cwds.values_mut() {
-            wake |= std::mem::take(&mut entry.inventory_wakeup)
-                && entry.inventory_pending
-                && entry.inventory_host.is_some()
-                && entry.inventory_report.is_some();
-        }
-        wake
     }
 
     pub(crate) fn inventory_context_stale(
@@ -605,33 +579,21 @@ mod tests {
     }
 
     #[test]
-    fn inventory_read_pending_reuses_wakeup_without_granting_authority() {
+    fn inventory_pending_needs_host_evidence_and_is_cleared_only_when_admitted() {
         let authority = new_authority();
         authority.pin_client_cwd("reader", "/workspace").unwrap();
-        assert!(!authority.take_inventory_wakeup());
-        // Only the scheduler notification state is exercised here. No Host
-        // observation, report, claim or inventory is fabricated by this test.
         {
             let mut state = authority.state.lock().unwrap();
             let entry = state.client_cwds.get_mut("reader").unwrap();
+            assert!(!entry.inventory_pending);
             entry.request_inventory_rescan();
-            assert!(entry.inventory_pending && entry.inventory_wakeup);
             entry.request_inventory_rescan();
-            assert!(entry.inventory_wakeup);
+            assert!(entry.inventory_pending);
         }
-        assert!(!authority.take_inventory_wakeup());
+        // Pending state never fabricates a runnable native context or authority.
         assert!(authority.pending_inventory_contexts(None, 1).is_empty());
-        {
-            let mut state = authority.state.lock().unwrap();
-            let entry = state.client_cwds.get_mut("reader").unwrap();
-            entry.request_inventory_rescan();
-            assert!(
-                !entry.inventory_wakeup,
-                "the same pending read is coalesced"
-            );
-        }
         authority.inventory_context_admitted("reader");
-        assert!(!authority.take_inventory_wakeup());
+        assert!(!authority.state.lock().unwrap().client_cwds["reader"].inventory_pending);
     }
 
     #[test]
