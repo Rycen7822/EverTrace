@@ -16,6 +16,7 @@ from uvicorn.protocols.http.h11_impl import H11Protocol
 
 from .backend import Backend, BackendError, _decode
 from .jobs import read_jobs
+from .memories import read_memories
 
 ROOT = Path(__file__).resolve().parent
 CSP = (
@@ -270,7 +271,7 @@ class App:
                 frontier = parse_frontier(payload.get("expected_frontier"), optional=True)
                 if not valid_ref(after, optional=True):
                     return JSONResponse({"error": "invalid_read"}, status_code=400)
-                result = await self.backend.memories(after, frontier, payload.get("query"))
+                result = await read_memories(self.backend, payload.get("query"), after, frontier)
                 if result["kind"] == "conflict":
                     data = {"conflict": True}
                 else:

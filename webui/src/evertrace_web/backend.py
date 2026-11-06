@@ -262,17 +262,6 @@ class Backend:
             "time_range": normalize_time_range(query.get("time_range")),
         }
 
-    async def memories(self, after=None, expected_frontier=None, query=None):
-        return await self._request(
-            {
-                "kind": "browse_memories",
-                "query": self._memory_query(query),
-                "expected_frontier": expected_frontier,
-                "after": after,
-                "limit": 32,
-            }
-        )
-
     async def read_exact(self, revision_ref):
         if not isinstance(revision_ref, str) or not revision_ref or len(revision_ref.encode()) > 2048:
             raise BackendError("invalid_input")

@@ -4,7 +4,8 @@
   'global_support_validation': '支持复核', 'procedure_negative_review': '负面证据复核',
   'procedure_state_event': '方法发布状态', 'work_binding': '工作归属', 'competing_attempt_group': '尝试采纳',
   'attempt': '中断尝试', 'execution_lane': '执行通道', 'capture_receipt': '捕获完整性',
-  'worktree_transition': '工作树沿袭', 'recovery_capture_request_revision': '恢复捕获'
+  'worktree_transition': '工作树沿袭', 'recovery_capture_request_revision': '恢复捕获',
+  'fact': '事实', 'constraint': '约束'
 } %}
 {% set origins = {
   'stored_value': '已有内容摘录', 'type_fallback': '类型提示', 'digest_deterministic': '确定性汇总',
@@ -16,7 +17,8 @@
   data-kind="{{ item.object_kind }}" data-object="{{ item.object_ref or '' }}"
   {% if surface is defined %}data-surface="{{ surface }}"{% endif %}>
   <div class="item-topline">
-    <span class="type-pill" title="{{ item.object_kind }}">{{ kinds.get(item.object_kind, item.object_kind) }}</span>
+    {% set display_kind = item.get("display_kind") or item.object_kind %}
+    <span class="type-pill" title="{{ item.object_kind }}">{{ kinds.get(display_kind, display_kind) }}</span>
     {% if item.epistemic %}<span class="badge">真值：{{ item.epistemic }}</span>{% endif %}
     {% if item.proposal %}<span class="badge">提案：{{ item.proposal.status }}</span>{% endif %}
   </div>
@@ -44,6 +46,9 @@
     ] if value %}{% if not loop.first %} · {% endif %}{{ label }}：{{ value }}{% endfor %}
   </div>
   {% endif %}
-  <p class="scope-ref">{{ item.scope_ref or '范围未提供；正文权限在展开时验证' }}</p>
+  <p class="scope-ref">{{ item.scope_ref or '范围未提供；不视为 global' }}</p>
+  {% if 'event_time_us' in item %}<p class="muted">
+    {% if item.event_time_us is not none %}事件时间：{{ item.event_time_us }} µs{% else %}事件时间未提供{% endif %}
+  </p>{% endif %}
 </button>
 {% else %}<div class="empty">{{ empty_message }}</div>{% endfor %}

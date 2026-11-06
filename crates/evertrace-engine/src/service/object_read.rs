@@ -254,10 +254,15 @@ impl EngineService {
         .map_err(|_| ErrorCode::StoreCorrupt)?;
         use evertrace_store::JournalPayload as P;
         let fields = match payload {
-            P::AtomRecorded(value) => serde_json::json!({"value": value.value}),
+            P::AtomRecorded(value) => {
+                serde_json::json!({"kind": value.kind, "scope": value.scope, "value": value.value})
+            }
             P::ProcedureRevisionRecorded(value) => serde_json::json!({"draft": value.draft}),
             P::RevisionProposalRecorded(value) => {
-                serde_json::json!({"payload": value.payload, "status": value.status})
+                serde_json::json!({
+                    "payload": value.payload, "status": value.status,
+                    "eligibility": value.eligibility, "operation": value.operation,
+                })
             }
             P::CoreMembershipRecorded(value) => {
                 serde_json::json!({"atom_revision_id": value.atom_revision_id, "active": value.active})
