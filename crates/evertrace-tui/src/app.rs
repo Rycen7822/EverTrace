@@ -495,7 +495,6 @@ impl App {
                         | HumanGovernanceResponse::RevisionComparison { .. }
                         | HumanGovernanceResponse::RevisionPage { .. }
                         | HumanGovernanceResponse::MemoryPage { .. }
-                        | HumanGovernanceResponse::MemoryOverview { .. }
                         | HumanGovernanceResponse::CompiledProjections { .. }
                         | HumanGovernanceResponse::Content { .. }
                         | HumanGovernanceResponse::ScopeDirectory { .. }
@@ -538,7 +537,6 @@ impl App {
                     | HumanGovernanceResponse::RevisionComparison { .. }
                     | HumanGovernanceResponse::RevisionPage { .. }
                     | HumanGovernanceResponse::MemoryPage { .. }
-                    | HumanGovernanceResponse::MemoryOverview { .. }
                     | HumanGovernanceResponse::CompiledProjections { .. }
                     | HumanGovernanceResponse::Content { .. }
                     | HumanGovernanceResponse::ScopeDirectory { .. }

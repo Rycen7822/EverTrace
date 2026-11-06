@@ -1,7 +1,5 @@
 mod compiled;
 pub use compiled::{HumanCompiledEntry, HumanCompiledPage};
-mod overview;
-pub use overview::HumanMemoryOverviewPage;
 
 use evertrace_domain::{
     evidence::IdentityStrength,
@@ -124,10 +122,6 @@ pub enum HumanReadRequest {
         expected_frontier: Option<u64>,
         after: Option<String>,
         limit: u16,
-    },
-    MemoryOverview {
-        query: evertrace_domain::query::MemoryOverviewQuery,
-        expected_frontier: Option<u64>,
     },
     Search {
         query: Box<evertrace_domain::query::HumanSearchQuery>,
@@ -981,9 +975,6 @@ pub enum HumanGovernanceResponse {
     CompiledProjections {
         page: Box<HumanCompiledPage>,
     },
-    MemoryOverview {
-        page: Box<HumanMemoryOverviewPage>,
-    },
     Search {
         page: Box<evertrace_domain::query::HumanSearchPage>,
     },
@@ -1088,7 +1079,6 @@ impl HumanReadRequest {
                         .as_ref()
                         .is_none_or(|v| !v.is_empty() && v.len() <= 4096)
             }
-            Self::MemoryOverview { query, .. } => query.validate().is_ok(),
             Self::Search { query } => query.validate().is_ok(),
             Self::CompareRevisions {
                 query,
@@ -1433,7 +1423,6 @@ impl HumanGovernanceResponse {
             Self::Jobs { page } => page.validate(),
             Self::State { state } => state.validate(),
             Self::CompiledProjections { page } => page.validate(),
-            Self::MemoryOverview { page } => page.validate(),
             Self::Search { page } => page.validate(),
             Self::RevisionComparison { comparison } => {
                 use evertrace_domain::query::{HumanComparedValue, RevisionCompareCursor};

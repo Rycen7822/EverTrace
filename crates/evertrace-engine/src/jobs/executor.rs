@@ -116,12 +116,6 @@ enum WriterRequest {
             Result<evertrace_store::projections::CompiledEntriesContext, WriterActorError>,
         >,
     },
-    MemoryOverview {
-        query: evertrace_domain::query::MemoryOverviewQuery,
-        reply: oneshot::Sender<
-            Result<evertrace_store::projections::MemoryOverviewContext, WriterActorError>,
-        >,
-    },
     ReadStoredFields {
         query: Box<evertrace_domain::query::ExactFieldsQuery>,
         cancelled: std::sync::Arc<std::sync::atomic::AtomicBool>,
@@ -787,21 +781,6 @@ impl WriterHandle {
                 query: query.clone(),
                 offset,
                 limit,
-                reply,
-            })
-            .await
-            .map_err(|_| WriterActorError::Stopped)?;
-        response.await.map_err(|_| WriterActorError::Stopped)?
-    }
-
-    pub(crate) async fn memory_overview_context(
-        &self,
-        query: &evertrace_domain::query::MemoryOverviewQuery,
-    ) -> Result<evertrace_store::projections::MemoryOverviewContext, WriterActorError> {
-        let (reply, response) = oneshot::channel();
-        self.sender
-            .send(WriterRequest::MemoryOverview {
-                query: query.clone(),
                 reply,
             })
             .await
@@ -1646,27 +1625,6 @@ async fn run_writer(
                         .as_ref()
                         .ok_or(WriterActorError::Stopped)?
                         .compiled_entries_context(&query, offset, limit)
-                        .await
-                        .map_err(map_store_error);
-                    let fatal = result
-                        .as_ref()
-                        .is_err_and(|error| *error != WriterActorError::InvalidInput);
-                    let _ = reply.send(result);
-                    if fatal {
-                        return Err(WriterActorError::Store);
-                    }
-                }
-                WriterRequest::MemoryOverview { query, reply } => {
-                    if reply.is_closed() {
-                        continue;
-                    }
-                    let result = writer
-                        .as_ref()
-                        .ok_or(WriterActorError::Stopped)?
-                        .memory_overview_context(
-                            &query,
-                            crate::procedure::inbox_negative_proof_limit(),
-                        )
                         .await
                         .map_err(map_store_error);
                     let fatal = result

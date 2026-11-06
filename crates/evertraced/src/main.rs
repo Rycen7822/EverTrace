@@ -886,7 +886,6 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
                         )
                         .with_session_report(Arc::clone(&session_catalog_report))
                         .with_inventory_bindings(mcp_bindings.clone())
-                        .with_summary_policy(&config_snapshot.config().llm)
                         .for_config(&config_snapshot)
                         .map_err(|_| ErrorCode::Internal)?;
                         let response = match command {
@@ -969,14 +968,6 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
                                         Ok(page) => HumanGovernanceResponse::CompiledProjections {
                                             page: Box::new(map_human_compiled(page)),
                                         },
-                                        Err(current_frontier) => HumanGovernanceResponse::Conflict {
-                                            current_revision_ref: None, current_frontier,
-                                        },
-                                    }
-                                }
-                                HumanReadRequest::MemoryOverview { query, expected_frontier } => {
-                                    match human_governance.memory_overview(query, expected_frontier).await.map_err(map_human_error)? {
-                                        Ok(page) => HumanGovernanceResponse::MemoryOverview { page: Box::new(map_human_overview(page)) },
                                         Err(current_frontier) => HumanGovernanceResponse::Conflict {
                                             current_revision_ref: None, current_frontier,
                                         },
@@ -1747,28 +1738,6 @@ fn map_human_compiled(
                 .collect(),
             next_cursor,
         },
-    }
-}
-
-fn map_human_overview(
-    page: evertrace_engine::HumanMemoryOverviewPage,
-) -> evertrace_protocol::dto::HumanMemoryOverviewPage {
-    evertrace_protocol::dto::HumanMemoryOverviewPage {
-        frontier: page.frontier,
-        observed_at_us: page.observed_at_us,
-        query: page.query,
-        scope_available: page.scope_available,
-        complete: page.complete,
-        summaries: map_human_items(page.summaries),
-        changes: map_human_items(page.changes),
-        unresolved: map_human_items(page.unresolved),
-        reviews: map_human_items(page.reviews),
-        summary_count: page.summary_count,
-        formal_count: page.formal_count,
-        loop_count: page.loop_count,
-        review_count: page.review_count,
-        review_reasons: page.review_reasons,
-        generation: page.generation,
     }
 }
 

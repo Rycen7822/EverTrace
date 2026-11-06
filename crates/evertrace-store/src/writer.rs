@@ -1835,59 +1835,6 @@ impl JournalWriter {
         .await
     }
 
-    pub async fn memory_overview_context(
-        &self,
-        query: &evertrace_domain::query::MemoryOverviewQuery,
-        proof_limit: usize,
-    ) -> Result<crate::projections::MemoryOverviewContext, StoreError> {
-        use evertrace_domain::query::MemoryReadingKind as Kind;
-        query.validate().map_err(|_| StoreError::InvalidInput)?;
-        self.validated_current_read(|state, stamp| {
-            let build = |mut times: Option<&mut crate::sqlite_state::JournalTimeReader<'_>>| {
-                let (summaries, facts, methods) = {
-                    let mut browse = |kind| {
-                        state.memory_browse_context(
-                            &query.browse(kind),
-                            None,
-                            usize::from(query.limit),
-                            stamp.has_failed_job,
-                            times.as_deref_mut(),
-                            None,
-                        )
-                    };
-                    (
-                        browse(Kind::Summaries)?,
-                        browse(Kind::FactsAndConstraints)?,
-                        browse(Kind::Methods)?,
-                    )
-                };
-                let reviews = state.memory_overview_review_context(
-                    query,
-                    proof_limit,
-                    stamp.has_failed_job,
-                    times.as_deref_mut(),
-                    None,
-                )?;
-                let work = state.memory_overview_work_context(query, times, None)?;
-                Ok(crate::projections::MemoryOverviewContext {
-                    frontier: summaries.page.frontier,
-                    summaries,
-                    facts,
-                    methods,
-                    reviews,
-                    work,
-                })
-            };
-            if query.time_range.is_some() {
-                self.lock_sqlite()?
-                    .with_memory_journal_times(|times| build(Some(times)))
-            } else {
-                build(None)
-            }
-        })
-        .await
-    }
-
     pub async fn capture_current_context(
         &self,
         after: Option<&str>,

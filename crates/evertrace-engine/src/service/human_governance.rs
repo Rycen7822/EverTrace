@@ -13,9 +13,7 @@ mod compiled;
 mod export;
 mod history;
 pub use compiled::{HumanCompiledEntry, HumanCompiledPage};
-mod overview;
 mod presentation;
-pub use overview::HumanMemoryOverviewPage;
 mod reading;
 mod scopes;
 mod searching;
@@ -658,7 +656,6 @@ pub struct HumanGovernanceService {
     writer: WriterHandle,
     effective_config_hash: [u8; 32],
     runtime_snapshot: Option<RuntimeSnapshot>,
-    summary_policy: Option<overview::SummaryPolicy>,
     global_promotion: GlobalPromotionConfig,
     session_report:
         Option<std::sync::Arc<tokio::sync::RwLock<Option<evertrace_codex::HostProbeReport>>>>,
@@ -935,7 +932,6 @@ impl HumanGovernanceService {
             writer,
             effective_config_hash,
             runtime_snapshot: None,
-            summary_policy: None,
             global_promotion: GlobalPromotionConfig::default(),
             session_report: None,
             inventory_bindings: None,
@@ -952,7 +948,6 @@ impl HumanGovernanceService {
             writer,
             effective_config_hash,
             runtime_snapshot: Some(runtime_snapshot),
-            summary_policy: None,
             global_promotion,
             session_report: None,
             inventory_bindings: None,

@@ -651,7 +651,6 @@ class Backend:
                     "stored_fields",
                     "snapshot",
                     "memory_page",
-                    "memory_overview",
                     "compiled_projections",
                     "revision_page",
                     "scope_directory",

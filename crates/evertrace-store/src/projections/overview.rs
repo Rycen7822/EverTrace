@@ -2,15 +2,6 @@
 use super::*;
 use evertrace_domain::query::{MemoryOverviewQuery, MemoryTimeBasis};
 
-pub struct MemoryOverviewContext {
-    pub frontier: u64,
-    pub summaries: memories::MemoryBrowseContext,
-    pub facts: memories::MemoryBrowseContext,
-    pub methods: memories::MemoryBrowseContext,
-    pub reviews: MemoryOverviewReviewContext,
-    pub work: MemoryOverviewWorkContext,
-}
-
 pub struct MemoryOverviewReviewContext {
     pub page: InboxCurrentContext,
     pub event_times: BTreeMap<u64, i64>,

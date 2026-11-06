@@ -3573,23 +3573,6 @@ pub struct MemoryOverviewQuery {
     pub limit: u16,
 }
 
-#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
-#[serde(rename_all = "snake_case")]
-pub enum OverviewCountBasis {
-    Exact,
-    LowerBound,
-    Unknown,
-}
-
-#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
-#[serde(rename_all = "snake_case")]
-pub enum OverviewCountUnit {
-    CurrentSummaryRevisions,
-    CurrentFormalRevisions,
-    OpenLoopEntries,
-    PendingReviewItems,
-}
-
 /// Current compiler output has provenance watermarks, never an asset revision.
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "snake_case")]
@@ -3743,45 +3726,6 @@ impl InboxReviewReason {
             Self::Recovery { .. } => "recovery_capture_request_revision",
         }
     }
-}
-
-#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
-#[serde(deny_unknown_fields)]
-pub struct MemoryOverviewCount {
-    pub count: Option<u64>,
-    pub basis: OverviewCountBasis,
-    pub unit: OverviewCountUnit,
-}
-
-#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
-#[serde(rename_all = "snake_case")]
-pub enum SummaryGenerationObservation {
-    NoInputs,
-    LlmDisabled,
-    EpisodeEnrichmentDisabled,
-    WorkInProgress,
-    LastAttemptBudgetExhausted,
-    LastAttemptProviderUnavailable,
-    NotRead,
-}
-
-#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
-#[serde(deny_unknown_fields)]
-pub struct SummaryGenerationRecord {
-    pub run_id: crate::ids::SemanticDerivationRunId,
-    pub episode_id: WorkEpisodeId,
-    pub input_revision_id: crate::revision::RevisionId,
-    pub status: crate::semantic::DerivationRunStatus,
-    pub created_at_us: i64,
-}
-
-#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
-#[serde(deny_unknown_fields)]
-pub struct MemoryOverviewGeneration {
-    pub observations: Vec<SummaryGenerationObservation>,
-    pub llm_enabled: Option<bool>,
-    pub episode_enrichment_enabled: Option<bool>,
-    pub last_run: Option<SummaryGenerationRecord>,
 }
 
 impl MemoryOverviewQuery {

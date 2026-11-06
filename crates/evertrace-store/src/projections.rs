@@ -92,7 +92,7 @@ pub use inventory::{
     inventory_job_context_ref, inventory_job_worktree, inventory_repository_target,
 };
 pub use memories::MemoryBrowseContext;
-pub use overview::{MemoryOverviewContext, MemoryOverviewRun, MemoryOverviewWorkContext};
+pub use overview::{MemoryOverviewRun, MemoryOverviewWorkContext};
 pub use recovery::{RecoveryCurrentState, RecoveryCurrentView};
 pub use segmentation::{
     EpisodeCurrentView, OperationBurstCurrentView, SegmentationCurrentState,
