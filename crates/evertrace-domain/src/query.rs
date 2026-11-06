@@ -3900,9 +3900,6 @@ pub enum HumanContentState {
     Unavailable,
 }
 
-pub const HUMAN_COMPARE_LIMIT: u16 = 32;
-pub const HUMAN_COMPARE_VALUE_BYTES: usize = 2048;
-
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct HumanRevisionRef {
@@ -3933,100 +3930,6 @@ impl RevisionCompareQuery {
     }
 }
 
-#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
-#[serde(deny_unknown_fields)]
-pub struct RevisionCompareCursor {
-    pub frontier: u64,
-    pub query: RevisionCompareQuery,
-    pub after_path: String,
-}
-
-impl RevisionCompareCursor {
-    pub fn validate_for(
-        &self,
-        query: &RevisionCompareQuery,
-        frontier: u64,
-    ) -> Result<(), QueryError> {
-        query.validate()?;
-        if self.query == *query && self.frontier == frontier && compare_path(&self.after_path) {
-            Ok(())
-        } else {
-            Err(QueryError::Invalid)
-        }
-    }
-}
-
-fn compare_path(value: &str) -> bool {
-    if !value.starts_with('/') || value.len() > 1024 || value.chars().any(char::is_control) {
-        return false;
-    }
-    let mut bytes = value.bytes();
-    while let Some(byte) = bytes.next() {
-        if byte == b'~' && !matches!(bytes.next(), Some(b'0' | b'1')) {
-            return false;
-        }
-    }
-    true
-}
-
-/// Absent differs from an existing JSON null; oversized fields never masquerade
-/// as empty values. Full values remain available through exact content ranges.
-#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
-#[serde(tag = "state", rename_all = "snake_case", deny_unknown_fields)]
-pub enum HumanComparedValue {
-    Absent,
-    Ready { json: String },
-    TooLarge { original_bytes: u64 },
-}
-
-impl HumanComparedValue {
-    fn validate(&self) -> bool {
-        match self {
-            Self::Absent => true,
-            Self::Ready { json } => !json.is_empty() && json.len() <= HUMAN_COMPARE_VALUE_BYTES,
-            Self::TooLarge { original_bytes } => *original_bytes > HUMAN_COMPARE_VALUE_BYTES as u64,
-        }
-    }
-}
-
-#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
-#[serde(rename_all = "snake_case")]
-pub enum HumanFieldChangeKind {
-    Added,
-    Removed,
-    Modified,
-}
-
-#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
-#[serde(deny_unknown_fields)]
-pub struct HumanFieldChange {
-    pub path: String,
-    pub change: HumanFieldChangeKind,
-    pub left: HumanComparedValue,
-    pub right: HumanComparedValue,
-}
-
-impl HumanFieldChange {
-    fn validate(&self) -> bool {
-        use HumanComparedValue::{Absent, Ready};
-        compare_path(&self.path)
-            && self.left.validate()
-            && self.right.validate()
-            && match (&self.left, &self.right, self.change) {
-                (Absent, Absent, _) => false,
-                (Absent, _, HumanFieldChangeKind::Added) => true,
-                (_, Absent, HumanFieldChangeKind::Removed) => true,
-                (Ready { json: left }, Ready { json: right }, HumanFieldChangeKind::Modified) => {
-                    left != right
-                }
-                (left, right, HumanFieldChangeKind::Modified) => {
-                    !matches!(left, Absent) && !matches!(right, Absent)
-                }
-                _ => false,
-            }
-    }
-}
-
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum HumanRevisionKind {
@@ -4035,66 +3938,6 @@ pub enum HumanRevisionKind {
     CoreMembership,
     Proposal,
     Digest,
-}
-
-#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
-#[serde(rename_all = "snake_case")]
-pub enum HumanComparisonStatus {
-    Ready,
-    SideUnavailable,
-    BudgetExhausted,
-}
-
-#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
-#[serde(deny_unknown_fields)]
-pub struct HumanRevisionComparison {
-    pub frontier: u64,
-    pub query: RevisionCompareQuery,
-    pub object_kind: Option<HumanRevisionKind>,
-    pub status: HumanComparisonStatus,
-    pub left_state: HumanContentState,
-    pub right_state: HumanContentState,
-    pub fields: Vec<HumanFieldChange>,
-    pub changed_fields: Option<u64>,
-    pub next_cursor: Option<String>,
-}
-
-impl HumanRevisionComparison {
-    pub fn validate(&self) -> bool {
-        let ready = self.left_state == HumanContentState::Ready
-            && self.right_state == HumanContentState::Ready;
-        if self.query.validate().is_err() || self.fields.len() > usize::from(HUMAN_COMPARE_LIMIT) {
-            return false;
-        }
-        if self.status != HumanComparisonStatus::Ready {
-            return self.fields.is_empty()
-                && self.changed_fields.is_none()
-                && self.next_cursor.is_none()
-                && match self.status {
-                    HumanComparisonStatus::SideUnavailable => !ready,
-                    HumanComparisonStatus::BudgetExhausted => ready && self.object_kind.is_some(),
-                    HumanComparisonStatus::Ready => false,
-                };
-        }
-        ready
-            && self.object_kind.is_some()
-            && self
-                .changed_fields
-                .is_some_and(|count| count >= self.fields.len() as u64)
-            && self.fields.iter().all(HumanFieldChange::validate)
-            && self
-                .fields
-                .windows(2)
-                .all(|pair| pair[0].path < pair[1].path)
-            && self.next_cursor.as_ref().is_none_or(|raw| {
-                raw.len() <= 8192
-                    && !raw.is_empty()
-                    && !self.fields.is_empty()
-                    && self
-                        .changed_fields
-                        .is_some_and(|count| count > self.fields.len() as u64)
-            })
-    }
 }
 
 /// Request-local body representation; never a CAS path or generic RPC selector.

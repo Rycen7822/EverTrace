@@ -493,7 +493,6 @@ impl App {
                         | HumanGovernanceResponse::State { .. }
                         | HumanGovernanceResponse::Action { .. }
                         | HumanGovernanceResponse::Search { .. }
-                        | HumanGovernanceResponse::RevisionComparison { .. }
                         | HumanGovernanceResponse::RevisionPage { .. }
                         | HumanGovernanceResponse::MemoryPage { .. }
                         | HumanGovernanceResponse::CompiledProjections { .. }
@@ -536,7 +535,6 @@ impl App {
                     | HumanGovernanceResponse::State { .. }
                     | HumanGovernanceResponse::Snapshot { .. }
                     | HumanGovernanceResponse::Search { .. }
-                    | HumanGovernanceResponse::RevisionComparison { .. }
                     | HumanGovernanceResponse::RevisionPage { .. }
                     | HumanGovernanceResponse::MemoryPage { .. }
                     | HumanGovernanceResponse::CompiledProjections { .. }

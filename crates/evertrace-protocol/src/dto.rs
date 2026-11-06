@@ -129,12 +129,6 @@ pub enum HumanReadRequest {
     Search {
         query: Box<evertrace_domain::query::HumanSearchQuery>,
     },
-    CompareRevisions {
-        query: evertrace_domain::query::RevisionCompareQuery,
-        expected_frontier: u64,
-        after: Option<String>,
-        limit: u16,
-    },
     SourceArchive {
         query: evertrace_domain::source::SourceArchiveQuery,
         expected_frontier: Option<u64>,
@@ -984,9 +978,6 @@ pub enum HumanGovernanceResponse {
     Search {
         page: Box<evertrace_domain::query::HumanSearchPage>,
     },
-    RevisionComparison {
-        comparison: Box<evertrace_domain::query::HumanRevisionComparison>,
-    },
     SourceArchive {
         page: Box<evertrace_domain::source::SourceArchivePage>,
     },
@@ -1087,22 +1078,6 @@ impl HumanReadRequest {
                         .is_none_or(|v| !v.is_empty() && v.len() <= 4096)
             }
             Self::Search { query } => query.validate().is_ok(),
-            Self::CompareRevisions {
-                query,
-                expected_frontier,
-                after,
-                limit,
-            } => {
-                query.validate().is_ok()
-                    && (1..=evertrace_domain::query::HUMAN_COMPARE_LIMIT).contains(limit)
-                    && after.as_ref().is_none_or(|raw| {
-                        raw.len() <= 8192
-                        && serde_json::from_str::<evertrace_domain::query::RevisionCompareCursor>(
-                            raw,
-                        )
-                        .is_ok_and(|cursor| cursor.validate_for(query, *expected_frontier).is_ok())
-                    })
-            }
             Self::SourceArchive {
                 query,
                 expected_frontier,
@@ -1432,36 +1407,6 @@ impl HumanGovernanceResponse {
             Self::State { state } => state.validate(),
             Self::CompiledProjections { page } => page.validate(),
             Self::Search { page } => page.validate(),
-            Self::RevisionComparison { comparison } => {
-                use evertrace_domain::query::{HumanComparedValue, RevisionCompareCursor};
-                comparison.validate()
-                    && comparison.fields.iter().all(|field| {
-                        [&field.left, &field.right]
-                            .into_iter()
-                            .all(|value| match value {
-                                HumanComparedValue::Ready { json } => {
-                                    serde_json::from_str::<serde_json::Value>(json).is_ok_and(
-                                        |value| {
-                                            serde_json::to_string(&value)
-                                                .is_ok_and(|canonical| canonical == *json)
-                                        },
-                                    )
-                                }
-                                _ => true,
-                            })
-                    })
-                    && comparison.next_cursor.as_ref().is_none_or(|raw| {
-                        serde_json::from_str::<RevisionCompareCursor>(raw).is_ok_and(|cursor| {
-                            cursor
-                                .validate_for(&comparison.query, comparison.frontier)
-                                .is_ok()
-                                && comparison
-                                    .fields
-                                    .last()
-                                    .is_some_and(|last| last.path == cursor.after_path)
-                        })
-                    })
-            }
             Self::SourceArchive { page } => {
                 use evertrace_domain::source::*;
                 let shape = match (&page.query, &page.entries) {

@@ -664,7 +664,6 @@ class Backend:
                     "source_catalog",
                     "source_archive",
                     "content",
-                    "revision_comparison",
                     "conflict",
                 ):
                     raise BackendError("invalid_read_response")

@@ -5,7 +5,6 @@ pub use crate::semantic::human_acceptance::{
     HumanActionOutcome, HumanGovernanceError, HumanProposalDecision,
 };
 
-mod comparison;
 mod content;
 mod diagnostics;
 pub use content::HumanContentChunk;
