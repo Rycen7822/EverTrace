@@ -847,6 +847,18 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
                                 state: Box::new(state),
                             }));
                         }
+                        if let HumanGovernanceRequest::Read { request: HumanReadRequest::Jobs { query } } = &command {
+                            let page = EngineService::read_jobs(writer.clone(), query.clone(), config_snapshot.hash())
+                                .await.map_err(|_| ErrorCode::Internal)?;
+                            use evertrace_protocol::dto::JobsReadOutcome;
+                            return Ok(Response::HumanGovernance(match page {
+                                JobsReadOutcome::Page(page) => HumanGovernanceResponse::Jobs { page },
+                                JobsReadOutcome::Conflict(frontier) => HumanGovernanceResponse::Conflict {
+                                    current_frontier: frontier, current_revision_ref: None,
+                                },
+                                JobsReadOutcome::TooLarge => return Err(ErrorCode::ResourceExhausted),
+                            }));
+                        }
                         let human_governance = HumanGovernanceService::with_acceptance(
                             writer,
                             runtime_snapshot.effective_config_hash,
@@ -884,7 +896,7 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
                             }
                             HumanGovernanceRequest::Read { request } => match request {
                                 // Kernel reads are dispatched before constructing the facade.
-                                HumanReadRequest::State => return Err(ErrorCode::Internal),
+                                HumanReadRequest::State | HumanReadRequest::Jobs { .. } => return Err(ErrorCode::Internal),
                                 HumanReadRequest::Search {query} => {
                                     let page = human_governance.search(query).await.map_err(map_human_error)?;
                                     HumanGovernanceResponse::Search {page: Box::new(page)}

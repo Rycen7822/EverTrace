@@ -1522,6 +1522,44 @@ impl JournalWriter {
         .await
     }
 
+    /// Borrow only canonical job facts. No projection synchronization or System diagnostics.
+    pub fn read_jobs(
+        &self,
+        query: &evertrace_domain::query::JobsReadQuery,
+        cancelled: &std::sync::atomic::AtomicBool,
+        effective_config_hash: [u8; 32],
+    ) -> Result<evertrace_domain::query::JobsReadOutcome, StoreError> {
+        if cancelled.load(std::sync::atomic::Ordering::SeqCst) {
+            return Err(StoreError::Io);
+        }
+        self._lock.validate_held()?;
+        // The single writer already owns this map; do not reacquire its reader fence or SQL permits.
+        let (before, (database_device, database_inode)) = {
+            let mut physical = self.lock_sqlite()?;
+            (physical.stamp()?, physical.file_identity())
+        };
+        if before.frontier != self.frontier() {
+            return Err(StoreError::StoreCorrupt);
+        }
+        let state = evertrace_domain::query::ObjectReadState {
+            frontier: before.frontier,
+            data_identity: evertrace_domain::query::ReadDataIdentity {
+                database_device,
+                database_inode,
+                incarnation: before.incarnation,
+            },
+            effective_config_hash: evertrace_domain::evidence::hex(&effective_config_hash),
+        };
+        let result = self.admission_state.read_jobs(query, state, cancelled)?;
+        if self.physical_stamp()? != before {
+            return Err(StoreError::StoreCorrupt);
+        }
+        if cancelled.load(std::sync::atomic::Ordering::SeqCst) {
+            return Err(StoreError::Io);
+        }
+        Ok(result)
+    }
+
     pub async fn memory_browse_context(
         &self,
         query: &evertrace_domain::query::MemoryBrowseQuery,

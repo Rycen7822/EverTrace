@@ -165,6 +165,52 @@ class Backend:
             raise BackendError("inactive_configuration")
         return state
 
+    async def jobs(self, query=None):
+        query = {} if query is None else query
+        keys = {"expected_frontier", "expected_data_identity", "after", "job_id", "limit"}
+        if not isinstance(query, dict) or set(query) - keys:
+            raise BackendError("invalid_input")
+        frontier = query.get("expected_frontier")
+        if frontier is not None and (type(frontier) is not int or not 0 <= frontier < 2**64):
+            raise BackendError("invalid_input")
+        identity = query.get("expected_data_identity")
+        if identity is not None:
+            names = ("database_device", "database_inode", "incarnation")
+            if not isinstance(identity, dict) or set(identity) != set(names):
+                raise BackendError("invalid_input")
+            if any(type(identity[name]) is not int or not 0 <= identity[name] < 2**64 for name in names):
+                raise BackendError("invalid_input")
+            identity = {name: identity[name] for name in names}
+        after, selected = query.get("after"), query.get("job_id")
+        for value in (after, selected):
+            if value is not None:
+                try:
+                    parsed = uuid.UUID(value)
+                except (TypeError, ValueError, AttributeError) as error:
+                    raise BackendError("invalid_input") from error
+                if str(parsed) != value or parsed.version != 7 or parsed.variant != uuid.RFC_4122:
+                    raise BackendError("invalid_input")
+        limit = query.get("limit", 1 if selected else 32)
+        if type(limit) is not int or not 1 <= limit <= 64:
+            raise BackendError("invalid_input")
+        result = await self._request({
+            "kind": "jobs",
+            "query": {
+                "expected_frontier": frontier,
+                "expected_data_identity": identity,
+                "after": after,
+                "job_id": selected,
+                "limit": limit,
+            },
+        })
+        if result["kind"] == "conflict":
+            return result
+        if result["kind"] != "jobs":
+            raise BackendError("invalid_read_response")
+        if result["page"]["state"]["effective_config_hash"] != self.config_hash:
+            raise BackendError("inactive_configuration")
+        return result
+
     async def memories(self, after=None, expected_frontier=None, query=None):
         # Closed wire spellings/defaults, not policy: Rust owns axis combinations,
         # visibility, filtering and counts. Reject malformed enum JSON here rather
@@ -549,6 +595,7 @@ class Backend:
                 result = response["human_governance"]
                 if result.get("kind") not in (
                     "state",
+                    "jobs",
                     "snapshot",
                     "memory_page",
                     "memory_overview",

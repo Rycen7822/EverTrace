@@ -103,14 +103,54 @@ class App:
     async def __call__(self, scope, receive, send):
         if scope["type"] != "http":
             return
-        request = Request(scope, receive)
+        messages = asyncio.Queue(maxsize=1)
+        disconnected = asyncio.Event()
+        started = False
+
+        async def incoming():
+            while True:
+                message = await receive()
+                if message["type"] == "http.disconnect":
+                    disconnected.set()
+                    return
+                await messages.put(message)
+
+        async def sending(message):
+            nonlocal started
+            if message["type"] == "http.response.start":
+                started = True
+            await send(message)
+
+        async def respond():
+            request = Request(scope, receive=messages.get)
+            try:
+                response = await self.handle(request)
+            except (ValueError, TypeError, KeyError, BackendError, ClientDisconnect):
+                response = JSONResponse({"error": "invalid_request"}, status_code=400)
+            for key, value in SECURITY.items():
+                response.headers[key] = value
+            await response(scope, messages.get, sending)
+
+        reader = asyncio.create_task(incoming())
+        operation = asyncio.create_task(respond())
+        peer = asyncio.create_task(disconnected.wait())
+        expired = False
         try:
-            response = await self.handle(request)
-        except (ValueError, TypeError, KeyError, BackendError, ClientDisconnect):
-            response = JSONResponse({"error": "invalid_request"}, status_code=400)
-        for key, value in SECURITY.items():
-            response.headers[key] = value
-        await response(scope, receive, send)
+            async with asyncio.timeout(5):
+                done, _ = await asyncio.wait((operation, reader, peer), return_when=asyncio.FIRST_COMPLETED)
+                if operation in done:
+                    await operation
+                elif reader in done:
+                    reader.result()
+        except TimeoutError:
+            expired = True
+        finally:
+            for task in (operation, reader, peer):
+                task.cancel()
+            await asyncio.gather(operation, reader, peer, return_exceptions=True)
+        if expired and not started:
+            response = JSONResponse({"error": "read_deadline"}, status_code=504, headers=SECURITY)
+            await response(scope, receive, send)
 
     async def handle(self, request):
         raw = request.scope["headers"]

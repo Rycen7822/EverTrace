@@ -8,8 +8,8 @@ use thiserror::Error;
 use crate::{
     evidence::EvidenceSurface,
     ids::{
-        AnyPublicId, ExecutionLaneId, OperationId, RepositoryId, SourceObservationId, TaskId,
-        WorkEpisodeId, WorkstreamId, WorktreeId,
+        AnyPublicId, ExecutionLaneId, JobId, OperationId, RepositoryId, SourceObservationId,
+        TaskId, WorkEpisodeId, WorkstreamId, WorktreeId,
     },
     revision::RevisionId,
     semantic::SemanticResolution,
@@ -2539,6 +2539,68 @@ pub struct ObjectReadState {
     pub frontier: u64,
     pub data_identity: ReadDataIdentity,
     pub effective_config_hash: String,
+}
+
+pub const METADATA_READ_LIMIT: u16 = 64;
+pub const METADATA_REPLY_BYTES: usize = 256 * 1024;
+
+impl ObjectReadState {
+    pub fn validate(&self) -> bool {
+        self.effective_config_hash.len() == 64
+            && self
+                .effective_config_hash
+                .bytes()
+                .all(|byte| byte.is_ascii_hexdigit() && !byte.is_ascii_uppercase())
+    }
+}
+
+/// Only stored job metadata. Selection never admits or starts a job.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct JobsReadQuery {
+    pub expected_frontier: Option<u64>,
+    pub expected_data_identity: Option<ReadDataIdentity>,
+    pub after: Option<JobId>,
+    pub job_id: Option<JobId>,
+    pub limit: u16,
+}
+
+impl JobsReadQuery {
+    pub fn validate(&self) -> bool {
+        (1..=METADATA_READ_LIMIT).contains(&self.limit)
+            && (self.after.is_none()
+                || (self.expected_frontier.is_some() && self.expected_data_identity.is_some()))
+            && (self.job_id.is_none() || (self.after.is_none() && self.limit == 1))
+    }
+}
+
+/// Canonical stored job values, not a System page or a display model.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct ObjectReadJobs {
+    pub state: ObjectReadState,
+    /// Exact stored-job count for this selection at the returned frontier, not body readability.
+    pub record_count: u64,
+    pub records: Vec<serde_json::Value>,
+    pub next_cursor: Option<JobId>,
+}
+
+/// Native outcome before encoding the existing read response or typed wire error.
+#[derive(Debug)]
+pub enum JobsReadOutcome {
+    Page(Box<ObjectReadJobs>),
+    Conflict(u64),
+    TooLarge,
+}
+
+impl ObjectReadJobs {
+    pub fn validate(&self) -> bool {
+        self.state.validate()
+            && self.records.len() <= usize::from(METADATA_READ_LIMIT)
+            && self.record_count >= self.records.len() as u64
+            && self.records.iter().all(serde_json::Value::is_object)
+            && serde_json::to_vec(self).is_ok_and(|bytes| bytes.len() <= METADATA_REPLY_BYTES)
+    }
 }
 
 /// Literal search plus explicitly supplied typed intent. No access grants,

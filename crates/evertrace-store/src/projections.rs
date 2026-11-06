@@ -4608,6 +4608,70 @@ fn source_observation_s11_candidate_ids(
 }
 
 impl JournalAdmissionState {
+    pub(crate) fn read_jobs(
+        &self,
+        query: &evertrace_domain::query::JobsReadQuery,
+        state: evertrace_domain::query::ObjectReadState,
+        cancelled: &std::sync::atomic::AtomicBool,
+    ) -> Result<evertrace_domain::query::JobsReadOutcome, StoreError> {
+        use evertrace_domain::query::{JobsReadOutcome, METADATA_REPLY_BYTES, ObjectReadJobs};
+        use std::sync::atomic::Ordering;
+        if !query.validate() {
+            return Err(StoreError::InvalidInput);
+        }
+        if query
+            .expected_frontier
+            .is_some_and(|frontier| frontier != state.frontier)
+            || query
+                .expected_data_identity
+                .as_ref()
+                .is_some_and(|identity| *identity != state.data_identity)
+        {
+            return Ok(JobsReadOutcome::Conflict(state.frontier));
+        }
+        let mut page = ObjectReadJobs {
+            state,
+            record_count: query.job_id.map_or(self.jobs.len() as u64, |id| {
+                u64::from(self.jobs.contains_key(&id))
+            }),
+            records: Vec::new(),
+            next_cursor: None,
+        };
+        let mut last = None;
+        let mut bytes = 0;
+        use std::ops::Bound::{Excluded, Included, Unbounded};
+        let lower = query
+            .job_id
+            .map(Included)
+            .unwrap_or_else(|| query.after.map(Excluded).unwrap_or(Unbounded));
+        let upper = query.job_id.map(Included).unwrap_or(Unbounded);
+        for (id, job) in self.jobs.range((lower, upper)) {
+            if cancelled.load(Ordering::SeqCst) {
+                return Err(StoreError::Io);
+            }
+            if page.records.len() == usize::from(query.limit) {
+                page.next_cursor = last;
+                break;
+            }
+            let record = serde_json::to_value(job).map_err(|_| StoreError::Serialization)?;
+            bytes += serde_json::to_vec(&record)
+                .map_err(|_| StoreError::Serialization)?
+                .len();
+            if bytes > METADATA_REPLY_BYTES {
+                return Ok(JobsReadOutcome::TooLarge);
+            }
+            page.records.push(record);
+            last = Some(*id);
+        }
+        if cancelled.load(Ordering::SeqCst) {
+            return Err(StoreError::Io);
+        }
+        if !page.validate() {
+            return Ok(JobsReadOutcome::TooLarge);
+        }
+        Ok(JobsReadOutcome::Page(Box::new(page)))
+    }
+
     pub(crate) fn committed_frontier(&self) -> u64 {
         self.frontier
     }

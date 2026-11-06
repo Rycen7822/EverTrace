@@ -486,7 +486,8 @@ impl App {
                     }
                     (
                         _,
-                        HumanGovernanceResponse::State { .. }
+                        HumanGovernanceResponse::Jobs { .. }
+                        | HumanGovernanceResponse::State { .. }
                         | HumanGovernanceResponse::Action { .. }
                         | HumanGovernanceResponse::Search { .. }
                         | HumanGovernanceResponse::RevisionComparison { .. }
@@ -526,7 +527,8 @@ impl App {
                         audit_event_ref: None,
                         reason: Some("optimistic_conflict".into()),
                     },
-                    HumanGovernanceResponse::State { .. }
+                    HumanGovernanceResponse::Jobs { .. }
+                    | HumanGovernanceResponse::State { .. }
                     | HumanGovernanceResponse::Snapshot { .. }
                     | HumanGovernanceResponse::Search { .. }
                     | HumanGovernanceResponse::RevisionComparison { .. }

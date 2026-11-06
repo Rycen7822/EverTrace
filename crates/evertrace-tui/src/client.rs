@@ -112,6 +112,7 @@ async fn send_human(
         HumanGovernanceRequest::Export { .. } => PendingKind::Export,
         HumanGovernanceRequest::Read { request } => match request {
             HumanReadRequest::State
+            | HumanReadRequest::Jobs { .. }
             | HumanReadRequest::CompiledProjections { .. }
             | HumanReadRequest::MemoryOverview { .. }
             | HumanReadRequest::Search { .. }

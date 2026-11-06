@@ -122,6 +122,12 @@ enum WriterRequest {
             Result<evertrace_store::projections::MemoryOverviewContext, WriterActorError>,
         >,
     },
+    ReadJobs {
+        query: Box<evertrace_domain::query::JobsReadQuery>,
+        cancelled: std::sync::Arc<std::sync::atomic::AtomicBool>,
+        config_hash: [u8; 32],
+        reply: oneshot::Sender<Result<evertrace_domain::query::JobsReadOutcome, WriterActorError>>,
+    },
     MemoryBrowse {
         query: evertrace_domain::query::MemoryBrowseQuery,
         after: Option<evertrace_domain::query::MemoryBrowseCursor>,
@@ -762,6 +768,25 @@ impl WriterHandle {
         self.sender
             .send(WriterRequest::MemoryOverview {
                 query: query.clone(),
+                reply,
+            })
+            .await
+            .map_err(|_| WriterActorError::Stopped)?;
+        response.await.map_err(|_| WriterActorError::Stopped)?
+    }
+
+    pub(crate) async fn read_jobs(
+        &self,
+        query: Box<evertrace_domain::query::JobsReadQuery>,
+        cancelled: std::sync::Arc<std::sync::atomic::AtomicBool>,
+        config_hash: [u8; 32],
+    ) -> Result<evertrace_domain::query::JobsReadOutcome, WriterActorError> {
+        let (reply, response) = oneshot::channel();
+        self.sender
+            .send(WriterRequest::ReadJobs {
+                query,
+                cancelled,
+                config_hash,
                 reply,
             })
             .await
@@ -1566,6 +1591,25 @@ async fn run_writer(
                     if fatal {
                         return Err(WriterActorError::Store);
                     }
+                }
+                WriterRequest::ReadJobs {
+                    query,
+                    cancelled,
+                    config_hash,
+                    reply,
+                } => {
+                    if reply.is_closed() {
+                        continue;
+                    }
+                    // Read cancellation/budget failures cannot terminate the single writer.
+                    // Every subsequent native read/write still performs its own binding checks.
+                    let result = match writer.as_ref() {
+                        Some(writer) => writer
+                            .read_jobs(&query, &cancelled, config_hash)
+                            .map_err(map_store_error),
+                        None => Err(WriterActorError::Stopped),
+                    };
+                    let _ = reply.send(result);
                 }
                 WriterRequest::MemoryBrowse {
                     query,

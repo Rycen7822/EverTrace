@@ -33,6 +33,8 @@ use evertrace_domain::{
 };
 use serde::{Deserialize, Serialize};
 
+pub use evertrace_domain::query::JobsReadOutcome;
+
 pub const PROTOCOL_VERSION: u32 = 1;
 pub const MAX_FRAME_SIZE: usize = 1_048_576;
 pub fn proposal_payload_pretty_document(
@@ -108,6 +110,9 @@ pub enum HumanRelationKind {
 #[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
 pub enum HumanReadRequest {
     State,
+    Jobs {
+        query: Box<evertrace_domain::query::JobsReadQuery>,
+    },
     CompiledProjections {
         query: evertrace_domain::query::CompiledProjectionQuery,
         expected_frontier: Option<u64>,
@@ -955,6 +960,9 @@ pub struct HumanActionResult {
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
 pub enum HumanGovernanceResponse {
+    Jobs {
+        page: Box<evertrace_domain::query::ObjectReadJobs>,
+    },
     State {
         state: Box<evertrace_domain::query::ObjectReadState>,
     },
@@ -1049,6 +1057,7 @@ impl HumanReadRequest {
     fn validate(&self) -> bool {
         match self {
             Self::State => true,
+            Self::Jobs { query } => query.validate(),
             Self::CompiledProjections {
                 query,
                 expected_frontier,
@@ -1405,14 +1414,8 @@ impl HumanDiagnostics {
 impl HumanGovernanceResponse {
     pub fn validate(&self) -> bool {
         match self {
-            // The hash uses the existing Health wire representation.
-            Self::State { state } => {
-                state.effective_config_hash.len() == 64
-                    && state
-                        .effective_config_hash
-                        .bytes()
-                        .all(|byte| byte.is_ascii_hexdigit() && !byte.is_ascii_uppercase())
-            }
+            Self::Jobs { page } => page.validate(),
+            Self::State { state } => state.validate(),
             Self::CompiledProjections { page } => page.validate(),
             Self::MemoryOverview { page } => page.validate(),
             Self::Search { page } => page.validate(),

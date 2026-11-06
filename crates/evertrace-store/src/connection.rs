@@ -390,6 +390,13 @@ impl StoreReadHandle {
         Ok(())
     }
 
+    /// One request-local flag; dropping its owner cancels queued or running reads.
+    /// It carries no caller input, reader actor or persistent registration.
+    pub fn cancellation_scope() -> (Arc<AtomicBool>, impl Drop + Send) {
+        let flag = Arc::new(AtomicBool::new(false));
+        (Arc::clone(&flag), CancelOnDrop(flag))
+    }
+
     /// Run one short synchronous read on its own read-only connection. The
     /// blocking closure owns the connection, the permit and the fence lease;
     /// they are released only after the connection actually closed. Dropping

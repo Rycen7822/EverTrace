@@ -45,6 +45,7 @@ use notification::{Notification, NotificationEnvelope};
 use response::{HealthResponse, RecoveryActionResponse, Response};
 #[cfg(feature = "runtime")]
 use tokio::{
+    io::AsyncReadExt,
     net::{
         UnixListener, UnixStream,
         unix::{OwnedReadHalf, OwnedWriteHalf},
@@ -457,21 +458,63 @@ where
             } else {
                 pending_mcp_return = None;
             }
-            let dispatched =
-                match command_handler(context, command.request_id, command.command).await {
-                    Ok(value) => value,
-                    Err(code) => {
-                        let _ = send_wire_error(
+            let result = if context.client_kind == dto::ClientKind::Web {
+                let mut operation = Box::pin(command_handler(
+                    context,
+                    command.request_id,
+                    command.command,
+                ));
+                tokio::select! {
+                    biased;
+                    // EOF or pipelining cancels the one allowed Web operation.
+                    peer = stream.read_u8() => {
+                        drop(operation);
+                        if peer.is_ok() {
+                            send_wire_error(
+                                &mut stream,
+                                ErrorCode::InvalidInput,
+                                Some(command.request_id),
+                                negotiated_max as usize,
+                                options,
+                            ).await?;
+                            return Err(ProtocolError::Wire(ErrorCode::InvalidInput));
+                        }
+                        return Ok(());
+                    }
+                    _ = shutdown.changed() => {
+                        drop(operation);
+                        return Ok(());
+                    }
+                    _ = tokio::time::sleep(options.frame_timeout) => {
+                        drop(operation);
+                        send_wire_error(
                             &mut stream,
-                            code,
+                            ErrorCode::ResourceExhausted,
                             Some(command.request_id),
                             negotiated_max as usize,
                             options,
-                        )
-                        .await;
-                        continue;
+                        ).await?;
+                        return Err(ProtocolError::Timeout);
                     }
-                };
+                    result = &mut operation => result,
+                }
+            } else {
+                command_handler(context, command.request_id, command.command).await
+            };
+            let dispatched = match result {
+                Ok(value) => value,
+                Err(code) => {
+                    let _ = send_wire_error(
+                        &mut stream,
+                        code,
+                        Some(command.request_id),
+                        negotiated_max as usize,
+                        options,
+                    )
+                    .await;
+                    continue;
+                }
+            };
             let returned = if search {
                 match &dispatched {
                     Response::McpResult(result)
@@ -497,11 +540,26 @@ where
             } else {
                 None
             };
+            let data_reply = matches!(
+                &dispatched,
+                Response::HumanGovernance(
+                    dto::HumanGovernanceResponse::Jobs { .. }
+                        | dto::HumanGovernanceResponse::State { .. }
+                )
+            );
+            let maximum = if data_reply {
+                // Include the frame header and envelope, and stay below the negotiated body limit.
+                evertrace_domain::query::METADATA_REPLY_BYTES
+                    .saturating_sub(4)
+                    .min((negotiated_max as usize).saturating_sub(1))
+            } else {
+                negotiated_max as usize
+            };
             let response = ServerEnvelope::Response(response::ResponseEnvelope {
                 request_id: command.request_id,
                 response: dispatched,
             });
-            if canonical_json(&response)?.len() > negotiated_max as usize {
+            if canonical_json(&response)?.len() > maximum {
                 let _ = send_wire_error(
                     &mut stream,
                     ErrorCode::ResourceExhausted,
