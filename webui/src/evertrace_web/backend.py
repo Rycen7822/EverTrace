@@ -470,14 +470,11 @@ class Backend:
             }
         )
 
-    async def observations(self, surface, after=None, expected_frontier=None):
-        if surface not in ("inbox", "system"):
-            raise BackendError("invalid_input")
-        read = {"kind": "list", "surface": surface}
-        if surface == "system":
-            read["system_selection"] = "jobs"
-        read.update(expected_frontier=expected_frontier, after=after, limit=32)
-        return await self._request(read)
+    async def observations(self, after=None, expected_frontier=None):
+        return await self._request({
+            "kind": "list", "surface": "inbox", "expected_frontier": expected_frontier,
+            "after": after, "limit": 32,
+        })
 
     async def detail(self, reference, frontier, revision, surface):
         if surface not in ("explorer", "inbox", "system"):

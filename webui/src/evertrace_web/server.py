@@ -15,6 +15,7 @@ import orjson
 from uvicorn.protocols.http.h11_impl import H11Protocol
 
 from .backend import Backend, BackendError, _decode
+from .jobs import read_jobs
 
 ROOT = Path(__file__).resolve().parent
 CSP = (
@@ -336,15 +337,34 @@ class App:
                         "scope_available": page["scope_available"],
                         "complete": page["complete"],
                     }
-            elif payload.get("kind") in ("inbox", "jobs") and not (
+            elif payload.get("kind") == "jobs" and not (
                 set(payload) - {"kind", "after", "expected_frontier"}
             ):
                 after = payload.get("after")
                 frontier = parse_frontier(payload.get("expected_frontier"), optional=True)
                 if not valid_ref(after, optional=True):
                     return JSONResponse({"error": "invalid_read"}, 400)
-                surface = "inbox" if payload["kind"] == "inbox" else "system"
-                result = await self.backend.observations(surface, after, frontier)
+                result = await read_jobs(self.backend, after, frontier)
+                if result["kind"] == "conflict":
+                    data = {"conflict": True}
+                else:
+                    data = {
+                        "html": self.templates.get_template("jobs.html").render(jobs=result["records"]),
+                        "frontier": str(result["frontier"]),
+                        "next_cursor": result["next_cursor"],
+                        "count": len(result["records"]),
+                        "total_count": result["total_count"],
+                        "degraded": False,
+                    }
+            elif payload.get("kind") == "inbox" and not (
+                set(payload) - {"kind", "after", "expected_frontier"}
+            ):
+                after = payload.get("after")
+                frontier = parse_frontier(payload.get("expected_frontier"), optional=True)
+                if not valid_ref(after, optional=True):
+                    return JSONResponse({"error": "invalid_read"}, 400)
+                surface = "inbox"
+                result = await self.backend.observations(after, frontier)
                 if result["kind"] == "conflict":
                     data = {"conflict": True}
                 else:

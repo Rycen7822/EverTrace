@@ -1,0 +1,27 @@
+{% set names = {
+  'session_import_v1': '导入会话',
+  'semantic_synthesis_v1': '整理来源',
+  'quiesced_backup_create_v1': '创建备份',
+  'quiesced_backup_verify_v1': '验证备份'
+} %}
+{% set states = {'queued': '排队中', 'leased': '已领取', 'succeeded': '已结束', 'failed': '失败', 'cancelled': '已取消'} %}
+<p class="muted">以下是全局任务记录。历史失败不代表当前全局故障；已领取不表示模型正在响应。</p>
+{% for job in jobs %}
+<button class="memory-item" data-key="runtime:job:{{ job.job_id }}" data-revision=""
+  data-kind="job" data-object="runtime:job:{{ job.job_id }}" data-surface="system">
+  <div class="item-topline">
+    <span class="type-pill">后台任务</span>
+    <span class="badge">{{ states.get(job.state, job.state) }}</span>
+  </div>
+  <h3>{{ names.get(job.kind, job.kind) }}</h3>
+  <p class="reading-excerpt">Job ID：{{ job.job_id }}</p>
+  <p class="muted">
+    尝试 {{ job.attempt }}
+    {% if job.get("terminal") %} · 终态原因：{{ job.terminal.reason }}
+    {% elif job.get("backoff_until_us") is not none %} · 有重试等待水位{% endif %}
+  </p>
+  <p class="scope-ref">目标：{{ job.target_revision }}</p>
+</button>
+{% else %}
+<div class="empty">当前没有已保存的任务记录；这不表示某个操作已成功。</div>
+{% endfor %}
