@@ -511,8 +511,8 @@ impl CasStore {
         self.read_bounded_checked(digest, max_encoded, max_decoded, || Ok(()))
     }
 
-    /// The caller's checkpoint covers file reads, decompression and hashing.
-    /// Byte budgets are unchanged; decoded bytes are still retained in full.
+    /// Checkpoints cover encoded reads, decompression and hashing. This API
+    /// intentionally retains decoded bytes; decoder window RSS is separate.
     pub fn read_bounded_checked(
         &self,
         digest: &CasDigest,
@@ -520,91 +520,31 @@ impl CasStore {
         max_decoded: u64,
         mut check: impl FnMut() -> Result<(), CasError>,
     ) -> Result<(Vec<u8>, u64), CasError> {
-        check()?;
-        self.validate_root()?;
-        let path = self.blob_path(digest);
-        let before = fs::symlink_metadata(&path).map_err(|error| {
-            if error.kind() == io::ErrorKind::NotFound {
-                CasError::NotFound
-            } else {
-                map_io(error)
-            }
-        })?;
-        if before.file_type().is_symlink() || !before.is_file() {
-            return Err(CasError::InvalidType);
-        }
-        if before.uid() != current_uid()? {
-            return Err(CasError::WrongOwner);
-        }
-        if before.len() < HEADER_LENGTH as u64 {
-            return Err(CasError::StoreCorrupt);
-        }
-        let mut file = File::open(&path).map_err(map_io)?;
-        let opened = file.metadata().map_err(map_io)?;
-        if opened.dev() != before.dev() || opened.ino() != before.ino() || !opened.is_file() {
-            return Err(CasError::IdentityChanged);
-        }
-        let mut header = [0_u8; HEADER_LENGTH];
-        file.read_exact(&mut header)
-            .map_err(|_| CasError::StoreCorrupt)?;
-        let decoded = decode_header(&header, digest)?;
-        if before.len() > max_encoded
-            || decoded.compressed_length > max_encoded
-            || decoded.uncompressed_length > max_decoded
-        {
-            return Err(CasError::ReadBudgetExceeded);
-        }
-        if before.len()
-            != (HEADER_LENGTH as u64)
-                .checked_add(decoded.compressed_length)
-                .ok_or(CasError::StoreCorrupt)?
-        {
-            return Err(CasError::StoreCorrupt);
-        }
-        let compressed_length =
-            usize::try_from(decoded.compressed_length).map_err(|_| CasError::StoreCorrupt)?;
-        check()?;
-        let mut compressed = vec![0_u8; compressed_length];
-        for chunk in compressed.chunks_mut(64 * 1024) {
-            check()?;
-            file.read_exact(chunk).map_err(|_| CasError::StoreCorrupt)?;
-        }
-        check()?;
-        let expected_length =
-            usize::try_from(decoded.uncompressed_length).map_err(|_| CasError::StoreCorrupt)?;
-        let decoder = zstd::stream::read::Decoder::new(compressed.as_slice())
-            .map_err(|_| CasError::StoreCorrupt)?;
-        let limit = u64::try_from(expected_length)
-            .ok()
-            .and_then(|length| length.checked_add(1))
-            .ok_or(CasError::StoreCorrupt)?;
-        let mut decoder = decoder.take(limit);
-        let mut protected = Vec::with_capacity(expected_length.min(1024 * 1024));
-        let mut checksum = Sha256::new();
-        let mut buffer = [0_u8; 64 * 1024];
-        loop {
-            check()?;
-            let read = decoder
-                .read(&mut buffer)
-                .map_err(|_| CasError::StoreCorrupt)?;
-            if read == 0 {
-                break;
-            }
-            check()?;
-            checksum.update(&buffer[..read]);
-            protected.extend_from_slice(&buffer[..read]);
-        }
-        check()?;
-        let actual: [u8; 32] = checksum.finalize().into();
-        if protected.len() != expected_length || actual != *digest.as_bytes() {
-            return Err(CasError::StoreCorrupt);
-        }
-        Ok((protected, before.len()))
+        let mut protected = Vec::new();
+        let (_, encoded) =
+            self.read_verified(digest, max_encoded, max_decoded, &mut check, &mut |bytes| {
+                protected.extend_from_slice(bytes);
+                Ok(())
+            })?;
+        Ok((protected, encoded))
     }
 
-    /// Verifies one encoded CAS envelope and its protected-payload digest with
-    /// fixed memory, without returning or retaining the protected bytes.
+    /// Verifies the same envelope/digest without retaining decoded bytes.
+    /// This does not assert a format-independent bound on the decoder window.
     pub fn verify_envelope(&self, digest: &CasDigest) -> Result<u64, CasError> {
+        self.read_verified(digest, u64::MAX, u64::MAX, &mut || Ok(()), &mut |_| Ok(()))
+            .map(|(decoded, _)| decoded)
+    }
+
+    fn read_verified(
+        &self,
+        digest: &CasDigest,
+        max_encoded: u64,
+        max_decoded: u64,
+        check: &mut dyn FnMut() -> Result<(), CasError>,
+        visit: &mut dyn FnMut(&[u8]) -> Result<(), CasError>,
+    ) -> Result<(u64, u64), CasError> {
+        check()?;
         self.validate_root()?;
         let path = self.blob_path(digest);
         let before = fs::symlink_metadata(&path).map_err(|error| {
@@ -619,9 +559,6 @@ impl CasStore {
         }
         if before.uid() != current_uid()? {
             return Err(CasError::WrongOwner);
-        }
-        if before.permissions().mode() & 0o777 != 0o600 {
-            return Err(CasError::InvalidPermissions);
         }
         let mut file =
             crate::open_regular_nofollow(&path).map_err(|_| CasError::IdentityChanged)?;
@@ -636,6 +573,15 @@ impl CasStore {
         file.read_exact(&mut header)
             .map_err(|_| CasError::StoreCorrupt)?;
         let decoded = decode_header(&header, digest)?;
+        if before.permissions().mode() & 0o777 != 0o600 {
+            return Err(CasError::InvalidPermissions);
+        }
+        if before.len() > max_encoded
+            || decoded.compressed_length > max_encoded
+            || decoded.uncompressed_length > max_decoded
+        {
+            return Err(CasError::ReadBudgetExceeded);
+        }
         if before.len()
             != (HEADER_LENGTH as u64)
                 .checked_add(decoded.compressed_length)
@@ -643,48 +589,63 @@ impl CasStore {
         {
             return Err(CasError::StoreCorrupt);
         }
-        let limited = file.take(decoded.compressed_length);
+        let reader = CheckedRead {
+            inner: file.take(decoded.compressed_length),
+            check,
+            failure: None,
+        };
         let mut decoder =
-            zstd::stream::read::Decoder::new(limited).map_err(|_| CasError::StoreCorrupt)?;
+            zstd::stream::read::Decoder::new(reader).map_err(|_| CasError::StoreCorrupt)?;
         let mut checksum = Sha256::new();
         let mut total = 0_u64;
         let mut buffer = [0_u8; 64 * 1024];
         loop {
-            let read = decoder
-                .read(&mut buffer)
-                .map_err(|_| CasError::StoreCorrupt)?;
+            (decoder.get_mut().get_mut().check)()?;
+            let read = match decoder.read(&mut buffer) {
+                Ok(read) => read,
+                Err(_) => {
+                    return Err(decoder
+                        .get_mut()
+                        .get_mut()
+                        .failure
+                        .take()
+                        .unwrap_or(CasError::StoreCorrupt));
+                }
+            };
             if read == 0 {
                 break;
             }
             total = total
-                .checked_add(u64::try_from(read).map_err(|_| CasError::StoreCorrupt)?)
+                .checked_add(read as u64)
                 .ok_or(CasError::StoreCorrupt)?;
             if total > decoded.uncompressed_length {
                 return Err(CasError::StoreCorrupt);
             }
+            (decoder.get_mut().get_mut().check)()?;
             checksum.update(&buffer[..read]);
+            visit(&buffer[..read])?;
         }
         let buffered = decoder.finish();
-        if !buffered.buffer().is_empty() || buffered.get_ref().limit() != 0 {
+        if !buffered.buffer().is_empty() || buffered.get_ref().inner.limit() != 0 {
             return Err(CasError::StoreCorrupt);
         }
-        let file = buffered.into_inner().into_inner();
+        let CheckedRead { inner, check, .. } = buffered.into_inner();
+        let file = inner.into_inner();
+        check()?;
         let after = fs::symlink_metadata(&path).map_err(map_io)?;
         let opened_after = file.metadata().map_err(map_io)?;
-        let actual: [u8; 32] = checksum.finalize().into();
-        if after.dev() != before.dev()
-            || after.ino() != before.ino()
+        if metadata_identity(&after) != metadata_identity(&before)
+            || metadata_identity(&opened_after) != metadata_identity(&before)
             || after.len() != before.len()
-            || opened_after.dev() != before.dev()
-            || opened_after.ino() != before.ino()
             || opened_after.len() != before.len()
         {
             return Err(CasError::IdentityChanged);
         }
+        let actual: [u8; 32] = checksum.finalize().into();
         if total != decoded.uncompressed_length || actual != *digest.as_bytes() {
             return Err(CasError::StoreCorrupt);
         }
-        Ok(total)
+        Ok((total, before.len()))
     }
 
     pub fn encoded_blob_length(&self, digest: &CasDigest) -> Result<u64, CasError> {
@@ -881,6 +842,24 @@ fn metadata_identity(metadata: &fs::Metadata) -> (u64, u64, i64, i64) {
         metadata.ctime(),
         metadata.ctime_nsec(),
     )
+}
+
+/// Limits each encoded read and preserves cancellation rather than relabeling it as corruption.
+struct CheckedRead<'a> {
+    inner: io::Take<File>,
+    check: &'a mut dyn FnMut() -> Result<(), CasError>,
+    failure: Option<CasError>,
+}
+
+impl Read for CheckedRead<'_> {
+    fn read(&mut self, buffer: &mut [u8]) -> io::Result<usize> {
+        if let Err(error) = (self.check)() {
+            self.failure = Some(error);
+            return Err(io::Error::other("CAS read checkpoint refused"));
+        }
+        let limit = buffer.len().min(64 * 1024);
+        self.inner.read(&mut buffer[..limit])
+    }
 }
 
 struct DecodedHeader {
