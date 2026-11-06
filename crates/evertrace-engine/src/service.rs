@@ -6,6 +6,7 @@ use thiserror::Error;
 mod actions;
 mod binding;
 mod human_governance;
+mod object_read;
 mod scope;
 pub use actions::*;
 pub use binding::*;

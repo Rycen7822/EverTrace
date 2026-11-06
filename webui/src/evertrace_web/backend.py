@@ -1,4 +1,4 @@
-"""Closed human-read transport. Rust remains the sole domain/validation owner."""
+"""Closed kernel-read transport; data authority and page presentation are separate responsibilities."""
 
 import asyncio
 import contextlib
@@ -155,6 +155,15 @@ class Backend:
 
     async def health(self):
         return await self._request(None)
+
+    async def state(self):
+        result = await self._request({"kind": "state"})
+        state = result.get("state")
+        if not isinstance(state, dict):
+            raise BackendError("invalid_read_response")
+        if state.get("effective_config_hash") != self.config_hash:
+            raise BackendError("inactive_configuration")
+        return state
 
     async def memories(self, after=None, expected_frontier=None, query=None):
         # Closed wire spellings/defaults, not policy: Rust owns axis combinations,
@@ -539,6 +548,7 @@ class Backend:
                 response = await call({"human_governance": {"operation": "read", "request": read}})
                 result = response["human_governance"]
                 if result.get("kind") not in (
+                    "state",
                     "snapshot",
                     "memory_page",
                     "memory_overview",

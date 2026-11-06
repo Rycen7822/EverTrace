@@ -6,7 +6,7 @@ use evertrace_protocol::{
     command::Command,
     dto::{
         ClientKind, HumanActionRequest, HumanActionStatus, HumanGovernanceRequest,
-        HumanGovernanceResponse, HumanReadRequest, HumanSurface,
+        HumanGovernanceResponse, HumanReadRequest,
     },
     resolve_data_dir,
     response::Response,
@@ -36,19 +36,12 @@ pub async fn run(
         .request(
             RequestId::new_v7(),
             Command::HumanGovernance(HumanGovernanceRequest::Read {
-                request: HumanReadRequest::List {
-                    explorer_selection: None,
-                    system_selection: None,
-                    surface: HumanSurface::System,
-                    expected_frontier: None,
-                    after: None,
-                    limit: 1,
-                },
+                request: HumanReadRequest::State,
             }),
         )
         .await?
     {
-        Response::HumanGovernance(HumanGovernanceResponse::Snapshot { frontier, .. }) => frontier,
+        Response::HumanGovernance(HumanGovernanceResponse::State { state }) => state.frontier,
         _ => return Err("backup state unavailable; no job submitted".into()),
     };
     let request_id = RequestId::new_v7();

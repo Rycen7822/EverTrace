@@ -107,6 +107,7 @@ pub enum HumanRelationKind {
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
 pub enum HumanReadRequest {
+    State,
     CompiledProjections {
         query: evertrace_domain::query::CompiledProjectionQuery,
         expected_frontier: Option<u64>,
@@ -954,6 +955,9 @@ pub struct HumanActionResult {
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
 pub enum HumanGovernanceResponse {
+    State {
+        state: Box<evertrace_domain::query::ObjectReadState>,
+    },
     CompiledProjections {
         page: Box<HumanCompiledPage>,
     },
@@ -1044,6 +1048,7 @@ impl HumanGovernanceRequest {
 impl HumanReadRequest {
     fn validate(&self) -> bool {
         match self {
+            Self::State => true,
             Self::CompiledProjections {
                 query,
                 expected_frontier,
@@ -1400,6 +1405,14 @@ impl HumanDiagnostics {
 impl HumanGovernanceResponse {
     pub fn validate(&self) -> bool {
         match self {
+            // The hash uses the existing Health wire representation.
+            Self::State { state } => {
+                state.effective_config_hash.len() == 64
+                    && state
+                        .effective_config_hash
+                        .bytes()
+                        .all(|byte| byte.is_ascii_hexdigit() && !byte.is_ascii_uppercase())
+            }
             Self::CompiledProjections { page } => page.validate(),
             Self::MemoryOverview { page } => page.validate(),
             Self::Search { page } => page.validate(),

@@ -400,6 +400,18 @@ impl StoreReadHandle {
         T: Send + 'static,
         F: FnOnce(&SqliteConnection, &ReadCancel) -> Result<T, crate::StoreError> + Send + 'static,
     {
+        self.read_bound(move |connection, cancel, _| read(connection, cancel))
+            .await
+    }
+
+    // Identity comes from the binding held by this real closure, never a second read.
+    async fn read_bound<T, F>(&self, read: F) -> Result<T, crate::StoreError>
+    where
+        T: Send + 'static,
+        F: FnOnce(&SqliteConnection, &ReadCancel, &BoundIdentity) -> Result<T, crate::StoreError>
+            + Send
+            + 'static,
+    {
         // Fixed lock order: the fair maintenance fence first, then the short
         // SQL permit, then a brief writer-state check. Permit-first could
         // deadlock a fair maintenance write against a reader that still waits
@@ -423,7 +435,7 @@ impl StoreReadHandle {
             let connection = open_read_connection(&inner.data_dir, &path)?;
             install_cancel(&connection, &cancel)?;
             let token = ReadCancel(Arc::clone(&cancel));
-            let result = read(&connection, &token);
+            let result = read(&connection, &token, &task_identity);
             drop(connection);
             result
         });
@@ -432,6 +444,30 @@ impl StoreReadHandle {
         let value = result?;
         self.check_identity(&identity)?;
         Ok(value)
+    }
+
+    /// Only committed frontier and the binding; no projection or diagnostics work.
+    pub async fn state(
+        &self,
+    ) -> Result<(u64, evertrace_domain::query::ReadDataIdentity), crate::StoreError> {
+        self.read_bound(|connection, cancel, identity| {
+            cancel.check()?;
+            let transaction = connection
+                .unchecked_transaction()
+                .map_err(|_| crate::StoreError::Io)?;
+            let frontier = crate::sqlite_state::read_persisted_frontier(connection)?;
+            cancel.check()?;
+            drop(transaction);
+            Ok((
+                frontier,
+                evertrace_domain::query::ReadDataIdentity {
+                    database_device: identity.file_identity.0,
+                    database_inode: identity.file_identity.1,
+                    incarnation: identity.incarnation,
+                },
+            ))
+        })
+        .await
     }
 
     /// Drain every reader lease and block new ones. The returned guard is

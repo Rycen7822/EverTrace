@@ -839,6 +839,14 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
                         if !command.validate() {
                             return Err(ErrorCode::InvalidInput);
                         }
+                        // Kernel facts never construct a governance/view context.
+                        if matches!(&command, HumanGovernanceRequest::Read { request: HumanReadRequest::State }) {
+                            let state = EngineService::read_state(writer.read_handle(), config_snapshot.hash())
+                                .await.map_err(|_| ErrorCode::Internal)?;
+                            return Ok(Response::HumanGovernance(HumanGovernanceResponse::State {
+                                state: Box::new(state),
+                            }));
+                        }
                         let human_governance = HumanGovernanceService::with_acceptance(
                             writer,
                             runtime_snapshot.effective_config_hash,
@@ -875,6 +883,8 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
                                 }
                             }
                             HumanGovernanceRequest::Read { request } => match request {
+                                // Kernel reads are dispatched before constructing the facade.
+                                HumanReadRequest::State => return Err(ErrorCode::Internal),
                                 HumanReadRequest::Search {query} => {
                                     let page = human_governance.search(query).await.map_err(map_human_error)?;
                                     HumanGovernanceResponse::Search {page: Box::new(page)}

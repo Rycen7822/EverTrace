@@ -2522,6 +2522,25 @@ impl std::fmt::Debug for SearchContext {
     }
 }
 
+/// The already-open database incarnation, not a path supplied by a client.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct ReadDataIdentity {
+    pub database_device: u64,
+    pub database_inode: u64,
+    pub incarnation: u64,
+}
+
+/// Kernel facts used by read clients and CLI commands that need a frontier.
+/// This does not construct diagnostics, page models or a database snapshot.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct ObjectReadState {
+    pub frontier: u64,
+    pub data_identity: ReadDataIdentity,
+    pub effective_config_hash: String,
+}
+
 /// Literal search plus explicitly supplied typed intent. No access grants,
 /// budgets, candidate boundary or completeness proof comes from the client.
 #[derive(Clone, Deserialize, Eq, PartialEq, Serialize)]
