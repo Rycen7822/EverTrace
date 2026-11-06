@@ -4613,8 +4613,11 @@ impl JournalAdmissionState {
         query: &evertrace_domain::query::JobsReadQuery,
         state: evertrace_domain::query::ObjectReadState,
         cancelled: &std::sync::atomic::AtomicBool,
-    ) -> Result<evertrace_domain::query::JobsReadOutcome, StoreError> {
-        use evertrace_domain::query::{JobsReadOutcome, METADATA_REPLY_BYTES, ObjectReadJobs};
+    ) -> Result<
+        evertrace_domain::query::MetadataReadOutcome<evertrace_domain::query::ObjectReadJobs>,
+        StoreError,
+    > {
+        use evertrace_domain::query::{METADATA_REPLY_BYTES, MetadataReadOutcome, ObjectReadJobs};
         use std::sync::atomic::Ordering;
         if !query.validate() {
             return Err(StoreError::InvalidInput);
@@ -4627,7 +4630,7 @@ impl JournalAdmissionState {
                 .as_ref()
                 .is_some_and(|identity| *identity != state.data_identity)
         {
-            return Ok(JobsReadOutcome::Conflict(state.frontier));
+            return Ok(MetadataReadOutcome::Conflict(state.frontier));
         }
         let mut page = ObjectReadJobs {
             state,
@@ -4658,7 +4661,7 @@ impl JournalAdmissionState {
                 .map_err(|_| StoreError::Serialization)?
                 .len();
             if bytes > METADATA_REPLY_BYTES {
-                return Ok(JobsReadOutcome::TooLarge);
+                return Ok(MetadataReadOutcome::TooLarge);
             }
             page.records.push(record);
             last = Some(*id);
@@ -4667,9 +4670,9 @@ impl JournalAdmissionState {
             return Err(StoreError::Io);
         }
         if !page.validate() {
-            return Ok(JobsReadOutcome::TooLarge);
+            return Ok(MetadataReadOutcome::TooLarge);
         }
-        Ok(JobsReadOutcome::Page(Box::new(page)))
+        Ok(MetadataReadOutcome::Page(Box::new(page)))
     }
 
     pub(crate) fn committed_frontier(&self) -> u64 {

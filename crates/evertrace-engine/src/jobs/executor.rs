@@ -122,11 +122,31 @@ enum WriterRequest {
             Result<evertrace_store::projections::MemoryOverviewContext, WriterActorError>,
         >,
     },
+    ReadMetadataBatch {
+        query: Box<evertrace_domain::query::MetadataBatchQuery>,
+        cancelled: std::sync::Arc<std::sync::atomic::AtomicBool>,
+        config_hash: [u8; 32],
+        reply: oneshot::Sender<
+            Result<
+                evertrace_domain::query::MetadataReadOutcome<
+                    evertrace_domain::query::ObjectReadBatch,
+                >,
+                WriterActorError,
+            >,
+        >,
+    },
     ReadJobs {
         query: Box<evertrace_domain::query::JobsReadQuery>,
         cancelled: std::sync::Arc<std::sync::atomic::AtomicBool>,
         config_hash: [u8; 32],
-        reply: oneshot::Sender<Result<evertrace_domain::query::JobsReadOutcome, WriterActorError>>,
+        reply: oneshot::Sender<
+            Result<
+                evertrace_domain::query::MetadataReadOutcome<
+                    evertrace_domain::query::ObjectReadJobs,
+                >,
+                WriterActorError,
+            >,
+        >,
     },
     MemoryBrowse {
         query: evertrace_domain::query::MemoryBrowseQuery,
@@ -780,10 +800,35 @@ impl WriterHandle {
         query: Box<evertrace_domain::query::JobsReadQuery>,
         cancelled: std::sync::Arc<std::sync::atomic::AtomicBool>,
         config_hash: [u8; 32],
-    ) -> Result<evertrace_domain::query::JobsReadOutcome, WriterActorError> {
+    ) -> Result<
+        evertrace_domain::query::MetadataReadOutcome<evertrace_domain::query::ObjectReadJobs>,
+        WriterActorError,
+    > {
         let (reply, response) = oneshot::channel();
         self.sender
             .send(WriterRequest::ReadJobs {
+                query,
+                cancelled,
+                config_hash,
+                reply,
+            })
+            .await
+            .map_err(|_| WriterActorError::Stopped)?;
+        response.await.map_err(|_| WriterActorError::Stopped)?
+    }
+
+    pub(crate) async fn read_metadata_batch(
+        &self,
+        query: Box<evertrace_domain::query::MetadataBatchQuery>,
+        cancelled: std::sync::Arc<std::sync::atomic::AtomicBool>,
+        config_hash: [u8; 32],
+    ) -> Result<
+        evertrace_domain::query::MetadataReadOutcome<evertrace_domain::query::ObjectReadBatch>,
+        WriterActorError,
+    > {
+        let (reply, response) = oneshot::channel();
+        self.sender
+            .send(WriterRequest::ReadMetadataBatch {
                 query,
                 cancelled,
                 config_hash,
@@ -1591,6 +1636,23 @@ async fn run_writer(
                     if fatal {
                         return Err(WriterActorError::Store);
                     }
+                }
+                WriterRequest::ReadMetadataBatch {
+                    query,
+                    cancelled,
+                    config_hash,
+                    reply,
+                } => {
+                    if reply.is_closed() {
+                        continue;
+                    }
+                    let result = match writer.as_ref() {
+                        Some(writer) => writer
+                            .read_metadata_batch(&query, &cancelled, config_hash)
+                            .map_err(map_store_error),
+                        None => Err(WriterActorError::Stopped),
+                    };
+                    let _ = reply.send(result);
                 }
                 WriterRequest::ReadJobs {
                     query,

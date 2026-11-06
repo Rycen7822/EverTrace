@@ -33,7 +33,7 @@ use evertrace_domain::{
 };
 use serde::{Deserialize, Serialize};
 
-pub use evertrace_domain::query::JobsReadOutcome;
+pub use evertrace_domain::query::MetadataReadOutcome;
 
 pub const PROTOCOL_VERSION: u32 = 1;
 pub const MAX_FRAME_SIZE: usize = 1_048_576;
@@ -110,6 +110,9 @@ pub enum HumanRelationKind {
 #[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
 pub enum HumanReadRequest {
     State,
+    ReadBatch {
+        query: Box<evertrace_domain::query::MetadataBatchQuery>,
+    },
     Jobs {
         query: Box<evertrace_domain::query::JobsReadQuery>,
     },
@@ -960,6 +963,9 @@ pub struct HumanActionResult {
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
 pub enum HumanGovernanceResponse {
+    MetadataBatch {
+        page: Box<evertrace_domain::query::ObjectReadBatch>,
+    },
     Jobs {
         page: Box<evertrace_domain::query::ObjectReadJobs>,
     },
@@ -1057,6 +1063,7 @@ impl HumanReadRequest {
     fn validate(&self) -> bool {
         match self {
             Self::State => true,
+            Self::ReadBatch { query } => query.validate(),
             Self::Jobs { query } => query.validate(),
             Self::CompiledProjections {
                 query,
@@ -1414,6 +1421,7 @@ impl HumanDiagnostics {
 impl HumanGovernanceResponse {
     pub fn validate(&self) -> bool {
         match self {
+            Self::MetadataBatch { page } => page.validate(),
             Self::Jobs { page } => page.validate(),
             Self::State { state } => state.validate(),
             Self::CompiledProjections { page } => page.validate(),

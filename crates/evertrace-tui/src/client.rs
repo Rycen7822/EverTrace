@@ -113,6 +113,7 @@ async fn send_human(
         HumanGovernanceRequest::Read { request } => match request {
             HumanReadRequest::State
             | HumanReadRequest::Jobs { .. }
+            | HumanReadRequest::ReadBatch { .. }
             | HumanReadRequest::CompiledProjections { .. }
             | HumanReadRequest::MemoryOverview { .. }
             | HumanReadRequest::Search { .. }

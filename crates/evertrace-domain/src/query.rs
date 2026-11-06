@@ -2523,7 +2523,7 @@ impl std::fmt::Debug for SearchContext {
 }
 
 /// The already-open database incarnation, not a path supplied by a client.
-#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct ReadDataIdentity {
     pub database_device: u64,
@@ -2542,6 +2542,7 @@ pub struct ObjectReadState {
 }
 
 pub const METADATA_READ_LIMIT: u16 = 64;
+pub const METADATA_BATCH_LIMIT: usize = 8;
 pub const METADATA_REPLY_BYTES: usize = 256 * 1024;
 
 impl ObjectReadState {
@@ -2587,8 +2588,8 @@ pub struct ObjectReadJobs {
 
 /// Native outcome before encoding the existing read response or typed wire error.
 #[derive(Debug)]
-pub enum JobsReadOutcome {
-    Page(Box<ObjectReadJobs>),
+pub enum MetadataReadOutcome<T> {
+    Page(Box<T>),
     Conflict(u64),
     TooLarge,
 }
@@ -2599,6 +2600,132 @@ impl ObjectReadJobs {
             && self.records.len() <= usize::from(METADATA_READ_LIMIT)
             && self.record_count >= self.records.len() as u64
             && self.records.iter().all(serde_json::Value::is_object)
+            && serde_json::to_vec(self).is_ok_and(|bytes| bytes.len() <= METADATA_REPLY_BYTES)
+    }
+}
+
+/// Closed metadata reads used by the Python memory lists and Jobs observer.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
+pub enum MetadataReadQuery {
+    Memories {
+        query: Box<MemoryBrowseQuery>,
+        after: Option<String>,
+        limit: u16,
+    },
+    Jobs {
+        after: Option<JobId>,
+        job_id: Option<JobId>,
+        limit: u16,
+    },
+}
+
+impl MetadataReadQuery {
+    pub fn limit(&self) -> u16 {
+        match self {
+            Self::Memories { limit, .. } | Self::Jobs { limit, .. } => *limit,
+        }
+    }
+
+    fn validate(&self, batch: &MetadataBatchQuery) -> bool {
+        match self {
+            Self::Memories { query, after, .. } => {
+                query.validate().is_ok()
+                    && after.as_ref().is_none_or(|raw| {
+                        raw.len() <= 2048
+                            && batch.expected_data_identity.is_some()
+                            && serde_json::from_str::<MemoryBrowseCursor>(raw).is_ok_and(|cursor| {
+                                Some(cursor.frontier) == batch.expected_frontier
+                                    && cursor.validate_for(query).is_ok()
+                            })
+                    })
+            }
+            Self::Jobs {
+                after,
+                job_id,
+                limit,
+            } => JobsReadQuery {
+                expected_frontier: batch.expected_frontier,
+                expected_data_identity: batch.expected_data_identity,
+                after: *after,
+                job_id: *job_id,
+                limit: *limit,
+            }
+            .validate(),
+        }
+    }
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct MetadataBatchQuery {
+    pub expected_frontier: Option<u64>,
+    pub expected_data_identity: Option<ReadDataIdentity>,
+    pub items: Vec<MetadataReadQuery>,
+}
+
+impl MetadataBatchQuery {
+    pub fn validate(&self) -> bool {
+        (1..=METADATA_BATCH_LIMIT).contains(&self.items.len())
+            && self.items.iter().all(|item| {
+                (1..=METADATA_READ_LIMIT).contains(&item.limit()) && item.validate(self)
+            })
+            && self
+                .items
+                .iter()
+                .map(|item| u32::from(item.limit()))
+                .sum::<u32>()
+                <= u32::from(METADATA_READ_LIMIT)
+    }
+}
+
+/// Only stored metadata columns. Payload, body and support-reference values are not read out.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct MemoryMetadataPage {
+    pub query: Box<MemoryBrowseQuery>,
+    pub records: Vec<serde_json::Value>,
+    pub total_count: Option<u64>,
+    pub matching_count: Option<u64>,
+    pub scope_available: bool,
+    pub counts_complete: bool,
+    pub unresolved_scope_count: u64,
+    pub next_cursor: Option<String>,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
+pub enum MetadataReadPage {
+    Memories { page: Box<MemoryMetadataPage> },
+    Jobs { page: Box<ObjectReadJobs> },
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct ObjectReadBatch {
+    pub state: ObjectReadState,
+    pub items: Vec<MetadataReadPage>,
+}
+
+impl ObjectReadBatch {
+    pub fn validate(&self) -> bool {
+        let mut count = 0;
+        self.state.validate()
+            && (1..=METADATA_BATCH_LIMIT).contains(&self.items.len())
+            && self.items.iter().all(|item| match item {
+                MetadataReadPage::Jobs { page } => {
+                    count += page.records.len();
+                    page.state == self.state && page.validate()
+                }
+                MetadataReadPage::Memories { page } => {
+                    count += page.records.len();
+                    page.query.validate().is_ok()
+                        && page.records.iter().all(|record| {
+                            record.is_object() && record.get("payload_json").is_none()
+                        })
+                }
+            })
+            && count <= usize::from(METADATA_READ_LIMIT)
             && serde_json::to_vec(self).is_ok_and(|bytes| bytes.len() <= METADATA_REPLY_BYTES)
     }
 }

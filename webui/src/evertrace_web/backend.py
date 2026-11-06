@@ -147,6 +147,19 @@ def _private_socket(path):
     return info.st_dev, info.st_ino, info.st_uid
 
 
+def _read_boundary(frontier, identity):
+    if frontier is not None and (type(frontier) is not int or not 0 <= frontier < 2**64):
+        raise BackendError("invalid_input")
+    if identity is not None:
+        names = ("database_device", "database_inode", "incarnation")
+        if not isinstance(identity, dict) or set(identity) != set(names):
+            raise BackendError("invalid_input")
+        if any(type(identity[name]) is not int or not 0 <= identity[name] < 2**64 for name in names):
+            raise BackendError("invalid_input")
+        identity = {name: identity[name] for name in names}
+    return frontier, identity
+
+
 class Backend:
     def __init__(self, socket_path, config_hash, build_id):
         self.path = Path(socket_path)
@@ -165,22 +178,13 @@ class Backend:
             raise BackendError("inactive_configuration")
         return state
 
-    async def jobs(self, query=None):
+    @staticmethod
+    def _jobs_query(query=None):
         query = {} if query is None else query
         keys = {"expected_frontier", "expected_data_identity", "after", "job_id", "limit"}
         if not isinstance(query, dict) or set(query) - keys:
             raise BackendError("invalid_input")
-        frontier = query.get("expected_frontier")
-        if frontier is not None and (type(frontier) is not int or not 0 <= frontier < 2**64):
-            raise BackendError("invalid_input")
-        identity = query.get("expected_data_identity")
-        if identity is not None:
-            names = ("database_device", "database_inode", "incarnation")
-            if not isinstance(identity, dict) or set(identity) != set(names):
-                raise BackendError("invalid_input")
-            if any(type(identity[name]) is not int or not 0 <= identity[name] < 2**64 for name in names):
-                raise BackendError("invalid_input")
-            identity = {name: identity[name] for name in names}
+        frontier, identity = _read_boundary(query.get("expected_frontier"), query.get("expected_data_identity"))
         after, selected = query.get("after"), query.get("job_id")
         for value in (after, selected):
             if value is not None:
@@ -193,16 +197,16 @@ class Backend:
         limit = query.get("limit", 1 if selected else 32)
         if type(limit) is not int or not 1 <= limit <= 64:
             raise BackendError("invalid_input")
-        result = await self._request({
-            "kind": "jobs",
-            "query": {
-                "expected_frontier": frontier,
-                "expected_data_identity": identity,
-                "after": after,
-                "job_id": selected,
-                "limit": limit,
-            },
-        })
+        return {
+            "expected_frontier": frontier,
+            "expected_data_identity": identity,
+            "after": after,
+            "job_id": selected,
+            "limit": limit,
+        }
+
+    async def jobs(self, query=None):
+        result = await self._request({"kind": "jobs", "query": self._jobs_query(query)})
         if result["kind"] == "conflict":
             return result
         if result["kind"] != "jobs":
@@ -211,7 +215,8 @@ class Backend:
             raise BackendError("inactive_configuration")
         return result
 
-    async def memories(self, after=None, expected_frontier=None, query=None):
+    @staticmethod
+    def _memory_query(query=None):
         # Closed wire spellings/defaults, not policy: Rust owns axis combinations,
         # visibility, filtering and counts. Reject malformed enum JSON here rather
         # than misreporting the native codec's connection close as daemon loss.
@@ -250,21 +255,68 @@ class Backend:
         if type(include_global) is not bool:
             raise BackendError("invalid_input")
         # Native canonical frames follow the declared field order, including null range.
-        normalized = {
+        return {
             "selection": normalize_scope(query.get("selection", {"kind": "all"})),
             "include_global": include_global,
             **{key: query.get(key, values[0]) for key, values in wire_values.items()},
             "time_range": normalize_time_range(query.get("time_range")),
         }
+
+    async def memories(self, after=None, expected_frontier=None, query=None):
         return await self._request(
             {
                 "kind": "browse_memories",
-                "query": normalized,
+                "query": self._memory_query(query),
                 "expected_frontier": expected_frontier,
                 "after": after,
                 "limit": 32,
             }
         )
+
+    async def read_batch(self, items, expected_frontier=None, expected_data_identity=None):
+        """Closed metadata only; no content, search, action or raw native command."""
+        frontier, identity = _read_boundary(expected_frontier, expected_data_identity)
+        if not isinstance(items, list) or not 1 <= len(items) <= 8:
+            raise BackendError("invalid_input")
+        normalized = []
+        for item in items:
+            if not isinstance(item, dict):
+                raise BackendError("invalid_input")
+            kind = item.get("kind")
+            if kind == "memories":
+                if set(item) - {"kind", "query", "after", "limit"}:
+                    raise BackendError("invalid_input")
+                after = item.get("after")
+                if after is not None and (not isinstance(after, str) or len(after.encode()) > 2048):
+                    raise BackendError("invalid_input")
+                value = {
+                    "kind": kind,
+                    "query": self._memory_query(item.get("query")),
+                    "after": after,
+                    "limit": item.get("limit", 32),
+                }
+            elif kind == "jobs":
+                if set(item) - {"kind", "after", "job_id", "limit"}:
+                    raise BackendError("invalid_input")
+                jobs = self._jobs_query({key: value for key, value in item.items() if key != "kind"})
+                value = {"kind": kind, **{key: jobs[key] for key in ("after", "job_id", "limit")}}
+            else:
+                raise BackendError("invalid_input")
+            if type(value["limit"]) is not int or not 1 <= value["limit"] <= 64:
+                raise BackendError("invalid_input")
+            normalized.append(value)
+        if sum(item["limit"] for item in normalized) > 64:
+            raise BackendError("invalid_input")
+        result = await self._request({"kind": "read_batch", "query": {
+            "expected_frontier": frontier, "expected_data_identity": identity, "items": normalized,
+        }})
+        if result["kind"] == "conflict":
+            return result
+        if result["kind"] != "metadata_batch":
+            raise BackendError("invalid_read_response")
+        if result["page"]["state"]["effective_config_hash"] != self.config_hash:
+            raise BackendError("inactive_configuration")
+        return result
 
     async def compiled(self, query, expected_frontier=None, after=None):
         if not isinstance(query, dict) or query.get("kind") not in ("directory", "entries"):
@@ -596,6 +648,7 @@ class Backend:
                 if result.get("kind") not in (
                     "state",
                     "jobs",
+                    "metadata_batch",
                     "snapshot",
                     "memory_page",
                     "memory_overview",

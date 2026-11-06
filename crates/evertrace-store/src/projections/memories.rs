@@ -327,6 +327,7 @@ impl JournalAdmissionState {
         limit: usize,
         has_failed_job: bool,
         mut journal_times: Option<&mut crate::sqlite_state::JournalTimeReader<'_>>,
+        cancelled: Option<&std::sync::atomic::AtomicBool>,
     ) -> Result<MemoryBrowseContext, StoreError> {
         query.validate().map_err(|_| StoreError::InvalidInput)?;
         if after.is_some_and(|cursor| cursor.validate_for(query).is_err())
@@ -428,6 +429,9 @@ impl JournalAdmissionState {
         let (mut total_count, mut matching_count, mut unresolved_scope_count) =
             (0_u64, 0_u64, 0_u64);
         for candidate in candidates {
+            if cancelled.is_some_and(|flag| flag.load(std::sync::atomic::Ordering::SeqCst)) {
+                return Err(StoreError::Io);
+            }
             let candidate = candidate?;
             if candidate.product_deleted(
                 &deleted.revision_ids,
@@ -516,11 +520,17 @@ impl JournalAdmissionState {
             None
         };
         selected.truncate(limit);
+        if cancelled.is_some_and(|flag| flag.load(std::sync::atomic::Ordering::SeqCst)) {
+            return Err(StoreError::Io);
+        }
         let expected_count = selected.len();
         let mut event_times = BTreeMap::new();
         let items = selected
             .into_iter()
             .map(|(_, (candidate, event))| {
+                if cancelled.is_some_and(|flag| flag.load(std::sync::atomic::Ordering::SeqCst)) {
+                    return Err(StoreError::Io);
+                }
                 if query.order.uses_event_time()
                     && let Some(event) = event
                 {

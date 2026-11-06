@@ -1528,35 +1528,197 @@ impl JournalWriter {
         query: &evertrace_domain::query::JobsReadQuery,
         cancelled: &std::sync::atomic::AtomicBool,
         effective_config_hash: [u8; 32],
-    ) -> Result<evertrace_domain::query::JobsReadOutcome, StoreError> {
+    ) -> Result<
+        evertrace_domain::query::MetadataReadOutcome<evertrace_domain::query::ObjectReadJobs>,
+        StoreError,
+    > {
         if cancelled.load(std::sync::atomic::Ordering::SeqCst) {
             return Err(StoreError::Io);
         }
+        let (before, state) = self.metadata_read_boundary(effective_config_hash)?;
+        let result = self.admission_state.read_jobs(query, state, cancelled)?;
+        self.finish_metadata_read(before, cancelled)?;
+        Ok(result)
+    }
+
+    fn metadata_read_boundary(
+        &self,
+        effective_config_hash: [u8; 32],
+    ) -> Result<(SqliteStamp, evertrace_domain::query::ObjectReadState), StoreError> {
         self._lock.validate_held()?;
-        // The single writer already owns this map; do not reacquire its reader fence or SQL permits.
-        let (before, (database_device, database_inode)) = {
+        // Borrow the writer's canonical map/binding, without waiting for reader permits or a maintenance fence.
+        let (stamp, (database_device, database_inode)) = {
             let mut physical = self.lock_sqlite()?;
             (physical.stamp()?, physical.file_identity())
         };
-        if before.frontier != self.frontier() {
+        if stamp.frontier != self.frontier() {
             return Err(StoreError::StoreCorrupt);
         }
-        let state = evertrace_domain::query::ObjectReadState {
-            frontier: before.frontier,
-            data_identity: evertrace_domain::query::ReadDataIdentity {
-                database_device,
-                database_inode,
-                incarnation: before.incarnation,
+        Ok((
+            stamp,
+            evertrace_domain::query::ObjectReadState {
+                frontier: stamp.frontier,
+                data_identity: evertrace_domain::query::ReadDataIdentity {
+                    database_device,
+                    database_inode,
+                    incarnation: stamp.incarnation,
+                },
+                effective_config_hash: evertrace_domain::evidence::hex(&effective_config_hash),
             },
-            effective_config_hash: evertrace_domain::evidence::hex(&effective_config_hash),
-        };
-        let result = self.admission_state.read_jobs(query, state, cancelled)?;
+        ))
+    }
+
+    fn finish_metadata_read(
+        &self,
+        before: SqliteStamp,
+        cancelled: &std::sync::atomic::AtomicBool,
+    ) -> Result<(), StoreError> {
         if self.physical_stamp()? != before {
             return Err(StoreError::StoreCorrupt);
         }
         if cancelled.load(std::sync::atomic::Ordering::SeqCst) {
             return Err(StoreError::Io);
         }
+        Ok(())
+    }
+
+    /// All subqueries borrow one canonical admission state and, when needed, one short SQL time reader.
+    pub fn read_metadata_batch(
+        &self,
+        query: &evertrace_domain::query::MetadataBatchQuery,
+        cancelled: &std::sync::atomic::AtomicBool,
+        effective_config_hash: [u8; 32],
+    ) -> Result<
+        evertrace_domain::query::MetadataReadOutcome<evertrace_domain::query::ObjectReadBatch>,
+        StoreError,
+    > {
+        use evertrace_domain::query::{
+            MemoryMetadataPage, MetadataReadOutcome as Outcome, MetadataReadPage,
+            MetadataReadQuery, ObjectReadBatch,
+        };
+        if !query.validate() {
+            return Err(StoreError::InvalidInput);
+        }
+        if cancelled.load(std::sync::atomic::Ordering::SeqCst) {
+            return Err(StoreError::Io);
+        }
+        let (before, state) = self.metadata_read_boundary(effective_config_hash)?;
+        if query
+            .expected_frontier
+            .is_some_and(|value| value != state.frontier)
+            || query
+                .expected_data_identity
+                .is_some_and(|value| value != state.data_identity)
+        {
+            return Ok(Outcome::Conflict(state.frontier));
+        }
+        let build = |mut times: Option<&mut crate::sqlite_state::JournalTimeReader<'_>>| {
+            let mut items = Vec::with_capacity(query.items.len());
+            for item in &query.items {
+                if cancelled.load(std::sync::atomic::Ordering::SeqCst) {
+                    return Err(StoreError::Io);
+                }
+                let page = match item {
+                    MetadataReadQuery::Jobs {
+                        after,
+                        job_id,
+                        limit,
+                    } => {
+                        let jobs = evertrace_domain::query::JobsReadQuery {
+                            expected_frontier: Some(state.frontier),
+                            expected_data_identity: Some(state.data_identity),
+                            after: *after,
+                            job_id: *job_id,
+                            limit: *limit,
+                        };
+                        match self
+                            .admission_state
+                            .read_jobs(&jobs, state.clone(), cancelled)?
+                        {
+                            Outcome::Page(page) => MetadataReadPage::Jobs { page },
+                            Outcome::Conflict(frontier) => return Ok(Outcome::Conflict(frontier)),
+                            Outcome::TooLarge => return Ok(Outcome::TooLarge),
+                        }
+                    }
+                    MetadataReadQuery::Memories {
+                        query,
+                        after,
+                        limit,
+                    } => {
+                        let cursor = after
+                            .as_deref()
+                            .map(serde_json::from_str)
+                            .transpose()
+                            .map_err(|_| StoreError::InvalidInput)?;
+                        // Page-only diagnostics are not part of this data SDK.
+                        let context = self.admission_state.memory_browse_context(
+                            query,
+                            cursor.as_ref(),
+                            usize::from(*limit),
+                            false,
+                            times.as_deref_mut(),
+                            Some(cancelled),
+                        )?;
+                        let records = context
+                            .page
+                            .items
+                            .into_iter()
+                            .map(|row| {
+                                serde_json::json!({
+                                    "row_id": row.row_id,
+                                    "object_kind": row.object_kind,
+                                    "object_id": row.object_id,
+                                    "current_revision_id": row.current_revision_id,
+                                    "lifecycle": row.lifecycle,
+                                    "epistemic": row.epistemic,
+                                    "authority": row.authority,
+                                    "publication_state": row.publication_state,
+                                    "support_state": row.support_state,
+                                    "repository_id": row.repository_id,
+                                    "worktree_id": row.worktree_id,
+                                    "task_id": row.task_id,
+                                    "workstream_id": row.workstream_id,
+                                    "source_event_seq": row.source_event_seq,
+                                    "projection_generation": row.projection_generation,
+                                    "event_time_us": context.event_times.get(&row.source_event_seq),
+                                })
+                            })
+                            .collect();
+                        MetadataReadPage::Memories {
+                            page: Box::new(MemoryMetadataPage {
+                                query: query.clone(),
+                                records,
+                                total_count: context.total_count,
+                                matching_count: context.matching_count,
+                                scope_available: context.scope_available,
+                                counts_complete: context.counts_complete,
+                                unresolved_scope_count: context.unresolved_scope_count,
+                                next_cursor: context.page.next_cursor,
+                            }),
+                        }
+                    }
+                };
+                items.push(page);
+            }
+            let result = ObjectReadBatch {
+                state: state.clone(),
+                items,
+            };
+            if !result.validate() {
+                return Ok(Outcome::TooLarge);
+            }
+            Ok(Outcome::Page(Box::new(result)))
+        };
+        let needs_times = query.items.iter().any(|item| matches!(
+            item, MetadataReadQuery::Memories { query, .. } if query.time_range.is_some() || query.order.uses_event_time()
+        ));
+        let result = if needs_times {
+            self.lock_sqlite()?
+                .with_memory_journal_times(|times| build(Some(times)))
+        } else {
+            build(None)
+        }?;
+        self.finish_metadata_read(before, cancelled)?;
         Ok(result)
     }
 
@@ -1575,10 +1737,11 @@ impl JournalWriter {
                         limit,
                         stamp.has_failed_job,
                         Some(times),
+                        None,
                     )
                 })
             } else {
-                state.memory_browse_context(query, after, limit, stamp.has_failed_job, None)
+                state.memory_browse_context(query, after, limit, stamp.has_failed_job, None, None)
             }
         })
         .await
@@ -1601,6 +1764,7 @@ impl JournalWriter {
                             usize::from(query.limit),
                             stamp.has_failed_job,
                             times.as_deref_mut(),
+                            None,
                         )
                     };
                     (

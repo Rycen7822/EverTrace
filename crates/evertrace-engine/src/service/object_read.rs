@@ -2,11 +2,28 @@
 use super::EngineService;
 
 impl EngineService {
+    pub async fn read_metadata_batch(
+        writer: crate::WriterHandle,
+        query: Box<evertrace_domain::query::MetadataBatchQuery>,
+        effective_config_hash: [u8; 32],
+    ) -> Result<
+        evertrace_domain::query::MetadataReadOutcome<evertrace_domain::query::ObjectReadBatch>,
+        crate::WriterActorError,
+    > {
+        let (cancelled, _cancel_on_drop) = evertrace_store::StoreReadHandle::cancellation_scope();
+        writer
+            .read_metadata_batch(query, cancelled, effective_config_hash)
+            .await
+    }
+
     pub async fn read_jobs(
         writer: crate::WriterHandle,
         query: Box<evertrace_domain::query::JobsReadQuery>,
         effective_config_hash: [u8; 32],
-    ) -> Result<evertrace_domain::query::JobsReadOutcome, crate::WriterActorError> {
+    ) -> Result<
+        evertrace_domain::query::MetadataReadOutcome<evertrace_domain::query::ObjectReadJobs>,
+        crate::WriterActorError,
+    > {
         let (cancelled, _cancel_on_drop) = evertrace_store::StoreReadHandle::cancellation_scope();
         writer
             .read_jobs(query, cancelled, effective_config_hash)
