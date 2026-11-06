@@ -1,6 +1,7 @@
 """On-demand memory cards over Native selections and individually authorized stored fields."""
 
 import json
+import time
 
 from .backend import BackendError, _decode
 
@@ -34,6 +35,10 @@ def _body(kind, fields, truncated):
     if kind == "procedure_revision":
         draft = fields.get("draft", {})
         return _preview(draft.get("title"), draft.get("summary"), truncated=truncated), draft.get("scope")
+    if kind == "work_episode":
+        phase = fields.get("phase_contract", {})
+        loops = fields.get("open_loops", [])
+        return _preview(phase.get("local_goal"), "\n".join(loops), truncated=truncated), None
     if kind == "semantic_digest":
         application = fields.get("application", {})
         delta = next((entry for key in ("progress_delta", "decision_delta", "outcome_delta")
@@ -81,10 +86,13 @@ async def _fields(backend, revision, boundary):
     return page
 
 
+def _metadata_card(row):
+    return {**row, "stable_key": row["row_id"], "revision_ref": row["current_revision_id"],
+            "object_ref": row.get("object_id") or row["row_id"], "proposal": None, "scope_ref": _scope(row, None)}
+
+
 async def _card(backend, row, boundary):
-    item = {**row, "stable_key": row["row_id"], "revision_ref": row["current_revision_id"],
-            "object_ref": row.get("object_id") or row["row_id"], "proposal": None}
-    item["scope_ref"] = _scope(row, None)
+    item = _metadata_card(row)
     if item["revision_ref"] is None:
         item["reading_preview"] = _unavailable("missing")
         return item
@@ -156,3 +164,92 @@ async def read_memories(backend, query=None, after=None, expected_frontier=None)
                              "after": _decode(page["next_cursor"].encode("utf-8"))}, separators=(",", ":"), ensure_ascii=False)
     return {"kind": "memories", **page, "items": items, "frontier": boundary["frontier"], "next_cursor": cursor,
             "status": "ready" if page["counts_complete"] else "partial"}
+
+
+def _count(value, complete, unit):
+    return {"count": value, "unit": unit,
+            "basis": "unknown" if value is None else "exact" if complete else "lower_bound"}
+
+
+def _generation(work, summary_count, metadata_complete, complete, config_hash):
+    observations = []
+    run = work["last_run"]
+    if summary_count is None or summary_count == 0:
+        if work["no_inputs"] and complete:
+            observations.append("no_inputs")
+        if work["llm_enabled"] is False:
+            observations.append("llm_disabled")
+        if work["episode_enrichment_enabled"] is False:
+            observations.append("episode_enrichment_disabled")
+        if (work["open_work_count"] or 0) > 0:
+            observations.append("work_in_progress")
+        if run and bytes(run["effective_config_hash"]).hex() == config_hash:
+            if run["status"] == "budget_exhausted":
+                observations.append("last_attempt_budget_exhausted")
+            elif run["status"] in ("provider_unavailable", "provider_failed"):
+                observations.append("last_attempt_provider_unavailable")
+        if not observations or not metadata_complete or summary_count is None:
+            observations.append("not_read")
+    return {"observations": observations, "llm_enabled": work["llm_enabled"],
+            "episode_enrichment_enabled": work["episode_enrichment_enabled"],
+            "last_run": {key: value for key, value in run.items() if key != "effective_config_hash"} if run else None}
+
+
+async def read_overview(backend, query, expected_frontier=None):
+    query = backend._overview_query(query)
+    limit = query["limit"]
+    # At most five finite selectors; each Native batch stays within its 64-record aggregate budget.
+    scope = {key: query[key] for key in ("selection", "include_global", "time_range")}
+    time_range = scope["time_range"]
+    order = "event_newest" if time_range and time_range["basis"] == "event" else "recorded_newest"
+    requests = [{"kind": "memories", "query": {**scope, "kind": kind, "order": order}, "limit": limit}
+                for kind in ("summaries", "facts_and_constraints", "methods")]
+    requests.extend({"kind": kind, "query": query} for kind in ("work", "review"))
+    parts, boundary, identity = [], None, None
+    batch_size = max(1, 64 // limit)
+    for start in range(0, len(requests), batch_size):
+        result = await backend.read_batch(requests[start:start + batch_size], expected_frontier, identity)
+        if result["kind"] == "conflict":
+            return result
+        boundary = result["page"]["state"]
+        expected_frontier, identity = boundary["frontier"], boundary["data_identity"]
+        parts.extend(part["page"] for part in result["page"]["items"])
+    summaries, facts, methods, work, reviews = parts
+    scope_available = all(page["scope_available"] for page in (summaries, facts, methods, work, reviews))
+    metadata_complete = all(page["counts_complete"] for page in (summaries, facts, methods, work, reviews))
+    formal_count = None
+    if facts["matching_count"] is not None and methods["matching_count"] is not None:
+        formal_count = facts["matching_count"] + methods["matching_count"]
+        if formal_count >= 1 << 64:
+            raise BackendError("invalid_read_response")
+    changes = facts["records"] + methods["records"]
+    if order == "event_newest" and any(row["event_time_us"] is None for row in changes):
+        raise BackendError("invalid_read_response")
+    changes.sort(key=lambda row: (-row["event_time_us"] if order == "event_newest" else 0,
+                                  -row["source_event_seq"], row["row_id"]))
+    metadata_only = set(reviews["metadata_only_refs"])
+    sections = {}
+    for name, rows in (("summaries", summaries["records"]), ("changes", changes[:limit]),
+                       ("unresolved", work["records"]), ("reviews", reviews["records"])):
+        cards = []
+        for row in rows:
+            if name == "reviews" and row["row_id"] in metadata_only:
+                item = {**_metadata_card(row), "reading_preview": None}
+            else:
+                item = await _card(backend, row, boundary)
+                if item is None:
+                    return {"kind": "conflict"}
+            cards.append(item)
+        sections[name] = cards
+    complete = scope_available and metadata_complete and all(
+        (item["reading_preview"] or {}).get("state") == "ready" or item["stable_key"] in metadata_only
+        for cards in sections.values() for item in cards)
+    return {"kind": "memory_overview", "page": {
+        **sections, "frontier": boundary["frontier"], "observed_at_us": time.time_ns() // 1000,
+        "query": query, "scope_available": scope_available, "complete": complete, "review_reasons": reviews["reasons"],
+        "summary_count": _count(summaries["matching_count"], summaries["counts_complete"], "current_summary_revisions"),
+        "formal_count": _count(formal_count, facts["counts_complete"] and methods["counts_complete"], "current_formal_revisions"),
+        "loop_count": _count(work["loop_count"], work["counts_complete"], "open_loop_entries"),
+        "review_count": _count(reviews["matching_count"], reviews["counts_complete"], "pending_review_items"),
+        "generation": _generation(work, summaries["matching_count"], metadata_complete, complete, boundary["effective_config_hash"]),
+    }}

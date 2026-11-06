@@ -321,14 +321,29 @@ impl EngineService {
         writer: crate::WriterHandle,
         query: Box<evertrace_domain::query::MetadataBatchQuery>,
         effective_config_hash: [u8; 32],
+        llm: &evertrace_domain::config::LlmConfig,
     ) -> Result<
         evertrace_domain::query::MetadataReadOutcome<evertrace_domain::query::ObjectReadBatch>,
         crate::WriterActorError,
     > {
         let (cancelled, _cancel_on_drop) = evertrace_store::StoreReadHandle::cancellation_scope();
-        writer
+        let mut outcome = writer
             .read_metadata_batch(query, cancelled, effective_config_hash)
-            .await
+            .await?;
+        if let evertrace_domain::query::MetadataReadOutcome::Page(batch) = &mut outcome {
+            for item in &mut batch.items {
+                if let evertrace_domain::query::MetadataReadPage::Work { page } = item {
+                    page.llm_enabled = Some(llm.enabled);
+                    page.episode_enrichment_enabled = Some(
+                        llm.episode_enrichment != evertrace_domain::config::EpisodeEnrichment::Off,
+                    );
+                }
+            }
+            if !batch.validate() {
+                return Ok(evertrace_domain::query::MetadataReadOutcome::TooLarge);
+            }
+        }
+        Ok(outcome)
     }
 
     pub async fn read_jobs(

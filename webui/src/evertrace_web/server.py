@@ -16,7 +16,7 @@ from uvicorn.protocols.http.h11_impl import H11Protocol
 
 from .backend import Backend, BackendError, _decode
 from .jobs import read_jobs
-from .memories import read_memories
+from .memories import read_memories, read_overview
 
 ROOT = Path(__file__).resolve().parent
 CSP = (
@@ -325,7 +325,7 @@ class App:
                 set(payload) - {"kind", "query", "expected_frontier"}
             ):
                 frontier = parse_frontier(payload.get("expected_frontier"), optional=True)
-                result = await self.backend.overview(payload.get("query", {}), frontier)
+                result = await read_overview(self.backend, payload.get("query", {}), frontier)
                 if result["kind"] == "conflict":
                     data = {"conflict": True}
                 else:

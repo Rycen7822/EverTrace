@@ -277,7 +277,7 @@ class Backend:
         frontier, identity = _read_boundary(expected_frontier, expected_data_identity)
         if not isinstance(items, list) or not 1 <= len(items) <= 8:
             raise BackendError("invalid_input")
-        normalized = []
+        normalized, total_limit = [], 0
         for item in items:
             if not isinstance(item, dict):
                 raise BackendError("invalid_input")
@@ -294,6 +294,10 @@ class Backend:
                     "after": after,
                     "limit": item.get("limit", 32),
                 }
+            elif kind in ("work", "review"):
+                if set(item) - {"kind", "query"}:
+                    raise BackendError("invalid_input")
+                value = {"kind": kind, "query": self._overview_query(item.get("query", {}))}
             elif kind == "jobs":
                 if set(item) - {"kind", "after", "job_id", "limit"}:
                     raise BackendError("invalid_input")
@@ -301,10 +305,12 @@ class Backend:
                 value = {"kind": kind, **{key: jobs[key] for key in ("after", "job_id", "limit")}}
             else:
                 raise BackendError("invalid_input")
-            if type(value["limit"]) is not int or not 1 <= value["limit"] <= 64:
+            limit = value["query"]["limit"] if kind in ("work", "review") else value["limit"]
+            if type(limit) is not int or not 1 <= limit <= 64:
                 raise BackendError("invalid_input")
+            total_limit += limit
             normalized.append(value)
-        if sum(item["limit"] for item in normalized) > 64:
+        if total_limit > 64:
             raise BackendError("invalid_input")
         result = await self._request({"kind": "read_batch", "query": {
             "expected_frontier": frontier, "expected_data_identity": identity, "items": normalized,
@@ -345,7 +351,8 @@ class Backend:
             "limit": 32 if kind == "directory" else 4,
         })
 
-    async def overview(self, query, expected_frontier=None):
+    @staticmethod
+    def _overview_query(query):
         if not isinstance(query, dict) or set(query) - {
             "selection", "include_global", "time_range", "limit"
         }:
@@ -354,16 +361,12 @@ class Backend:
         limit = query.get("limit", 8)
         if type(include_global) is not bool or type(limit) is not int or not 1 <= limit <= 64:
             raise BackendError("invalid_input")
-        return await self._request({
-            "kind": "memory_overview",
-            "query": {
-                "selection": normalize_scope(query.get("selection", {"kind": "all"})),
-                "include_global": include_global,
-                "time_range": normalize_time_range(query.get("time_range")),
-                "limit": limit,
-            },
-            "expected_frontier": expected_frontier,
-        })
+        return {
+            "selection": normalize_scope(query.get("selection", {"kind": "all"})),
+            "include_global": include_global,
+            "time_range": normalize_time_range(query.get("time_range")),
+            "limit": limit,
+        }
 
     async def source_archive(self, query, after=None, expected_frontier=None):
         if not isinstance(query, dict) or query.get("kind") not in ("revisions", "records"):

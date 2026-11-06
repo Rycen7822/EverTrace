@@ -1613,7 +1613,7 @@ impl JournalWriter {
     > {
         use evertrace_domain::query::{
             MemoryMetadataPage, MetadataReadOutcome as Outcome, MetadataReadPage,
-            MetadataReadQuery, ObjectReadBatch,
+            MetadataReadQuery, ObjectReadBatch, ScopedReviewMetadata, ScopedWorkMetadata,
         };
         if !query.validate() {
             return Err(StoreError::InvalidInput);
@@ -1638,6 +1638,74 @@ impl JournalWriter {
                     return Err(StoreError::Io);
                 }
                 let page = match item {
+                    MetadataReadQuery::Work { query } => {
+                        let context = self.admission_state.memory_overview_work_context(
+                            query,
+                            times.as_deref_mut(),
+                            Some(cancelled),
+                        )?;
+                        let records = context
+                            .episodes
+                            .into_iter()
+                            .map(|row| {
+                                let event = context.event_times.get(&row.source_event_seq).copied();
+                                Self::metadata_record(row, event)
+                            })
+                            .collect();
+                        MetadataReadPage::Work {
+                            page: Box::new(ScopedWorkMetadata {
+                                records,
+                                scope_available: context.scope_available,
+                                counts_complete: context.complete,
+                                work_count: context.scope_available.then_some(context.work_count),
+                                open_work_count: context
+                                    .scope_available
+                                    .then_some(context.open_work_count),
+                                loop_count: context.scope_available.then_some(context.loop_count),
+                                no_inputs: context.no_inputs,
+                                last_run: context
+                                    .last_run
+                                    .map(serde_json::to_value)
+                                    .transpose()
+                                    .map_err(|_| StoreError::StoreCorrupt)?,
+                                llm_enabled: None,
+                                episode_enrichment_enabled: None,
+                            }),
+                        }
+                    }
+                    MetadataReadQuery::Review { query } => {
+                        let context = self.admission_state.memory_overview_review_context(
+                            query,
+                            64,
+                            false,
+                            times.as_deref_mut(),
+                            Some(cancelled),
+                        )?;
+                        let records = context
+                            .page
+                            .items
+                            .into_iter()
+                            .map(|row| {
+                                let event = context.event_times.get(&row.source_event_seq).copied();
+                                Self::metadata_record(row, event)
+                            })
+                            .collect();
+                        MetadataReadPage::Review {
+                            page: Box::new(ScopedReviewMetadata {
+                                records,
+                                metadata_only_refs: context
+                                    .reasons
+                                    .iter()
+                                    .filter(|(_, reason)| reason.is_metadata_only())
+                                    .map(|(id, _)| id.clone())
+                                    .collect(),
+                                scope_available: context.scope_available,
+                                counts_complete: context.complete,
+                                matching_count: context.count,
+                                reasons: context.reasons,
+                            }),
+                        }
+                    }
                     MetadataReadQuery::Jobs {
                         after,
                         job_id,
@@ -1683,24 +1751,8 @@ impl JournalWriter {
                             .items
                             .into_iter()
                             .map(|row| {
-                                serde_json::json!({
-                                    "row_id": row.row_id,
-                                    "object_kind": row.object_kind,
-                                    "object_id": row.object_id,
-                                    "current_revision_id": row.current_revision_id,
-                                    "lifecycle": row.lifecycle,
-                                    "epistemic": row.epistemic,
-                                    "authority": row.authority,
-                                    "publication_state": row.publication_state,
-                                    "support_state": row.support_state,
-                                    "repository_id": row.repository_id,
-                                    "worktree_id": row.worktree_id,
-                                    "task_id": row.task_id,
-                                    "workstream_id": row.workstream_id,
-                                    "source_event_seq": row.source_event_seq,
-                                    "projection_generation": row.projection_generation,
-                                    "event_time_us": context.event_times.get(&row.source_event_seq),
-                                })
+                                let event = context.event_times.get(&row.source_event_seq).copied();
+                                Self::metadata_record(row, event)
                             })
                             .collect();
                         MetadataReadPage::Memories {
@@ -1728,9 +1780,15 @@ impl JournalWriter {
             }
             Ok(Outcome::Page(Box::new(result)))
         };
-        let needs_times = query.items.iter().any(|item| matches!(
-            item, MetadataReadQuery::Memories { query, .. } if query.time_range.is_some() || query.order.uses_event_time()
-        ));
+        let needs_times = query.items.iter().any(|item| match item {
+            MetadataReadQuery::Memories { query, .. } => {
+                query.time_range.is_some() || query.order.uses_event_time()
+            }
+            MetadataReadQuery::Work { query } | MetadataReadQuery::Review { query } => {
+                query.time_range.is_some()
+            }
+            MetadataReadQuery::Jobs { .. } => false,
+        });
         let result = if needs_times {
             self.lock_sqlite()?
                 .with_memory_journal_times(|times| build(Some(times)))
@@ -1739,6 +1797,17 @@ impl JournalWriter {
         }?;
         self.finish_metadata_read(before, cancelled)?;
         Ok(result)
+    }
+
+    fn metadata_record(row: ObjectRow, event_time_us: Option<i64>) -> serde_json::Value {
+        serde_json::json!({
+            "row_id": row.row_id, "object_kind": row.object_kind, "object_id": row.object_id,
+            "current_revision_id": row.current_revision_id, "lifecycle": row.lifecycle,
+            "epistemic": row.epistemic, "authority": row.authority, "publication_state": row.publication_state,
+            "support_state": row.support_state, "repository_id": row.repository_id, "worktree_id": row.worktree_id,
+            "task_id": row.task_id, "workstream_id": row.workstream_id, "source_event_seq": row.source_event_seq,
+            "projection_generation": row.projection_generation, "event_time_us": event_time_us,
+        })
     }
 
     pub async fn memory_browse_context(
@@ -1797,8 +1866,9 @@ impl JournalWriter {
                     proof_limit,
                     stamp.has_failed_job,
                     times.as_deref_mut(),
+                    None,
                 )?;
-                let work = state.memory_overview_work_context(query, times)?;
+                let work = state.memory_overview_work_context(query, times, None)?;
                 Ok(crate::projections::MemoryOverviewContext {
                     frontier: summaries.page.frontier,
                     summaries,

@@ -32,6 +32,7 @@ pub struct MemoryOverviewWorkContext {
     pub last_run: Option<MemoryOverviewRun>,
 }
 
+#[derive(serde::Serialize)]
 pub struct MemoryOverviewRun {
     pub run_id: evertrace_domain::ids::SemanticDerivationRunId,
     pub episode_id: evertrace_domain::ids::WorkEpisodeId,
@@ -67,6 +68,7 @@ impl JournalAdmissionState {
         proof_limit: usize,
         has_failed_job: bool,
         mut times: Option<&mut crate::sqlite_state::JournalTimeReader<'_>>,
+        cancelled: Option<&std::sync::atomic::AtomicBool>,
     ) -> Result<MemoryOverviewReviewContext, StoreError> {
         use evertrace_domain::query::MemoryScopeSelection as S;
         query.validate().map_err(|_| StoreError::InvalidInput)?;
@@ -79,8 +81,16 @@ impl JournalAdmissionState {
         let mut complete = scope.complete;
         let mut count = 0_u64;
         let mut selected = BTreeMap::new();
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
         if scope.available {
             for (row_id, value, seq) in self.current_inbox_candidates(&deleted)? {
+                if cancelled.is_some_and(|flag| flag.load(std::sync::atomic::Ordering::SeqCst)) {
+                    return Err(StoreError::Io);
+                }
+                if std::time::Instant::now() >= deadline {
+                    complete = false;
+                    break;
+                }
                 let included = if query.selection == S::All {
                     true
                 } else if let Some(lane) = match value {
@@ -310,6 +320,7 @@ impl JournalAdmissionState {
         &self,
         query: &MemoryOverviewQuery,
         mut times: Option<&mut crate::sqlite_state::JournalTimeReader<'_>>,
+        cancelled: Option<&std::sync::atomic::AtomicBool>,
     ) -> Result<MemoryOverviewWorkContext, StoreError> {
         use evertrace_domain::work::EpisodeLifecycle;
         query.validate().map_err(|_| StoreError::InvalidInput)?;
@@ -332,6 +343,9 @@ impl JournalAdmissionState {
         let mut selected = BTreeMap::new();
         let mut scoped_work = BTreeMap::new();
         for (episode, seq) in self.episodes.values() {
+            if cancelled.is_some_and(|flag| flag.load(std::sync::atomic::Ordering::SeqCst)) {
+                return Err(StoreError::Io);
+            }
             if std::time::Instant::now() >= deadline {
                 result.complete = false;
                 break;
@@ -387,6 +401,9 @@ impl JournalAdmissionState {
         }
         // Only observations tied to current scoped input watermarks, not global diagnostics.
         for (run, _) in self.synthesis.runs().values() {
+            if cancelled.is_some_and(|flag| flag.load(std::sync::atomic::Ordering::SeqCst)) {
+                return Err(StoreError::Io);
+            }
             if std::time::Instant::now() >= deadline {
                 result.complete = false;
                 break;

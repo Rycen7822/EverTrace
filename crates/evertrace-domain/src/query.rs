@@ -2665,10 +2665,16 @@ impl ExactStoredFields {
     }
 }
 
-/// Closed metadata reads used by the Python memory lists and Jobs observer.
+/// Closed metadata reads of current memory, work, review and job facts.
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
 pub enum MetadataReadQuery {
+    Work {
+        query: Box<MemoryOverviewQuery>,
+    },
+    Review {
+        query: Box<MemoryOverviewQuery>,
+    },
     Memories {
         query: Box<MemoryBrowseQuery>,
         after: Option<String>,
@@ -2684,12 +2690,14 @@ pub enum MetadataReadQuery {
 impl MetadataReadQuery {
     pub fn limit(&self) -> u16 {
         match self {
+            Self::Work { query } | Self::Review { query } => query.limit,
             Self::Memories { limit, .. } | Self::Jobs { limit, .. } => *limit,
         }
     }
 
     fn validate(&self, batch: &MetadataBatchQuery) -> bool {
         match self {
+            Self::Work { query } | Self::Review { query } => query.validate().is_ok(),
             Self::Memories { query, after, .. } => {
                 query.validate().is_ok()
                     && after.as_ref().is_none_or(|raw| {
@@ -2759,6 +2767,35 @@ pub struct MemoryMetadataPage {
 pub enum MetadataReadPage {
     Memories { page: Box<MemoryMetadataPage> },
     Jobs { page: Box<ObjectReadJobs> },
+    Work { page: Box<ScopedWorkMetadata> },
+    Review { page: Box<ScopedReviewMetadata> },
+}
+
+/// Scoped domain counts and the original input-matching derivation record, not generation explanations.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct ScopedWorkMetadata {
+    pub records: Vec<serde_json::Value>,
+    pub scope_available: bool,
+    pub counts_complete: bool,
+    pub work_count: Option<u64>,
+    pub open_work_count: Option<u64>,
+    pub loop_count: Option<u64>,
+    pub no_inputs: bool,
+    pub last_run: Option<serde_json::Value>,
+    pub llm_enabled: Option<bool>,
+    pub episode_enrichment_enabled: Option<bool>,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct ScopedReviewMetadata {
+    pub records: Vec<serde_json::Value>,
+    pub metadata_only_refs: Vec<String>,
+    pub scope_available: bool,
+    pub counts_complete: bool,
+    pub matching_count: Option<u64>,
+    pub reasons: std::collections::BTreeMap<String, InboxReviewReason>,
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -2780,15 +2817,30 @@ impl ObjectReadBatch {
                 }
                 MetadataReadPage::Memories { page } => {
                     count += page.records.len();
-                    page.query.validate().is_ok()
-                        && page.records.iter().all(|record| {
-                            record.is_object() && record.get("payload_json").is_none()
-                        })
+                    page.query.validate().is_ok() && valid_metadata_records(&page.records)
+                }
+                MetadataReadPage::Work { page } => {
+                    count += page.records.len();
+                    valid_metadata_records(&page.records)
+                        && page
+                            .last_run
+                            .as_ref()
+                            .is_none_or(serde_json::Value::is_object)
+                }
+                MetadataReadPage::Review { page } => {
+                    count += page.records.len();
+                    valid_metadata_records(&page.records)
                 }
             })
             && count <= usize::from(METADATA_READ_LIMIT)
             && serde_json::to_vec(self).is_ok_and(|bytes| bytes.len() <= METADATA_REPLY_BYTES)
     }
+}
+
+fn valid_metadata_records(records: &[serde_json::Value]) -> bool {
+    records
+        .iter()
+        .all(|record| record.is_object() && record.get("payload_json").is_none())
 }
 
 /// Literal search plus explicitly supplied typed intent. No access grants,

@@ -855,7 +855,7 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
                         }
                         if let HumanGovernanceRequest::Read { request: HumanReadRequest::ReadBatch { query } } = &command {
                             let outcome = EngineService::read_metadata_batch(
-                                writer.clone(), query.clone(), config_snapshot.hash(),
+                                writer.clone(), query.clone(), config_snapshot.hash(), &config_snapshot.config().llm,
                             ).await.map_err(|_| ErrorCode::Internal)?;
                             use evertrace_protocol::dto::MetadataReadOutcome;
                             return Ok(Response::HumanGovernance(match outcome {
