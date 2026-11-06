@@ -2,7 +2,7 @@ use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
 use crate::{
-    canonical::{CanonicalValue, sha256},
+    canonical::{CanonicalBytesHasher, CanonicalValue, sha256},
     ids::{
         CaptureOutageIntervalId, DuplicateGroupId, ExecutionLaneId, ExperimentRunId,
         HostOccurrenceId, OperationId, RepositoryId, ScopeEffectId, SourceObservationId,
@@ -1460,20 +1460,36 @@ pub fn payload_fingerprint(
     protected_payload: &[u8],
     protected_secret_digest: Option<[u8; 32]>,
 ) -> Result<[u8; 32], EvidenceError> {
-    if canonicalization_version == 0 || protected_payload.is_empty() {
-        return Err(EvidenceError::Invalid);
-    }
-    sha256(
-        "source_payload_fingerprint",
-        1,
-        &CanonicalValue::Map(vec![
+    let mut fingerprint = SourcePayloadFingerprint::new(
+        canonicalization_version,
+        protected_payload.len(),
+        protected_secret_digest,
+    )?;
+    fingerprint.update(protected_payload)?;
+    fingerprint.finish()
+}
+
+/// The existing source fingerprint, computed without owning or copying its payload.
+/// Length and metadata are immutable for the lifetime of this in-process calculation.
+pub struct SourcePayloadFingerprint(CanonicalBytesHasher);
+
+impl SourcePayloadFingerprint {
+    pub fn new(
+        canonicalization_version: u32,
+        protected_length: usize,
+        protected_secret_digest: Option<[u8; 32]>,
+    ) -> Result<Self, EvidenceError> {
+        if canonicalization_version == 0 || protected_length == 0 {
+            return Err(EvidenceError::Invalid);
+        }
+        let entries = [
             (
                 "canonicalization_version".into(),
                 CanonicalValue::Integer(i128::from(canonicalization_version)),
             ),
             (
                 "protected_payload".into(),
-                CanonicalValue::Bytes(protected_payload.to_vec()),
+                CanonicalValue::Bytes(Vec::new()),
             ),
             (
                 "protected_secret_digest".into(),
@@ -1481,9 +1497,25 @@ pub fn payload_fingerprint(
                     CanonicalValue::Bytes(value.to_vec())
                 }),
             ),
-        ]),
-    )
-    .map_err(|_| EvidenceError::Canonical)
+        ];
+        CanonicalBytesHasher::new(
+            "source_payload_fingerprint",
+            1,
+            &entries,
+            "protected_payload",
+            protected_length,
+        )
+        .map(Self)
+        .map_err(|_| EvidenceError::Canonical)
+    }
+
+    pub fn update(&mut self, bytes: &[u8]) -> Result<(), EvidenceError> {
+        self.0.update(bytes).map_err(|_| EvidenceError::Canonical)
+    }
+
+    pub fn finish(self) -> Result<[u8; 32], EvidenceError> {
+        self.0.finish().map_err(|_| EvidenceError::Canonical)
+    }
 }
 
 pub fn evidence_span_hash(
