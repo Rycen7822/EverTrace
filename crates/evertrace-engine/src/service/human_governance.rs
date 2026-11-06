@@ -33,7 +33,7 @@ use std::{
 use evertrace_capture::{CasDigest, CasStore, RuntimeSnapshot};
 use evertrace_domain::{
     config::GlobalPromotionConfig,
-    evidence::{IdentityStrength, SourceArchiveMode, hex, payload_fingerprint},
+    evidence::{IdentityStrength, hex},
     ids::{
         AtomId, AttemptId, CaptureReceiptId, CommandId, CoreMembershipId, ExecutionLaneId, JobId,
         ProcedureId, ProcedureNegativeEvidenceId, RecoveryApplicationId, RecoveryBundleId,

@@ -25,12 +25,66 @@ pub struct HumanContentChunk {
     pub next_cursor: Option<String>,
 }
 
+/// Classifies the complete archive while retaining at most one partial UTF-8 character.
+struct Utf8Check {
+    valid: bool,
+    pending: [u8; 4],
+    pending_len: usize,
+}
+
+impl Default for Utf8Check {
+    fn default() -> Self {
+        Self {
+            valid: true,
+            pending: [0; 4],
+            pending_len: 0,
+        }
+    }
+}
+
+impl Utf8Check {
+    fn update(&mut self, mut bytes: &[u8]) {
+        if !self.valid {
+            return;
+        }
+        if bytes.contains(&0) {
+            self.valid = false;
+            return;
+        }
+        if self.pending_len != 0 {
+            let needed = self.pending[0].leading_ones() as usize;
+            let take = bytes.len().min(needed - self.pending_len);
+            self.pending[self.pending_len..self.pending_len + take].copy_from_slice(&bytes[..take]);
+            self.pending_len += take;
+            if self.pending_len < needed {
+                return;
+            }
+            if std::str::from_utf8(&self.pending[..needed]).is_err() {
+                self.valid = false;
+                return;
+            }
+            self.pending_len = 0;
+            bytes = &bytes[take..];
+        }
+        if let Err(error) = std::str::from_utf8(bytes) {
+            if error.error_len().is_some() {
+                self.valid = false;
+                return;
+            }
+            let tail = &bytes[error.valid_up_to()..];
+            self.pending[..tail.len()].copy_from_slice(tail);
+            self.pending_len = tail.len();
+        }
+    }
+}
+
 impl HumanGovernanceService {
-    async fn source_text(
+    async fn source_window(
         &self,
         snapshot: &evertrace_store::projections::ProjectionSnapshot,
         row: &evertrace_store::objects::ObjectRow,
-    ) -> Result<String, HumanContentState> {
+        range: std::ops::Range<u64>,
+    ) -> Result<(Vec<u8>, u64, bool), HumanContentState> {
         use evertrace_domain::evidence::ProtectedPresentation;
         let decode = |row: &evertrace_store::objects::ObjectRow| {
             let payload: JournalPayload = serde_json::from_str(
@@ -87,9 +141,9 @@ impl HumanGovernanceService {
             .cas_dir
             .clone();
         let deadline = std::time::Instant::now() + presentation::READ_DEADLINE;
-        // Verify the entire archive under the actual reader fence. Cancellation
-        // covers encoded reads, decompression and hashing, not just the reply.
-        // This still retains the archive; it is not a constant-RSS range reader.
+        // Verify the complete archive under the real reader fence, retaining only
+        // the requested range plus one UTF-8 boundary byte. Metadata selection is
+        // still the existing snapshot path, not yet the finite ReadExact consumer.
         self.writer
             .read_handle()
             .read_blocking(move |cancel| {
@@ -102,27 +156,37 @@ impl HumanGovernanceService {
                     .map_err(|_| evertrace_store::StoreError::Io)?;
                 let digest = evertrace_capture::CasStore::parse_digest(&receipt.cas_ref)
                     .map_err(|_| evertrace_store::StoreError::StoreCorrupt)?;
-                let (bytes, _) = cas
-                    .read_bounded_checked(
+                let mut verifier =
+                    evertrace_capture::cas::SourceArchiveVerifier::new(&receipt, &observation)
+                        .map_err(|_| evertrace_store::StoreError::StoreCorrupt)?;
+                let mut utf8 = Utf8Check::default();
+                let window = cas
+                    .read_bounded_window_checked(
                         &digest,
                         export::MAX_ENCODED_BYTES,
                         export::MAX_DECODED_BYTES,
-                        || check().map_err(|_| evertrace_capture::CasError::ReadCancelled),
+                        range,
+                        &mut || check().map_err(|_| evertrace_capture::CasError::ReadCancelled),
+                        &mut |bytes| {
+                            verifier.update(bytes)?;
+                            utf8.update(bytes);
+                            Ok(())
+                        },
                     )
                     .map_err(|_| evertrace_store::StoreError::Io)?;
                 check()?;
-                export::validate_source_archive(&receipt, &observation, &bytes)
+                verifier
+                    .finish()
                     .map_err(|_| evertrace_store::StoreError::StoreCorrupt)?;
                 check()?;
-                let text = match String::from_utf8(bytes) {
-                    Ok(text) if !text.contains('\0') => Ok(text),
-                    _ => Err(HumanContentState::Unsupported),
-                };
-                check()?;
-                Ok(text)
+                Ok((
+                    window.bytes,
+                    window.total_bytes,
+                    utf8.valid && utf8.pending_len == 0,
+                ))
             })
             .await
-            .map_err(|_| HumanContentState::Unavailable)?
+            .map_err(|_| HumanContentState::Unavailable)
     }
 
     pub async fn content(
@@ -223,9 +287,9 @@ impl HumanGovernanceService {
             result.state = presentation::access_state(error);
             return Ok(Ok(result));
         }
-        // Source text is the complete native-verified protected archive, never
-        // a stored preview, an EvidenceSurface or a Python-supplied CAS path.
-        let text = if matches!(
+        let offset = cursor.as_ref().map_or(0, |cursor| cursor.offset);
+        let backwards = cursor.as_ref().is_some_and(|cursor| cursor.backwards);
+        let (text, start, end, total) = if matches!(
             row.object_kind.as_deref(),
             Some("source_receipt" | "source_observation")
         ) {
@@ -233,86 +297,137 @@ impl HumanGovernanceService {
                 result.state = HumanContentState::Unsupported;
                 return Ok(Ok(result));
             }
-            match self.source_text(&snapshot, row).await {
-                Ok(text) => text,
+            let start = if backwards {
+                offset.saturating_sub(u64::from(limit))
+            } else {
+                offset
+            };
+            let requested_end = if backwards {
+                offset
+            } else {
+                offset.saturating_add(u64::from(limit))
+            };
+            let (mut bytes, total, is_text) = match self
+                .source_window(&snapshot, row, start..requested_end.saturating_add(1))
+                .await
+            {
+                Ok(window) => window,
                 Err(state) => {
                     result.state = state;
                     return Ok(Ok(result));
                 }
-            }
-        } else if row.object_kind.as_deref() == Some("work_episode")
-            && representation == HumanContentRepresentation::Text
-        {
-            let payload: JournalPayload = serde_json::from_str(
-                row.payload_json
-                    .as_deref()
-                    .ok_or(HumanGovernanceError::Store)?,
-            )
-            .map_err(|_| HumanGovernanceError::Store)?;
-            let JournalPayload::WorkEpisodeRecorded(value) = payload else {
-                return Err(HumanGovernanceError::Store);
             };
-            let mut text = value.phase_contract.local_goal;
-            text.push_str("\n\n未解决事项\n");
-            for (index, entry) in value.open_loops.iter().enumerate() {
-                use std::fmt::Write;
-                writeln!(text, "{}. {}", index + 1, entry)
-                    .map_err(|_| HumanGovernanceError::Store)?;
-            }
-            text
-        } else if row.object_kind.as_deref() == Some("revision_proposal_revision") {
-            let payload: JournalPayload = serde_json::from_str(
-                row.payload_json
-                    .as_deref()
-                    .ok_or(HumanGovernanceError::Store)?,
-            )
-            .map_err(|_| HumanGovernanceError::Store)?;
-            let JournalPayload::RevisionProposalRecorded(value) = payload else {
-                return Err(HumanGovernanceError::Store);
-            };
-            if representation != HumanContentRepresentation::SemanticJson {
+            if !is_text {
                 result.state = HumanContentState::Unsupported;
                 return Ok(Ok(result));
             }
-            serde_json::to_string_pretty(&value).map_err(|_| HumanGovernanceError::Store)?
+            if offset > total {
+                return Err(HumanGovernanceError::InvalidInput);
+            }
+            let end = requested_end.min(total);
+            let span = (end - start) as usize;
+            if bytes.len() < span {
+                return Err(HumanGovernanceError::Store);
+            }
+            let continuation = |byte: &u8| byte & 0xc0 == 0x80;
+            if bytes
+                .get(if backwards { span } else { 0 })
+                .is_some_and(continuation)
+            {
+                return Err(HumanGovernanceError::InvalidInput);
+            }
+            let mut leading = 0;
+            while leading < span && continuation(&bytes[leading]) {
+                leading += 1;
+            }
+            let mut trailing = span;
+            while trailing > leading && bytes.get(trailing).is_some_and(continuation) {
+                trailing -= 1;
+            }
+            bytes.truncate(trailing);
+            bytes.drain(..leading);
+            let text = String::from_utf8(bytes).map_err(|_| HumanGovernanceError::Store)?;
+            (text, start + leading as u64, start + trailing as u64, total)
         } else {
-            let Some((content, _)) = presentation::semantic_value(row)? else {
-                result.state = HumanContentState::Unsupported;
-                return Ok(Ok(result));
-            };
-            match (&content, representation) {
-                (HumanSemanticContent::Atom(value), HumanContentRepresentation::Text) => {
-                    value.value.text.clone()
+            let text = if row.object_kind.as_deref() == Some("work_episode")
+                && representation == HumanContentRepresentation::Text
+            {
+                let payload: JournalPayload = serde_json::from_str(
+                    row.payload_json
+                        .as_deref()
+                        .ok_or(HumanGovernanceError::Store)?,
+                )
+                .map_err(|_| HumanGovernanceError::Store)?;
+                let JournalPayload::WorkEpisodeRecorded(value) = payload else {
+                    return Err(HumanGovernanceError::Store);
+                };
+                let mut text = value.phase_contract.local_goal;
+                text.push_str("\n\n未解决事项\n");
+                for (index, entry) in value.open_loops.iter().enumerate() {
+                    use std::fmt::Write;
+                    writeln!(text, "{}. {}", index + 1, entry)
+                        .map_err(|_| HumanGovernanceError::Store)?;
                 }
-                (_, HumanContentRepresentation::SemanticJson) => {
-                    serde_json::to_string_pretty(&content)
-                        .map_err(|_| HumanGovernanceError::Store)?
-                }
-                _ => {
+                text
+            } else if row.object_kind.as_deref() == Some("revision_proposal_revision") {
+                let payload: JournalPayload = serde_json::from_str(
+                    row.payload_json
+                        .as_deref()
+                        .ok_or(HumanGovernanceError::Store)?,
+                )
+                .map_err(|_| HumanGovernanceError::Store)?;
+                let JournalPayload::RevisionProposalRecorded(value) = payload else {
+                    return Err(HumanGovernanceError::Store);
+                };
+                if representation != HumanContentRepresentation::SemanticJson {
                     result.state = HumanContentState::Unsupported;
                     return Ok(Ok(result));
                 }
+                serde_json::to_string_pretty(&value).map_err(|_| HumanGovernanceError::Store)?
+            } else {
+                let Some((content, _)) = presentation::semantic_value(row)? else {
+                    result.state = HumanContentState::Unsupported;
+                    return Ok(Ok(result));
+                };
+                match (&content, representation) {
+                    (HumanSemanticContent::Atom(value), HumanContentRepresentation::Text) => {
+                        value.value.text.clone()
+                    }
+                    (_, HumanContentRepresentation::SemanticJson) => {
+                        serde_json::to_string_pretty(&content)
+                            .map_err(|_| HumanGovernanceError::Store)?
+                    }
+                    _ => {
+                        result.state = HumanContentState::Unsupported;
+                        return Ok(Ok(result));
+                    }
+                }
+            };
+            let offset = usize::try_from(offset).map_err(|_| HumanGovernanceError::InvalidInput)?;
+            if offset > text.len() || !text.is_char_boundary(offset) {
+                return Err(HumanGovernanceError::InvalidInput);
             }
-        };
-        let offset = cursor.as_ref().map_or(0, |cursor| cursor.offset);
-        let offset = usize::try_from(offset).map_err(|_| HumanGovernanceError::InvalidInput)?;
-        if offset > text.len() || !text.is_char_boundary(offset) {
-            return Err(HumanGovernanceError::InvalidInput);
-        }
-        let (mut start, mut end) = if cursor.as_ref().is_some_and(|cursor| cursor.backwards) {
-            (offset.saturating_sub(usize::from(limit)), offset)
-        } else {
+            let (mut start, mut end) = if backwards {
+                (offset.saturating_sub(usize::from(limit)), offset)
+            } else {
+                (
+                    offset,
+                    offset.saturating_add(usize::from(limit)).min(text.len()),
+                )
+            };
+            while !text.is_char_boundary(start) {
+                start += 1;
+            }
+            while !text.is_char_boundary(end) {
+                end -= 1;
+            }
             (
-                offset,
-                offset.saturating_add(usize::from(limit)).min(text.len()),
+                text[start..end].to_owned(),
+                start as u64,
+                end as u64,
+                text.len() as u64,
             )
         };
-        while !text.is_char_boundary(start) {
-            start += 1;
-        }
-        while !text.is_char_boundary(end) {
-            end -= 1;
-        }
         let encode_cursor = |offset, backwards| {
             serde_json::to_string(&HumanContentCursor {
                 object_ref: object_ref.into(),
@@ -324,15 +439,15 @@ impl HumanGovernanceService {
             .map_err(|_| HumanGovernanceError::Store)
         };
         result.state = HumanContentState::Ready;
-        result.total_bytes = Some(text.len() as u64);
-        result.range_start = Some(start as u64);
-        result.range_end = Some(end as u64);
-        result.text = Some(text[start..end].into());
+        result.total_bytes = Some(total);
+        result.range_start = Some(start);
+        result.range_end = Some(end);
+        result.text = Some(text);
         result.previous_cursor = (start > 0)
-            .then(|| encode_cursor(start as u64, true))
+            .then(|| encode_cursor(start, true))
             .transpose()?;
-        result.next_cursor = (end < text.len())
-            .then(|| encode_cursor(end as u64, false))
+        result.next_cursor = (end < total)
+            .then(|| encode_cursor(end, false))
             .transpose()?;
         Ok(Ok(result))
     }

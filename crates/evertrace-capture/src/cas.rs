@@ -3,6 +3,7 @@ use std::{
     fmt,
     fs::{self, DirBuilder, File, OpenOptions},
     io::{self, Read, Write},
+    ops::Range,
     os::{
         fd::AsRawFd,
         unix::fs::{DirBuilderExt, FileTypeExt, MetadataExt, OpenOptionsExt, PermissionsExt},
@@ -11,6 +12,10 @@ use std::{
     str::FromStr,
 };
 
+use evertrace_domain::evidence::{
+    ProtectedPresentation, SourceArchiveMode, SourceObservation, SourcePayloadFingerprint,
+    SourceReceipt,
+};
 use fs2::FileExt;
 use rustix::fs::{AtFlags, Mode, OFlags, openat, statat, unlinkat};
 use rustix::io::Errno;
@@ -529,6 +534,46 @@ impl CasStore {
         Ok((protected, encoded))
     }
 
+    /// Verify the whole bounded envelope, retaining only the requested decoded range.
+    /// The visitor is a Native validator, not a delivery sink; neither it nor the
+    /// selected bytes may be exposed until this read and the validator finish.
+    pub fn read_bounded_window_checked(
+        &self,
+        digest: &CasDigest,
+        max_encoded: u64,
+        max_decoded: u64,
+        range: Range<u64>,
+        check: &mut dyn FnMut() -> Result<(), CasError>,
+        visit: &mut dyn FnMut(&[u8]) -> Result<(), CasError>,
+    ) -> Result<CasReadWindow, CasError> {
+        if range.end < range.start || range.end - range.start > max_decoded {
+            return Err(CasError::ReadBudgetExceeded);
+        }
+        let mut bytes = Vec::new();
+        let mut offset = 0_u64;
+        let (total_bytes, encoded_bytes) =
+            self.read_verified(digest, max_encoded, max_decoded, check, &mut |chunk| {
+                visit(chunk)?;
+                let next = offset
+                    .checked_add(chunk.len() as u64)
+                    .ok_or(CasError::StoreCorrupt)?;
+                let start = range.start.max(offset);
+                let end = range.end.min(next);
+                if start < end {
+                    bytes.extend_from_slice(
+                        &chunk[(start - offset) as usize..(end - offset) as usize],
+                    );
+                }
+                offset = next;
+                Ok(())
+            })?;
+        Ok(CasReadWindow {
+            bytes,
+            total_bytes,
+            encoded_bytes,
+        })
+    }
+
     /// Verifies the same envelope/digest without retaining decoded bytes.
     /// This does not assert a format-independent bound on the decoder window.
     pub fn verify_envelope(&self, digest: &CasDigest) -> Result<u64, CasError> {
@@ -739,6 +784,132 @@ impl CasStore {
     fn validate_root(&self) -> Result<(), CasError> {
         validate_directory(&self.root)?;
         validate_directory(&self.root.join("blobs"))
+    }
+}
+
+/// A verified CAS byte range. An offset beyond EOF yields an empty range and the actual total.
+/// The data owner still validates the requested text boundary and current access.
+pub struct CasReadWindow {
+    pub bytes: Vec<u8>,
+    pub total_bytes: u64,
+    pub encoded_bytes: u64,
+}
+
+/// One request-local check of an existing source archive. Export and exact reads
+/// share its tuple, protected-presentation, fingerprint and redaction validation.
+/// It does not authorize access or retain the archive.
+pub struct SourceArchiveVerifier<'a> {
+    fingerprint: SourcePayloadFingerprint,
+    expected_fingerprint: &'a str,
+    presentation_prefix: &'a [u8],
+    protected_length: u64,
+    offset: u64,
+    redactions: usize,
+    minimum_redactions: usize,
+    marker_position: usize,
+}
+
+impl<'a> SourceArchiveVerifier<'a> {
+    pub fn new(
+        receipt: &'a SourceReceipt,
+        observation: &'a SourceObservation,
+    ) -> Result<Self, CasError> {
+        receipt.validate().map_err(|_| CasError::StoreCorrupt)?;
+        observation.validate().map_err(|_| CasError::StoreCorrupt)?;
+        if receipt.source_observation_id != observation.source_observation_id
+            || receipt.source_receipt_id != observation.source_receipt_ref
+            || receipt.source_instance_id != observation.source_instance_id
+            || receipt.source_revision != observation.source_revision
+            || receipt.source_record_identity != observation.source_record_identity
+            || receipt.observation_role != observation.observation_role
+            || receipt.identity_strength != observation.identity_strength
+            || receipt.capture_completeness != observation.capture_completeness
+            || receipt.adapter_revision != observation.adapter_revision
+            || receipt.parser_revision != observation.parser_revision
+            || receipt.canonicalization_revision != observation.canonicalization_revision
+            || receipt.detector_revision != observation.detector_revision
+            || receipt.redaction_revision != observation.redaction_revision
+        {
+            return Err(CasError::StoreCorrupt);
+        }
+        let secret = receipt
+            .protected_secret_digest
+            .as_deref()
+            .map(str::parse::<CasDigest>)
+            .transpose()?
+            .map(|digest| *digest.as_bytes());
+        let fingerprint = SourcePayloadFingerprint::new(
+            receipt.canonicalization_revision,
+            usize::try_from(receipt.protected_length).map_err(|_| CasError::StoreCorrupt)?,
+            secret,
+        )
+        .map_err(|_| CasError::StoreCorrupt)?;
+        let presentation_prefix = match &receipt.protected_presentation {
+            Some(
+                ProtectedPresentation::Inline { text } | ProtectedPresentation::Preview { text },
+            ) => text.as_bytes(),
+            _ => &[],
+        };
+        Ok(Self {
+            fingerprint,
+            expected_fingerprint: &observation.payload_fingerprint,
+            presentation_prefix,
+            protected_length: receipt.protected_length,
+            offset: 0,
+            redactions: 0,
+            marker_position: 0,
+            minimum_redactions: if receipt.archive_mode == SourceArchiveMode::Redacted {
+                receipt.redaction_spans.len()
+            } else {
+                0
+            },
+        })
+    }
+
+    pub fn update(&mut self, bytes: &[u8]) -> Result<(), CasError> {
+        self.fingerprint
+            .update(bytes)
+            .map_err(|_| CasError::StoreCorrupt)?;
+        let start = usize::try_from(self.offset).map_err(|_| CasError::StoreCorrupt)?;
+        if start < self.presentation_prefix.len() {
+            let size = bytes.len().min(self.presentation_prefix.len() - start);
+            if bytes[..size] != self.presentation_prefix[start..start + size] {
+                return Err(CasError::StoreCorrupt);
+            }
+        }
+        if self.minimum_redactions != 0 {
+            // REDACTION_TOKEN contains no internal '['; only that byte can restart a partial match.
+            for &byte in bytes {
+                if byte == crate::protect::REDACTION_TOKEN[self.marker_position] {
+                    self.marker_position += 1;
+                    if self.marker_position == crate::protect::REDACTION_TOKEN.len() {
+                        self.redactions += 1;
+                        self.marker_position = 0;
+                    }
+                } else {
+                    self.marker_position = usize::from(byte == b'[');
+                }
+            }
+        }
+        self.offset = self
+            .offset
+            .checked_add(bytes.len() as u64)
+            .ok_or(CasError::StoreCorrupt)?;
+        Ok(())
+    }
+
+    pub fn finish(self) -> Result<(), CasError> {
+        if self.offset != self.protected_length
+            || self.redactions < self.minimum_redactions
+            || hex(&self
+                .fingerprint
+                .finish()
+                .map_err(|_| CasError::StoreCorrupt)?)
+                != self.expected_fingerprint
+        {
+            return Err(CasError::StoreCorrupt);
+        }
+        Ok(())
     }
 }
 

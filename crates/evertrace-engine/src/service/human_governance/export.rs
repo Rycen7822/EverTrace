@@ -755,46 +755,10 @@ pub(super) fn validate_source_archive(
     observation: &evertrace_domain::evidence::SourceObservation,
     bytes: &[u8],
 ) -> ExportResult<()> {
-    if receipt.protected_length != bytes.len() as u64 {
-        return Err(Failure::Corrupt);
-    }
-    if receipt
-        .protected_presentation
-        .as_ref()
-        .is_some_and(|presentation| match presentation {
-            evertrace_domain::evidence::ProtectedPresentation::Inline { text } => {
-                text.as_bytes() != bytes
-            }
-            evertrace_domain::evidence::ProtectedPresentation::Preview { text } => {
-                !bytes.starts_with(text.as_bytes())
-            }
-            evertrace_domain::evidence::ProtectedPresentation::Unavailable { .. } => false,
-        })
-    {
-        return Err(Failure::Corrupt);
-    }
-    let secret = receipt
-        .protected_secret_digest
-        .as_deref()
-        .map(parse_hex)
-        .transpose()?;
-    if observation.source_observation_id != receipt.source_observation_id
-        || observation.source_receipt_ref != receipt.source_receipt_id
-        || observation.payload_fingerprint
-            != hex(
-                &payload_fingerprint(receipt.canonicalization_revision, bytes, secret)
-                    .map_err(|_| Failure::Corrupt)?,
-            )
-        || (receipt.archive_mode == SourceArchiveMode::Redacted
-            && bytes
-                .windows(b"[REDACTED]".len())
-                .filter(|span| *span == b"[REDACTED]")
-                .count()
-                < receipt.redaction_spans.len())
-    {
-        return Err(Failure::Corrupt);
-    }
-    Ok(())
+    let mut verifier = evertrace_capture::cas::SourceArchiveVerifier::new(receipt, observation)
+        .map_err(|_| Failure::Corrupt)?;
+    verifier.update(bytes).map_err(|_| Failure::Corrupt)?;
+    verifier.finish().map_err(|_| Failure::Corrupt)
 }
 
 fn stage(
@@ -813,7 +777,12 @@ fn stage(
         check_deadline(deadline)?;
         let payload = decode(row)?;
         let mut document = format!(
-            "# EverTrace selected object\n\nFrontier: {frontier}\n\nObject: {}\n\nRevision: {}\n\nScope: {:?}\n\nLifecycle: {:?}; publication: {:?}; support: {:?}\n\nComplete stored content (selected object only):\n\n",
+            concat!(
+                "# EverTrace selected object\n\nFrontier: {}\n\nObject: {}\n\nRevision: {}\n\n",
+                "Scope: {:?}\n\nLifecycle: {:?}; publication: {:?}; support: {:?}\n\n",
+                "Complete stored content (selected object only):\n\n",
+            ),
+            frontier,
             row.object_id.as_deref().unwrap_or(&row.row_id),
             row.current_revision_id.as_deref().unwrap_or("none"),
             (&row.repository_id, &row.task_id, &row.workstream_id),
@@ -915,18 +884,6 @@ fn stage(
         .and_then(|file| file.sync_all())
         .map_err(|_| Failure::Io)?;
     Ok(stage)
-}
-
-fn parse_hex(value: &str) -> ExportResult<[u8; 32]> {
-    if value.len() != 64 || !value.is_ascii() {
-        return Err(Failure::Corrupt);
-    }
-    let mut bytes = [0; 32];
-    for (index, byte) in bytes.iter_mut().enumerate() {
-        *byte = u8::from_str_radix(&value[index * 2..index * 2 + 2], 16)
-            .map_err(|_| Failure::Corrupt)?;
-    }
-    Ok(bytes)
 }
 
 #[cfg(test)]
