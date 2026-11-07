@@ -6381,6 +6381,74 @@ impl JournalAdmissionState {
         )
     }
 
+    fn stored_read_dependencies(
+        &self,
+        row: &ObjectRow,
+        payload: &JournalPayload,
+        cancelled: &std::sync::atomic::AtomicBool,
+        deadline: std::time::Instant,
+        suppressed: &mut bool,
+    ) -> Result<Option<BTreeSet<String>>, StoreError> {
+        let mut refs = read_dependencies_for(row, payload);
+        if let JournalPayload::CaptureReceiptRecorded(capture) = payload {
+            let lookup = CandidateSourceLookup::Current {
+                observations: &self.source_observations,
+                receipts: &self.source_receipts,
+                surfaces: &self.evidence_surfaces,
+            };
+            let has_deletions = self.deletions.events().next().is_some();
+            let mut sources = BTreeSet::new();
+            let mut scopes = BTreeSet::new();
+            // The archive receipt_ids index covers imports only; ordinary capture uses the same primary facts.
+            for (receipt, seq) in self.source_receipts.values() {
+                if cancelled.load(std::sync::atomic::Ordering::SeqCst) {
+                    return Err(StoreError::Io);
+                }
+                if std::time::Instant::now() >= deadline {
+                    return Ok(None);
+                }
+                // Later observations are not dependencies of this immutable coverage receipt.
+                if *seq > row.source_event_seq {
+                    continue;
+                }
+                let Some(source) = capture.source_revision_refs.iter().find(|source| {
+                    source
+                        .strip_prefix(receipt.source_instance_id.as_str())
+                        .and_then(|suffix| suffix.strip_prefix('@'))
+                        == Some(receipt.source_revision.as_str())
+                }) else {
+                    continue;
+                };
+                sources.insert(source);
+                // Copy one actual witness per source/scope, not every protected record or another resident index.
+                if scopes.insert((
+                    source,
+                    receipt.task_id,
+                    receipt.repository_instance_id,
+                    receipt.worktree_instance_id,
+                )) {
+                    refs.insert(receipt.source_observation_id.to_string());
+                    if refs.len() >= READ_DEPENDENCY_LIMIT {
+                        return Ok(None);
+                    }
+                }
+                // An off-witness suppression must not leak through the coverage receipt's references/counts.
+                if has_deletions {
+                    *suppressed |= source_suppressed(
+                        self.deletions.events(),
+                        lookup
+                            .suppression_refs(receipt.source_observation_id)?
+                            .as_ref(),
+                    );
+                }
+            }
+            if sources.len() != capture.source_revision_refs.len() {
+                return Err(StoreError::StoreCorrupt);
+            }
+        }
+        Ok(Some(refs))
+    }
+
     fn stored_fields_context_for_row(
         &self,
         selected: Option<ObjectRow>,
@@ -6400,9 +6468,9 @@ impl JournalAdmissionState {
             return Ok(Outcome::Page(Box::new(context)));
         };
         let root_id = root.row_id.clone();
-        let source_record = matches!(
+        let source_cohort = matches!(
             root.object_kind.as_deref(),
-            Some("source_receipt" | "source_observation")
+            Some("source_receipt" | "source_observation" | "capture_receipt")
         );
         let payload: JournalPayload = serde_json::from_str(
             root.payload_json
@@ -6410,7 +6478,16 @@ impl JournalAdmissionState {
                 .ok_or(StoreError::StoreCorrupt)?,
         )
         .map_err(|_| StoreError::StoreCorrupt)?;
-        let mut pending = read_dependencies_for(&root, &payload);
+        let Some(mut pending) = self.stored_read_dependencies(
+            &root,
+            &payload,
+            cancelled,
+            deadline,
+            &mut context.source_suppressed,
+        )?
+        else {
+            return Ok(Outcome::TooLarge);
+        };
         let mut visited = BTreeSet::new();
         let mut rows = BTreeMap::from([(root_id.clone(), root)]);
         budget.rows += 1;
@@ -6446,9 +6523,9 @@ impl JournalAdmissionState {
                         .ok_or(StoreError::StoreCorrupt)?,
                 )
                 .map_err(|_| StoreError::StoreCorrupt)?;
-                // Source reads use only their receipt/observation/surface cohort plus direct Task/Worktree scope facts.
+                // Evidence reads use only their source cohort plus direct Task/Worktree scope facts.
                 // Following a Task's unrelated request roots would incorrectly inherit their revocation or suppression.
-                if !source_record
+                if !source_cohort
                     || matches!(
                         &payload,
                         JournalPayload::SourceReceiptRecorded(_)
@@ -6456,7 +6533,17 @@ impl JournalAdmissionState {
                             | JournalPayload::EvidenceSurfaceRecorded(_)
                     )
                 {
-                    pending.extend(read_dependencies_for(&row, &payload));
+                    let Some(dependencies) = self.stored_read_dependencies(
+                        &row,
+                        &payload,
+                        cancelled,
+                        deadline,
+                        &mut context.source_suppressed,
+                    )?
+                    else {
+                        return Ok(Outcome::TooLarge);
+                    };
+                    pending.extend(dependencies);
                 }
                 budget.rows += 1;
                 budget.bytes += row.payload_json.as_ref().map_or(0, |v| v.len()) as u64;
