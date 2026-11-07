@@ -12,10 +12,9 @@ use evertrace_domain::{
     procedure::ProcedureNegativeReviewStatus,
     purge::{ObjectDeletionTarget, ObjectReauthorizationRef},
     repository::{
-        DestructiveClass, GitRegistrationState, OrderingIntegrity, RecoveryApplicationKind,
-        RecoveryApplicationStatus, RecoveryCaptureStatus, RecoveryInputDeliveryState,
-        RecoveryOmissionReason, RecoveryReasonCode, RecoveryRequestStatus, UntrackedCaptureScope,
-        WorktreeKind, WorktreeLifecycle,
+        DestructiveClass, OrderingIntegrity, RecoveryApplicationKind, RecoveryApplicationStatus,
+        RecoveryCaptureStatus, RecoveryInputDeliveryState, RecoveryOmissionReason,
+        RecoveryReasonCode, RecoveryRequestStatus, UntrackedCaptureScope,
     },
     revision::RevisionId,
     semantic::{
@@ -499,7 +498,6 @@ pub struct HumanSnapshotItem {
     pub repository_purge_preview: Option<Box<HumanRepositoryPurgePreview>>,
     pub negative_review: Option<HumanNegativeReviewMetadata>,
     pub recovery_detail: Option<HumanRecoveryDetail>,
-    pub worktree_detail: Option<HumanWorktreeDetail>,
     pub execution_integrity_detail: Option<HumanExecutionIntegrityDetail>,
     pub system_detail: Option<HumanSystemDetail>,
     pub stable_key: String,
@@ -845,17 +843,6 @@ pub enum HumanRecoveryDetail {
 pub struct HumanRecoveryOmissionCount {
     pub reason: RecoveryOmissionReason,
     pub count: u32,
-}
-
-#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
-#[serde(deny_unknown_fields)]
-pub struct HumanWorktreeDetail {
-    pub worktree_id: WorktreeId,
-    pub repository_id: RepositoryId,
-    pub kind: WorktreeKind,
-    pub lifecycle: WorktreeLifecycle,
-    pub registration_state: GitRegistrationState,
-    pub current_snapshot_id: Option<WorktreeSnapshotId>,
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -1681,11 +1668,6 @@ impl HumanSnapshotItem {
                         self.revision_ref.as_deref(),
                     )
             })
-            && self.worktree_detail.as_ref().is_none_or(|detail| {
-                self.category == HumanItemCategory::Repository
-                    && self.object_kind == "worktree"
-                    && self.object_ref.as_deref() == Some(detail.worktree_id.to_string().as_str())
-            })
             && self
                 .execution_integrity_detail
                 .as_ref()
@@ -1703,7 +1685,6 @@ impl HumanSnapshotItem {
                 .system_detail
                 .as_ref()
                 .is_none_or(|detail| detail.validate(self))
-            && (self.object_kind == "worktree" || self.worktree_detail.is_none())
             && valid_ref(&self.stable_key)
             && valid_short(&self.object_kind)
             && self.source_event_seq > 0
@@ -2565,7 +2546,6 @@ mod human_backup_summary_tests {
                 repository_purge_preview: None,
                 negative_review: None,
                 recovery_detail: None,
-                worktree_detail: None,
                 execution_integrity_detail: None,
                 system_detail: Some(HumanSystemDetail::Job {
                     detail: Box::new(HumanJobDetail {

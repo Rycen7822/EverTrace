@@ -1491,18 +1491,22 @@ impl JournalWriter {
         evertrace_domain::query::MetadataReadOutcome<crate::projections::ReferenceReadContext>,
         StoreError,
     > {
-        use evertrace_domain::query::{ExactFieldsQuery, ExactReadQuery, MetadataReadOutcome as O};
+        use evertrace_domain::query::{ExactReadQuery, ExactRecordQuery, MetadataReadOutcome as O};
         let (before, state) = self.metadata_read_boundary(config_hash)?;
         let mut budget = crate::projections::ReadDependencyBudget::default();
         let context = (|| {
-            let query = ExactReadQuery::Fields(ExactFieldsQuery {
-                revision_ref: reference
-                    .revision_ref
-                    .clone()
-                    .ok_or(StoreError::InvalidInput)?,
+            if reference.revision_ref.is_none() {
+                return Err(StoreError::InvalidInput);
+            }
+            let query = ExactReadQuery::Record(ExactRecordQuery {
+                reference: reference.clone(),
+                field: None,
+                range: None,
+                expected_data_identity: None,
+                expected_selection: None,
             });
-            // Reference selectors also admit native physical revision IDs (for example capture receipts),
-            // which are not the Fields wire contract. Only a missing UUID Work revision needs the historical path.
+            // Raw reference selectors also admit physical revisions outside the Record/Fields wire contracts.
+            // Only missing, closed Work coordinates use the historical Record path; never widen Fields.
             let cached = self.admission_state.stored_fields_context_with_budget(
                 query.lookup_ref(),
                 state.clone(),
@@ -1511,10 +1515,12 @@ impl JournalWriter {
                 &mut budget,
             )?;
             let source = if matches!(&cached, O::Page(context) if context.selected.is_none())
-                && query
+                && (query
                     .lookup_ref()
                     .parse::<evertrace_domain::revision::RevisionId>()
                     .is_ok()
+                    || evertrace_domain::query::parse_worktree_revision(query.lookup_ref())
+                        .is_some())
             {
                 self.stored_fields_at_state(&query, state, cancelled, deadline, &mut budget)?
             } else {
@@ -1528,20 +1534,32 @@ impl JournalWriter {
             let predecessor = match source
                 .selected
                 .as_ref()
-                .filter(|row| matches!(row.object_kind.as_deref(), Some("task" | "workstream")))
+                .filter(|row| {
+                    matches!(
+                        row.object_kind.as_deref(),
+                        Some("task" | "workstream" | "worktree")
+                    )
+                })
                 .and_then(|row| row.payload_json.as_deref())
             {
                 Some(json) => match serde_json::from_str::<JournalPayload>(json)
                     .map_err(|_| StoreError::StoreCorrupt)?
                 {
-                    JournalPayload::TaskRecorded(value) => value.predecessor_revision_id,
-                    JournalPayload::WorkstreamRecorded(value) => value.predecessor_revision_id,
+                    JournalPayload::TaskRecorded(value) => {
+                        value.predecessor_revision_id.map(|id| id.to_string())
+                    }
+                    JournalPayload::WorkstreamRecorded(value) => {
+                        value.predecessor_revision_id.map(|id| id.to_string())
+                    }
+                    JournalPayload::WorktreeInstanceRecorded(value) => value
+                        .predecessor_revision
+                        .map(|revision| format!("{}@{revision}", value.worktree_instance_id)),
                     _ => None,
                 },
                 None => None,
             };
             let historical = if let Some(revision) = predecessor {
-                match self.historical_work_row(&revision.to_string(), cancelled, deadline)? {
+                match self.historical_work_row(&revision, cancelled, deadline)? {
                     O::Page(row) => *row,
                     O::TooLarge => return Ok(O::TooLarge),
                     O::Conflict(frontier) => return Ok(O::Conflict(frontier)),
@@ -1711,6 +1729,7 @@ impl JournalWriter {
         if reference
             .parse::<evertrace_domain::revision::RevisionId>()
             .is_err()
+            && evertrace_domain::query::parse_worktree_revision(reference).is_none()
         {
             return Ok(O::Page(Box::new(None)));
         }
@@ -1739,11 +1758,14 @@ impl JournalWriter {
                     return Err(StoreError::StoreCorrupt);
                 }
                 let revision = match &payload {
-                    JournalPayload::TaskRecorded(value) => value.revision_id,
-                    JournalPayload::WorkstreamRecorded(value) => value.revision_id,
+                    JournalPayload::TaskRecorded(value) => value.revision_id.to_string(),
+                    JournalPayload::WorkstreamRecorded(value) => value.revision_id.to_string(),
+                    JournalPayload::WorktreeInstanceRecorded(value) => {
+                        format!("{}@{}", value.worktree_instance_id, value.worktree_revision)
+                    }
                     _ => return Err(StoreError::StoreCorrupt),
                 };
-                if revision.to_string() != reference || row.seq > self.frontier() {
+                if revision != reference || row.seq > self.frontier() {
                     return Err(StoreError::StoreCorrupt);
                 }
                 Ok(O::Page(Box::new(

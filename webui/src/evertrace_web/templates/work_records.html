@@ -98,4 +98,36 @@
 {{ text_list('实验运行', value.experiment_run_ids) }}
 {{ text_list('产物引用', value.artifact_refs) }}
 <p class="reading-note">范围、前后快照与产物分别读取；没有快照就不补造 diff，没有 verifier 就不声称验证通过。</p>
+{% elif content.kind == 'worktree' %}
+<h2>工作树实例</h2>
+<p>仓库：{{ value.repository_instance_id }} · 实例类型：{{ value.kind }}</p>
+<p>生命周期：{{ value.lifecycle }} · Git 注册状态：{{ value.git_registration_state }}</p>
+<p class="memory-prose">所选修订记录的路径：{{ value.current_path or '未记录' }}</p>
+<p>所选修订的快照：{{ value.current_snapshot_id or '未记录' }}</p>
+<p>创建证据：{{ value.created_event_ref }} · 终止证据：{{ value.terminal_event_ref or '未记录' }}</p>
+<p>重建自：{{ value.recreated_from_worktree_instance_id or '未记录' }}</p>
+<h3>路径记录</h3>
+{% for entry in value.path_history %}
+<p class="memory-prose">{{ entry.path }} · 首次记录：{{ entry.first_observed_at_us }} · 最后记录：{{ entry.last_observed_at_us }}</p>
+{% endfor %}
+<p class="reading-note">路径与 branch 不是实例身份；信任撤销与生命周期分别判断。此处保留所选修订，不用当前快照覆盖旧记录。</p>
+{% elif content.kind == 'worktree_snapshot' %}
+<h2>工作树快照</h2>
+<p>工作树：{{ value.worktree_instance_id }} · 捕获状态：{{ value.capture_status }}</p>
+<p>HEAD：{{ value.head_oid or '未记录' }} · tree：{{ value.tree_oid or '未记录' }}</p>
+<p>branch：{{ value.branch_ref or '未记录' }} · detached：{{ '是' if value.detached_head else '否' }}</p>
+<p>Git 操作：{{ value.git_operation }} · 捕获时刻：{{ value.captured_at_us }}</p>
+<dl class="semantic-fields">
+  <dt>已跟踪变更摘要</dt><dd>{{ value.tracked_diff_digest or '未记录' }}</dd>
+  <dt>index 摘要</dt><dd>{{ value.index_digest or '未记录' }}</dd>
+  <dt>untracked 清单摘要</dt><dd>{{ value.untracked_manifest_digest or '未记录' }}</dd>
+</dl>
+{{ text_list('相关锚点摘要', value.relevant_anchor_digests) }}
+{{ text_list('依赖指纹', value.dependency_fingerprints) }}
+<p>工具链指纹：{{ value.toolchain_fingerprint or '未记录' }}</p>
+<h3>捕获缺项</h3>
+{% for omission in value.omission_reasons %}<p>{{ omission.field }}：{{ omission.reason }}</p>
+{% else %}<p>没有记录额外缺项。</p>{% endfor %}
+{{ text_list('快照证据', value.evidence_refs) }}
+<p class="reading-note">这些是捕获时的状态收据，不是文件正文、可恢复副本或测试通过证明；缺失摘要不判定状态相同。</p>
 {% endif %}

@@ -37,10 +37,9 @@ use evertrace_domain::{
     procedure::{ProcedureNegativeReviewEvent, ProcedureNegativeReviewStatus},
     purge::{ObjectDeletionTarget, ObjectReauthorizationRef, RepositoryPurgeBlocker},
     repository::{
-        DestructiveClass, GitRegistrationState, OrderingIntegrity as RecoveryOrderingIntegrity,
-        RecoveryApplicationKind, RecoveryApplicationStatus, RecoveryCaptureStatus,
-        RecoveryInputDeliveryState, RecoveryOmissionReason, RecoveryReasonCode,
-        RecoveryRequestStatus, UntrackedCaptureScope, WorktreeKind, WorktreeLifecycle,
+        DestructiveClass, OrderingIntegrity as RecoveryOrderingIntegrity, RecoveryApplicationKind,
+        RecoveryApplicationStatus, RecoveryCaptureStatus, RecoveryInputDeliveryState,
+        RecoveryOmissionReason, RecoveryReasonCode, RecoveryRequestStatus, UntrackedCaptureScope,
     },
     revision::RevisionId,
     semantic::{
@@ -173,7 +172,6 @@ pub struct HumanSummary {
     pub repository_purge_preview: Option<Box<HumanRepositoryPurgePreview>>,
     pub negative_review: Option<HumanNegativeReviewSummary>,
     pub recovery_detail: Option<HumanRecoveryDetail>,
-    pub worktree_detail: Option<HumanWorktreeDetail>,
     pub execution_integrity_detail: Option<HumanExecutionIntegrityDetail>,
     pub system_detail: Option<HumanSystemDetail>,
     pub stable_key: String,
@@ -445,16 +443,6 @@ pub enum HumanRecoveryDetail {
 pub struct HumanRecoveryOmissionCount {
     pub reason: RecoveryOmissionReason,
     pub count: u32,
-}
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub struct HumanWorktreeDetail {
-    pub worktree_id: WorktreeId,
-    pub repository_id: RepositoryId,
-    pub kind: WorktreeKind,
-    pub lifecycle: WorktreeLifecycle,
-    pub registration_state: GitRegistrationState,
-    pub current_snapshot_id: Option<WorktreeSnapshotId>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -3957,11 +3945,11 @@ fn summary(
     } else {
         None
     };
-    let (recovery_detail, worktree_detail, execution_integrity_detail, system_detail) =
+    let (recovery_detail, execution_integrity_detail, system_detail) =
         if include_detail || row.row_id.starts_with("runtime:job:") {
             typed_current_detail(row)?
         } else {
-            (None, None, None, None)
+            (None, None, None)
         };
     Ok(HumanSummary {
         reading_preview: None,
@@ -3982,7 +3970,6 @@ fn summary(
         repository_purge_preview,
         negative_review,
         recovery_detail,
-        worktree_detail,
         execution_integrity_detail,
         system_detail,
         ..summary_fields(row, surface)
@@ -4044,7 +4031,6 @@ fn summary_fields(row: &ObjectRow, surface: HumanSurface) -> HumanSummary {
         repository_purge_preview: None,
         negative_review: None,
         recovery_detail: None,
-        worktree_detail: None,
         execution_integrity_detail: None,
         system_detail: None,
         stable_key: row.row_id.clone(),
@@ -4102,7 +4088,6 @@ fn forget_target(row: &ObjectRow) -> Result<Option<ObjectDeletionTarget>, HumanG
 
 type HumanTypedDetails = (
     Option<HumanRecoveryDetail>,
-    Option<HumanWorktreeDetail>,
     Option<HumanExecutionIntegrityDetail>,
     Option<HumanSystemDetail>,
 );
@@ -4112,7 +4097,6 @@ fn typed_current_detail(row: &ObjectRow) -> Result<HumanTypedDetails, HumanGover
         .map_err(|_| HumanGovernanceError::Store)?
     {
         return Ok((
-            None,
             None,
             None,
             Some(HumanSystemDetail::SessionImport {
@@ -4130,21 +4114,20 @@ fn typed_current_detail(row: &ObjectRow) -> Result<HumanTypedDetails, HumanGover
     let kind = match row.object_kind.as_deref() {
         Some(kind) => kind,
         None if row.row_class == Some(ObjectRowClass::Runtime) => "runtime_event",
-        None => return Ok((None, None, None, None)),
+        None => return Ok((None, None, None)),
     };
     if !matches!(
         kind,
         "recovery_capture_request_revision"
             | "recovery_bundle"
             | "recovery_application_revision"
-            | "worktree"
             | "execution_lane"
             | "capture_receipt"
             | "runtime_event"
             | "repository"
             | "capability_inventory"
     ) {
-        return Ok((None, None, None, None));
+        return Ok((None, None, None));
     }
     let payload: JournalPayload = serde_json::from_str(
         row.payload_json
@@ -4154,7 +4137,6 @@ fn typed_current_detail(row: &ObjectRow) -> Result<HumanTypedDetails, HumanGover
     .map_err(|_| HumanGovernanceError::Store)?;
     match (kind, payload) {
         ("repository", JournalPayload::RepositoryInstanceRecorded(value)) => Ok((
-            None,
             None,
             None,
             Some(HumanSystemDetail::Repository {
@@ -4173,7 +4155,6 @@ fn typed_current_detail(row: &ObjectRow) -> Result<HumanTypedDetails, HumanGover
             }),
         )),
         ("capability_inventory", JournalPayload::CapabilityInventoryRecorded(value)) => Ok((
-            None,
             None,
             None,
             Some(HumanSystemDetail::CapabilityInventory {
@@ -4205,7 +4186,6 @@ fn typed_current_detail(row: &ObjectRow) -> Result<HumanTypedDetails, HumanGover
                 bundle_id: value.recovery_bundle_id,
                 reason_codes: sorted_reason_codes(&value.reason_codes),
             }),
-            None,
             None,
             None,
         )),
@@ -4251,7 +4231,6 @@ fn typed_current_detail(row: &ObjectRow) -> Result<HumanTypedDetails, HumanGover
                 }),
                 None,
                 None,
-                None,
             ))
         }
         ("recovery_application_revision", JournalPayload::RecoveryApplicationRecorded(value)) => {
@@ -4278,24 +4257,10 @@ fn typed_current_detail(row: &ObjectRow) -> Result<HumanTypedDetails, HumanGover
                 }),
                 None,
                 None,
-                None,
             ))
         }
-        ("worktree", JournalPayload::WorktreeInstanceRecorded(value)) => Ok((
-            None,
-            Some(HumanWorktreeDetail {
-                worktree_id: value.worktree_instance_id,
-                repository_id: value.repository_instance_id,
-                kind: value.kind,
-                lifecycle: value.lifecycle,
-                registration_state: value.git_registration_state,
-                current_snapshot_id: value.current_snapshot_id,
-            }),
-            None,
-            None,
-        )),
+
         ("execution_lane", JournalPayload::ExecutionLaneRecorded(value)) => Ok((
-            None,
             None,
             Some(HumanExecutionIntegrityDetail::Lane {
                 execution_lane_id: value.execution_lane_id,
@@ -4317,7 +4282,6 @@ fn typed_current_detail(row: &ObjectRow) -> Result<HumanTypedDetails, HumanGover
             None,
         )),
         ("capture_receipt", JournalPayload::CaptureReceiptRecorded(value)) => Ok((
-            None,
             None,
             Some(HumanExecutionIntegrityDetail::Receipt {
                 capture_receipt_revision_id: value.capture_receipt_revision_id,
@@ -4363,7 +4327,6 @@ fn typed_current_detail(row: &ObjectRow) -> Result<HumanTypedDetails, HumanGover
                 return Err(HumanGovernanceError::Store);
             }
             Ok((
-                None,
                 None,
                 None,
                 Some(HumanSystemDetail::Job {
@@ -4418,7 +4381,6 @@ fn typed_current_detail(row: &ObjectRow) -> Result<HumanTypedDetails, HumanGover
             Ok((
                 None,
                 None,
-                None,
                 Some(HumanSystemDetail::Config {
                     config_version: value.config_version,
                     effective_config_hash: value.effective_config_hash,
@@ -4426,7 +4388,7 @@ fn typed_current_detail(row: &ObjectRow) -> Result<HumanTypedDetails, HumanGover
                 }),
             ))
         }
-        ("runtime_event", _) => Ok((None, None, None, None)),
+        ("runtime_event", _) => Ok((None, None, None)),
         _ => Err(HumanGovernanceError::Store),
     }
 }
@@ -4833,9 +4795,8 @@ mod tests {
                 .into(),
         );
 
-        let (recovery, worktree, execution, system) = typed_current_detail(&row).unwrap();
+        let (recovery, execution, system) = typed_current_detail(&row).unwrap();
         assert!(recovery.is_none());
-        assert!(worktree.is_none());
         assert!(system.is_none());
         assert!(matches!(
             execution,

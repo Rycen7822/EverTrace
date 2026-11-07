@@ -2731,10 +2731,7 @@ mod tests {
         ids::{ProcedureNegativeEvidenceId, RepositoryId, WorktreeSnapshotId},
         procedure::ProcedureNegativeReviewStatus,
         purge::ObjectDeletionTarget,
-        repository::{
-            GitRegistrationState, OrderingIntegrity, RecoveryCaptureStatus, WorktreeKind,
-            WorktreeLifecycle,
-        },
+        repository::{OrderingIntegrity, RecoveryCaptureStatus},
         revision::RevisionId,
         work::{
             CoverageLevel, LaneStatus, LivenessState, OrderingIntegrity as WorkOrderingIntegrity,
@@ -2748,8 +2745,8 @@ mod tests {
         HumanJobBudget, HumanJobDetail, HumanJobState, HumanNegativeReviewMetadata,
         HumanObjectFamily, HumanProposalMetadata, HumanProposalReview, HumanRecoveryDetail,
         HumanRelationKind, HumanRepositoryPurgePreview, HumanRowClass, HumanSnapshotItem,
-        HumanSnapshotStatus, HumanSurface, HumanSystemDetail, HumanWorktreeDetail,
-        NegativeReviewDecision, PROTOCOL_VERSION, ProposalHumanDecision,
+        HumanSnapshotStatus, HumanSurface, HumanSystemDetail, NegativeReviewDecision,
+        PROTOCOL_VERSION, ProposalHumanDecision,
     };
     use evertrace_protocol::response::HealthResponse;
 
@@ -3158,17 +3155,6 @@ mod tests {
         assert!(rendered.contains("captured bytes: 12"));
 
         let mut worktree_detail = snapshot_item("worktree", worktree_one.to_string());
-        worktree_detail.worktree_detail = Some(HumanWorktreeDetail {
-            worktree_id: worktree_one,
-            repository_id: RepositoryId::new_v7(),
-            kind: WorktreeKind::Main,
-            lifecycle: WorktreeLifecycle::Active,
-            registration_state: GitRegistrationState::Registered,
-            current_snapshot_id: Some(source_snapshot_id),
-        });
-        app.state.detail = Some(worktree_detail.clone());
-        app.state.detail_frontier = None;
-        assert!(render_app(&app, 100, 30).contains("Registered"));
         worktree_detail.recovery_detail = bundle_detail.recovery_detail;
         assert!(
             !HumanGovernanceResponse::Snapshot {
@@ -3548,7 +3534,6 @@ mod tests {
             repository_purge_preview: None,
             negative_review: None,
             recovery_detail: None,
-            worktree_detail: None,
             execution_integrity_detail: None,
             system_detail: None,
             stable_key: "proposal-row".into(),
@@ -4406,7 +4391,6 @@ mod tests {
             repository_purge_preview: None,
             negative_review: None,
             recovery_detail: None,
-            worktree_detail: None,
             execution_integrity_detail: None,
             system_detail: None,
             stable_key: format!("object:{family}:{object_ref}"),

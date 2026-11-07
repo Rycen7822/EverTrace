@@ -99,9 +99,10 @@ DETAIL_KINDS = {"atom_revision": "atom", "procedure_revision": "procedure", "cor
                 "semantic_digest": "digest", "revision_proposal_revision": None,
                 "work_episode": "work_episode", "capture_receipt": "capture_receipt", "task": "task", "workstream": "workstream",
                 "attempt": "attempt", "operation_burst": "operation_burst", "operation": "operation",
-                "host_occurrence": "host_occurrence", "scope_effect": "scope_effect"}
+                "host_occurrence": "host_occurrence", "scope_effect": "scope_effect",
+                "worktree": "worktree", "worktree_snapshot": "worktree_snapshot"}
 WORK_DETAIL_KINDS = {"task", "workstream", "work_episode", "attempt", "operation_burst", "operation",
-                     "host_occurrence", "scope_effect"}
+                     "host_occurrence", "scope_effect", "worktree", "worktree_snapshot"}
 
 
 async def read_record_detail(backend, reference, frontier, revision, object_kind):

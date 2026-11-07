@@ -293,7 +293,6 @@ mod tests {
             repository_purge_preview: None,
             negative_review: None,
             recovery_detail: None,
-            worktree_detail: None,
             execution_integrity_detail: None,
             system_detail: Some(HumanSystemDetail::SessionImport {
                 session_id: "019d0000-0000-7000-8000-000000000001".into(),

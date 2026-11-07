@@ -6143,6 +6143,10 @@ impl JournalAdmissionState {
                 self.host_occurrences
                     .get(&id)
                     .map(|(value, _)| format!("{id}@{}", value.normalization_revision))
+            } else if let Ok(id) = reference.parse::<WorktreeId>() {
+                self.worktrees
+                    .get(&id)
+                    .map(|(value, _)| format!("{id}@{}", value.worktree_revision))
             } else {
                 None
             }
@@ -6420,6 +6424,8 @@ impl JournalAdmissionState {
                                 | "operation"
                                 | "host_occurrence"
                                 | "scope_effect"
+                                | "worktree"
+                                | "worktree_snapshot"
                                 | "capture_receipt"
                                 | "capture_receipt_revision"
                         )
@@ -6621,6 +6627,32 @@ impl JournalAdmissionState {
                 context.source_suppressed |=
                     source_suppressed(self.deletions.events(), hashes.as_ref());
             }
+        }
+        // These exact-read rows are transient. Derive physical scope here without changing business projections.
+        for row in rows.values_mut() {
+            let repository = match row.object_kind.as_deref() {
+                Some("worktree" | "worktree_snapshot") => {
+                    let payload: JournalPayload = serde_json::from_str(
+                        row.payload_json
+                            .as_deref()
+                            .ok_or(StoreError::StoreCorrupt)?,
+                    )
+                    .map_err(|_| StoreError::StoreCorrupt)?;
+                    match payload {
+                        JournalPayload::WorktreeInstanceRecorded(value) => {
+                            value.repository_instance_id
+                        }
+                        JournalPayload::WorktreeSnapshotRecorded(value) => self
+                            .worktrees
+                            .get(&value.worktree_instance_id)
+                            .map(|(tree, _)| tree.repository_instance_id)
+                            .ok_or(StoreError::StoreCorrupt)?,
+                        _ => return Err(StoreError::StoreCorrupt),
+                    }
+                }
+                _ => continue,
+            };
+            row.repository_id = Some(repository.to_string());
         }
         context.rows = filter_product_rows(
             rows.into_values().collect(),

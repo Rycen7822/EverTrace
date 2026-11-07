@@ -1167,38 +1167,6 @@ pub(crate) fn content_lines(
             ]),
         }
     }
-    if let Some(detail) = &item.worktree_detail {
-        lines.extend([
-            crate::locale::format!(
-                language,
-                "worktree/repository: {} / {}",
-                "工作树／仓库: {} / {}",
-                detail.worktree_id,
-                detail.repository_id
-            ),
-            crate::locale::format!(
-                language,
-                "kind/lifecycle: {:?} / {:?}",
-                "类型／生命周期: {:?} / {:?}",
-                detail.kind,
-                detail.lifecycle
-            ),
-            crate::locale::format!(
-                language,
-                "registration: {:?}",
-                "注册: {:?}",
-                detail.registration_state
-            ),
-            crate::locale::format!(
-                language,
-                "current snapshot: {}",
-                "当前快照: {}",
-                detail
-                    .current_snapshot_id
-                    .map_or_else(|| "-".into(), |value| value.to_string())
-            ),
-        ]);
-    }
     if let Some(detail) = &item.execution_integrity_detail {
         use evertrace_protocol::dto::HumanExecutionIntegrityDetail;
         match detail {

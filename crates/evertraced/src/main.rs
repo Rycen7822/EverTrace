@@ -59,8 +59,8 @@ use evertrace_protocol::{
         HumanNegativeReviewMetadata, HumanObjectFamily, HumanProposalMetadata, HumanProposalReview,
         HumanReadRequest, HumanRecoveryDetail, HumanRecoveryOmissionCount, HumanRelationKind,
         HumanRepositoryPurgePreview, HumanRowClass, HumanSnapshotItem, HumanSnapshotStatus,
-        HumanSupportDetail, HumanSurface, HumanSystemDetail, HumanWorktreeDetail,
-        NegativeReviewDecision, PROTOCOL_VERSION, ProposalHumanDecision,
+        HumanSupportDetail, HumanSurface, HumanSystemDetail, NegativeReviewDecision,
+        PROTOCOL_VERSION, ProposalHumanDecision,
     },
     envelope::{McpItem, McpItems, McpResultEnvelope, McpStatus},
     error::ErrorCode,
@@ -1988,14 +1988,6 @@ fn map_human_item(item: evertrace_engine::HumanSummary) -> HumanSnapshotItem {
                         result_count,
                         verifier_count,
                     },
-                }),
-                worktree_detail: item.worktree_detail.map(|detail| HumanWorktreeDetail {
-                    worktree_id: detail.worktree_id,
-                    repository_id: detail.repository_id,
-                    kind: detail.kind,
-                    lifecycle: detail.lifecycle,
-                    registration_state: detail.registration_state,
-                    current_snapshot_id: detail.current_snapshot_id,
                 }),
                 execution_integrity_detail: item.execution_integrity_detail.map(|detail| {
                     match detail {

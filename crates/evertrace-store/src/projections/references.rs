@@ -99,6 +99,18 @@ pub fn source_references_for(row: &ObjectRow, payload: &JournalPayload) -> BTree
             refs.extend(value.selected_outcome_refs.iter().cloned());
             refs.extend(value.interruption_refs.iter().cloned());
         }
+        JournalPayload::WorktreeInstanceRecorded(value) => {
+            refs.extend(
+                value
+                    .predecessor_revision
+                    .map(|revision| format!("{}@{revision}", value.worktree_instance_id)),
+            );
+            refs.extend(
+                value
+                    .recreated_from_worktree_instance_id
+                    .map(|id| id.to_string()),
+            );
+        }
         JournalPayload::OperationBurstRecorded(value) => {
             for member in &value.members {
                 refs.insert(format!(
@@ -208,6 +220,8 @@ impl JournalAdmissionState {
                     | "operation"
                     | "host_occurrence"
                     | "scope_effect"
+                    | "worktree"
+                    | "worktree_snapshot"
                     | "task"
                     | "workstream"
             )

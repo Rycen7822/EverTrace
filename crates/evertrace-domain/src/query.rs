@@ -360,20 +360,27 @@ impl TemporalScope {
     }
 }
 
-/// Existing immutable Operation coordinates are `<public ID>@<positive revision>`.
-pub fn parse_operation_revision(value: &str) -> Option<(OperationId, u32)> {
+fn parse_numbered_revision<I: std::str::FromStr + std::fmt::Display>(
+    value: &str,
+) -> Option<(I, u32)> {
     let (id, revision) = value.rsplit_once('@')?;
-    let id = id.parse::<OperationId>().ok()?;
+    let id = id.parse::<I>().ok()?;
     let revision = revision.parse::<u32>().ok().filter(|value| *value > 0)?;
     (value == format!("{id}@{revision}")).then_some((id, revision))
 }
 
+/// Existing immutable Operation coordinates are `<public ID>@<positive revision>`.
+pub fn parse_operation_revision(value: &str) -> Option<(OperationId, u32)> {
+    parse_numbered_revision(value)
+}
+
 /// Immutable normalization coordinates, accepted only by the bounded stored-record readers.
 pub fn parse_host_occurrence_revision(value: &str) -> Option<(crate::ids::HostOccurrenceId, u32)> {
-    let (id, revision) = value.rsplit_once('@')?;
-    let id = id.parse::<crate::ids::HostOccurrenceId>().ok()?;
-    let revision = revision.parse::<u32>().ok().filter(|value| *value > 0)?;
-    (value == format!("{id}@{revision}")).then_some((id, revision))
+    parse_numbered_revision(value)
+}
+
+pub fn parse_worktree_revision(value: &str) -> Option<(WorktreeId, u32)> {
+    parse_numbered_revision(value)
 }
 
 pub fn valid_object_reference(value: &str) -> bool {
@@ -2748,6 +2755,8 @@ impl ExactRecordQuery {
                     || revision.parse::<crate::ids::CaptureReceiptId>().is_ok()
                     || parse_operation_revision(revision).is_some()
                     || parse_host_occurrence_revision(revision).is_some()
+                    || parse_worktree_revision(revision).is_some()
+                    || revision.parse::<crate::ids::WorktreeSnapshotId>().is_ok()
                     || revision.parse::<crate::ids::ScopeEffectId>().is_ok()
                     || revision.parse::<crate::ids::SourceObservationId>().is_ok()
                     || revision.parse::<crate::ids::SourceReceiptId>().is_ok()
@@ -2766,6 +2775,8 @@ impl ExactRecordQuery {
                     || key.parse::<crate::ids::OperationBurstId>().is_ok()
                     || key.parse::<crate::ids::OperationId>().is_ok()
                     || key.parse::<crate::ids::HostOccurrenceId>().is_ok()
+                    || key.parse::<WorktreeId>().is_ok()
+                    || key.parse::<crate::ids::WorktreeSnapshotId>().is_ok()
                     || key.parse::<crate::ids::ScopeEffectId>().is_ok()
                     || key.parse::<crate::ids::SourceObservationId>().is_ok()
                     || key.parse::<crate::ids::SourceReceiptId>().is_ok()
@@ -3130,6 +3141,7 @@ impl MetadataReadQuery {
                             || revision.parse::<AnyPublicId>().is_ok()
                             || parse_operation_revision(revision).is_some()
                             || parse_host_occurrence_revision(revision).is_some()
+                            || parse_worktree_revision(revision).is_some()
                     })
                     && (1..=32).contains(limit)
                     && after.as_ref().is_none_or(|key| {

@@ -580,18 +580,27 @@ impl SqliteState {
                 if cancelled.load(std::sync::atomic::Ordering::Relaxed) {
                     return Err(StoreError::Io);
                 }
-                // Logical journal envelope identity columns are intentionally empty; the admitted payload owns revision identity.
-                // A too-large Work payload is a budget failure, never an absent target or an unchecked JSON allocation.
+                // The admitted payload owns revision identity, not the empty logical journal envelope columns.
+                let events = if evertrace_domain::query::parse_worktree_revision(revision).is_some() {
+                    ["worktree_instance_recorded_v1"; 2]
+                } else {
+                    ["task_recorded_v1", "workstream_recorded_v1"]
+                };
                 let mut statement = connection.prepare(
                     "SELECT seq, length(CAST(payload_json AS BLOB)), content_hash FROM journal_events \
-                     WHERE seq <= ?2 AND event_type IN ('task_recorded_v1','workstream_recorded_v1') AND \
-                     CASE WHEN length(CAST(payload_json AS BLOB)) > ?3 THEN 1 \
-                     ELSE json_extract(payload_json,'$.value.revision_id') = ?1 END ORDER BY seq LIMIT ?4"
+                     WHERE seq <= ?2 AND event_type IN (?5,?6) AND \
+                     CASE WHEN length(CAST(payload_json AS BLOB)) > ?3 THEN 1 ELSE \
+                       CASE WHEN event_type='worktree_instance_recorded_v1' THEN \
+                         json_extract(payload_json,'$.value.worktree_instance_id') || '@' || \
+                         json_extract(payload_json,'$.value.worktree_revision') \
+                       ELSE json_extract(payload_json,'$.value.revision_id') END = ?1 \
+                     END ORDER BY seq LIMIT ?4"
                 ).map_err(|_| StoreError::StoreCorrupt)?;
                 let mut queried = statement.query(params![
                     revision, frontier.to_be_bytes().as_slice(), i64::try_from(crate::projections::READ_DEPENDENCY_BYTES)
                         .map_err(|_| StoreError::StoreCorrupt)?,
-                    i64::try_from(crate::projections::READ_DEPENDENCY_LIMIT + 1).map_err(|_| StoreError::StoreCorrupt)?
+                    i64::try_from(crate::projections::READ_DEPENDENCY_LIMIT + 1).map_err(|_| StoreError::StoreCorrupt)?,
+                    events[0], events[1]
                 ]).map_err(|_| StoreError::StoreCorrupt)?;
                 let mut selected: Option<(u64, Vec<u8>)> = None;
                 let mut matches = 0;
