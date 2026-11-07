@@ -173,7 +173,7 @@ def normalize_scope_query(query):
 
 def normalize_source_query(query):
     query = {} if query is None else query
-    if not isinstance(query, dict) or set(query) - {"session_id", "source_instance_id", "unassigned_only"}:
+    if not isinstance(query, dict) or set(query) - {"selection", "session_id", "source_instance_id", "unassigned_only"}:
         raise BackendError("invalid_input")
     session, source = query.get("session_id"), query.get("source_instance_id")
     for value, limit in ((session, 512), (source, 1024)):
@@ -183,7 +183,8 @@ def normalize_source_query(query):
     unassigned = query.get("unassigned_only", False)
     if type(unassigned) is not bool:
         raise BackendError("invalid_input")
-    return {"session_id":session, "source_instance_id":source, "unassigned_only":unassigned}
+    return {"selection":normalize_scope(query.get("selection", {"kind":"all"})),
+            "session_id":session, "source_instance_id":source, "unassigned_only":unassigned}
 
 
 def normalize_archive_query(query):

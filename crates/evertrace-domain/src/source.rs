@@ -2,7 +2,7 @@
 use crate::{
     evidence::SourceRevision,
     ids::{JobId, RepositoryId, WorktreeId},
-    query::QueryError,
+    query::{ExactRecordRef, HumanContentState, MemoryScopeSelection, QueryError},
 };
 use serde::{Deserialize, Serialize};
 
@@ -50,6 +50,8 @@ pub enum SessionAccessDecision {
 #[derive(Clone, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct SourceCatalogQuery {
+    #[serde(default)]
+    pub selection: MemoryScopeSelection,
     pub session_id: Option<String>,
     pub source_instance_id: Option<String>,
     pub unassigned_only: bool,
@@ -75,6 +77,17 @@ impl SourceCatalogQuery {
     }
 }
 
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SourceSelectionBasis {
+    Catalogue,
+    HistoricalMetadata,
+    ProspectiveOrigin,
+    RetainedRecord,
+    TaskRequest,
+    Unassigned,
+}
+
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct SourceCatalogEntry {
@@ -90,6 +103,10 @@ pub struct SourceCatalogEntry {
     pub workspace_resolution_kind: WorkspaceResolutionKind,
     pub resolved_repository_id: Option<RepositoryId>,
     pub resolved_worktree_id: Option<WorktreeId>,
+    /// The observed forward interval, never a reassignment of historical metadata.
+    pub prospective_repository_id: Option<RepositoryId>,
+    pub prospective_worktree_id: Option<WorktreeId>,
+    pub selection_basis: SourceSelectionBasis,
     pub repository_read_restrictions: Option<Vec<RepositoryId>>,
     /// Catalogued hints, never assignment or read authority.
     pub workspace_hint: Option<String>,
@@ -121,6 +138,8 @@ impl SourceCatalogEntry {
             && self.started_at_us.is_none_or(|v| v >= 0)
             && self.ended_at_us.is_none_or(|v| v >= 0)
             && self.observed_end.is_some() == self.origin_closed.is_some()
+            && self.prospective_repository_id.is_some() == self.prospective_worktree_id.is_some()
+            && self.prospective_repository_id.is_some() == self.observed_end.is_some()
             && self
                 .record_start
                 .is_none_or(|start| self.observed_end.is_some_and(|end| start >= end))
@@ -135,15 +154,42 @@ impl SourceCatalogEntry {
 pub struct SourceMetadataPage {
     pub query: SourceCatalogQuery,
     pub records: Vec<SourceCatalogEntry>,
-    /// Exact matching source-instance count in the visible, committed Native catalogue namespace.
-    pub matching_count: u64,
+    pub state: HumanContentState,
+    /// Native exact Task selection used only for the existing current access gate.
+    pub selection_ref: Option<ExactRecordRef>,
+    /// Exact source-instance count, unknown for unavailable selection or denied Task inputs.
+    pub matching_count: Option<u64>,
     pub next: Option<String>,
 }
 
 impl SourceMetadataPage {
+    pub fn clear(&mut self, state: HumanContentState) {
+        self.state = state;
+        self.records.clear();
+        self.matching_count = None;
+        self.next = None;
+        self.selection_ref = None;
+    }
+
     pub fn validate(&self) -> bool {
         self.query.validate().is_ok()
-            && self.matching_count >= self.records.len() as u64
+            && if self.state == HumanContentState::Ready {
+                self.matching_count
+                    .is_some_and(|count| count >= self.records.len() as u64)
+            } else {
+                self.records.is_empty() && self.matching_count.is_none() && self.next.is_none()
+            }
+            && match (self.query.selection, &self.selection_ref) {
+                (MemoryScopeSelection::Task { task_id }, Some(reference)) => {
+                    self.state == HumanContentState::Ready
+                        && reference.stable_key == task_id.to_string()
+                        && reference.revision_ref.as_ref().is_some_and(|value| {
+                            value.parse::<crate::revision::RevisionId>().is_ok()
+                        })
+                }
+                (MemoryScopeSelection::Task { .. }, None) => self.state != HumanContentState::Ready,
+                (_, reference) => reference.is_none(),
+            }
             && self.records.iter().all(SourceCatalogEntry::validate)
             && self
                 .records

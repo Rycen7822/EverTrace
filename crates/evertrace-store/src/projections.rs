@@ -6356,6 +6356,7 @@ impl JournalAdmissionState {
                                 | "procedure_revision"
                                 | "revision_proposal_revision"
                                 | "semantic_digest"
+                                | "task"
                                 | "work_episode"
                                 | "source_receipt"
                                 | "source_observation"

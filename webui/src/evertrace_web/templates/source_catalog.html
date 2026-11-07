@@ -9,13 +9,19 @@
   <h3 class="item-title">{{ item.source_instance_id }}</h3>
   <p class="reading-excerpt">{{ item.progress_label }}</p>
   <div class="item-meta">
-    <span>历史归属：{{ item.workspace_resolution_kind }}</span><span>目录修订 {{ item.catalog_revision }}</span>
+    <span class="source-progress">历史归属：{{ item.workspace_resolution_kind }} · 目录修订 {{ item.catalog_revision }}</span>
+    <span class="source-progress">匹配依据：{{ item.selection_label }}</span>
   </div>
 </button>
 {% endfor %}
 </section>
 {% else %}
 <div class="empty">
+  {% if state != 'ready' %}
+  <h3>所选范围暂时不能读取来源</h3><p>状态：{{ state }}；计数未知，没有换用全部来源。</p>
+  {% else %}
   <h3>这些条件下没有已登记来源</h3><p>这不表示宿主没有历史会话，也不表示正文已完成扫描或导入。</p>
+  <p>来源不是 global 长期资产；Task 范围只匹配已证明的请求或归档关联，不按 Session、路径或仓库猜归属。</p>
+  {% endif %}
 </div>
 {% endfor %}

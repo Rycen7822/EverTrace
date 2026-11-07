@@ -1625,14 +1625,29 @@ impl EngineService {
             .await?;
         if let evertrace_domain::query::MetadataReadOutcome::Page(batch) = &mut outcome {
             for item in &mut batch.items {
-                if let P::Revisions { page } = item {
-                    if page.content_state != S::Ready {
-                        continue;
-                    }
+                let source = match &*item {
+                    P::Revisions { page } if page.content_state == S::Ready => Some((
+                        evertrace_domain::query::ExactRecordRef {
+                            stable_key: page.reference.stable_key.clone(),
+                            revision_ref: Some(page.reference.revision_ref.clone()),
+                        },
+                        false,
+                    )),
+                    P::Sources { page } if page.state == S::Ready => page
+                        .selection_ref
+                        .clone()
+                        .map(|reference| (reference, true)),
+                    _ => None,
+                };
+                if let Some((reference, logical)) = source {
+                    let revision = reference
+                        .revision_ref
+                        .as_ref()
+                        .ok_or(crate::WriterActorError::StoreCorrupt)?;
                     let context = writer
                         .read_stored_fields_context(
                             Box::new(ExactReadQuery::Fields(ExactFieldsQuery {
-                                revision_ref: page.reference.revision_ref.clone(),
+                                revision_ref: revision.clone(),
                             })),
                             cancelled.clone(),
                             deadline,
@@ -1648,9 +1663,10 @@ impl EngineService {
                         return Ok(O::Conflict(context.state.frontier));
                     }
                     let state = if context.selected.as_ref().is_none_or(|row| {
-                        row.row_id != page.reference.stable_key
-                            || row.current_revision_id.as_deref()
-                                != Some(&page.reference.revision_ref)
+                        (row.row_id != reference.stable_key
+                            && !(logical
+                                && row.object_id.as_deref() == Some(reference.stable_key.as_str())))
+                            || row.current_revision_id.as_deref() != Some(revision)
                     }) {
                         Some(S::Missing)
                     } else {
@@ -1666,10 +1682,16 @@ impl EngineService {
                             })
                     };
                     if let Some(state) = state {
-                        page.content_state = state;
-                        page.records.clear();
-                        page.matching_count = None;
-                        page.next = None;
+                        match item {
+                            P::Revisions { page } => {
+                                page.content_state = state;
+                                page.records.clear();
+                                page.matching_count = None;
+                                page.next = None;
+                            }
+                            P::Sources { page } => page.clear(state),
+                            _ => unreachable!(),
+                        }
                     }
                 }
                 if let evertrace_domain::query::MetadataReadPage::Work { page } = item {
@@ -1683,7 +1705,8 @@ impl EngineService {
             if batch
                 .items
                 .iter()
-                .any(|item| matches!(item, P::Revisions { .. }))
+                .any(|item| matches!(item, P::Revisions { .. }) || matches!(item, P::Sources { page }
+                    if matches!(page.query.selection, evertrace_domain::query::MemoryScopeSelection::Task { .. })))
             {
                 let current = match tokio::time::timeout_at(
                     tokio::time::Instant::from_std(deadline),

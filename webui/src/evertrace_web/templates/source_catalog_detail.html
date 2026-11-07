@@ -11,6 +11,9 @@
 <dt>导入状态（原记录）</dt><dd>{{ item.body_label }} · {{ item.body_state }}</dd>
 <dt>显式读取意图</dt><dd>{{ item.access_decision if item.access_decision is not none else '尚无批准记录' }}</dd>
 <dt>历史归属</dt><dd>{{ item.workspace_resolution_kind }}</dd>
+<dt>本页范围匹配依据</dt><dd>{{ item.selection_label }}；不改变来源归属或读取许可。</dd>
+<dt>前瞻区间仓库</dt><dd>{{ item.prospective_repository_id or '没有已记录的前瞻仓库' }}</dd>
+<dt>前瞻区间工作树</dt><dd>{{ item.prospective_worktree_id or '没有已记录的前瞻工作树' }}</dd>
 <dt>已证明仓库</dt><dd>{{ item.resolved_repository_id if item.resolved_repository_id is not none else '未确定' }}</dd>
 <dt>已证明工作树</dt><dd>{{ item.resolved_worktree_id if item.resolved_worktree_id is not none else '未确定' }}</dd>
 <dt>目录提示（不是归属）</dt><dd>{{ item.workspace_hint if item.workspace_hint is not none else '未记录' }}</dd>

@@ -601,7 +601,7 @@ async function readCatalogue(controller) {
     "read",
     {
       kind: "source_catalog",
-      query: sourceQuery,
+      query: { ...sourceQuery, selection: state.query.selection },
       after: state.after,
       expected_frontier: state.after ? state.frontier : null,
     },
@@ -632,16 +632,18 @@ async function readCatalogue(controller) {
   else fragmentInto($("detail-body"), page.detail_html);
   $("memory-items").scrollTop = listScroll;
   $("detail-body").scrollTop = detailScroll;
-  $("page-count").textContent = `本页 ${page.count} / 匹配 ${page.matching_count} 个已登记来源`;
-  const conditions = [];
+  const count = page.matching_count === null ? "未知" : page.matching_count;
+  $("page-count").textContent = `本页 ${page.count} / 匹配 ${count} 个已登记来源`;
+  const conditions = [scopeLabel(page.query.selection)];
   if (page.query.session_id) conditions.push("Session：" + page.query.session_id);
   if (page.query.source_instance_id) conditions.push("来源：" + page.query.source_instance_id);
-  if (page.query.unassigned_only) conditions.push("仅未确定仓库/工作树");
-  $("source-picked").textContent =
-    (conditions.join("；") || "全部已登记来源") + "；按原生来源键分页，不是时间排序。";
+  if (page.query.unassigned_only) conditions.push("仅历史归属未确定");
+  $("source-picked").textContent = conditions.join("；") + "；按原生来源键分页，不是时间排序。";
   $("next-page").disabled = !page.next_cursor;
   notice(
-    "只读已登记来源。一个 Session 可有多个独立来源；目录不表示宿主历史已全部发现，也不表示正文已获许可或全部导入。",
+    page.state === "ready"
+      ? "只读已登记来源，范围匹配不改变历史归属。目录不表示宿主历史已全部发现，也不表示正文已获许可或全部导入。"
+      : `来源范围当前不可读取（${page.state}），计数未知；没有换成全部来源。`,
   );
 }
 function changeSourceQuery(patch) {
@@ -948,7 +950,7 @@ function route(name) {
   $("overview-limit-control").hidden = name !== "overview";
   $("first-page").parentElement.hidden = name === "overview";
   document.querySelector(".browse-filters").hidden = name !== "memories";
-  $("scope-open").hidden = !reading;
+  $("scope-open").hidden = !reading && name !== "sources";
   $("include-global").parentElement.hidden = !reading;
   const label = document.querySelector('[data-route="' + name + '"]')?.textContent.trim() || name;
   $("breadcrumb").textContent = label;
@@ -1189,8 +1191,13 @@ function chooseScope(selection) {
   state.selected = null;
   state.content = null;
   state.query = { ...state.query, selection, include_global: false };
+  archive = null;
+  state.links = null;
+  state.revisions = null;
+  sourceQuery = { ...sourceQuery, source_instance_id: null };
   updateScopeControls();
   $("scope-dialog").close();
+  refresh();
 }
 $("scope-open").onclick = () => {
   cancel();

@@ -434,7 +434,7 @@ class App:
                     )
                     data = {
                         "html": self.templates.get_template("source_catalog.html").render(
-                            groups=page["groups"]
+                            groups=page["groups"], state=page["state"]
                         ),
                         "detail_html": self.templates.get_template(
                             "source_catalog_detail.html"
@@ -443,7 +443,8 @@ class App:
                         "frontier": str(page["frontier"]),
                         "next_cursor": page["next_cursor"],
                         "count": len(page["entries"]),
-                        "matching_count": str(page["matching_count"]),
+                        "state": page["state"],
+                        "matching_count": str(page["matching_count"]) if page["matching_count"] is not None else None,
                         "count_basis": page["count_basis"],
                     }
             elif payload.get("kind") == "scopes" and not (

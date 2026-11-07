@@ -285,7 +285,7 @@ impl JournalAdmissionState {
         Ok(context)
     }
 
-    fn directory_source_root(
+    pub(super) fn directory_source_root(
         &self,
         reference: &str,
     ) -> Result<Option<(ObjectRow, SourceObservationId)>, StoreError> {

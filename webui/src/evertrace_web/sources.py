@@ -8,7 +8,11 @@ from .memories import _metadata_card
 
 _REFERENCE_ALGORITHM = "direct_reference_metadata_v1"
 _ARCHIVE_ALGORITHM = "source_archive_metadata_v1"
-_CATALOG_ALGORITHM = "source_metadata_v1"
+_CATALOG_ALGORITHM = "scoped_source_metadata_v1"
+_SOURCE_SELECTION_LABELS = {
+    "catalogue":"已登记目录", "historical_metadata":"已证明的历史归属", "prospective_origin":"实际观察后的前瞻区间",
+    "retained_record":"已保留归档记录的范围", "task_request":"Task引用的原始请求", "unassigned":"暂无已证明仓库/工作树",
+}
 _BODY_LABELS = {
     "not_imported":"尚未导入", "queued":"已排队", "importing":"正在导入", "imported":"已记录导入完成",
     "blocked_untrusted":"信任限制", "blocked_unapproved":"未获读取许可", "blocked_scope_unresolved":"归属未确定",
@@ -38,7 +42,8 @@ def _source_entry(record):
             progress += f"；后续水位 {through}；较早前缀水位 " + (str(earlier) if earlier is not None else "未记录")
         else:
             progress += "；此修订尚无已提交归档水位"
-    return {**record, "body_label":_BODY_LABELS.get(record["body_state"], record["body_state"]), "progress_label":progress,
+    return {**record, "selection_label":_SOURCE_SELECTION_LABELS[record["selection_basis"]],
+            "body_label":_BODY_LABELS.get(record["body_state"], record["body_state"]), "progress_label":progress,
             "started_label":_source_time(record["started_at_us"]), "ended_label":_source_time(record["ended_at_us"])}
 
 
@@ -75,13 +80,27 @@ async def read_source_catalog(backend, query=None, after=None, frontier=None, li
         if len(next_cursor.encode()) > 4096:
             raise BackendError("invalid_read_response")
     entries = [_source_entry(record) for record in page["records"]]
+    if query["selection"]["kind"] == "task" and page["state"] == "ready":
+        final = await backend.read_batch([{"kind":"sources", "query":query, "after":position, "limit":limit}],
+            batch["state"]["frontier"], batch["state"]["data_identity"])
+        if final["kind"] == "conflict":
+            return final
+        current = final["page"]["items"][0]["page"]
+        if (final["page"]["state"] != batch["state"] or current["query"] != query
+            or current["state"] == "ready" and current["selection_ref"] != page["selection_ref"]):
+            return {"kind":"conflict"}
+        page = current
+        entries = [_source_entry(record) for record in page["records"]]
+        if page["next"] is None:
+            next_cursor = None
     groups = {}
     for entry in entries:
         groups.setdefault(entry["session_id"], []).append(entry)
     return {"kind":"source_catalog", "page":{"query":query, "entries":entries,
         "groups":[{"session_id":session, "entries":items} for session, items in groups.items()],
-        "frontier":batch["state"]["frontier"], "next_cursor":next_cursor, "matching_count":page["matching_count"],
-        "count_basis":{"unit":"source_instance", "range":"committed_catalogue", "time_kind":"current", "accuracy":"exact"}}}
+        "frontier":batch["state"]["frontier"], "next_cursor":next_cursor, "matching_count":page["matching_count"], "state":page["state"],
+        "count_basis":{"unit":"source_instance", "range":{"kind":"committed_catalogue", "query":query},
+                      "time_kind":"current", "accuracy":"exact" if page["matching_count"] is not None else "unknown"}}}
 
 
 
