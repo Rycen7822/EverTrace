@@ -26,17 +26,7 @@ impl JournalAdmissionState {
         }
         // Retained watermark identities do not bypass the canonical product
         // deletion/repository closure that hides their owning catalogue source.
-        let visible = !self
-            .source_catalog_page(
-                &SourceCatalogQuery {
-                    source_instance_id: Some(query.source().to_owned()),
-                    ..Default::default()
-                },
-                None,
-                1,
-            )?
-            .entries
-            .is_empty();
+        let visible = self.source_catalog_contains(query.source())?;
         if !visible {
             return Ok(match query {
                 SourceArchiveQuery::Revisions { .. } => {

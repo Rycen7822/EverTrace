@@ -1491,16 +1491,6 @@ impl JournalWriter {
         .await
     }
 
-    pub async fn source_catalog_page(
-        &self,
-        query: &evertrace_domain::source::SourceCatalogQuery,
-        after: Option<&evertrace_domain::source::SourceCatalogCursor>,
-        limit: usize,
-    ) -> Result<evertrace_domain::source::SourceCatalogPage, StoreError> {
-        self.validated_current_read(|state, _| state.source_catalog_page(query, after, limit))
-            .await
-    }
-
     pub async fn compiled_entries_context(
         &self,
         query: &evertrace_domain::query::CompiledProjectionQuery,

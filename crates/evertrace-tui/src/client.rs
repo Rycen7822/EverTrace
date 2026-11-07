@@ -119,7 +119,6 @@ async fn send_human(
             | HumanReadRequest::CompiledProjections { .. }
             | HumanReadRequest::Search { .. }
             | HumanReadRequest::BrowseMemories { .. }
-            | HumanReadRequest::SourceCatalog { .. }
             | HumanReadRequest::SourceArchive { .. } => {
                 return Err(evertrace_protocol::error::ProtocolError::Wire(
                     evertrace_protocol::error::ErrorCode::InvalidInput,

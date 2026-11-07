@@ -13,7 +13,6 @@ mod presentation;
 mod reading;
 mod searching;
 mod source_archive;
-mod source_catalog;
 pub use diagnostics::{
     HumanDiagnosticCheck, HumanDiagnosticState, HumanDiagnostics, HumanTableDiagnostic,
 };

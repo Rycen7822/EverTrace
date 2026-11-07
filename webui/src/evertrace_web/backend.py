@@ -712,7 +712,6 @@ class Backend:
                     "snapshot",
                     "memory_page",
                     "compiled_projections",
-                    "source_catalog",
                     "source_archive",
                     "conflict",
                 ):

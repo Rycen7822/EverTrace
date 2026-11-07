@@ -77,28 +77,6 @@ impl SourceCatalogQuery {
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
-pub struct SourceCatalogCursor {
-    pub frontier: u64,
-    pub query: SourceCatalogQuery,
-    pub after_source: String,
-}
-
-impl SourceCatalogCursor {
-    pub fn validate_for(&self, query: &SourceCatalogQuery) -> Result<(), QueryError> {
-        query.validate()?;
-        if &self.query != query
-            || self.after_source.is_empty()
-            || self.after_source.len() > 512
-            || self.after_source.chars().any(char::is_control)
-        {
-            return Err(QueryError::Invalid);
-        }
-        Ok(())
-    }
-}
-
-#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
-#[serde(deny_unknown_fields)]
 pub struct SourceCatalogEntry {
     pub key: String,
     pub session_id: String,
@@ -176,16 +154,6 @@ impl SourceMetadataPage {
                 .as_ref()
                 .is_none_or(|key| self.records.last().is_some_and(|row| &row.key == key))
     }
-}
-
-#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
-#[serde(deny_unknown_fields)]
-pub struct SourceCatalogPage {
-    pub frontier: u64,
-    pub query: SourceCatalogQuery,
-    pub entries: Vec<SourceCatalogEntry>,
-    /// Only the already catalogued native namespace, not a full host scan.
-    pub next_cursor: Option<String>,
 }
 
 /// Archive revisions are metadata identities, never a grant to read records.

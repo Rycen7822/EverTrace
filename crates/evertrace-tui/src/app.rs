@@ -497,7 +497,6 @@ impl App {
                         | HumanGovernanceResponse::Search { .. }
                         | HumanGovernanceResponse::MemoryPage { .. }
                         | HumanGovernanceResponse::CompiledProjections { .. }
-                        | HumanGovernanceResponse::SourceCatalog { .. }
                         | HumanGovernanceResponse::SourceArchive { .. }
                         | HumanGovernanceResponse::Export { .. },
                     ) => UiCommand::None,
@@ -538,7 +537,6 @@ impl App {
                     | HumanGovernanceResponse::Search { .. }
                     | HumanGovernanceResponse::MemoryPage { .. }
                     | HumanGovernanceResponse::CompiledProjections { .. }
-                    | HumanGovernanceResponse::SourceCatalog { .. }
                     | HumanGovernanceResponse::SourceArchive { .. } => return UiCommand::None,
                 };
                 if result.reason.as_deref() != Some("local_busy") {

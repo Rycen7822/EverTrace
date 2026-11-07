@@ -1,75 +1,16 @@
 //! Bounded facts of the committed source catalogue, never host discovery or body parsing.
 use super::*;
-use evertrace_domain::source::{
-    SourceCatalogCursor, SourceCatalogEntry, SourceCatalogPage, SourceCatalogQuery,
-};
+use evertrace_domain::source::{SourceCatalogEntry, SourceCatalogQuery};
 
 impl JournalAdmissionState {
-    pub(crate) fn source_catalog_page(
-        &self,
-        query: &SourceCatalogQuery,
-        after: Option<&SourceCatalogCursor>,
-        limit: usize,
-    ) -> Result<SourceCatalogPage, StoreError> {
-        use std::ops::Bound::{Excluded, Unbounded};
-        query.validate().map_err(|_| StoreError::InvalidInput)?;
-        if !(1..=64).contains(&limit) || after.is_some_and(|v| v.validate_for(query).is_err()) {
-            return Err(StoreError::InvalidInput);
-        }
-        let matches = |current: &crate::SessionImportCurrent| {
-            query
-                .session_id
-                .as_ref()
-                .is_none_or(|id| id == &current.session_id)
-                && query
-                    .source_instance_id
-                    .as_ref()
-                    .is_none_or(|id| id == &current.source_instance())
-                && (!query.unassigned_only
-                    || (current.metadata.resolved_repository_instance_id.is_none()
-                        && current.metadata.resolved_worktree_instance_id.is_none()))
-        };
-        let visible = |current: &crate::SessionImportCurrent| self.source_catalog_visible(current);
-        if let Some(cursor) = after
-            && cursor.frontier == self.frontier
-        {
-            let current = self
-                .session_imports
-                .get(&cursor.after_source)
-                .ok_or(StoreError::InvalidInput)?;
-            if !matches(current) || !visible(current)? {
-                return Err(StoreError::InvalidInput);
+    /// Archive visibility depends on the owning canonical catalogue fact, not a human page or current job.
+    pub(super) fn source_catalog_contains(&self, source: &str) -> Result<bool, StoreError> {
+        for current in self.session_imports.values() {
+            if current.source_instance() == source && self.source_catalog_visible(current)? {
+                return Ok(true);
             }
         }
-        let mut entries = Vec::with_capacity(limit);
-        let mut next_cursor = None;
-        let bound = after.map_or(Unbounded, |cursor| Excluded(cursor.after_source.clone()));
-        for (key, current) in self.session_imports.range((bound, Unbounded)) {
-            if !matches(current) || !visible(current)? {
-                continue;
-            }
-            if entries.len() == limit {
-                next_cursor = Some(
-                    serde_json::to_string(&SourceCatalogCursor {
-                        frontier: self.frontier,
-                        query: query.clone(),
-                        after_source: entries
-                            .last()
-                            .map(|entry: &SourceCatalogEntry| entry.key.clone())
-                            .ok_or(StoreError::StoreCorrupt)?,
-                    })
-                    .map_err(|_| StoreError::StoreCorrupt)?,
-                );
-                break;
-            }
-            entries.push(self.source_metadata_record(key, current)?);
-        }
-        Ok(SourceCatalogPage {
-            frontier: self.frontier,
-            query: query.clone(),
-            entries,
-            next_cursor,
-        })
+        Ok(false)
     }
 
     fn source_catalog_visible(
