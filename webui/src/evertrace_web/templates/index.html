@@ -141,6 +141,16 @@
                 </div>
                 <p id="source-picked" class="muted"></p>
               </form>
+              <form id="source-record-lookup" class="time-filter" hidden>
+                <label>打开已知归档记录<input id="source-record-id" type="text" maxlength="256"
+                  autocomplete="off" spellcheck="false" required aria-label="来源记录 ID" /></label>
+                <label>记录类型<select id="source-record-kind" aria-label="来源记录类型">
+                  <option value="source_observation">来源观察（obs）</option>
+                  <option value="source_receipt">来源回执（src）</option>
+                </select></label>
+                <button class="text-button" type="submit">按 ID 打开记录</button>
+                <p class="muted">只读这个精确 ID，不改目录筛选，也不扫描原文件。</p>
+              </form>
               <form id="job-lookup" class="time-filter" hidden>
                 <label
                   >用 CLI 返回的 Job ID 回查<input

@@ -211,6 +211,33 @@ impl JournalAdmissionState {
         )
         .map_err(|_| StoreError::StoreCorrupt)?;
         let mut refs = source_references_for(root, &payload);
+        let source_tuple = match &payload {
+            JournalPayload::SourceReceiptRecorded(value) => {
+                Some((&value.source_instance_id, &value.source_revision))
+            }
+            JournalPayload::SourceObservationRecorded(value) => {
+                Some((&value.source_instance_id, &value.source_revision))
+            }
+            _ => None,
+        };
+        if let Some((instance, revision)) = source_tuple {
+            let source_revision = source_revision_ref(instance, revision);
+            // This is source-revision membership, not proof that this record belongs to or is covered by the lane.
+            for (capture, _) in self.capture_receipts.values() {
+                if cancelled.load(std::sync::atomic::Ordering::Relaxed) {
+                    return Err(StoreError::Io);
+                }
+                if std::time::Instant::now() >= deadline {
+                    return Ok(O::TooLarge);
+                }
+                if capture.source_revision_refs.contains(&source_revision) {
+                    refs.insert(capture.capture_receipt_revision_id.to_string());
+                    if refs.len() > READ_DEPENDENCY_LIMIT {
+                        return Ok(O::TooLarge);
+                    }
+                }
+            }
+        }
         refs.remove(&root.row_id);
         if let Some(value) = &root.object_id {
             refs.remove(value);

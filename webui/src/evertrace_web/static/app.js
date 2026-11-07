@@ -62,6 +62,7 @@ function closed(text, broadcast = false) {
   restoreSourceControls = false;
   sourceQuery = { session_id: null, source_instance_id: null, unassigned_only: false };
   $("source-session").value = "";
+  $("source-record-id").value = "";
   $("source-unassigned").checked = false;
   cancel();
   clear();
@@ -627,7 +628,8 @@ async function readCatalogue(controller) {
     restoreSourceControls = false;
   }
   fragmentInto($("memory-items"), page.html);
-  if (state.selected && archive) await readSelection(state.selected, controller, detailScroll);
+  // A known exact source record need not belong to the current catalogue page.
+  if (state.selected) await readSelection(state.selected, controller, detailScroll);
   else if (archive) await readArchive(controller, detailScroll);
   else fragmentInto($("detail-body"), page.detail_html);
   $("memory-items").scrollTop = listScroll;
@@ -670,6 +672,13 @@ $("source-filter").onsubmit = (event) => {
   });
 };
 $("source-all").onclick = () => changeSourceQuery({ source_instance_id: null });
+$("source-record-lookup").onsubmit = (event) => {
+  event.preventDefault();
+  const key = $("source-record-id").value.trim();
+  if (!key) return;
+  archive = null;
+  select({ key, kind: $("source-record-kind").value, revision: null, object: null, path: [] });
+};
 async function readObservations(controller, health) {
   const system = state.route === "system";
   const page = await api(
@@ -946,6 +955,7 @@ function route(name) {
   $("records-title").textContent =
     { overview: "范围总览", sources: "已登记来源", review: "待处理条目", system: "后台任务" }[name] || "记忆记录";
   $("source-filter").hidden = name !== "sources";
+  $("source-record-lookup").hidden = name !== "sources";
   $("time-filter").hidden = !reading;
   $("overview-limit-control").hidden = name !== "overview";
   $("first-page").parentElement.hidden = name === "overview";

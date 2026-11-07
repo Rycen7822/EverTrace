@@ -86,6 +86,7 @@
 {% elif content.kind == 'capture_receipt' %}
   <h2>采集覆盖凭证</h2>
   <p class="muted">这是原生采集记录，不是原消息正文；覆盖状态、终止或 finalized 不代表工作成功，也不授予读取或执行资格。</p>
+  <p class="reading-note">以下维度描述该 lane 的采集情况，不等于原文件的导入进度或 EOF，也不证明某一条记录已被覆盖。</p>
   <section class="semantic-section">
     <h3>各维度状态</h3>
     <dl>
@@ -111,6 +112,7 @@
       <li>{{ gap.first_sequence }} — {{ gap.last_sequence }}</li>{% endfor %}</ul>{% endif %}
   </section>
   <details><summary>缺口、配对及内容处理的原始引用</summary>
+    <p>Gap／outage 引用会作为故障证据保留。不要仅凭引用是否存在重算完整性；各维度按这份凭证的原始判定显示。</p>
     {{ text_list('捕获 gap marker', value.capture_gap_marker_refs) }}
     {{ text_list('捕获 outage', value.capture_outage_interval_refs) }}
     {{ text_list('未配对 tool call', value.unmatched_tool_call_ids) }}
@@ -122,8 +124,7 @@
   </details>
   <details><summary>身份、manifest 与关闭证据</summary>
     <p>所选凭证修订：{{ value.capture_receipt_revision_id }} · ExecutionLane：{{ value.execution_lane_id }}</p>
-    <p>{{ '历史凭证修订' if item.object_kind == 'capture_receipt_revision' else '当前凭证投影' }}；
-      类别来自本次 Native 读取，不按时间或 finalized 猜测。凭证身份不可变。</p>
+    <p>所选不可变凭证修订；不按时间、finalized 或本次打开详情就认定它是当前版本。后继判定不改写这份历史。</p>
     <p>child session：{{ value.child_session_id or '未关联' }} · resolver version：{{ value.resolver_version }}</p>
     {{ text_list('adapter manifest', value.adapter_manifest_ids) }}
     {{ text_list('eligible event manifest', value.eligible_event_manifest_refs) }}
