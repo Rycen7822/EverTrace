@@ -2627,6 +2627,7 @@ impl ExactFieldsQuery {
 pub enum ExactReadQuery {
     Fields(ExactFieldsQuery),
     SourceText(ExactSourceTextQuery),
+    Record(ExactRecordQuery),
 }
 
 impl ExactReadQuery {
@@ -2634,6 +2635,7 @@ impl ExactReadQuery {
         match self {
             Self::Fields(query) => query.validate(),
             Self::SourceText(query) => query.validate(),
+            Self::Record(query) => query.validate(),
         }
     }
 
@@ -2641,6 +2643,7 @@ impl ExactReadQuery {
         match self {
             Self::Fields(query) => &query.revision_ref,
             Self::SourceText(query) => &query.reference.revision_ref,
+            Self::Record(query) => &query.reference.revision_ref,
         }
     }
 }
@@ -2649,7 +2652,7 @@ impl ExactReadQuery {
 #[serde(deny_unknown_fields)]
 pub struct ExactSourceTextQuery {
     pub reference: HumanRevisionRef,
-    pub range: Option<ExactSourceRange>,
+    pub range: Option<ExactUtf8Range>,
     pub expected_data_identity: Option<ReadDataIdentity>,
     pub expected_source: Option<ExactSourceIdentity>,
 }
@@ -2668,13 +2671,7 @@ impl ExactSourceTextQuery {
                     .revision_ref
                     .parse::<crate::ids::SourceReceiptId>()
                     .is_ok())
-            && self.range.as_ref().is_none_or(|range| {
-                (4..=HUMAN_CONTENT_LIMIT).contains(&range.length)
-                    && range
-                        .offset
-                        .checked_add(u64::from(range.length) + 1)
-                        .is_some()
-            })
+            && self.range.as_ref().is_none_or(ExactUtf8Range::validate)
             && self
                 .expected_source
                 .as_ref()
@@ -2682,12 +2679,118 @@ impl ExactSourceTextQuery {
     }
 }
 
-/// None in ExactSourceTextQuery requests metadata/current gates only, not a CAS read.
+/// None in a bounded exact request selects current metadata/gates only, not content.
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
-pub struct ExactSourceRange {
+pub struct ExactUtf8Range {
     pub offset: u64,
     pub length: u16,
+}
+
+impl ExactUtf8Range {
+    pub fn validate(&self) -> bool {
+        (4..=HUMAN_CONTENT_LIMIT).contains(&self.length)
+            && self
+                .offset
+                .checked_add(u64::from(self.length) + 1)
+                .is_some()
+    }
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct ExactRecordQuery {
+    pub reference: HumanRevisionRef,
+    pub field: Option<ExactRecordField>,
+    pub range: Option<ExactUtf8Range>,
+    pub expected_data_identity: Option<ReadDataIdentity>,
+    pub expected_selection: Option<ExactFieldIdentity>,
+}
+
+impl ExactRecordQuery {
+    pub fn validate(&self) -> bool {
+        let reference = &self.reference;
+        !reference.stable_key.is_empty()
+            && reference.stable_key.len() <= 512
+            && !reference.stable_key.chars().any(char::is_control)
+            && (ExactFieldsQuery {
+                revision_ref: reference.revision_ref.clone(),
+            }
+            .validate()
+                || reference
+                    .revision_ref
+                    .parse::<crate::ids::CaptureReceiptId>()
+                    .is_ok()
+                || parse_operation_revision(&reference.revision_ref).is_some())
+            && self.field.is_some() == self.range.is_some()
+            && self.range.as_ref().is_none_or(ExactUtf8Range::validate)
+            && self.expected_selection.as_ref().is_none_or(|selected| {
+                [
+                    &selected.object_ref,
+                    &selected.revision_ref,
+                    &selected.object_kind,
+                ]
+                .iter()
+                .all(|value| {
+                    !value.is_empty() && value.len() <= 512 && !value.chars().any(char::is_control)
+                })
+            })
+    }
+}
+
+/// Closed stored-record fields, not an arbitrary JSON path or display algorithm.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
+pub enum ExactRecordField {
+    Json,
+    Text,
+    Goal,
+    OpenLoop { index: u32 },
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
+pub enum ExactRecordInfo {
+    Semantic {
+        text_bytes: Option<u64>,
+    },
+    Work {
+        goal_bytes: u64,
+        open_loop_bytes: Vec<u64>,
+    },
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct ExactRecordWindow {
+    pub state: ObjectReadState,
+    pub selection: Option<ExactFieldIdentity>,
+    pub content_state: HumanContentState,
+    pub info: Option<ExactRecordInfo>,
+    pub window: Option<ExactUtf8Window>,
+}
+
+impl ExactRecordWindow {
+    pub fn validate(&self) -> bool {
+        self.state.validate()
+            && if self.content_state == HumanContentState::Ready {
+                self.selection.is_some()
+                    && self.info.as_ref().is_some_and(|info| match info {
+                        ExactRecordInfo::Semantic { .. } => true,
+                        ExactRecordInfo::Work {
+                            open_loop_bytes, ..
+                        } => open_loop_bytes.len() <= 64,
+                    })
+                    && self.window.as_ref().is_none_or(|window| {
+                        window.start <= window.end
+                            && window.end <= window.total_bytes
+                            && window.end - window.start == window.text.len() as u64
+                            && window.text.len() <= usize::from(HUMAN_CONTENT_LIMIT)
+                    })
+            } else {
+                self.info.is_none() && self.window.is_none()
+            }
+    }
 }
 
 /// Existing immutable source coordinates; no CAS locator or transferable authorization.

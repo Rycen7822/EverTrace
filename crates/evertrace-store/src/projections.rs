@@ -5787,6 +5787,14 @@ impl JournalAdmissionState {
             }
             return Ok(rows);
         }
+        if let Ok(revision) = reference.parse::<RevisionId>()
+            && let Some((value, seq)) = self.attempt_revisions.get(&revision)
+        {
+            return Ok(vec![inbox_work_row(
+                &JournalPayload::AttemptRecorded(Box::new(value.clone())),
+                *seq,
+            )?]);
+        }
         let refs = BTreeSet::from([reference.to_owned()]);
         let mut rows = self.reference_rows_unfiltered(&refs, false)?;
         let burst_row = |value: &OperationBurst, seq| -> Result<ObjectRow, StoreError> {
@@ -6123,6 +6131,11 @@ impl JournalAdmissionState {
                                 | "work_episode"
                                 | "source_receipt"
                                 | "source_observation"
+                                | "attempt"
+                                | "operation_burst"
+                                | "operation"
+                                | "capture_receipt"
+                                | "capture_receipt_revision"
                         )
                     )
             })

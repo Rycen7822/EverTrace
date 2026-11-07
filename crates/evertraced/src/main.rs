@@ -860,6 +860,16 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
                                     page: Box::new(EngineService::read_exact_fields(writer.clone(), Box::new(fields.clone()),
                                         config_snapshot.hash(), Arc::clone(&session_catalog_report)).await?),
                                 },
+                                ExactReadQuery::Record(record) => match EngineService::read_exact_record(
+                                    writer.clone(), Box::new(record.clone()), config_snapshot.hash(),
+                                    Arc::clone(&session_catalog_report),
+                                ).await? {
+                                    MetadataReadOutcome::Page(page) => HumanGovernanceResponse::RecordWindow { page },
+                                    MetadataReadOutcome::Conflict(current_frontier) => HumanGovernanceResponse::Conflict {
+                                        current_frontier, current_revision_ref: None,
+                                    },
+                                    MetadataReadOutcome::TooLarge => return Err(ErrorCode::ResourceExhausted),
+                                },
                                 ExactReadQuery::SourceText(source) => match EngineService::read_exact_source(
                                     writer.clone(), Box::new(source.clone()), config_snapshot.hash(),
                                     Arc::clone(&session_catalog_report), runtime_snapshot.cas_dir.clone(),
@@ -899,9 +909,7 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
                             }));
                         }
                         if context.client_kind == ClientKind::Web && matches!(&command,
-                            HumanGovernanceRequest::Read { request: HumanReadRequest::Content {
-                                representation: evertrace_protocol::dto::HumanContentRepresentation::SourceText, ..
-                            }}
+                            HumanGovernanceRequest::Read { request: HumanReadRequest::Content { .. }}
                         ) { return Err(ErrorCode::InvalidInput); }
                         let human_governance = HumanGovernanceService::with_acceptance(
                             writer,

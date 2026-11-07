@@ -291,7 +291,7 @@ fn source_records(
     }
 }
 
-fn source_utf8_window(
+fn utf8_window(
     mut bytes: Vec<u8>,
     offset: u64,
     length: u16,
@@ -325,6 +325,146 @@ fn source_utf8_window(
         end_boundary,
         text: String::from_utf8(bytes).map_err(|_| ErrorCode::StoreCorrupt)?,
     })
+}
+
+/// Serialize a single selected Domain record without allocating its complete JSON representation.
+struct RecordWindowWriter<'a> {
+    start: u64,
+    end: u64,
+    position: u64,
+    bytes: Vec<u8>,
+    check: &'a dyn Fn() -> Result<(), ErrorCode>,
+}
+
+impl std::io::Write for RecordWindowWriter<'_> {
+    fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+        (self.check)().map_err(|_| std::io::Error::other("exact record read cancelled"))?;
+        let next = self
+            .position
+            .checked_add(bytes.len() as u64)
+            .ok_or_else(|| std::io::Error::other("record length overflow"))?;
+        let start = self.start.max(self.position);
+        let end = self.end.min(next);
+        if start < end {
+            self.bytes.extend_from_slice(
+                &bytes[(start - self.position) as usize..(end - self.position) as usize],
+            );
+        }
+        self.position = next;
+        Ok(bytes.len())
+    }
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
+fn record_json<T: serde::Serialize>(
+    value: &T,
+    range: &evertrace_domain::query::ExactUtf8Range,
+    check: &dyn Fn() -> Result<(), ErrorCode>,
+) -> Result<evertrace_domain::query::ExactUtf8Window, ErrorCode> {
+    let mut writer = RecordWindowWriter {
+        start: range.offset,
+        end: range.offset + u64::from(range.length) + 1,
+        position: 0,
+        bytes: Vec::new(),
+        check,
+    };
+    let result = serde_json::to_writer_pretty(&mut writer, value);
+    check()?;
+    result.map_err(|_| ErrorCode::StoreCorrupt)?;
+    utf8_window(writer.bytes, range.offset, range.length, writer.position)
+}
+
+fn record_text(
+    value: &str,
+    range: &evertrace_domain::query::ExactUtf8Range,
+) -> Result<evertrace_domain::query::ExactUtf8Window, ErrorCode> {
+    let start = (range.offset.min(value.len() as u64)) as usize;
+    let end = (range.offset + u64::from(range.length) + 1).min(value.len() as u64) as usize;
+    utf8_window(
+        value.as_bytes()[start..end].to_vec(),
+        range.offset,
+        range.length,
+        value.len() as u64,
+    )
+}
+
+type RecordData = (
+    evertrace_domain::query::ExactRecordInfo,
+    Option<evertrace_domain::query::ExactUtf8Window>,
+);
+
+fn semantic_record<T: serde::Serialize>(
+    value: &T,
+    text: Option<&str>,
+    query: &evertrace_domain::query::ExactRecordQuery,
+    check: &dyn Fn() -> Result<(), ErrorCode>,
+) -> Result<Option<RecordData>, ErrorCode> {
+    use evertrace_domain::query::{ExactRecordField as Field, ExactRecordInfo as Info};
+    let window = match (&query.field, &query.range) {
+        (None, None) => None,
+        (Some(Field::Json), Some(range)) => Some(record_json(value, range, check)?),
+        (Some(Field::Text), Some(range)) if text.is_some() => {
+            Some(record_text(text.unwrap(), range)?)
+        }
+        _ => return Ok(None),
+    };
+    Ok(Some((
+        Info::Semantic {
+            text_bytes: text.map(|value| value.len() as u64),
+        },
+        window,
+    )))
+}
+
+fn record_data(
+    payload: evertrace_store::JournalPayload,
+    query: &evertrace_domain::query::ExactRecordQuery,
+    check: &dyn Fn() -> Result<(), ErrorCode>,
+) -> Result<Option<RecordData>, ErrorCode> {
+    use evertrace_domain::query::{ExactRecordField as Field, ExactRecordInfo as Info};
+    use evertrace_store::JournalPayload as P;
+    payload.validate().map_err(|_| ErrorCode::StoreCorrupt)?;
+    check()?;
+    match payload {
+        P::AtomRecorded(value) => semantic_record(&value, Some(&value.value.text), query, check),
+        P::ProcedureRevisionRecorded(value) => semantic_record(&value, None, query, check),
+        P::CoreMembershipRecorded(value) => semantic_record(&value, None, query, check),
+        P::SemanticDigestRecorded(value) => semantic_record(&value, None, query, check),
+        P::RevisionProposalRecorded(value) => semantic_record(&value, None, query, check),
+        P::AttemptRecorded(value) => semantic_record(&value, None, query, check),
+        P::OperationBurstRecorded(value) => semantic_record(&value, None, query, check),
+        P::OperationDerived(value) => semantic_record(&value, None, query, check),
+        P::CaptureReceiptRecorded(value) => semantic_record(&value, None, query, check),
+        P::WorkEpisodeRecorded(value) => {
+            let info = Info::Work {
+                goal_bytes: value.phase_contract.local_goal.len() as u64,
+                open_loop_bytes: value
+                    .open_loops
+                    .iter()
+                    .map(|entry| entry.len() as u64)
+                    .collect(),
+            };
+            let window = match (&query.field, &query.range) {
+                (None, None) => None,
+                (Some(Field::Json), Some(range)) => Some(record_json(&value, range, check)?),
+                (Some(Field::Goal), Some(range)) => {
+                    Some(record_text(&value.phase_contract.local_goal, range)?)
+                }
+                (Some(Field::OpenLoop { index }), Some(range)) => Some(record_text(
+                    value
+                        .open_loops
+                        .get(*index as usize)
+                        .ok_or(ErrorCode::InvalidInput)?,
+                    range,
+                )?),
+                _ => return Ok(None),
+            };
+            Ok(Some((info, window)))
+        }
+        _ => Ok(None),
+    }
 }
 
 impl EngineService {
@@ -479,7 +619,7 @@ impl EngineService {
             result.content_state = State::Unsupported;
         } else {
             if let (Some(Ok((window, _))), Some(range)) = (read, query.range.as_ref()) {
-                result.window = Some(source_utf8_window(
+                result.window = Some(utf8_window(
                     window.bytes,
                     range.offset,
                     range.length,
@@ -488,6 +628,134 @@ impl EngineService {
             }
             result.source = Some(source);
             result.content_state = State::Ready;
+        }
+        if !result.validate() {
+            return Err(ErrorCode::ResourceExhausted);
+        }
+        Ok(Outcome::Page(Box::new(result)))
+    }
+
+    /// Complete stored record values and closed text fields, never a management projection or Journal wrapper.
+    pub async fn read_exact_record(
+        writer: crate::WriterHandle,
+        query: Box<evertrace_domain::query::ExactRecordQuery>,
+        effective_config_hash: [u8; 32],
+        report: std::sync::Arc<tokio::sync::RwLock<Option<evertrace_codex::HostProbeReport>>>,
+    ) -> Result<
+        evertrace_domain::query::MetadataReadOutcome<evertrace_domain::query::ExactRecordWindow>,
+        ErrorCode,
+    > {
+        use evertrace_domain::query::{ExactReadQuery, ExactRecordWindow};
+        use evertrace_domain::query::{HumanContentState as State, MetadataReadOutcome as Outcome};
+        if !query.validate() {
+            return Err(ErrorCode::InvalidInput);
+        }
+        let deadline = Instant::now() + std::time::Duration::from_secs(2);
+        let (cancelled, _cancel_on_drop) = evertrace_store::StoreReadHandle::cancellation_scope();
+        let request = Box::new(ExactReadQuery::Record((*query).clone()));
+        let Outcome::Page(before) = writer
+            .read_stored_fields_context(
+                request.clone(),
+                cancelled.clone(),
+                deadline,
+                effective_config_hash,
+            )
+            .await
+            .map_err(|_| ErrorCode::Internal)?
+        else {
+            return Err(ErrorCode::ResourceExhausted);
+        };
+        if query
+            .expected_data_identity
+            .is_some_and(|identity| identity != before.state.data_identity)
+        {
+            return Ok(Outcome::Conflict(before.state.frontier));
+        }
+        let metadata = fields_metadata(&before)?;
+        let mut result = ExactRecordWindow {
+            state: metadata.state,
+            selection: metadata.selection,
+            content_state: State::Missing,
+            info: None,
+            window: None,
+        };
+        let Some(root) = &before.selected else {
+            return Ok(Outcome::Page(Box::new(result)));
+        };
+        if root.row_id != query.reference.stable_key
+            && root.object_id.as_deref() != Some(&query.reference.stable_key)
+            && query.reference.stable_key != query.reference.revision_ref
+        {
+            result.content_state = State::Unavailable;
+            return Ok(Outcome::Page(Box::new(result)));
+        }
+        if query
+            .expected_selection
+            .as_ref()
+            .is_some_and(|expected| Some(expected) != result.selection.as_ref())
+        {
+            return Ok(Outcome::Conflict(before.state.frontier));
+        }
+        if let Err(code) = fields_access(&writer, &before, &report, deadline).await {
+            result.content_state = if code == ErrorCode::Untrusted {
+                State::AccessDenied
+            } else {
+                State::Unavailable
+            };
+            return Ok(Outcome::Page(Box::new(result)));
+        }
+        let payload = root.payload_json.clone().ok_or(ErrorCode::StoreCorrupt)?;
+        let selected_query = query.clone();
+        let data = writer
+            .read_handle()
+            .read_blocking(move |cancel| {
+                let check = || {
+                    cancel.check().map_err(|_| ErrorCode::ResourceExhausted)?;
+                    if Instant::now() >= deadline {
+                        return Err(ErrorCode::ResourceExhausted);
+                    }
+                    Ok(())
+                };
+                let read = || {
+                    check()?;
+                    let payload =
+                        serde_json::from_str(&payload).map_err(|_| ErrorCode::StoreCorrupt)?;
+                    let data = record_data(payload, &selected_query, &check)?;
+                    check()?;
+                    Ok(data)
+                };
+                Ok(read())
+            })
+            .await
+            .map_err(|_| ErrorCode::ResourceExhausted)??;
+        let Outcome::Page(current) = writer
+            .read_stored_fields_context(request, cancelled, deadline, effective_config_hash)
+            .await
+            .map_err(|_| ErrorCode::Internal)?
+        else {
+            return Err(ErrorCode::ResourceExhausted);
+        };
+        result.state = current.state.clone();
+        result.selection = fields_metadata(&current)?.selection;
+        if let Err(code) = fields_access(&writer, &current, &report, deadline).await {
+            result.content_state = if code == ErrorCode::Untrusted {
+                State::AccessDenied
+            } else {
+                State::Unavailable
+            };
+        } else if current.selected.is_none() {
+            result.content_state = State::Missing;
+        } else if before.state.data_identity != current.state.data_identity
+            || before.selected != current.selected
+            || before.rows != current.rows
+        {
+            return Ok(Outcome::Conflict(current.state.frontier));
+        } else if let Some((info, window)) = data {
+            result.content_state = State::Ready;
+            result.info = Some(info);
+            result.window = window;
+        } else {
+            result.content_state = State::Unsupported;
         }
         if !result.validate() {
             return Err(ErrorCode::ResourceExhausted);

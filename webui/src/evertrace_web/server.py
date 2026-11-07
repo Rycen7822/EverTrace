@@ -17,7 +17,7 @@ from uvicorn.protocols.http.h11_impl import H11Protocol
 from .backend import Backend, BackendError, _decode
 from .jobs import read_jobs
 from .comparison import read_comparison
-from .content import read_source_content
+from .content import read_record_content, read_source_content
 from .memories import read_memories, read_overview
 
 ROOT = Path(__file__).resolve().parent
@@ -505,8 +505,8 @@ class App:
                         self.backend, payload["reference"], frontier, payload["revision"], payload["after"],
                     )
                 else:
-                    result = await self.backend.content(
-                        payload["reference"], frontier, payload["revision"], payload["representation"], payload["after"],
+                    result = await read_record_content(
+                        self.backend, payload["reference"], frontier, payload["revision"], payload["representation"], payload["after"],
                     )
                 if result["kind"] == "conflict":
                     data = {"conflict": True}

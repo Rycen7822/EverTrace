@@ -1,7 +1,7 @@
 mod compiled;
 pub use compiled::{HumanCompiledEntry, HumanCompiledPage};
 
-pub use evertrace_domain::query::{ExactReadQuery, HumanContentRepresentation};
+pub use evertrace_domain::query::ExactReadQuery;
 use evertrace_domain::{
     evidence::IdentityStrength,
     ids::{
@@ -958,6 +958,9 @@ pub struct HumanActionResult {
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
 pub enum HumanGovernanceResponse {
+    RecordWindow {
+        page: Box<evertrace_domain::query::ExactRecordWindow>,
+    },
     SourceWindow {
         page: Box<evertrace_domain::query::ExactSourceWindow>,
     },
@@ -1404,6 +1407,7 @@ impl HumanDiagnostics {
 impl HumanGovernanceResponse {
     pub fn validate(&self) -> bool {
         match self {
+            Self::RecordWindow { page } => page.validate(),
             Self::SourceWindow { page } => page.validate(),
             Self::StoredFields { page } => page.validate(),
             Self::RevisionPair { page } => page.validate(),

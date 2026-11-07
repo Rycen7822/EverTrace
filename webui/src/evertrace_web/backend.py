@@ -305,6 +305,43 @@ class Backend:
             raise BackendError("inactive_configuration")
         return result
 
+    async def read_record_window(self, reference, revision, field=None, byte_range=None, data_identity=None, selection=None):
+        if any(not isinstance(value, str) or not value or len(value.encode()) > 512
+               or any(ord(char) < 32 for char in value) for value in (reference, revision)):
+            raise BackendError("invalid_input")
+        if (field is None) != (byte_range is None):
+            raise BackendError("invalid_input")
+        if field is not None:
+            if not isinstance(field, dict) or field.get("kind") not in ("json", "text", "goal", "open_loop"):
+                raise BackendError("invalid_input")
+            keys = {"kind", "index"} if field["kind"] == "open_loop" else {"kind"}
+            if set(field) != keys or "index" in keys and (type(field["index"]) is not int or not 0 <= field["index"] < 2**32):
+                raise BackendError("invalid_input")
+            field = {key: field[key] for key in ("kind", "index") if key in field}
+            if (not isinstance(byte_range, dict) or set(byte_range) != {"offset", "length"}
+                or type(byte_range["offset"]) is not int or not 0 <= byte_range["offset"] < 2**64 - 8193
+                or type(byte_range["length"]) is not int or not 4 <= byte_range["length"] <= 8192):
+                raise BackendError("invalid_input")
+            byte_range = {key: byte_range[key] for key in ("offset", "length")}
+        _, data_identity = _read_boundary(None, data_identity)
+        if selection is not None:
+            keys = ("object_kind", "object_ref", "revision_ref", "source_event_seq")
+            if (not isinstance(selection, dict) or set(selection) != set(keys)
+                or any(not isinstance(selection[key], str) or not 0 < len(selection[key].encode()) <= 512 for key in keys[:3])
+                or type(selection["source_event_seq"]) is not int or not 0 <= selection["source_event_seq"] < 2**64):
+                raise BackendError("invalid_input")
+            selection = {key: selection[key] for key in keys}
+        result = await self._request({"kind": "read_exact", "query": {"kind": "record",
+            "reference": {"stable_key": reference, "revision_ref": revision}, "field": field, "range": byte_range,
+            "expected_data_identity": data_identity, "expected_selection": selection}})
+        if result["kind"] == "conflict":
+            return result
+        if result["kind"] != "record_window":
+            raise BackendError("invalid_read_response")
+        if result["page"]["state"]["effective_config_hash"] != self.config_hash:
+            raise BackendError("inactive_configuration")
+        return result
+
     async def read_batch(self, items, expected_frontier=None, expected_data_identity=None):
         """Closed metadata only; no content, search, action or raw native command."""
         frontier, identity = _read_boundary(expected_frontier, expected_data_identity)
@@ -584,21 +621,6 @@ class Backend:
             }
         )
 
-    async def content(self, reference, frontier, revision, representation, after=None):
-        if representation not in ("text", "semantic_json"):
-            raise BackendError("invalid_input")
-        return await self._request(
-            {
-                "kind": "content",
-                "object_ref": reference,
-                "expected_revision_ref": revision,
-                "expected_frontier": frontier,
-                "representation": representation,
-                "after": after,
-                "limit": 8192,
-            }
-        )
-
     async def _request(self, read):
         async def execute():
             writer = None
@@ -689,6 +711,7 @@ class Backend:
                     "metadata_batch",
                     "stored_fields",
                     "source_window",
+                    "record_window",
                     "revision_pair",
                     "snapshot",
                     "memory_page",
