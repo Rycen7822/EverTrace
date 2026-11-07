@@ -4415,36 +4415,6 @@ impl MemoryBrowseCursor {
     }
 }
 
-/// Continuation for one exact source/dependency anchor, not another object's page.
-#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
-#[serde(deny_unknown_fields)]
-pub struct SourceLinksCursor {
-    pub frontier: u64,
-    pub source_key: String,
-    pub source_revision: String,
-    pub after_key: String,
-}
-
-impl SourceLinksCursor {
-    pub fn validate_for(
-        &self,
-        source_key: &str,
-        source_revision: &str,
-        frontier: u64,
-    ) -> Result<(), QueryError> {
-        if self.source_key != source_key
-            || self.source_revision != source_revision
-            || self.frontier != frontier
-            || self.after_key.is_empty()
-            || self.after_key.len() > 512
-            || self.after_key.chars().any(char::is_control)
-        {
-            return Err(QueryError::Invalid);
-        }
-        Ok(())
-    }
-}
-
 /// Shared read states; used by semantic detail, ranges and revision comparisons.
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "snake_case")]

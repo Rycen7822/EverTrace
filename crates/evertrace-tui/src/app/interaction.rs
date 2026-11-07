@@ -1943,7 +1943,7 @@ mod tests {
             .collect()
     }
     #[test]
-    fn language_search_and_new_detail_frontier_preserve_page_and_navigation() {
+    fn language_and_new_detail_frontier_preserve_snapshot() {
         let mut app = populated();
         let mut item = selected_item(&app.state).unwrap().clone();
         item.object_kind = "core_membership".into();
@@ -2002,63 +2002,9 @@ mod tests {
         for language in [crate::Language::English, crate::Language::Chinese] {
             app.dispatch(UiCommand::Language(language));
             assert!(views::detail_text(&app.state).contains(&revision.to_string()));
-            for query in ["Sources", "来源"] {
-                app.state.ui.query = query.into();
-                assert!(
-                    app.palette()
-                        .iter()
-                        .any(|s| s.command == UiCommand::DetailView(DetailView::Sources))
-                );
-            }
             draw(&app, 80, 24);
             assert!(!app.state.write_queued);
         }
-        app.state.ui.query.clear();
-        app.dispatch(UiCommand::DetailView(DetailView::Sources));
-        assert_eq!(
-            app.state
-                .related_context
-                .as_ref()
-                .unwrap()
-                .expected_frontier,
-            9
-        );
-        app.handle(AppEvent::HumanRead {
-            surface: HumanSurface::Explorer,
-            locator: HumanReadLocator::Related {
-                relation: evertrace_protocol::dto::HumanRelationKind::ObjectSources,
-                source_stable_key: item.stable_key.clone(),
-                expected_source_revision_ref: revision.to_string(),
-                expected_frontier: 9,
-            },
-            response: HumanGovernanceResponse::Snapshot {
-                diagnostics: None,
-                frontier: 12,
-                status: HumanSnapshotStatus::Ready,
-                degraded_reasons: vec![],
-                items: vec![item.clone()],
-                next_cursor: Some("sources-next".into()),
-            },
-        });
-        assert_eq!(
-            app.state
-                .related_context
-                .as_ref()
-                .unwrap()
-                .expected_frontier,
-            12
-        );
-        app.dispatch(UiCommand::CancelModal);
-        assert_eq!(
-            app.state.detail.as_ref().unwrap().stable_key,
-            item.stable_key
-        );
-        assert_eq!(app.state.detail_frontier, Some(9));
-        assert!(app.state.related_context.is_none());
-        assert!(matches!(
-            &app.state.human,
-            Some(HumanGovernanceResponse::Snapshot { frontier: 4, .. })
-        ));
     }
     #[test]
     fn palette_mouse_tabs_and_empty_jobs_use_visible_context() {

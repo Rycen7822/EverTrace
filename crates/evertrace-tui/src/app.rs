@@ -2045,11 +2045,6 @@ fn related_context(state: &AppState) -> Option<crate::state::RelatedContext> {
         evertrace_protocol::dto::HumanRelationKind::ProposalEvidence
     } else if detail.support_detail.is_some() {
         evertrace_protocol::dto::HumanRelationKind::SupportDependencies
-    } else if matches!(
-        detail.object_kind.as_str(),
-        "atom_revision" | "procedure_revision" | "core_membership"
-    ) {
-        evertrace_protocol::dto::HumanRelationKind::ObjectSources
     } else {
         return None;
     };

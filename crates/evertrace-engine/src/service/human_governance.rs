@@ -102,7 +102,6 @@ pub enum HumanSurface {
 pub enum HumanRelationKind {
     ProposalEvidence,
     SupportDependencies,
-    ObjectSources,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -603,7 +602,6 @@ pub enum HumanSnapshotStatus {
 #[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
 pub enum HumanDegradedReason {
     CurrentJobFailed,
-    RelatedReferencesUnavailable,
 }
 
 #[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
@@ -1416,39 +1414,6 @@ impl HumanGovernanceService {
         let semantic_view = SemanticCurrentView::from_snapshot(&snapshot)
             .map_err(|_| HumanGovernanceError::Store)?;
         let refs = match request.relation {
-            HumanRelationKind::ObjectSources => {
-                if source.current_revision_id.as_deref()
-                    != Some(request.expected_source_revision_ref)
-                {
-                    return Ok(Err((snapshot.frontier, source.current_revision_id.clone())));
-                }
-                if !matches!(
-                    source.object_kind.as_deref(),
-                    Some(
-                        "atom_revision"
-                            | "procedure_revision"
-                            | "core_membership"
-                            | "semantic_digest"
-                            | "revision_proposal_revision"
-                            | "source_receipt"
-                            | "source_observation"
-                            | "work_episode"
-                            | "attempt"
-                            | "operation_burst"
-                            | "operation"
-                    )
-                ) {
-                    return Err(HumanGovernanceError::InvalidInput);
-                }
-                let payload: JournalPayload = serde_json::from_str(
-                    source
-                        .payload_json
-                        .as_deref()
-                        .ok_or(HumanGovernanceError::Store)?,
-                )
-                .map_err(|_| HumanGovernanceError::Store)?;
-                evertrace_store::projections::source_references_for(source, &payload)
-            }
             HumanRelationKind::ProposalEvidence => {
                 let proposal_id = source
                     .object_id
@@ -1500,100 +1465,15 @@ impl HumanGovernanceService {
                 support_dependency_refs(&validation, &contract)
             }
         };
-        let source_cursor = if request.relation == HumanRelationKind::ObjectSources {
-            request
-                .after
-                .map(|raw| {
-                    let value: evertrace_domain::query::SourceLinksCursor =
-                        serde_json::from_str(raw)
-                            .map_err(|_| HumanGovernanceError::InvalidInput)?;
-                    value
-                        .validate_for(
-                            request.source_stable_key,
-                            request.expected_source_revision_ref,
-                            request.expected_frontier,
-                        )
-                        .map_err(|_| HumanGovernanceError::InvalidInput)?;
-                    Ok::<_, HumanGovernanceError>(value)
-                })
-                .transpose()?
-        } else {
-            None
-        };
-        let after = source_cursor
-            .as_ref()
-            .map(|value| value.after_key.as_str())
-            .or(request.after);
-        let ((selected, next_cursor), unresolved_sources) =
-            if request.relation == HumanRelationKind::ObjectSources {
-                let (resolved, mut unavailable) = resolve_source_links(&snapshot, &index, refs);
-                export::source_metadata_budget(
-                    &resolved.values().copied().collect::<Vec<_>>(),
-                    deadline,
-                )
-                .map_err(|_| HumanGovernanceError::Store)?;
-                let mut readable = BTreeMap::new();
-                for (key, row) in resolved {
-                    match self
-                        .readable_indexed_row(&snapshot, row, &index, deadline)
-                        .await
-                    {
-                        Ok(()) => {
-                            readable.insert(key, row);
-                        }
-                        Err(export::Failure::Denied) => {
-                            unavailable = true;
-                        }
-                        Err(_) => return Err(HumanGovernanceError::Store),
-                    }
-                }
-                self.readable_indexed_row(&snapshot, source, &index, deadline)
-                    .await
-                    .map_err(|_| HumanGovernanceError::InvalidInput)?;
-                let frontier = self
-                    .writer
-                    .sync_objects_frontier()
-                    .await
-                    .map_err(|_| HumanGovernanceError::Store)?;
-                if frontier != snapshot.frontier {
-                    return Ok(Err((frontier, None)));
-                }
-                (
-                    related_page(readable, after, usize::from(request.limit))?,
-                    unavailable,
-                )
-            } else {
-                (
-                    related_rows(&snapshot, refs, after, usize::from(request.limit))?,
-                    false,
-                )
-            };
-        let next_cursor = if request.relation == HumanRelationKind::ObjectSources {
-            next_cursor
-                .map(|after_key| {
-                    serde_json::to_string(&evertrace_domain::query::SourceLinksCursor {
-                        frontier: snapshot.frontier,
-                        source_key: request.source_stable_key.into(),
-                        source_revision: request.expected_source_revision_ref.into(),
-                        after_key,
-                    })
-                    .map_err(|_| HumanGovernanceError::Store)
-                })
-                .transpose()?
-        } else {
-            next_cursor
-        };
+        let (selected, next_cursor) =
+            related_rows(&snapshot, refs, request.after, usize::from(request.limit))?;
         let usage_view = selected
             .iter()
             .any(|row| row.object_kind.as_deref() == Some("procedure_negative_review"))
             .then(|| ProcedureUsageCurrentView::from_snapshot(&snapshot))
             .transpose()
             .map_err(|_| HumanGovernanceError::Store)?;
-        let (mut status, mut degraded_reasons) = snapshot_status(&snapshot)?;
-        if unresolved_sources {
-            status = HumanSnapshotStatus::Degraded;
-            degraded_reasons.push(HumanDegradedReason::RelatedReferencesUnavailable);
-        }
+        let (status, degraded_reasons) = snapshot_status(&snapshot)?;
         Ok(Ok(HumanPage {
             diagnostics: None,
             frontier: snapshot.frontier,
@@ -3830,56 +3710,6 @@ fn related_page<'a>(
         (selected.len() > limit).then(|| selected[limit.saturating_sub(1)].row_id.clone());
     selected.truncate(limit);
     Ok((selected, next_cursor))
-}
-
-// Navigation is not the export/permission closure. Every target is independently
-// checked before pagination, so an Episode does not authorize all its Attempts.
-// Explicit revisions remain exact; logical references use the existing canonical
-// current selector at this frontier. A shared alias never chooses between objects.
-fn resolve_source_links<'a>(
-    snapshot: &'a ProjectionSnapshot,
-    index: &BTreeMap<&str, Vec<&'a ObjectRow>>,
-    refs: BTreeSet<String>,
-) -> (BTreeMap<String, &'a ObjectRow>, bool) {
-    let mut resolved = BTreeMap::new();
-    let mut unavailable = false;
-    for reference in refs {
-        let Some(rows) = index.get(reference.as_str()) else {
-            unavailable = true;
-            continue;
-        };
-        let objects = rows
-            .iter()
-            .copied()
-            .filter(|row| row.row_class == Some(ObjectRowClass::Object))
-            .collect::<Vec<_>>();
-        let candidates = if objects.is_empty() {
-            rows.as_slice()
-        } else {
-            objects.as_slice()
-        };
-        let selected = if candidates.len() == 1 {
-            Some(candidates[0])
-        } else if candidates.first().is_some_and(|first| {
-            first.object_id.as_deref() == Some(reference.as_str())
-                && candidates.iter().all(|row| {
-                    row.object_id == first.object_id && row.object_kind == first.object_kind
-                })
-        }) {
-            super::actions::select_object_row(snapshot, &reference)
-                .ok()
-                .flatten()
-                .map(|(row, _)| row)
-        } else {
-            None
-        };
-        if let Some(row) = selected {
-            resolved.insert(row.row_id.clone(), row);
-        } else {
-            unavailable = true;
-        }
-    }
-    (resolved, unavailable)
 }
 
 fn support_dependency_refs(

@@ -101,7 +101,6 @@ pub enum HumanSurface {
 pub enum HumanRelationKind {
     ProposalEvidence,
     SupportDependencies,
-    ObjectSources,
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -328,7 +327,6 @@ pub enum HumanSnapshotStatus {
 #[serde(rename_all = "snake_case")]
 pub enum HumanDegradedReason {
     CurrentJobFailed,
-    RelatedReferencesUnavailable,
 }
 
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]

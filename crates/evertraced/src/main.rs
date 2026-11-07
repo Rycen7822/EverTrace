@@ -1072,7 +1072,6 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
                                             HumanRelationKind::SupportDependencies => {
                                                 EngineHumanRelationKind::SupportDependencies
                                             }
-                                            HumanRelationKind::ObjectSources => EngineHumanRelationKind::ObjectSources,
                                         },
                                         source_stable_key: &source_stable_key,
                                         expected_source_revision_ref: &expected_source_revision_ref,
@@ -1723,9 +1722,6 @@ fn map_human_page(page: evertrace_engine::HumanPage) -> HumanGovernanceResponse 
             .map(|reason| match reason {
                 evertrace_engine::HumanDegradedReason::CurrentJobFailed => {
                     HumanDegradedReason::CurrentJobFailed
-                }
-                evertrace_engine::HumanDegradedReason::RelatedReferencesUnavailable => {
-                    HumanDegradedReason::RelatedReferencesUnavailable
                 }
             })
             .collect(),

@@ -2354,22 +2354,51 @@ async fn plain_accept_uses_one_real_command_for_atom_procedure_and_core_inner() 
         "Create has no base"
     );
 
-    let source_page = service
-        .related(HumanRelatedRequest {
-            relation: evertrace_engine::HumanRelationKind::ObjectSources,
-            source_stable_key: &readable.items[0].stable_key,
-            expected_source_revision_ref: &first_atom.revision_id.to_string(),
-            expected_frontier: readable.frontier,
-            after: None,
-            limit: 1,
+    let source_query = |after, expected_frontier, expected_data_identity| {
+        Box::new(evertrace_domain::query::MetadataBatchQuery {
+            expected_frontier,
+            expected_data_identity,
+            items: vec![evertrace_domain::query::MetadataReadQuery::References {
+                reference: evertrace_domain::query::ExactRecordRef {
+                    stable_key: readable.items[0].stable_key.clone(),
+                    revision_ref: Some(first_atom.revision_id.to_string()),
+                },
+                after,
+                limit: 1,
+            }],
         })
+    };
+    let evertrace_domain::query::MetadataReadOutcome::Page(source_batch) =
+        evertrace_engine::EngineService::read_metadata_batch(
+            handle.clone(),
+            source_query(None, Some(readable.frontier), None),
+            CONFIG,
+            &Default::default(),
+            report.clone(),
+        )
         .await
         .unwrap()
-        .unwrap();
-    assert_eq!(source_page.items.len(), 1);
+    else {
+        panic!("source metadata")
+    };
+    let evertrace_domain::query::MetadataReadPage::References { page: source_page } =
+        &source_batch.items[0]
+    else {
+        panic!("source references")
+    };
+    assert_eq!(
+        source_page.content_state,
+        evertrace_domain::query::HumanContentState::Ready
+    );
+    assert_eq!(source_page.records.len(), 1);
     assert!(
-        source_page.items[0].semantic_detail.is_none(),
-        "Related list never loads semantic bodies"
+        source_page.records[0]
+            .metadata
+            .as_ref()
+            .unwrap()
+            .get("payload_json")
+            .is_none(),
+        "Related metadata never loads semantic bodies"
     );
 
     // An unrelated background commit must not make an immutable, readable
@@ -2412,42 +2441,39 @@ async fn plain_accept_uses_one_real_command_for_atom_procedure_and_core_inner() 
         matches!(&after_background.items[0].semantic_detail.as_ref().unwrap().content,
         Some(evertrace_engine::HumanSemanticContent::Atom(atom)) if **atom == first_atom)
     );
-    let related_request = HumanRelatedRequest {
-        relation: evertrace_engine::HumanRelationKind::ObjectSources,
-        source_stable_key: &readable.items[0].stable_key,
-        expected_source_revision_ref: &first_atom.revision_id.to_string(),
-        expected_frontier: readable.frontier,
-        after: None,
-        limit: 1,
+    let evertrace_domain::query::MetadataReadOutcome::Page(after_background) =
+        evertrace_engine::EngineService::read_metadata_batch(
+            handle.clone(),
+            source_query(None, None, None),
+            CONFIG,
+            &Default::default(),
+            report.clone(),
+        )
+        .await
+        .unwrap()
+    else {
+        panic!("immutable source remains readable after unrelated append")
     };
-    assert_eq!(
-        service
-            .related(related_request)
-            .await
-            .unwrap()
-            .unwrap()
-            .frontier,
-        new_frontier
-    );
+    assert_eq!(after_background.state.frontier, new_frontier);
     let cursor = source_page
-        .next_cursor
-        .as_deref()
+        .next
+        .clone()
         .expect("source references have a second page");
-    assert_eq!(
-        service
-            .related(HumanRelatedRequest {
-                relation: evertrace_engine::HumanRelationKind::ObjectSources,
-                source_stable_key: &readable.items[0].stable_key,
-                expected_source_revision_ref: &first_atom.revision_id.to_string(),
-                expected_frontier: readable.frontier,
-                after: Some(cursor),
-                limit: 1,
-            })
-            .await
-            .unwrap()
-            .unwrap_err(),
-        (new_frontier, None)
-    );
+    let stale = evertrace_engine::EngineService::read_metadata_batch(
+        handle.clone(),
+        source_query(
+            Some(cursor),
+            Some(source_batch.state.frontier),
+            Some(source_batch.state.data_identity.clone()),
+        ),
+        CONFIG,
+        &Default::default(),
+        report.clone(),
+    )
+    .await
+    .unwrap();
+    assert!(matches!(stale,
+        evertrace_domain::query::MetadataReadOutcome::Conflict(frontier) if frontier == new_frontier));
     assert!(matches!(
         service
             .create_backup(RequestId::new_v7(), readable.frontier)
