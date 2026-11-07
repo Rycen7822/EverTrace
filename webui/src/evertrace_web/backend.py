@@ -720,7 +720,6 @@ class Backend:
                     "scope_directory",
                     "source_catalog",
                     "source_archive",
-                    "content",
                     "conflict",
                 ):
                     raise BackendError("invalid_read_response")

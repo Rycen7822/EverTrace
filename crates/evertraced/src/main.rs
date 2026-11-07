@@ -908,9 +908,6 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
                                 MetadataReadOutcome::TooLarge => return Err(ErrorCode::ResourceExhausted),
                             }));
                         }
-                        if context.client_kind == ClientKind::Web && matches!(&command,
-                            HumanGovernanceRequest::Read { request: HumanReadRequest::Content { .. }}
-                        ) { return Err(ErrorCode::InvalidInput); }
                         let human_governance = HumanGovernanceService::with_acceptance(
                             writer,
                             runtime_snapshot.effective_config_hash,
@@ -974,18 +971,6 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
                                         .await.map_err(map_human_error)? {
                                         Ok(page)=>HumanGovernanceResponse::ScopeDirectory {page:Box::new(page)},
                                         Err(frontier)=>HumanGovernanceResponse::Conflict {current_frontier:frontier,current_revision_ref:None},
-                                    }
-                                }
-                                HumanReadRequest::Content {
-                                    object_ref, expected_revision_ref, expected_frontier, representation, after, limit,
-                                } => {
-                                    match human_governance.content(
-                                        &object_ref, &expected_revision_ref, expected_frontier, representation, after.as_deref(), limit,
-                                    )
-                                        .await.map_err(map_human_error)?
-                                    {
-                                        Ok(content) => HumanGovernanceResponse::Content {content: Box::new(map_content_chunk(content))},
-                                        Err(frontier) => HumanGovernanceResponse::Conflict {current_frontier: frontier, current_revision_ref: None},
                                     }
                                 }
                                 HumanReadRequest::CompiledProjections { query, expected_frontier, after, limit } => {
@@ -1656,24 +1641,6 @@ fn map_human_surface(surface: HumanSurface) -> EngineHumanSurface {
         HumanSurface::Inbox => EngineHumanSurface::Inbox,
         HumanSurface::Explorer => EngineHumanSurface::Explorer,
         HumanSurface::System => EngineHumanSurface::System,
-    }
-}
-
-fn map_content_chunk(
-    content: evertrace_engine::HumanContentChunk,
-) -> evertrace_protocol::dto::HumanContentChunk {
-    evertrace_protocol::dto::HumanContentChunk {
-        frontier: content.frontier,
-        object_ref: content.object_ref,
-        revision_ref: content.revision_ref,
-        representation: content.representation,
-        state: content.state,
-        total_bytes: content.total_bytes,
-        range_start: content.range_start,
-        range_end: content.range_end,
-        text: content.text,
-        previous_cursor: content.previous_cursor,
-        next_cursor: content.next_cursor,
     }
 }
 

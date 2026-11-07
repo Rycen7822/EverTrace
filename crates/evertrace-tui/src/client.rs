@@ -119,7 +119,6 @@ async fn send_human(
             | HumanReadRequest::CompiledProjections { .. }
             | HumanReadRequest::Search { .. }
             | HumanReadRequest::BrowseMemories { .. }
-            | HumanReadRequest::Content { .. }
             | HumanReadRequest::ScopeDirectory { .. }
             | HumanReadRequest::SourceCatalog { .. }
             | HumanReadRequest::SourceArchive { .. } => {

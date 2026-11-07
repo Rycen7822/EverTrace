@@ -5,10 +5,8 @@ pub use crate::semantic::human_acceptance::{
     HumanActionOutcome, HumanGovernanceError, HumanProposalDecision,
 };
 
-mod content;
-mod diagnostics;
-pub use content::HumanContentChunk;
 mod compiled;
+mod diagnostics;
 mod export;
 mod history;
 pub use compiled::{HumanCompiledEntry, HumanCompiledPage};
