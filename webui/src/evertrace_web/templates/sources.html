@@ -4,6 +4,7 @@
 <button class="button" type="button" data-nav-back hidden>返回上一条记录</button>
 <p class="muted">这里列出原记录的直接引用。来源记录还可能列出包含其来源修订的采集覆盖凭证；各条仍独立检查权限。</p>
 <p class="muted">修订级关联不证明这条记录属于或已被该 lane 覆盖。显式修订保持原版；逻辑对象引用按本次读取水位定位当前修订。</p>
+<p class="muted">Task 的子工作线、Workstream 的子片段取本次水位的当前修订；不是所选父修订当时的历史子树，也不证明执行、采用或验证。</p>
 {% if matching_count is not none %}
 <p class="muted">共 {{ matching_count }} 个直接关联结果（含未能读取的引用），按当前水位计数；不是完整可读对象数量。</p>
 {% endif %}

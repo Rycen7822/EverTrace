@@ -151,6 +151,18 @@
                 <button class="text-button" type="submit">按 ID 打开记录</button>
                 <p class="muted">只读这个精确 ID，不改目录筛选，也不扫描原文件。</p>
               </form>
+              <form id="work-record-lookup" class="time-filter" hidden>
+                <label>工作记录 ID<input id="work-record-id" type="text" maxlength="512"
+                  autocomplete="off" spellcheck="false" required aria-label="工作记录 ID" /></label>
+                <label>记录类型<select id="work-record-kind" aria-label="工作记录类型">
+                  <option value="task">Task · 根目标</option><option value="workstream">Workstream · 工作线</option>
+                  <option value="work_episode">Episode · 工作片段</option>
+                </select></label>
+                <label>精确修订（可选）<input id="work-record-revision" type="text" maxlength="512"
+                  autocomplete="off" spellcheck="false" aria-label="工作记录修订" /></label>
+                <button class="text-button" type="submit">读取工作记录</button>
+                <p class="muted">也可从范围目录选择 Task。这里只读所选工作及有界关联，不把全局范围当空任务列表。</p>
+              </form>
               <form id="job-lookup" class="time-filter" hidden>
                 <label
                   >用 CLI 返回的 Job ID 回查<input

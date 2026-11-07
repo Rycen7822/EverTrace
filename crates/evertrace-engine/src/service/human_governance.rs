@@ -165,7 +165,6 @@ pub struct HumanSummary {
     pub reading_preview: Option<HumanMemoryPreview>,
     pub semantic_detail: Option<HumanSemanticDetail>,
     pub proposal_base: Option<HumanSemanticDetail>,
-    pub work_detail: Option<HumanWorkDetail>,
     pub proposal: Option<HumanProposalSummary>,
     pub proposal_review: Option<HumanProposalReview>,
     pub support_detail: Option<HumanSupportDetail>,
@@ -192,16 +191,6 @@ pub struct HumanSummary {
     pub scope_ref: Option<String>,
     pub native_event_time_us: Option<i64>,
     pub source_event_seq: u64,
-}
-
-#[derive(Clone, Debug, Eq, PartialEq, serde::Serialize)]
-pub struct HumanWorkDetail {
-    pub canonical_goal: String,
-    pub identity_confidence: evertrace_domain::work::TaskIdentityConfidence,
-    pub source_refs: Vec<String>,
-    pub workstream_goal: Option<String>,
-    pub phase: Option<evertrace_domain::work::PhaseContract>,
-    pub acceptance: Option<String>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -866,7 +855,6 @@ impl HumanGovernanceService {
         );
         for item in items {
             if blocked.contains(&item.stable_key) {
-                item.work_detail = None;
                 item.proposal_review = None;
                 item.semantic_detail = None;
                 item.proposal_base = None;
@@ -3722,11 +3710,6 @@ fn summary(
     surface: HumanSurface,
     include_detail: bool,
 ) -> Result<HumanSummary, HumanGovernanceError> {
-    let work_detail = if include_detail && surface == HumanSurface::Explorer {
-        work_evidence_detail(snapshot, row)?
-    } else {
-        None
-    };
     let deletion_admission = include_detail
         .then(|| ObjectDeletionCandidateAdmissionView::from_snapshot(snapshot))
         .transpose()
@@ -3991,7 +3974,6 @@ fn summary(
         } else {
             human_item_category(surface, row)
         },
-        work_detail,
         proposal,
         proposal_review,
         support_detail,
@@ -4054,7 +4036,6 @@ fn summary_fields(row: &ObjectRow, surface: HumanSurface) -> HumanSummary {
         reading_preview: None,
         semantic_detail: None,
         proposal_base: None,
-        work_detail: None,
         proposal: None,
         proposal_review: None,
         support_detail: None,
@@ -4091,44 +4072,6 @@ fn summary_fields(row: &ObjectRow, surface: HumanSurface) -> HumanSummary {
         native_event_time_us: None,
         source_event_seq: row.source_event_seq,
     }
-}
-
-pub(crate) fn work_evidence_detail(
-    snapshot: &ProjectionSnapshot,
-    row: &ObjectRow,
-) -> Result<Option<HumanWorkDetail>, HumanGovernanceError> {
-    if !matches!(row.object_kind.as_deref(), Some("task" | "workstream")) {
-        return Ok(None);
-    }
-    let payload: JournalPayload = serde_json::from_str(
-        row.payload_json
-            .as_deref()
-            .ok_or(HumanGovernanceError::Store)?,
-    )
-    .map_err(|_| HumanGovernanceError::Store)?;
-    let (task, stream) = match payload {
-        JournalPayload::TaskRecorded(task) => (*task, None),
-        JournalPayload::WorkstreamRecorded(stream) => {
-            let view = evertrace_store::WorkIdentityCurrentView::from_snapshot(snapshot)
-                .map_err(|_| HumanGovernanceError::Store)?;
-            (
-                view.tasks
-                    .get(&stream.task_id)
-                    .cloned()
-                    .ok_or(HumanGovernanceError::Store)?,
-                Some(*stream),
-            )
-        }
-        _ => return Err(HumanGovernanceError::Store),
-    };
-    Ok(Some(HumanWorkDetail {
-        canonical_goal: task.canonical_goal,
-        identity_confidence: task.identity_confidence,
-        source_refs: task.request_root_refs,
-        workstream_goal: stream.as_ref().map(|value| value.workstream_goal.clone()),
-        phase: stream.as_ref().map(|value| value.phase_contract.clone()),
-        acceptance: stream.map(|value| value.acceptance_boundary),
-    }))
 }
 
 fn forget_target(row: &ObjectRow) -> Result<Option<ObjectDeletionTarget>, HumanGovernanceError> {

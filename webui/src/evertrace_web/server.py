@@ -611,7 +611,9 @@ class App:
                 if payload["object_kind"] in ("source_receipt", "source_observation"):
                     result = await read_source_detail(self.backend, payload["reference"], frontier,
                         payload["revision"], payload["object_kind"])
-                elif surface == "explorer" and payload["object_kind"] in DETAIL_KINDS:
+                elif payload["object_kind"] in DETAIL_KINDS and (
+                    surface == "explorer" or payload["object_kind"] in ("task", "workstream")
+                ):
                     result = await read_record_detail(self.backend, payload["reference"], frontier,
                         payload["revision"], payload["object_kind"])
                 else:
@@ -649,8 +651,8 @@ def present_detail(templates, result, surface):
         semantic_text = content["value"]["value"]["text"]
     elif content and content["kind"] == "procedure":
         semantic_text = content["value"]["draft"]["summary"]
-    reading_source = item and item["object_kind"] in ("source_receipt", "source_observation")
-    template = "detail.html" if surface == "explorer" or reading_source else "observation_detail.html"
+    reading_record = item and item["object_kind"] in ("source_receipt", "source_observation", "task", "workstream")
+    template = "detail.html" if surface == "explorer" or reading_record else "observation_detail.html"
     selection = (
         {
             "key": item["stable_key"],

@@ -284,7 +284,6 @@ mod tests {
             reading_preview: None,
             semantic_detail: None,
             proposal_base: None,
-            work_detail: None,
             item_kind: HumanItemKind::Generic,
             proposal: None,
             proposal_review: None,

@@ -52,8 +52,8 @@ pub use service::{
     HumanRelatedRequest, HumanRelationKind, HumanRepositoryAccess, HumanRepositoryAccessAction,
     HumanRepositoryPurgePreview, HumanRowClass, HumanSemanticContent, HumanSemanticDetail,
     HumanSnapshotStatus, HumanSummary, HumanSupportDetail, HumanSurface, HumanSystemDetail,
-    HumanTableDiagnostic, HumanWorkDetail, McpActionService, McpBindingAuthority, McpBindingError,
-    McpBindingGrant, McpBindingIssue, McpItemPartition, McpResolvedScope, McpScopeMechanism,
-    McpServiceAction, McpServiceError, McpServiceItem, McpServiceRequest, McpServiceResult,
-    McpServiceStatus, RuntimeMode, summarize_inbox_snapshot,
+    HumanTableDiagnostic, McpActionService, McpBindingAuthority, McpBindingError, McpBindingGrant,
+    McpBindingIssue, McpItemPartition, McpResolvedScope, McpScopeMechanism, McpServiceAction,
+    McpServiceError, McpServiceItem, McpServiceRequest, McpServiceResult, McpServiceStatus,
+    RuntimeMode, summarize_inbox_snapshot,
 };

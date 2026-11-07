@@ -63,6 +63,8 @@ function closed(text, broadcast = false) {
   sourceQuery = { session_id: null, source_instance_id: null, unassigned_only: false };
   $("source-session").value = "";
   $("source-record-id").value = "";
+  $("work-record-id").value = "";
+  $("work-record-revision").value = "";
   $("source-unassigned").checked = false;
   cancel();
   clear();
@@ -679,6 +681,26 @@ $("source-record-lookup").onsubmit = (event) => {
   archive = null;
   select({ key, kind: $("source-record-kind").value, revision: null, object: null, path: [] });
 };
+$("work-record-lookup").onsubmit = (event) => {
+  event.preventDefault();
+  const key = $("work-record-id").value.trim();
+  if (!key) return;
+  select({ key, kind: $("work-record-kind").value, revision: $("work-record-revision").value.trim() || null,
+    object: null, path: [] });
+};
+async function readWork(controller) {
+  const scroll = $("detail-body").scrollTop;
+  clear();
+  state.frontier ??= "0";
+  if (!state.selected && state.query.selection.kind === "task") {
+    state.selected = { key: state.query.selection.task_id, kind: "task", revision: null, object: null, path: [] };
+  }
+  $("memory-items").textContent = "按精确工作记录读取。Task 的工作线、Workstream 的片段可从详情中的关联逐项展开。";
+  $("page-count").textContent = "精确工作 · 非任务总数";
+  if (state.selected) await readSelection(state.selected, controller, scroll);
+  else $("detail-body").textContent = "请从范围目录选择 Task，或输入已知工作 ID。没有把未选择工作显示成空列表。";
+  notice("只读所选修订；目标、计划、来源关联和工作状态不等于执行、采用或验证完成。");
+}
 async function readObservations(controller, health) {
   const system = state.route === "system";
   const page = await api(
@@ -832,6 +854,10 @@ async function refresh() {
       await readObservations(controller, health);
       return;
     }
+    if (state.route === "work") {
+      await readWork(controller);
+      return;
+    }
     if (state.route === "sources") {
       await readCatalogue(controller);
       return;
@@ -948,19 +974,20 @@ function route(name) {
     else button.removeAttribute("aria-current");
   }
   const reading = ["overview", "memories"].includes(name);
-  $("reader").hidden = !state.active || !["overview", "memories", "sources", "review", "system"].includes(name);
+  $("reader").hidden = !state.active || !["overview", "memories", "sources", "work", "review", "system"].includes(name);
   $("system-panel").hidden = !state.active || name !== "system";
   $("job-lookup").hidden = name !== "system";
   $("job-id").value = "";
   $("records-title").textContent =
-    { overview: "范围总览", sources: "已登记来源", review: "待处理条目", system: "后台任务" }[name] || "记忆记录";
+    { overview: "范围总览", sources: "已登记来源", work: "所选工作", review: "待处理条目", system: "后台任务" }[name] || "记忆记录";
   $("source-filter").hidden = name !== "sources";
   $("source-record-lookup").hidden = name !== "sources";
+  $("work-record-lookup").hidden = name !== "work";
   $("time-filter").hidden = !reading;
   $("overview-limit-control").hidden = name !== "overview";
-  $("first-page").parentElement.hidden = name === "overview";
+  $("first-page").parentElement.hidden = name === "overview" || name === "work";
   document.querySelector(".browse-filters").hidden = name !== "memories";
-  $("scope-open").hidden = !reading && name !== "sources";
+  $("scope-open").hidden = !reading && !["sources", "work"].includes(name);
   $("include-global").parentElement.hidden = !reading;
   const label = document.querySelector('[data-route="' + name + '"]')?.textContent.trim() || name;
   $("breadcrumb").textContent = label;
@@ -969,7 +996,7 @@ function route(name) {
   $("page-description").textContent =
     "独立 Python Web，只读调用现有 daemon；未接入的页面不使用示例数据。";
   notice(
-    ["overview", "memories", "sources", "review", "system"].includes(name)
+    ["overview", "memories", "sources", "work", "review", "system"].includes(name)
       ? "正在读取…"
       : "该页面尚未接入真实后端。",
   );

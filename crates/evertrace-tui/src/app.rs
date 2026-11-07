@@ -3528,7 +3528,6 @@ mod tests {
             reading_preview: None,
             semantic_detail: None,
             proposal_base: None,
-            work_detail: None,
             item_kind: HumanItemKind::RevisionProposal,
             proposal: Some(HumanProposalMetadata {
                 proposal_id,
@@ -4388,35 +4387,6 @@ mod tests {
         assert!(render_app(&stopping, 100, 30).contains("Daemon stopping; read unavailable"));
     }
 
-    #[test]
-    fn provisional_work_detail_remains_a_protected_plan() {
-        let mut app = App::with_language(crate::Language::English);
-        app.state.route = crate::Route::Explorer;
-        let mut item = snapshot_item("task", "task-test".into());
-        assert!(
-            !String::from_utf8(evertrace_protocol::frame::canonical_json(&item).unwrap())
-                .unwrap()
-                .contains("work_detail")
-        );
-        item.work_detail = Some(evertrace_protocol::dto::HumanWorkDetail {
-            canonical_goal: "inspect \u{1b}[31m source".into(),
-            identity_confidence: evertrace_domain::work::TaskIdentityConfidence::Provisional,
-            source_refs: vec!["source-observation".into()],
-            workstream_goal: None,
-            phase: None,
-            acceptance: None,
-        });
-        app.state.detail = Some(item);
-        app.state.detail_frontier = None;
-        let rendered = render_app(&app, 100, 40);
-        assert!(
-            rendered.contains("Provisional") && rendered.contains("instruction authority: none")
-        );
-        // The existing narrow Inspector wraps this warning across lines.
-        assert!(rendered.contains("not execution") && rendered.contains("authorization"));
-        assert!(rendered.contains("source-observation") && !rendered.contains('\u{1b}'));
-    }
-
     pub(super) fn snapshot_item(family: &str, object_ref: String) -> HumanSnapshotItem {
         let (category, object_family) = match family {
             "recovery_bundle" => (HumanItemCategory::RecoveryEvidence, HumanObjectFamily::Work),
@@ -4427,7 +4397,6 @@ mod tests {
             reading_preview: None,
             semantic_detail: None,
             proposal_base: None,
-            work_detail: None,
             item_kind: HumanItemKind::Generic,
             proposal: None,
             proposal_review: None,

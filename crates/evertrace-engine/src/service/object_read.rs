@@ -453,6 +453,12 @@ fn record_data(
         P::OperationBurstRecorded(value) => semantic_record(&value, None, query, check),
         P::OperationDerived(value) => semantic_record(&value, None, query, check),
         P::CaptureReceiptRecorded(value) => semantic_record(&value, None, query, check),
+        P::TaskRecorded(value) => {
+            semantic_record(&value, Some(&value.canonical_goal), query, check)
+        }
+        P::WorkstreamRecorded(value) => {
+            semantic_record(&value, Some(&value.workstream_goal), query, check)
+        }
         P::WorkEpisodeRecorded(value) => {
             let info = Info::Work {
                 goal_bytes: value.phase_contract.local_goal.len() as u64,

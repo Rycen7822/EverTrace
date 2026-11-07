@@ -83,6 +83,56 @@
     {{ text_list('证据引用', draft.evidence_refs) }}
     {{ text_list('支持修订', draft.support_revision_refs) }}
   </details>
+{% elif content.kind == 'task' %}
+  <h2>{{ value.canonical_goal }}</h2>
+  <p>身份：{{ value.identity_confidence }} · 状态：{{ value.lifecycle }} · 来源水位：{{ value.source_watermark }}</p>
+  {% if value.identity_confidence == 'provisional' %}
+  <p class="reading-note">这是暂定工作声明，不是已确认的根目标，也不授予执行、验证或主动提醒的资格。</p>
+  {% endif %}
+  <p class="muted">目标描述不是完成事实。Session 切换不会自动结束任务；续作关系也不自动继承旧任务的义务和权限。</p>
+  <section class="semantic-section"><h3>记录的仓库范围</h3>
+    {% for scope in value.scope_memberships %}
+    <p>仓库：{{ scope.repository_instance_id or '无仓库归属' }}</p>
+    {{ text_list('工作树', scope.worktree_instance_ids) }}
+    {% else %}<p>没有记录仓库成员关系；不补一个 primary repository。</p>{% endfor %}
+    <p class="muted">成员关系不证明某条来源记录归属这个仓库，也不代替当前读取授权。</p>
+  </section>
+  {{ text_list('根目标来源', value.request_root_refs) }}
+  <details><summary>修订与任务谱系</summary>
+    <p>创建时间（微秒）：{{ value.created_at_us }} · 结束时间：{{ value.closed_at_us if value.closed_at_us is not none else '未结束' }}</p>
+    <p>前序修订：{{ value.predecessor_revision_id or '无' }}</p>
+    <p>续作自：{{ value.continuation_of_task_id or '无' }} · 拆分自：{{ value.split_from_task_id or '无' }}</p>
+    <p>合并到：{{ value.merged_into_task_id or '无' }}</p>
+    {{ text_list('拆出的任务', value.split_into_task_ids) }}
+    {{ text_list('合并来源', value.merged_from_task_ids) }}
+  </details>
+  <p class="reading-note">下方关联可逐项展开当前子工作线；打开历史 Task 时，这仍是本次水位的关系，不代表当时的完整子树。</p>
+{% elif content.kind == 'workstream' %}
+  <h2>{{ value.workstream_goal }}</h2>
+  <p>状态：{{ value.status }} · 来源水位：{{ value.source_watermark }}</p>
+  <h3>该工作线保存的根目标</h3><div class="memory-prose">{{ value.root_goal }}</div>
+  <p>Task：{{ value.task_id }}。这里不拿当前 Task 的目标覆盖这份工作线修订。</p>
+  <h3>对象与假设</h3>
+  <p class="memory-prose">对象族：{{ value.target_family }} · 假设／失败机制：{{ value.hypothesis_or_failure_family }}</p>
+  <h3>验收边界</h3><div class="memory-prose">{{ value.acceptance_boundary }}</div>
+  <section class="semantic-section"><h3>记录的阶段</h3>
+    <p>{{ value.phase_contract.phase_kind }} · {{ value.phase_contract.phase_label }}</p>
+    <div class="memory-prose">{{ value.phase_contract.local_goal }}</div>
+    {{ text_list('主要对象', value.phase_contract.primary_targets) }}
+    {{ text_list('进入条件', value.phase_contract.entry_conditions) }}
+    <h4>阶段验收</h4><div class="memory-prose">{{ value.phase_contract.acceptance_boundary }}</div>
+    <h4>预期状态变化</h4><div class="memory-prose">{{ value.phase_contract.expected_state_transition }}</div>
+  </section>
+  <details><summary>范围、谱系与已记录的执行引用</summary>
+    <p>仓库：{{ value.repository_instance_id or '无仓库归属' }} · 活跃工作树：{{ value.active_worktree_instance_id or '未记录' }}</p>
+    <p>父工作线：{{ value.parent_workstream_id or '无' }} · 前序修订：{{ value.predecessor_revision_id or '无' }}</p>
+    <p>活跃工作片段：{{ value.active_episode_id or '未记录；不按最近时间补造' }}</p>
+    {{ text_list('工作树', value.worktree_instance_ids) }}
+    {{ text_list('工作树谱系', value.worktree_lineage_refs) }}
+    {{ text_list('依赖工作线', value.dependency_workstream_ids) }}
+    {{ text_list('执行通道', value.execution_lane_ids) }}
+  </details>
+  <p class="reading-note">工作线、通道和片段不是同一种身份。依赖与计划不证明执行成功、采用或验证通过；子片段从下方当前关联逐项读取。</p>
 {% elif content.kind == 'capture_receipt' %}
   <h2>采集覆盖凭证</h2>
   <p class="muted">这是原生采集记录，不是原消息正文；覆盖状态、终止或 finalized 不代表工作成功，也不授予读取或执行资格。</p>

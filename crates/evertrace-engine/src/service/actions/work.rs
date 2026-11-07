@@ -1253,16 +1253,23 @@ impl McpActionService {
                 {
                     continue;
                 }
-                if let Some(detail) =
-                    super::super::human_governance::work_evidence_detail(&snapshot, row)
-                        .map_err(|_| McpServiceError::Store)?
-                {
-                    items.push(evidence_item(
-                        row,
-                        serde_json::to_string(&detail).map_err(|_| McpServiceError::Store)?,
-                        ContentTrust::AgentClaim,
-                    ));
-                }
+                let stream = reference
+                    .parse::<WorkstreamId>()
+                    .ok()
+                    .and_then(|id| view.workstreams.get(&id));
+                let detail = serde_json::json!({
+                    "canonical_goal": task.canonical_goal,
+                    "identity_confidence": task.identity_confidence,
+                    "source_refs": task.request_root_refs,
+                    "workstream_goal": stream.map(|value| &value.workstream_goal),
+                    "phase": stream.map(|value| &value.phase_contract),
+                    "acceptance": stream.map(|value| &value.acceptance_boundary),
+                });
+                items.push(evidence_item(
+                    row,
+                    serde_json::to_string(&detail).map_err(|_| McpServiceError::Store)?,
+                    ContentTrust::AgentClaim,
+                ));
             } else if let Some(digest) = source_digest(row)? {
                 let source = digest.source_target.as_ref().unwrap();
                 if repository_visible(

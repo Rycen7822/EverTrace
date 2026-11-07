@@ -90,13 +90,7 @@ pub(crate) fn row_label(
             job_reason(job.terminal_reason, language)
         );
     }
-    let title = item
-        .work_detail
-        .as_ref()
-        .map(|detail| safe_content(&detail.canonical_goal))
-        .filter(|goal| !goal.trim().is_empty())
-        .map(|goal| goal.chars().take(60).collect::<String>())
-        .unwrap_or_else(|| short(item.object_ref.as_deref().unwrap_or(&item.stable_key)));
+    let title = short(item.object_ref.as_deref().unwrap_or(&item.stable_key));
     let kind = kind_label(&item.object_kind, language);
     let kind = if kind == item.object_kind {
         format!("{} ({kind})", language.label(category_label(item.category)))
@@ -728,68 +722,6 @@ pub(crate) fn content_lines(
     if let Some(base) = &item.proposal_base {
         lines.push(language.label("Exact proposal base").into());
         lines.extend(semantic_lines(base, language));
-    }
-    if let Some(detail) = &item.work_detail {
-        lines.push(crate::locale::format!(
-            language,
-            "Work identity: {:?}; instruction authority: none",
-            "工作身份: {:?}; 不具备指令权限",
-            detail.identity_confidence
-        ));
-        lines.push(
-            language
-                .label("Agent-organized plan, not execution or user authorization")
-                .into(),
-        );
-        lines.push(crate::locale::format!(
-            language,
-            "Goal: {}",
-            "目标: {}",
-            detail.canonical_goal.escape_debug()
-        ));
-        if let Some(goal) = &detail.workstream_goal {
-            lines.push(crate::locale::format!(
-                language,
-                "Workstream goal: {}",
-                "工作流目标: {}",
-                goal.escape_debug()
-            ));
-        }
-        if let Some(phase) = &detail.phase {
-            lines.push(crate::locale::format!(
-                language,
-                "Phase: {:?} / {}",
-                "阶段: {:?} / {}",
-                phase.phase_kind,
-                phase.phase_label.escape_debug()
-            ));
-            lines.push(crate::locale::format!(
-                language,
-                "Local goal: {}",
-                "阶段目标: {}",
-                phase.local_goal.escape_debug()
-            ));
-            lines.push(crate::locale::format!(
-                language,
-                "Expected transition: {}",
-                "预期转变: {}",
-                phase.expected_state_transition.escape_debug()
-            ));
-        }
-        if let Some(acceptance) = &detail.acceptance {
-            lines.push(crate::locale::format!(
-                language,
-                "Acceptance plan: {}",
-                "验收计划: {}",
-                acceptance.escape_debug()
-            ));
-        }
-        lines.push(crate::locale::format!(
-            language,
-            "Sources: {}",
-            "来源: {}",
-            detail.source_refs.join(", ").escape_debug()
-        ));
     }
     if let Some(proposal) = &item.proposal {
         lines.extend([

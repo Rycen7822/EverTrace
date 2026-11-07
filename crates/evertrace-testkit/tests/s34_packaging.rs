@@ -2879,19 +2879,10 @@ fn invoke(paths: &ManagedInstallPaths, bytes: &[u8]) {
 #[tokio::test]
 async fn submitted_sources_bootstrap_work_through_managed_mcp() {
     use evertrace_domain::ids::{RequestId, TaskId, WorkstreamId};
-    use evertrace_protocol::{
-        LocalClient,
-        command::Command as Rpc,
-        dto::{
-            ClientKind, HumanGovernanceRequest, HumanGovernanceResponse, HumanReadRequest,
-            HumanSurface,
-        },
-        response::Response,
-    };
     use serde_json::{Value, json};
     use std::time::{Duration, Instant};
     // Synthetic Host inputs, but actual managed launcher, binding consume,
-    // CLI stdout, ordinary daemon ingest, Store and Explorer consumers.
+    // CLI stdout, ordinary daemon ingest and Store consumers.
     fn call(
         paths: &ManagedInstallPaths,
         session: &str,
@@ -3241,66 +3232,6 @@ async fn submitted_sources_bootstrap_work_through_managed_mcp() {
         )["status"],
         "invalid_input"
     );
-    let mut client = LocalClient::connect(
-        &socket,
-        "work-test",
-        ClientKind::Cli,
-        Duration::from_secs(3),
-    )
-    .await
-    .unwrap();
-    loop {
-        let Response::HumanGovernance(HumanGovernanceResponse::Snapshot { frontier, .. }) = client
-            .request(
-                RequestId::new_v7(),
-                Rpc::HumanGovernance(HumanGovernanceRequest::Read {
-                    request: HumanReadRequest::List {
-                        explorer_selection: None,
-                        system_selection: None,
-                        surface: HumanSurface::Explorer,
-                        expected_frontier: None,
-                        after: None,
-                        limit: 16,
-                    },
-                }),
-            )
-            .await
-            .unwrap()
-        else {
-            panic!("list");
-        };
-        match client
-            .request(
-                RequestId::new_v7(),
-                Rpc::HumanGovernance(HumanGovernanceRequest::Read {
-                    request: HumanReadRequest::Detail {
-                        surface: HumanSurface::Explorer,
-                        object_ref: format!("object:work:task:{task}"),
-                        expected_frontier: frontier,
-                        expected_revision_ref: None,
-                    },
-                }),
-            )
-            .await
-            .unwrap()
-        {
-            Response::HumanGovernance(HumanGovernanceResponse::Snapshot { items, .. }) => {
-                assert_eq!(items.len(), 1);
-                let detail = items[0].work_detail.as_ref().unwrap();
-                assert_eq!(
-                    detail.identity_confidence,
-                    evertrace_domain::work::TaskIdentityConfidence::Provisional
-                );
-                assert!(!detail.canonical_goal.contains("plan-secret-canary"));
-                break;
-            }
-            Response::HumanGovernance(HumanGovernanceResponse::Conflict { .. }) => {
-                assert!(Instant::now() < deadline)
-            }
-            other => panic!("{other:?}"),
-        }
-    }
-    drop(client);
     drop(daemon);
     let rows = evertrace_store::StoreReadHandle::open_read_only(&paths.data_root)
         .await

@@ -1742,11 +1742,6 @@ fn map_human_item(item: evertrace_engine::HumanSummary) -> HumanSnapshotItem {
                 }),
                 semantic_detail: item.semantic_detail.map(map_semantic_detail),
                 proposal_base: item.proposal_base.map(map_semantic_detail),
-                work_detail: item.work_detail.map(|detail| evertrace_protocol::dto::HumanWorkDetail {
-                    canonical_goal: detail.canonical_goal, identity_confidence: detail.identity_confidence,
-                    source_refs: detail.source_refs, workstream_goal: detail.workstream_goal,
-                    phase: detail.phase, acceptance: detail.acceptance,
-                }),
                 item_kind: if item.proposal.is_some() {
                     HumanItemKind::RevisionProposal
                 } else {

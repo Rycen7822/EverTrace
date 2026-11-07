@@ -57,6 +57,34 @@ fn current_object_row_rows<'a>(
 pub fn source_references_for(row: &ObjectRow, payload: &JournalPayload) -> BTreeSet<String> {
     let mut refs = read_dependencies_for(row, payload);
     match payload {
+        JournalPayload::TaskRecorded(value) => {
+            refs.extend(value.predecessor_revision_id.map(|id| id.to_string()));
+            refs.extend(value.continuation_of_task_id.map(|id| id.to_string()));
+            refs.extend(value.split_from_task_id.map(|id| id.to_string()));
+            refs.extend(value.split_into_task_ids.iter().map(ToString::to_string));
+            refs.extend(value.merged_from_task_ids.iter().map(ToString::to_string));
+            refs.extend(value.merged_into_task_id.map(|id| id.to_string()));
+            for scope in &value.scope_memberships {
+                refs.extend(scope.repository_instance_id.map(|id| id.to_string()));
+                refs.extend(scope.worktree_instance_ids.iter().map(ToString::to_string));
+            }
+        }
+        JournalPayload::WorkstreamRecorded(value) => {
+            refs.insert(value.task_id.to_string());
+            refs.extend(value.predecessor_revision_id.map(|id| id.to_string()));
+            refs.extend(value.repository_instance_id.map(|id| id.to_string()));
+            refs.extend(value.worktree_instance_ids.iter().map(ToString::to_string));
+            refs.extend(value.worktree_lineage_refs.iter().cloned());
+            refs.extend(value.parent_workstream_id.map(|id| id.to_string()));
+            refs.extend(
+                value
+                    .dependency_workstream_ids
+                    .iter()
+                    .map(ToString::to_string),
+            );
+            refs.extend(value.active_episode_id.map(|id| id.to_string()));
+            refs.extend(value.execution_lane_ids.iter().map(ToString::to_string));
+        }
         JournalPayload::WorkEpisodeRecorded(value) => {
             refs.insert(value.workstream_id.to_string());
             refs.extend(value.attempt_ids.iter().map(ToString::to_string));
@@ -195,6 +223,8 @@ impl JournalAdmissionState {
                     | "attempt"
                     | "operation_burst"
                     | "operation"
+                    | "task"
+                    | "workstream"
             )
         ) {
             page.clear(S::Unsupported);
@@ -211,6 +241,37 @@ impl JournalAdmissionState {
         )
         .map_err(|_| StoreError::StoreCorrupt)?;
         let mut refs = source_references_for(root, &payload);
+        // These are current children of the selected logical identity, not a reconstruction of its historical subtree.
+        let children: Box<dyn Iterator<Item = (bool, RevisionId)> + '_> = match &payload {
+            JournalPayload::TaskRecorded(task) => Box::new(
+                self.workstreams
+                    .values()
+                    .map(|(stream, _)| (stream.task_id == task.task_id, stream.revision_id)),
+            ),
+            JournalPayload::WorkstreamRecorded(stream) => {
+                Box::new(self.episodes.values().map(|(episode, _)| {
+                    (
+                        episode.workstream_id == stream.workstream_id,
+                        episode.revision_id,
+                    )
+                }))
+            }
+            _ => Box::new(std::iter::empty()),
+        };
+        for (belongs, revision) in children {
+            if cancelled.load(std::sync::atomic::Ordering::Relaxed) {
+                return Err(StoreError::Io);
+            }
+            if std::time::Instant::now() >= deadline {
+                return Ok(O::TooLarge);
+            }
+            if belongs {
+                refs.insert(revision.to_string());
+                if refs.len() > READ_DEPENDENCY_LIMIT {
+                    return Ok(O::TooLarge);
+                }
+            }
+        }
         let source_tuple = match &payload {
             JournalPayload::SourceReceiptRecorded(value) => {
                 Some((&value.source_instance_id, &value.source_revision))

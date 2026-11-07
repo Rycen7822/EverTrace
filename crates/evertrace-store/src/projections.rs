@@ -6086,6 +6086,14 @@ impl JournalAdmissionState {
                 self.proposals
                     .get(&id)
                     .map(|(value, _)| value.proposal_revision_id.to_string())
+            } else if let Ok(id) = reference.parse::<TaskId>() {
+                self.tasks
+                    .get(&id)
+                    .map(|(value, _)| value.revision_id.to_string())
+            } else if let Ok(id) = reference.parse::<WorkstreamId>() {
+                self.workstreams
+                    .get(&id)
+                    .map(|(value, _)| value.revision_id.to_string())
             } else if let Ok(id) = reference.parse::<WorkEpisodeId>() {
                 self.episodes
                     .get(&id)
@@ -6357,6 +6365,7 @@ impl JournalAdmissionState {
                                 | "revision_proposal_revision"
                                 | "semantic_digest"
                                 | "task"
+                                | "workstream"
                                 | "work_episode"
                                 | "source_receipt"
                                 | "source_observation"
