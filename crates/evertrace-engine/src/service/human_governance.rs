@@ -11,7 +11,6 @@ mod export;
 pub use compiled::{HumanCompiledEntry, HumanCompiledPage};
 mod presentation;
 mod reading;
-mod scopes;
 mod searching;
 mod source_archive;
 mod source_catalog;

@@ -1452,19 +1452,6 @@ impl JournalWriter {
         .await
     }
 
-    pub async fn scope_directory_context(
-        &self,
-        query: &evertrace_domain::query::ScopeDirectoryQuery,
-        after: Option<&str>,
-        limit: usize,
-        deadline: std::time::Instant,
-    ) -> Result<crate::projections::ScopeDirectoryReadContext, StoreError> {
-        self.validated_current_read(|state, _| {
-            state.scope_directory_context(query, after, limit, deadline, None)
-        })
-        .await
-    }
-
     /// One bounded scope candidate cohort at the canonical writer binding; no presentation or diagnostics.
     pub fn read_scope_metadata_context(
         &self,
@@ -1482,13 +1469,9 @@ impl JournalWriter {
     > {
         use evertrace_domain::query::MetadataReadOutcome as O;
         let (before, state) = self.metadata_read_boundary(config_hash)?;
-        let context = self.admission_state.scope_directory_context(
-            query,
-            after,
-            64,
-            deadline,
-            Some(cancelled),
-        )?;
+        let context = self
+            .admission_state
+            .scope_directory_context(query, after, 64, deadline, cancelled)?;
         self.finish_metadata_read(before, cancelled)?;
         if !context.complete && context.parent_available || std::time::Instant::now() >= deadline {
             return Ok(O::TooLarge);

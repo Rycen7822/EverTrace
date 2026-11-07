@@ -24,7 +24,7 @@ impl JournalAdmissionState {
         after: Option<&str>,
         limit: usize,
         deadline: std::time::Instant,
-        cancelled: Option<&std::sync::atomic::AtomicBool>,
+        cancelled: &std::sync::atomic::AtomicBool,
     ) -> Result<ScopeDirectoryReadContext, StoreError> {
         use evertrace_domain::query::ScopeBoundary;
         query.validate().map_err(|_| StoreError::InvalidInput)?;
@@ -94,7 +94,7 @@ impl JournalAdmissionState {
                     .map(|(v, s)| ("worktree", v.worktree_instance_id.to_string(), *s)),
             );
         for (kind, id, seq) in candidates {
-            if cancelled.is_some_and(|flag| flag.load(std::sync::atomic::Ordering::SeqCst)) {
+            if cancelled.load(std::sync::atomic::Ordering::SeqCst) {
                 return Err(StoreError::Io);
             }
             let key = format!("object:work:{kind}:{id}");
@@ -171,8 +171,7 @@ impl JournalAdmissionState {
             let mut has_children = false;
             if let Some(parent) = parent {
                 for (task, seq) in self.tasks.values() {
-                    if cancelled.is_some_and(|flag| flag.load(std::sync::atomic::Ordering::SeqCst))
-                    {
+                    if cancelled.load(std::sync::atomic::Ordering::SeqCst) {
                         return Err(StoreError::Io);
                     }
                     if std::time::Instant::now() >= deadline {
@@ -196,9 +195,7 @@ impl JournalAdmissionState {
                     && !has_children
                 {
                     for (tree, seq) in self.worktrees.values() {
-                        if cancelled
-                            .is_some_and(|flag| flag.load(std::sync::atomic::Ordering::SeqCst))
-                        {
+                        if cancelled.load(std::sync::atomic::Ordering::SeqCst) {
                             return Err(StoreError::Io);
                         }
                         if std::time::Instant::now() >= deadline {
@@ -247,7 +244,7 @@ impl JournalAdmissionState {
             item.sources_complete = !task.request_root_refs.is_empty();
             let mut observations = BTreeSet::new();
             for reference in &task.request_root_refs {
-                if cancelled.is_some_and(|flag| flag.load(std::sync::atomic::Ordering::SeqCst)) {
+                if cancelled.load(std::sync::atomic::Ordering::SeqCst) {
                     return Err(StoreError::Io);
                 }
                 if std::time::Instant::now() >= deadline {

@@ -723,7 +723,6 @@ class Backend:
                     "snapshot",
                     "memory_page",
                     "compiled_projections",
-                    "scope_directory",
                     "source_catalog",
                     "source_archive",
                     "conflict",

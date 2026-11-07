@@ -970,13 +970,6 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
                                         Err(frontier)=>HumanGovernanceResponse::Conflict {current_frontier:frontier,current_revision_ref:None},
                                     }
                                 }
-                                HumanReadRequest::ScopeDirectory {query,expected_frontier,after,limit} => {
-                                    match human_governance.scope_directory(query, expected_frontier, after.as_deref(), limit)
-                                        .await.map_err(map_human_error)? {
-                                        Ok(page)=>HumanGovernanceResponse::ScopeDirectory {page:Box::new(page)},
-                                        Err(frontier)=>HumanGovernanceResponse::Conflict {current_frontier:frontier,current_revision_ref:None},
-                                    }
-                                }
                                 HumanReadRequest::CompiledProjections { query, expected_frontier, after, limit } => {
                                     let result = human_governance.compiled_projections(query, expected_frontier, after.as_deref(), limit)
                                         .await.map_err(map_human_error)?;

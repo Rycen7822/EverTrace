@@ -497,7 +497,6 @@ impl App {
                         | HumanGovernanceResponse::Search { .. }
                         | HumanGovernanceResponse::MemoryPage { .. }
                         | HumanGovernanceResponse::CompiledProjections { .. }
-                        | HumanGovernanceResponse::ScopeDirectory { .. }
                         | HumanGovernanceResponse::SourceCatalog { .. }
                         | HumanGovernanceResponse::SourceArchive { .. }
                         | HumanGovernanceResponse::Export { .. },
@@ -539,7 +538,6 @@ impl App {
                     | HumanGovernanceResponse::Search { .. }
                     | HumanGovernanceResponse::MemoryPage { .. }
                     | HumanGovernanceResponse::CompiledProjections { .. }
-                    | HumanGovernanceResponse::ScopeDirectory { .. }
                     | HumanGovernanceResponse::SourceCatalog { .. }
                     | HumanGovernanceResponse::SourceArchive { .. } => return UiCommand::None,
                 };

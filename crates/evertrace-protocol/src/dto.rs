@@ -141,12 +141,6 @@ pub enum HumanReadRequest {
         after: Option<String>,
         limit: u16,
     },
-    ScopeDirectory {
-        query: evertrace_domain::query::ScopeDirectoryQuery,
-        expected_frontier: Option<u64>,
-        after: Option<String>,
-        limit: u16,
-    },
     BrowseMemories {
         query: evertrace_domain::query::MemoryBrowseQuery,
         expected_frontier: Option<u64>,
@@ -982,9 +976,6 @@ pub enum HumanGovernanceResponse {
     SourceCatalog {
         page: Box<evertrace_domain::source::SourceCatalogPage>,
     },
-    ScopeDirectory {
-        page: Box<evertrace_domain::query::ScopeDirectoryPage>,
-    },
     MemoryPage {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         diagnostics: Option<Box<HumanDiagnostics>>,
@@ -1094,25 +1085,6 @@ impl HumanReadRequest {
                         raw.len() <= 4096
                         && serde_json::from_str::<evertrace_domain::source::SourceCatalogCursor>(
                             raw,
-                        )
-                        .is_ok_and(|cursor| {
-                            cursor.validate_for(query).is_ok()
-                                && *expected_frontier == Some(cursor.frontier)
-                        })
-                    })
-            }
-            Self::ScopeDirectory {
-                query,
-                expected_frontier,
-                after,
-                limit,
-            } => {
-                query.validate().is_ok()
-                    && (1..=HUMAN_PAGE_LIMIT).contains(limit)
-                    && after.as_ref().is_none_or(|value| {
-                        value.len() <= 2048
-                        && serde_json::from_str::<evertrace_domain::query::ScopeDirectoryCursor>(
-                            value,
                         )
                         .is_ok_and(|cursor| {
                             cursor.validate_for(query).is_ok()
@@ -1462,63 +1434,6 @@ impl HumanGovernanceResponse {
                                     .last()
                                     .is_some_and(|entry| entry.key == cursor.after_source)
                         })
-                    })
-            }
-            Self::ScopeDirectory { page } => {
-                use evertrace_domain::query::{ScopeDirectoryCursor, ScopeTitleState};
-                page.query.validate().is_ok()
-                    && (page.parent_available
-                        || (!page.complete
-                            && !page.names_complete
-                            && page.items.is_empty()
-                            && page.next_cursor.is_none()))
-                    && page.items.len() <= usize::from(HUMAN_PAGE_LIMIT)
-                    && (!page.names_complete
-                        || page.items.iter().all(|item| {
-                            !matches!(
-                                item.title_state,
-                                ScopeTitleState::AccessDenied | ScopeTitleState::Unavailable
-                            )
-                        }))
-                    && page
-                        .items
-                        .windows(2)
-                        .all(|pair| pair[0].stable_key < pair[1].stable_key)
-                    && page.items.iter().all(|item| {
-                        valid_ref(&item.stable_key)
-                            && item.stable_key.len() <= 512
-                            && item.selection.boundary().is_some()
-                            && !item.label.trim().is_empty()
-                            && !item.label.chars().any(char::is_control)
-                            && item.label.chars().count() <= 160
-                            && item
-                                .path_hint
-                                .as_ref()
-                                .is_none_or(|value| !value.is_empty() && value.len() <= 4096)
-                            && item
-                                .branch_hint
-                                .as_ref()
-                                .is_none_or(|value| !value.is_empty() && value.len() <= 4096)
-                            && item.lifecycle.as_deref().is_none_or(valid_ref)
-                            && item.restrictions.windows(2).all(|pair| pair[0] < pair[1])
-                            && (item.title_state != ScopeTitleState::ContentReady
-                                || matches!(
-                                    item.selection,
-                                    evertrace_domain::query::MemoryScopeSelection::Task { .. }
-                                ))
-                    })
-                    && page.next_cursor.as_ref().is_none_or(|value| {
-                        value.len() <= 2048
-                            && serde_json::from_str::<ScopeDirectoryCursor>(value).is_ok_and(
-                                |cursor| {
-                                    cursor.validate_for(&page.query).is_ok()
-                                        && cursor.frontier == page.frontier
-                                        && page
-                                            .items
-                                            .last()
-                                            .is_none_or(|item| cursor.after_key >= item.stable_key)
-                                },
-                            )
                     })
             }
             Self::Export { result } => {
