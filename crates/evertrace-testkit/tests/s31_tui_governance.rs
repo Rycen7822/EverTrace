@@ -764,7 +764,6 @@ fn human_wire_is_closed_and_tui_renders_daemon_snapshot() {
     let proposal_item = HumanSnapshotItem {
         native_event_time_us: None,
         reading_preview: None,
-        source_context: None,
         semantic_detail: None,
         proposal_base: None,
         work_detail: None,
@@ -5785,29 +5784,17 @@ async fn protected_archive_export(
         object_ref: archived.row_id.clone(),
         expected_revision_ref: archived.current_revision_id.clone(),
     }];
+    let JournalPayload::SourceReceiptRecorded(receipt) =
+        serde_json::from_str(archived.payload_json.as_deref().unwrap()).unwrap()
+    else {
+        panic!("receipt")
+    };
     std::fs::remove_file(transcript).unwrap();
     let legacy_page = import_service
         .list(HumanSurface::Explorer, None, None, 64)
         .await
         .unwrap()
         .unwrap();
-    let context = legacy_page
-        .items
-        .iter()
-        .find(|item| item.stable_key == archived.row_id)
-        .unwrap()
-        .source_context
-        .as_ref()
-        .expect("archived source context");
-    assert_eq!(context.session, session);
-    assert_eq!(context.directory.as_deref(), root.to_str());
-    let JournalPayload::SourceReceiptRecorded(receipt) =
-        serde_json::from_str(archived.payload_json.as_deref().unwrap()).unwrap()
-    else {
-        panic!("receipt")
-    };
-    assert_eq!(context.recorded_at_us, receipt.recorded_at_us);
-    assert_eq!(context.event_time_us, receipt.event_time_us);
     let legacy_capture = legacy_page
         .items
         .iter()
@@ -5826,12 +5813,6 @@ async fn protected_archive_export(
         .unwrap()
         .unwrap();
     assert_eq!(capture.items.len(), 16);
-    assert!(
-        capture
-            .items
-            .iter()
-            .all(|item| item.source_context.is_some())
-    );
     assert_eq!(capture.items, legacy_capture);
     let mut cursor = None;
     for expected in legacy_capture.chunks(8) {
@@ -5922,12 +5903,6 @@ async fn protected_archive_export(
         }
     }
     assert!(cursor.is_none());
-    assert!(
-        capture
-            .items
-            .iter()
-            .any(|item| item.source_context.as_ref() == Some(context))
-    );
     let last = capture.items.last().unwrap().stable_key.clone();
     let empty = import_service
         .list_selected(
@@ -6040,23 +6015,6 @@ async fn protected_archive_export(
         independent_preview.window.as_ref().unwrap().text,
         "reviewed evidence"
     );
-    let independent_context = import_service
-        .list_selected(
-            HumanSurface::Explorer,
-            None,
-            None,
-            64,
-            Some(evertrace_engine::HumanExplorerListSelection::Capture),
-        )
-        .await
-        .unwrap()
-        .unwrap()
-        .items
-        .into_iter()
-        .find(|item| item.object_ref.as_deref() == Some(independent_ref.as_str()))
-        .unwrap()
-        .source_context
-        .unwrap();
     assert_eq!(
         admin
             .handle(
@@ -6126,33 +6084,6 @@ async fn protected_archive_export(
         .await
         .unwrap();
     assert!(stale.is_err());
-    let revoked_capture = import_service
-        .list_selected(
-            HumanSurface::Explorer,
-            None,
-            None,
-            64,
-            Some(evertrace_engine::HumanExplorerListSelection::Capture),
-        )
-        .await
-        .unwrap()
-        .unwrap();
-    assert!(
-        revoked_capture
-            .items
-            .iter()
-            .filter(|item| item.object_ref.as_deref() != Some(independent_ref.as_str()))
-            .all(|item| item.source_context.is_none())
-    );
-    assert_eq!(
-        revoked_capture
-            .items
-            .iter()
-            .find(|item| item.object_ref.as_deref() == Some(independent_ref.as_str()))
-            .unwrap()
-            .source_context,
-        Some(independent_context)
-    );
     import_handle.shutdown().await.unwrap();
     import_task.await.unwrap().unwrap();
 }

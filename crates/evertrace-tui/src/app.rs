@@ -3526,7 +3526,6 @@ mod tests {
         assert!(reviewed.validate().is_ok());
         let item = HumanSnapshotItem {
             reading_preview: None,
-            source_context: None,
             semantic_detail: None,
             proposal_base: None,
             work_detail: None,
@@ -4426,7 +4425,6 @@ mod tests {
         };
         HumanSnapshotItem {
             reading_preview: None,
-            source_context: None,
             semantic_detail: None,
             proposal_base: None,
             work_detail: None,

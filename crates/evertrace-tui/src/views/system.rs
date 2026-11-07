@@ -282,7 +282,6 @@ mod tests {
         };
         let item = HumanSnapshotItem {
             reading_preview: None,
-            source_context: None,
             semantic_detail: None,
             proposal_base: None,
             work_detail: None,

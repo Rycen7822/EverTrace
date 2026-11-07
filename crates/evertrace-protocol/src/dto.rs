@@ -485,8 +485,6 @@ pub struct HumanSnapshotItem {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub reading_preview: Option<HumanMemoryPreview>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub source_context: Option<HumanSourceContext>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub semantic_detail: Option<HumanSemanticDetail>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub proposal_base: Option<HumanSemanticDetail>,
@@ -521,17 +519,6 @@ pub struct HumanSnapshotItem {
     pub scope_ref: Option<String>,
     pub native_event_time_us: Option<i64>,
     pub source_event_seq: u64,
-}
-
-#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
-#[serde(deny_unknown_fields)]
-pub struct HumanSourceContext {
-    pub directory: Option<String>,
-    pub session: String,
-    pub event_time_us: i64,
-    pub recorded_at_us: i64,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub event_time_provenance: Option<evertrace_domain::evidence::EventTimeProvenance>,
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -1539,21 +1526,7 @@ impl HumanSnapshotItem {
         }) {
             return false;
         }
-        self.source_context.as_ref().is_none_or(|context| {
-            !context.session.is_empty()
-                && context.session.len() <= 4096
-                && context.event_time_us >= 0
-                && context.recorded_at_us >= 0
-                && context.event_time_provenance.is_none_or(|value| {
-                    value
-                        .validate(context.event_time_us, context.recorded_at_us)
-                        .is_ok()
-                })
-                && context
-                    .directory
-                    .as_ref()
-                    .is_none_or(|value| !value.is_empty() && value.len() <= 4096)
-        }) && self.semantic_detail.as_ref().is_none_or(|detail| {
+        self.semantic_detail.as_ref().is_none_or(|detail| {
             detail.validate()
                 && detail.object_ref == self.object_ref
                 && detail.revision_ref == self.revision_ref
@@ -2643,7 +2616,6 @@ mod human_backup_summary_tests {
             degraded_reasons: Vec::new(),
             items: vec![HumanSnapshotItem {
                 reading_preview: None,
-                source_context: None,
                 semantic_detail: None,
                 proposal_base: None,
                 work_detail: None,

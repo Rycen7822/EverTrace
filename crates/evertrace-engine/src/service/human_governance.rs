@@ -163,7 +163,6 @@ pub enum HumanItemCategory {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct HumanSummary {
     pub reading_preview: Option<HumanMemoryPreview>,
-    pub source_context: Option<HumanSourceContext>,
     pub semantic_detail: Option<HumanSemanticDetail>,
     pub proposal_base: Option<HumanSemanticDetail>,
     pub work_detail: Option<HumanWorkDetail>,
@@ -193,16 +192,6 @@ pub struct HumanSummary {
     pub scope_ref: Option<String>,
     pub native_event_time_us: Option<i64>,
     pub source_event_seq: u64,
-}
-
-#[derive(Clone, Debug, Eq, PartialEq, serde::Serialize)]
-pub struct HumanSourceContext {
-    pub directory: Option<String>,
-    pub session: String,
-    pub event_time_us: i64,
-    pub recorded_at_us: i64,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub event_time_provenance: Option<evertrace_domain::evidence::EventTimeProvenance>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, serde::Serialize)]
@@ -877,7 +866,6 @@ impl HumanGovernanceService {
         );
         for item in items {
             if blocked.contains(&item.stable_key) {
-                item.source_context = None;
                 item.work_detail = None;
                 item.proposal_review = None;
                 item.semantic_detail = None;
@@ -1038,7 +1026,7 @@ impl HumanGovernanceService {
             if expected_frontier.is_some_and(|frontier| frontier != context.frontier) {
                 return Ok(Err(context.frontier));
             }
-            return Ok(Ok(Box::pin(self.capture_page(context)).await?));
+            return Ok(Ok(presentation::capture_page(context)));
         }
         if selection == Some(HumanExplorerListSelection::Memories) {
             let context = self
@@ -1078,7 +1066,6 @@ impl HumanGovernanceService {
         if surface == HumanSurface::Explorer {
             self.restrict_import_evidence(&snapshot, &mut result.items)
                 .await?;
-            self.source_contexts(&snapshot, &mut result.items).await?;
         }
         Ok(Ok(result))
     }
@@ -1297,7 +1284,6 @@ impl HumanGovernanceService {
             self.restrict_import_evidence(&snapshot, &mut items).await?;
         }
         self.semantic_details(&snapshot, &mut items).await?;
-        self.source_contexts(&snapshot, &mut items).await?;
         self.inventory_detail(&snapshot, &mut items).await?;
         if let Some((index, backup_job_id, validation_result)) =
             items.iter().enumerate().find_map(|(index, item)| {
@@ -3996,7 +3982,6 @@ fn summary(
         };
     Ok(HumanSummary {
         reading_preview: None,
-        source_context: None,
         semantic_detail: None,
         proposal_base: None,
         // Typed proposal summaries and metadata-only revisions have distinct
@@ -4067,7 +4052,6 @@ fn proposal_summary(value: &RevisionProposal) -> HumanProposalSummary {
 fn summary_fields(row: &ObjectRow, surface: HumanSurface) -> HumanSummary {
     HumanSummary {
         reading_preview: None,
-        source_context: None,
         semantic_detail: None,
         proposal_base: None,
         work_detail: None,

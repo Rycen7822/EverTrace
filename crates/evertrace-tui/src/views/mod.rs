@@ -97,20 +97,6 @@ pub(crate) fn row_label(
         .filter(|goal| !goal.trim().is_empty())
         .map(|goal| goal.chars().take(60).collect::<String>())
         .unwrap_or_else(|| short(item.object_ref.as_deref().unwrap_or(&item.stable_key)));
-    let title = item.source_context.as_ref().map_or(title, |source| {
-        format!(
-            "{} · {} · {}",
-            safe_content(
-                source
-                    .directory
-                    .as_deref()
-                    .unwrap_or(language.text("directory unknown", "目录未知"))
-            )
-            .replace(['\n', '\t'], " "),
-            safe_content(&source.session).replace(['\n', '\t'], " "),
-            detail::timestamp(Some(source.recorded_at_us))
-        )
-    });
     let kind = kind_label(&item.object_kind, language);
     let kind = if kind == item.object_kind {
         format!("{} ({kind})", language.label(category_label(item.category)))
@@ -245,13 +231,6 @@ pub(crate) fn render_list(f: &mut Frame, a: Rect, state: &AppState, title: &'sta
     if let Some(HumanGovernanceResponse::Snapshot { items, .. }) = &state.human {
         let indices = visible_indices(state);
         if !indices.is_empty() {
-            let source_table = state.route == Route::Explorer
-                && indices.iter().all(|index| {
-                    matches!(
-                        items[*index].object_kind.as_str(),
-                        "source_receipt" | "source_observation" | "host_occurrence"
-                    )
-                });
             use ratatui::{
                 layout::Constraint,
                 style::Style,
@@ -271,62 +250,7 @@ pub(crate) fn render_list(f: &mut Frame, a: Rect, state: &AppState, title: &'sta
                     ),
                     fields.get(1).cloned().unwrap_or_default(),
                 ];
-                if source_table {
-                    columns = match &item.source_context {
-                        Some(source) => {
-                            let directory = source
-                                .directory
-                                .as_deref()
-                                .map(|path| {
-                                    let mut parts = path
-                                        .rsplit('/')
-                                        .filter(|part| !part.is_empty())
-                                        .take(2)
-                                        .collect::<Vec<_>>();
-                                    parts.reverse();
-                                    if parts.is_empty() {
-                                        "/".into()
-                                    } else {
-                                        safe_content(&parts.join("/"))
-                                    }
-                                })
-                                .unwrap_or_else(|| {
-                                    state.language.text("unknown directory", "目录未知").into()
-                                });
-                            let session = source
-                                .session
-                                .chars()
-                                .rev()
-                                .take(10)
-                                .collect::<Vec<_>>()
-                                .into_iter()
-                                .rev()
-                                .collect::<String>();
-                            let timestamp = detail::timestamp(Some(source.recorded_at_us));
-                            vec![
-                                format!(
-                                    "{} {}",
-                                    if i == state.selection { ">" } else { " " },
-                                    directory
-                                ),
-                                safe_content(&session),
-                                timestamp
-                                    .strip_suffix(" UTC")
-                                    .and_then(|value| value.get(5..16))
-                                    .unwrap_or("—")
-                                    .to_owned(),
-                            ]
-                        }
-                        None => vec![
-                            state
-                                .language
-                                .text("Source unavailable", "来源不可用")
-                                .into(),
-                            "—".into(),
-                            "—".into(),
-                        ],
-                    };
-                } else if a.width >= 85 {
+                if a.width >= 85 {
                     columns.push(
                         fields
                             .iter()
@@ -342,13 +266,7 @@ pub(crate) fn render_list(f: &mut Frame, a: Rect, state: &AppState, title: &'sta
                     crate::theme::EVER_OS.ink
                 }))
             });
-            let widths = if source_table {
-                vec![
-                    Constraint::Percentage(45),
-                    Constraint::Percentage(25),
-                    Constraint::Percentage(30),
-                ]
-            } else if a.width >= 85 {
+            let widths = if a.width >= 85 {
                 vec![
                     Constraint::Percentage(40),
                     Constraint::Percentage(20),
@@ -360,14 +278,7 @@ pub(crate) fn render_list(f: &mut Frame, a: Rect, state: &AppState, title: &'sta
             f.render_widget(
                 Table::new(rows, widths).block(
                     Block::default()
-                        .title(if source_table {
-                            state.language.text(
-                                "Directory · Session (suffix) · Recorded (UTC)",
-                                "目录 · 会话尾号 · 记录时间 (UTC)",
-                            )
-                        } else {
-                            title
-                        })
+                        .title(title)
                         .borders(Borders::ALL)
                         .border_style(Style::default().fg(
                             if state.ui.focus == crate::state::Focus::List {

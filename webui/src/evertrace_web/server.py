@@ -608,7 +608,7 @@ class App:
                     or not valid_ref(payload["revision"], optional=True)
                 ):
                     return JSONResponse({"error": "invalid_read"}, status_code=400)
-                if surface == "explorer" and payload["object_kind"] in ("source_receipt", "source_observation"):
+                if payload["object_kind"] in ("source_receipt", "source_observation"):
                     result = await read_source_detail(self.backend, payload["reference"], frontier,
                         payload["revision"], payload["object_kind"])
                 elif surface == "explorer" and payload["object_kind"] in DETAIL_KINDS:
@@ -649,7 +649,8 @@ def present_detail(templates, result, surface):
         semantic_text = content["value"]["value"]["text"]
     elif content and content["kind"] == "procedure":
         semantic_text = content["value"]["draft"]["summary"]
-    template = "detail.html" if surface == "explorer" else "observation_detail.html"
+    reading_source = item and item["object_kind"] in ("source_receipt", "source_observation")
+    template = "detail.html" if surface == "explorer" or reading_source else "observation_detail.html"
     selection = (
         {
             "key": item["stable_key"],

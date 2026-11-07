@@ -148,18 +148,6 @@ impl HumanGovernanceService {
         self.resolved_rows_access(snapshot, &rows, deadline).await
     }
 
-    /// Source presentation checks its exact source cohort, not the export graph.
-    /// Apply the same metadata budget and current permissions to those rows.
-    pub(super) async fn readable_source_rows(
-        &self,
-        snapshot: &ProjectionSnapshot,
-        rows: &[&ObjectRow],
-        deadline: Instant,
-    ) -> ExportResult<()> {
-        source_metadata_budget(rows, deadline)?;
-        self.resolved_rows_access(snapshot, rows, deadline).await
-    }
-
     async fn resolved_rows_access(
         &self,
         snapshot: &ProjectionSnapshot,
@@ -488,15 +476,6 @@ fn collect_dependencies(
         dependencies.insert(reference, referenced.into_iter().cloned().collect());
     }
     Ok(dependencies)
-}
-
-pub(super) fn source_metadata_budget(rows: &[&ObjectRow], deadline: Instant) -> ExportResult<()> {
-    let mut charged = BTreeSet::new();
-    let mut remaining = MAX_METADATA_BYTES;
-    for row in rows {
-        charge_metadata(row, &mut charged, &mut remaining, deadline)?;
-    }
-    Ok(())
 }
 
 fn charge_metadata(
