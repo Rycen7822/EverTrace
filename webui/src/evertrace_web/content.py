@@ -102,10 +102,11 @@ DETAIL_KINDS = {"atom_revision": "atom", "procedure_revision": "procedure", "cor
                 "attempt": "attempt", "operation_burst": "operation_burst", "operation": "operation",
                 "host_occurrence": "host_occurrence", "scope_effect": "scope_effect",
                 "worktree": "worktree", "worktree_snapshot": "worktree_snapshot",
-                "recovery_capture_request": "recovery_capture_request", "recovery_bundle": "recovery_bundle"}
+                "recovery_capture_request": "recovery_capture_request", "recovery_bundle": "recovery_bundle",
+                "work_artifact": "work_artifact"}
 WORK_DETAIL_KINDS = {"task", "workstream", "work_episode", "attempt", "operation_burst", "operation",
                      "host_occurrence", "scope_effect", "worktree", "worktree_snapshot",
-                     "recovery_capture_request", "recovery_bundle"}
+                     "recovery_capture_request", "recovery_bundle", "work_artifact"}
 
 
 async def read_record_detail(backend, reference, frontier, revision, object_kind):
@@ -175,6 +176,8 @@ async def read_record_detail(backend, reference, frontier, revision, object_kind
         "object_ref": row["object_id"], "revision_ref": revision, "state": state,
         "preview": None, "original_bytes": total,
         "content": {"kind": DETAIL_KINDS[object_kind], "value": record} if record is not None else None}
+    if object_kind == "work_artifact" and record is not None:
+        detail["payload_source"] = final["info"]["source"]
     item = {**row, "stable_key": row["row_id"], "object_ref": row["object_id"], "revision_ref": revision,
             "semantic_detail": detail, "proposal": None}
     return {"kind": "detail", "items": [item]}
@@ -245,7 +248,21 @@ async def read_record_content(backend, reference, frontier, revision, representa
     identity, selection, info = meta["state"]["data_identity"], meta["selection"], meta["info"]
     start = max(0, offset - _LIMIT) if backwards else offset
     end = offset if backwards else offset + _LIMIT
-    if representation == "text" and info["kind"] == "work":
+    if representation == "text" and info["kind"] == "artifact":
+        source = info["source"]
+        if source is None:
+            return _unavailable({**meta, "content_state": "unsupported"}, reference, revision, representation)
+        source_ref = source["observation_ref"]
+        source_cursor = _cursor(source_ref, source_ref, identity, source, offset, backwards)
+        reply = await read_source_content(backend, source_ref, frontier, source_ref, source_cursor)
+        if reply["kind"] == "conflict":
+            return reply
+        content = reply["content"]
+        if content["state"] != "ready":
+            return _unavailable({**meta, "content_state": content["state"]}, reference, revision, representation)
+        text, total = content["text"], content["total_bytes"]
+        start, end = content["range_start"], content["range_end"]
+    elif representation == "text" and info["kind"] == "work":
         parts = _work_parts(info)
         total, position, pieces = sum(part[2] for part in parts), 0, []
         if offset > total:
@@ -308,6 +325,8 @@ async def read_record_content(backend, reference, frontier, revision, representa
         or current["state"]["data_identity"] != identity):
         return {"kind": "conflict"}
     content = _unavailable(current, reference, revision, representation)["content"]
+    if representation == "text" and info["kind"] == "artifact":
+        content["source_ref"] = info["source"]["observation_ref"]
     content.update({"text": text, "total_bytes": total, "range_start": start, "range_end": end,
         "previous_cursor": _record_cursor(reference, revision, representation, identity, selection, start, True) if start else None,
         "next_cursor": _record_cursor(reference, revision, representation, identity, selection, end, False) if end < total else None})

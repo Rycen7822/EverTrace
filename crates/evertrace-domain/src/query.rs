@@ -2780,6 +2780,7 @@ impl ExactRecordQuery {
                     || key.parse::<crate::ids::WorktreeSnapshotId>().is_ok()
                     || key.parse::<crate::ids::RecoveryCaptureRequestId>().is_ok()
                     || key.parse::<crate::ids::RecoveryBundleId>().is_ok()
+                    || key.parse::<crate::ids::WorkArtifactId>().is_ok()
                     || key.parse::<crate::ids::ScopeEffectId>().is_ok()
                     || key.parse::<crate::ids::SourceObservationId>().is_ok()
                     || key.parse::<crate::ids::SourceReceiptId>().is_ok()
@@ -2826,6 +2827,10 @@ pub enum ExactRecordInfo {
     },
     Semantic {
         text_bytes: Option<u64>,
+    },
+    /// A declared source with the same protected CAS payload, not a producer, verification or read grant.
+    Artifact {
+        source: Option<Box<ExactSourceIdentity>>,
     },
     Work {
         goal_bytes: u64,
@@ -2895,6 +2900,12 @@ impl ExactRecordWindow {
                                 })
                         }
                         ExactRecordInfo::Semantic { .. } => true,
+                        ExactRecordInfo::Artifact { source } => {
+                            self.selection
+                                .as_ref()
+                                .is_some_and(|selected| selected.object_kind == "work_artifact")
+                                && source.as_ref().is_none_or(|source| source.validate())
+                        }
                         ExactRecordInfo::Work {
                             open_loop_bytes, ..
                         } => open_loop_bytes.len() <= 64,

@@ -28,7 +28,9 @@
   {% endif %}
 {% elif detail.state != 'ready' %}
   <p>正文状态：{{ detail.state }}。
-    {% if detail.state == 'too_large' %}
+    {% if detail.state == 'too_large' and item.object_kind == 'work_artifact' %}
+    产物记录超出展示预算，没有返回不完整结构或用其他修订代替。
+    {% elif detail.state == 'too_large' %}
     {{ '凭证结构' if item.object_kind in ('capture_receipt', 'capture_receipt_revision') else '语义结构' }}共 {{ detail.original_bytes }} 字节，可按下方按钮分段读取。
     {% else %}未用空正文或当前版本代替。{% endif %}
   </p>
@@ -36,7 +38,7 @@
   {% with content=detail.content %}{% include 'semantic_content.html' %}{% endwith %}
   <p class="muted">来源内容只供阅读，不是当前执行指令，也不自动代表已验证结论。</p>
 {% endif %}
-{% if detail and detail.state in ('ready', 'too_large') %}
+{% if detail and detail.state in ('ready', 'too_large') and item.object_kind != 'work_artifact' %}
 <div class="chunk-controls">
   {% if item.object_kind == 'atom_revision' %}
   <button class="button" type="button" data-content-open="text">分段读取完整正文</button>
@@ -85,7 +87,7 @@
   'atom_revision', 'procedure_revision', 'core_membership', 'revision_proposal_revision',
   'semantic_digest', 'source_receipt', 'source_observation', 'work_episode',
   'attempt', 'operation_burst', 'operation', 'task', 'workstream', 'host_occurrence', 'scope_effect',
-  'worktree', 'worktree_snapshot', 'recovery_capture_request', 'recovery_bundle'
+  'worktree', 'worktree_snapshot', 'recovery_capture_request', 'recovery_bundle', 'work_artifact'
 ) %}<button class="button" type="button" data-sources-open>查看来源与直接关联</button>{% endif %}
 {% if item.object_kind in ('atom_revision', 'procedure_revision', 'core_membership', 'revision_proposal_revision', 'semantic_digest') %}
 <button class="button" type="button" data-compare-base>设为比较左侧</button>

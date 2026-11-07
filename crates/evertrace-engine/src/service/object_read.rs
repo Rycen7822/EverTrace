@@ -434,6 +434,68 @@ fn semantic_record<T: serde::Serialize>(
     )))
 }
 
+/// Original metadata and a bounded protected-source binding; never a generic CAS reader.
+fn artifact_record(
+    value: &evertrace_domain::work::WorkArtifact,
+    rows: &[ObjectRow],
+    query: &evertrace_domain::query::ExactRecordQuery,
+    check: &dyn Fn() -> Result<(), ErrorCode>,
+) -> Result<Option<RecordData>, ErrorCode> {
+    use evertrace_domain::work::ArtifactPayloadStatus as Status;
+    use evertrace_store::JournalPayload as P;
+    value.validate().map_err(|_| ErrorCode::StoreCorrupt)?;
+    let Some((_, window)) = semantic_record(value, None, query, check)? else {
+        return Ok(None);
+    };
+    let mut source = None;
+    if matches!(
+        value.revision.payload_status,
+        Status::Available | Status::Degraded
+    ) && let Some(blob) = value.revision.content_blob_ref
+    {
+        let expected = blob.to_string();
+        for id in &value.revision.source_observation_refs {
+            check()?;
+            let Some(row) = rows.iter().find(|row| {
+                row.object_kind.as_deref() == Some("source_observation")
+                    && row.object_id.as_deref() == Some(id.to_string().as_str())
+            }) else {
+                continue;
+            };
+            let P::SourceObservationRecorded(observation) =
+                serde_json::from_str(row.payload_json.as_deref().ok_or(ErrorCode::StoreCorrupt)?)
+                    .map_err(|_| ErrorCode::StoreCorrupt)?
+            else {
+                return Err(ErrorCode::StoreCorrupt);
+            };
+            let Some(row) = rows.iter().find(|row| {
+                row.object_kind.as_deref() == Some("source_receipt")
+                    && row.object_id.as_deref()
+                        == Some(observation.source_receipt_ref.to_string().as_str())
+            }) else {
+                continue;
+            };
+            let P::SourceReceiptRecorded(receipt) =
+                serde_json::from_str(row.payload_json.as_deref().ok_or(ErrorCode::StoreCorrupt)?)
+                    .map_err(|_| ErrorCode::StoreCorrupt)?
+            else {
+                return Err(ErrorCode::StoreCorrupt);
+            };
+            if expected.strip_prefix("cas:") == Some(receipt.cas_ref.as_str())
+                && evertrace_capture::cas::SourceArchiveVerifier::new(&receipt, &observation)
+                    .is_ok()
+            {
+                source = Some(Box::new(source_identity(&receipt, &observation)));
+                break;
+            }
+        }
+    }
+    Ok(Some((
+        evertrace_domain::query::ExactRecordInfo::Artifact { source },
+        window,
+    )))
+}
+
 fn record_data(
     payload: evertrace_store::JournalPayload,
     query: &evertrace_domain::query::ExactRecordQuery,
@@ -776,6 +838,21 @@ impl EngineService {
         } else {
             let payload = root.payload_json.clone().ok_or(ErrorCode::StoreCorrupt)?;
             let selected_query = query.clone();
+            let source_rows = if root.object_kind.as_deref() == Some("work_artifact") {
+                before
+                    .rows
+                    .iter()
+                    .filter(|row| {
+                        matches!(
+                            row.object_kind.as_deref(),
+                            Some("source_receipt" | "source_observation")
+                        )
+                    })
+                    .cloned()
+                    .collect::<Vec<_>>()
+            } else {
+                Vec::new()
+            };
             writer
                 .read_handle()
                 .read_blocking(move |cancel| {
@@ -790,7 +867,14 @@ impl EngineService {
                         check()?;
                         let payload =
                             serde_json::from_str(&payload).map_err(|_| ErrorCode::StoreCorrupt)?;
-                        let data = record_data(payload, &selected_query, &check)?;
+                        let data =
+                            if let evertrace_store::JournalPayload::WorkArtifactRecorded(value) =
+                                payload
+                            {
+                                artifact_record(&value, &source_rows, &selected_query, &check)?
+                            } else {
+                                record_data(payload, &selected_query, &check)?
+                            };
                         check()?;
                         Ok(data)
                     };

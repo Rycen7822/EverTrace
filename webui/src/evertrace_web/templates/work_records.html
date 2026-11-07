@@ -1,4 +1,35 @@
-{% if content.kind == 'attempt' %}
+{% if content.kind == 'work_artifact' %}
+{% set artifact = value.revision %}
+<h2>{{ artifact.logical_name }}</h2>
+<dl class="semantic-fields">
+  <dt>产物类型</dt><dd>{{ artifact.kind }}</dd>
+  <dt>媒体类型</dt><dd>{{ artifact.media_type }}</dd>
+  <dt>载荷状态</dt><dd>{{ artifact.payload_status }}</dd>
+  <dt>可重建性</dt><dd>{{ artifact.derivability }}</dd>
+  <dt>保留策略</dt><dd>{{ artifact.retention }}</dd>
+  <dt>记录时间（微秒）</dt><dd>{{ artifact.created_at_us }}</dd>
+</dl>
+<p class="reading-note">载荷状态不是读取许可，也不表示生产操作已验证或结果已采用。这里只展示所选修订。</p>
+<p>范围：{{ artifact.scope.kind }} · 仓库：{{ artifact.scope.get('repository_instance_id') or '未记录' }}</p>
+<p>工作树：{{ artifact.scope.get('worktree_instance_id') or '未记录' }} · Task：{{ artifact.scope.get('task_id') or '未记录' }}</p>
+<p>产物：{{ value.work_artifact_id }} · 修订：{{ artifact.revision_id }}</p>
+<p>前序修订：{{ artifact.parent_revision_id or '未记录' }}</p>
+<p>载荷引用：{{ artifact.content_blob_ref or '未记录' }}</p>
+<p>外部引用：{{ artifact.external_reference or '未记录' }}（仅记录，不自动打开或读取）</p>
+{% for title, actors in [('生产者', artifact.produced_by_refs), ('消费者', artifact.consumed_by_refs)] %}
+<section class="semantic-section"><h3>{{ title }}</h3>
+{% if actors %}<ul>{% for actor in actors %}<li>{{ actor.kind }}：{{ actor.id }}</li>{% endfor %}</ul>
+{% else %}<p class="muted">未记录。</p>{% endif %}
+</section>
+{% endfor %}
+{{ text_list('来源观察', artifact.source_observation_refs) }}
+{% if detail.payload_source %}
+<p>下方读取与本修订载荷一致的受保护来源归档；内容可能包含采集信封，不将其冒充纯命令输出。</p>
+<button class="button" type="button" data-content-open="text">分段读取受保护载荷</button>
+{% else %}
+<p>没有可供此读取通道验证的同一载荷归档；不回退到文件、外部引用或其他修订。</p>
+{% endif %}
+{% elif content.kind == 'attempt' %}
 <h2>策略尝试</h2>
 <dl class="semantic-fields">
   <dt>执行</dt><dd>{{ value.execution_status }}</dd>

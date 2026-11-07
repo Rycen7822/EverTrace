@@ -99,6 +99,9 @@ pub fn source_references_for(row: &ObjectRow, payload: &JournalPayload) -> BTree
             refs.extend(value.selected_outcome_refs.iter().cloned());
             refs.extend(value.interruption_refs.iter().cloned());
         }
+        JournalPayload::WorkArtifactRecorded(value) => {
+            refs.extend(value.revision.parent_revision_id.map(|id| id.to_string()));
+        }
         JournalPayload::RecoveryCaptureRequestRecorded(value) => {
             refs.extend(value.parent_request_revision_id.map(|id| id.to_string()));
         }
@@ -227,6 +230,7 @@ impl JournalAdmissionState {
                     | "worktree_snapshot"
                     | "recovery_capture_request"
                     | "recovery_bundle"
+                    | "work_artifact"
                     | "task"
                     | "workstream"
             )

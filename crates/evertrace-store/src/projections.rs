@@ -3600,6 +3600,19 @@ pub fn read_dependencies_for(row: &ObjectRow, payload: &JournalPayload) -> BTree
             );
         }
         JournalPayload::WorkArtifactRecorded(value) => {
+            for actor in value
+                .revision
+                .produced_by_refs
+                .iter()
+                .chain(&value.revision.consumed_by_refs)
+            {
+                use evertrace_domain::work::ArtifactActor as A;
+                refs.insert(match actor {
+                    A::Operation(id) => id.to_string(),
+                    A::ExperimentRun(id) => id.to_string(),
+                    A::WorkEpisode(id) => id.to_string(),
+                });
+            }
             refs.extend(
                 value
                     .revision
@@ -5734,24 +5747,7 @@ impl JournalAdmissionState {
         }
         for (revision, (value, seq)) in &self.artifact_revisions {
             if matches(&revision.to_string()) || matches(&value.work_artifact_id.to_string()) {
-                let mut row = work_identity_row(
-                    "work_artifact",
-                    value.work_artifact_id.to_string(),
-                    value.revision.revision_id.to_string(),
-                    value.revision.payload_status.as_str(),
-                    value.revision.scope.task_id().map(|id| id.to_string()),
-                    None,
-                    value
-                        .revision
-                        .scope
-                        .repository_id()
-                        .map(|id| id.to_string()),
-                    value.revision.scope.worktree_id().map(|id| id.to_string()),
-                    &JournalPayload::WorkArtifactRecorded(Box::new(value.clone())),
-                    *seq,
-                )?;
-                row.row_id = format!("object:work:work_artifact:{revision}");
-                rows.push(row);
+                rows.push(work_artifact_row(value, *seq)?);
             }
         }
         for (revision, (value, seq)) in &self.atom_revisions {
@@ -5839,6 +5835,19 @@ impl JournalAdmissionState {
                 &JournalPayload::AttemptRecorded(Box::new(value.clone())),
                 *seq,
             )?]);
+        }
+        let artifact = reference
+            .parse::<RevisionId>()
+            .ok()
+            .and_then(|id| self.artifact_revisions.get(&id))
+            .or_else(|| {
+                reference
+                    .parse::<WorkArtifactId>()
+                    .ok()
+                    .and_then(|id| self.work_artifacts.get(&id))
+            });
+        if let Some((value, seq)) = artifact {
+            return Ok(vec![work_artifact_row(value, *seq)?]);
         }
         let refs = BTreeSet::from([reference.to_owned()]);
         let mut rows = self.reference_rows_unfiltered(&refs, false)?;
@@ -6200,6 +6209,10 @@ impl JournalAdmissionState {
                 self.host_occurrences
                     .get(&id)
                     .map(|(value, _)| format!("{id}@{}", value.normalization_revision))
+            } else if let Ok(id) = reference.parse::<WorkArtifactId>() {
+                self.work_artifacts
+                    .get(&id)
+                    .map(|(value, _)| value.revision.revision_id.to_string())
             } else if let Ok(id) = reference.parse::<RecoveryCaptureRequestId>() {
                 self.recovery_requests
                     .get(&id)
@@ -6489,6 +6502,7 @@ impl JournalAdmissionState {
                                 | "worktree_snapshot"
                                 | "recovery_capture_request"
                                 | "recovery_bundle"
+                                | "work_artifact"
                                 | "capture_receipt"
                                 | "capture_receipt_revision"
                         )
@@ -17955,6 +17969,24 @@ fn evidence_object_row_fields(fields: EvidenceRowFields, source_event_seq: u64) 
         source_event_seq,
         projection_generation: PROJECTION_GENERATION,
     }
+}
+
+fn work_artifact_row(value: &WorkArtifact, seq: u64) -> Result<ObjectRow, StoreError> {
+    let revision = &value.revision;
+    let mut row = work_identity_row(
+        "work_artifact",
+        value.work_artifact_id.to_string(),
+        revision.revision_id.to_string(),
+        revision.payload_status.as_str(),
+        revision.scope.task_id().map(|id| id.to_string()),
+        None,
+        revision.scope.repository_id().map(|id| id.to_string()),
+        revision.scope.worktree_id().map(|id| id.to_string()),
+        &JournalPayload::WorkArtifactRecorded(Box::new(value.clone())),
+        seq,
+    )?;
+    row.row_id = format!("object:work:work_artifact:{}", revision.revision_id);
+    Ok(row)
 }
 
 fn physical_object_row(

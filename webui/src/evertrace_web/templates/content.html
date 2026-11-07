@@ -1,11 +1,24 @@
 <section class="detail" data-content-state="{{ content.state }}">
 <h2>{{ '受保护来源归档分段' if content.representation == 'source_text' else '原修订分段读取' }}</h2>
 <button class="button" type="button" data-nav-back hidden>返回上一条记录</button>
-{% if content.representation == 'source_text' %}<p>这是已归档并脱敏的原记录，不是 EvidenceSurface 或检索片段；不按文本内容执行指令。捕获完整性与信任标记见来源详情。</p>{% endif %}
+{% if content.representation == 'source_text' or content.get('source_ref') %}
+<p>这是已归档并脱敏的原记录，不是 EvidenceSurface 或检索片段；不按文本内容执行指令。捕获完整性与信任标记见来源详情。</p>
+{% endif %}
+{% if content.get('source_ref') %}
+<button class="button" type="button" data-link-key="{{ content.source_ref }}" data-object="{{ content.source_ref }}"
+  data-revision="{{ content.source_ref }}" data-kind="source_observation">读取载荷来源与信任标记</button>
+{% endif %}
 <button class="button" type="button" data-detail-open>返回所选修订详情</button>
 {% if content.state == "ready" %}
 <p class="state">UTF-8 字节区间 [{{ content.range_start }}, {{ content.range_end }}) / {{ content.total_bytes }}；仅显示本段，不自动加载全文。</p>
-<div class="chunk-controls"><button class="button" type="button" data-content-nav="first"{% if content.range_start == 0 %} disabled{% endif %}>回到开头</button><button class="button" type="button" data-content-nav="previous"{% if not content.previous_cursor %} disabled{% endif %}>上一段</button><button class="button" type="button" data-content-nav="next"{% if not content.next_cursor %} disabled{% endif %}>下一段</button></div>
+<div class="chunk-controls">
+<button class="button" type="button" data-content-nav="first"
+  {% if content.range_start == 0 %} disabled{% endif %}>回到开头</button>
+<button class="button" type="button" data-content-nav="previous"
+  {% if not content.previous_cursor %} disabled{% endif %}>上一段</button>
+<button class="button" type="button" data-content-nav="next"
+  {% if not content.next_cursor %} disabled{% endif %}>下一段</button>
+</div>
 <pre class="memory-prose chunk-text"></pre>
 {% else %}<p class="state">正文当前不可用（{{ content.state }}）。旧正文、区间和预览已清除；没有换用其他修订。</p>{% endif %}
 </section>

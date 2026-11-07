@@ -189,7 +189,9 @@
   {% if value.predecessor_revision_id %}<button class="button" type="button"
     data-link-key="{{ value.predecessor_revision_id }}" data-revision="{{ value.predecessor_revision_id }}"
     data-object="{{ value.predecessor_revision_id }}" data-kind="capture_receipt">读取原前序凭证</button>{% endif %}
-{% elif content.kind in ('attempt', 'operation_burst', 'operation', 'host_occurrence', 'scope_effect', 'worktree', 'worktree_snapshot') %}
+{% elif content.kind in (
+  'attempt', 'operation_burst', 'operation', 'host_occurrence', 'scope_effect', 'worktree', 'worktree_snapshot', 'work_artifact'
+) %}
   {% include 'work_records.html' %}
 {% elif content.kind in ('recovery_capture_request', 'recovery_bundle') %}
   {% include 'recovery_records.html' %}
