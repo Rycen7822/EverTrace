@@ -2739,6 +2739,8 @@ impl ExactRecordQuery {
                 .validate()
                     || revision.parse::<crate::ids::CaptureReceiptId>().is_ok()
                     || parse_operation_revision(revision).is_some()
+                    || revision.parse::<crate::ids::SourceObservationId>().is_ok()
+                    || revision.parse::<crate::ids::SourceReceiptId>().is_ok()
             }
             None => {
                 let key = &reference.stable_key;
@@ -2748,6 +2750,8 @@ impl ExactRecordQuery {
                     || key.parse::<crate::ids::RevisionProposalId>().is_ok()
                     || key.parse::<crate::ids::SemanticDigestId>().is_ok()
                     || key.parse::<crate::ids::WorkEpisodeId>().is_ok()
+                    || key.parse::<crate::ids::SourceObservationId>().is_ok()
+                    || key.parse::<crate::ids::SourceReceiptId>().is_ok()
             }
         };
         identity
@@ -2783,6 +2787,12 @@ pub enum ExactRecordField {
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
 pub enum ExactRecordInfo {
+    Source {
+        record: Box<crate::source::SourceRecordMetadata>,
+        source: Box<ExactSourceIdentity>,
+        source_kind: crate::evidence::EvidenceSourceKind,
+        source_session_ref: String,
+    },
     Semantic {
         text_bytes: Option<u64>,
     },
@@ -2823,6 +2833,36 @@ impl ExactRecordWindow {
                 self.selection.is_some()
                     && self.metadata.is_some()
                     && self.info.as_ref().is_some_and(|info| match info {
+                        ExactRecordInfo::Source {
+                            record,
+                            source,
+                            source_session_ref,
+                            ..
+                        } => {
+                            record.validate()
+                                && source.validate()
+                                && record.observation_id == source.observation_ref
+                                && record.receipt_id == source.receipt_ref
+                                && record.record_identity == source.source_record_identity
+                                && !source_session_ref.is_empty()
+                                && source_session_ref.len() <= 1024
+                                && !source_session_ref
+                                    .bytes()
+                                    .any(|byte| byte.is_ascii_control())
+                                && self.window.is_none()
+                                && self.selection.as_ref().is_some_and(|selected| {
+                                    match selected.object_kind.as_str() {
+                                        "source_observation" => {
+                                            selected.object_ref
+                                                == source.observation_ref.to_string()
+                                        }
+                                        "source_receipt" => {
+                                            selected.object_ref == source.receipt_ref.to_string()
+                                        }
+                                        _ => false,
+                                    }
+                                })
+                        }
                         ExactRecordInfo::Semantic { .. } => true,
                         ExactRecordInfo::Work {
                             open_loop_bytes, ..

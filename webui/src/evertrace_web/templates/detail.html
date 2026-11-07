@@ -59,7 +59,8 @@
   <h2>受保护来源记录</h2>
   <p>来源：{{ evidence.source_kind }} · 角色：{{ evidence.source_role }} · 信任：{{ evidence.content_trust }}</p>
   <p>观察：{{ evidence.observation_role }} · 捕获完整性：{{ evidence.capture_completeness }}</p>
-  <p>归档保护后长度：{{ evidence.protected_length }} 字节。来源文本 instruction_authority=none，不视为操作指令。</p>
+  <p>归档模式：{{ evidence.archive_mode }} · 保护后 {{ evidence.protected_length }} 字节 · 原始 {{ evidence.original_length }} 字节。</p>
+  <p>原始长度不表示可以读取未脱敏字节。来源文本 instruction_authority=none，不视为操作指令。</p>
   {% if source_context %}
   <p>目录：{{ source_context.directory or '未提供' }} · 会话：{{ source_context.session }}</p>
   <p>{{ source_time(source_context) }}</p>
@@ -73,7 +74,7 @@
   <button class="button" type="button" data-content-open="source_text">分段读取受保护归档</button>
 </section>
 {% elif item.object_kind in ('source_receipt', 'source_observation') %}
-<p>来源正文当前不可读或缺失。没有返回旧预览、目录提示或归档字节。</p>
+<p>来源读取状态：{{ item.get('source_state', 'unavailable') }}。没有返回旧预览、目录提示或归档字节。</p>
 {% endif %}
 {% if item.object_kind in (
   'atom_revision', 'procedure_revision', 'core_membership', 'revision_proposal_revision',

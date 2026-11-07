@@ -18,7 +18,7 @@ from .backend import Backend, BackendError, _decode
 from .jobs import read_jobs
 from .comparison import read_comparison
 from .content import DETAIL_KINDS, read_record_content, read_record_detail, read_source_content
-from .sources import read_revisions, read_source_catalog, read_source_archive
+from .sources import read_revisions, read_source_catalog, read_source_archive, read_source_detail
 from .scopes import read_scopes
 from .memories import read_memories, read_overview
 
@@ -610,7 +610,10 @@ class App:
                     or not valid_ref(payload["revision"], optional=True)
                 ):
                     return JSONResponse({"error": "invalid_read"}, status_code=400)
-                if surface == "explorer" and payload["object_kind"] in DETAIL_KINDS:
+                if surface == "explorer" and payload["object_kind"] in ("source_receipt", "source_observation"):
+                    result = await read_source_detail(self.backend, payload["reference"], frontier,
+                        payload["revision"], payload["object_kind"])
+                elif surface == "explorer" and payload["object_kind"] in DETAIL_KINDS:
                     result = await read_record_detail(self.backend, payload["reference"], frontier,
                         payload["revision"], payload["object_kind"])
                 else:

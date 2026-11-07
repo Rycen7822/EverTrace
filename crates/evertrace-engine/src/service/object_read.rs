@@ -291,6 +291,22 @@ fn source_records(
     }
 }
 
+fn source_identity(
+    receipt: &evertrace_domain::evidence::SourceReceipt,
+    observation: &evertrace_domain::evidence::SourceObservation,
+) -> evertrace_domain::query::ExactSourceIdentity {
+    evertrace_domain::query::ExactSourceIdentity {
+        observation_ref: observation.source_observation_id,
+        receipt_ref: receipt.source_receipt_id,
+        source_instance_ref: receipt.source_instance_id.clone(),
+        source_revision: receipt.source_revision.clone(),
+        source_record_identity: receipt.source_record_identity.clone(),
+        payload_fingerprint: observation.payload_fingerprint.clone(),
+        protected_bytes: receipt.protected_length,
+        original_bytes: receipt.original_length,
+    }
+}
+
 fn utf8_window(
     mut bytes: Vec<u8>,
     offset: u64,
@@ -479,9 +495,7 @@ impl EngineService {
         evertrace_domain::query::MetadataReadOutcome<evertrace_domain::query::ExactSourceWindow>,
         ErrorCode,
     > {
-        use evertrace_domain::query::{
-            ExactReadQuery, ExactSourceIdentity, ExactSourceWindow, SourceTextField,
-        };
+        use evertrace_domain::query::{ExactReadQuery, ExactSourceWindow, SourceTextField};
         use evertrace_domain::query::{HumanContentState as State, MetadataReadOutcome as Outcome};
         if !query.validate() {
             return Err(ErrorCode::InvalidInput);
@@ -534,16 +548,7 @@ impl EngineService {
             return Ok(Outcome::Page(Box::new(result)));
         }
         let (receipt, observation) = source_records(&before)?;
-        let source = ExactSourceIdentity {
-            observation_ref: observation.source_observation_id,
-            receipt_ref: receipt.source_receipt_id,
-            source_instance_ref: receipt.source_instance_id.clone(),
-            source_revision: receipt.source_revision.clone(),
-            source_record_identity: receipt.source_record_identity.clone(),
-            payload_fingerprint: observation.payload_fingerprint.clone(),
-            protected_bytes: receipt.protected_length,
-            original_bytes: receipt.original_length,
-        };
+        let source = source_identity(&receipt, &observation);
         if query
             .expected_source
             .as_ref()
@@ -733,30 +738,55 @@ impl EngineService {
             };
             return Ok(Outcome::Page(Box::new(result)));
         }
-        let payload = root.payload_json.clone().ok_or(ErrorCode::StoreCorrupt)?;
-        let selected_query = query.clone();
-        let data = writer
-            .read_handle()
-            .read_blocking(move |cancel| {
-                let check = || {
-                    cancel.check().map_err(|_| ErrorCode::ResourceExhausted)?;
-                    if Instant::now() >= deadline {
-                        return Err(ErrorCode::ResourceExhausted);
-                    }
-                    Ok(())
-                };
-                let read = || {
-                    check()?;
-                    let payload =
-                        serde_json::from_str(&payload).map_err(|_| ErrorCode::StoreCorrupt)?;
-                    let data = record_data(payload, &selected_query, &check)?;
-                    check()?;
-                    Ok(data)
-                };
-                Ok(read())
-            })
-            .await
-            .map_err(|_| ErrorCode::ResourceExhausted)??;
+        let data = if matches!(
+            root.object_kind.as_deref(),
+            Some("source_receipt" | "source_observation")
+        ) {
+            if query.field.is_some() {
+                None
+            } else {
+                let (receipt, observation) = source_records(&before)?;
+                let record = evertrace_domain::source::SourceRecordMetadata::from_records(
+                    &receipt,
+                    &observation,
+                )
+                .ok_or(ErrorCode::StoreCorrupt)?;
+                Some((
+                    evertrace_domain::query::ExactRecordInfo::Source {
+                        record: Box::new(record),
+                        source: Box::new(source_identity(&receipt, &observation)),
+                        source_kind: receipt.source_kind,
+                        source_session_ref: receipt.source_session_ref,
+                    },
+                    None,
+                ))
+            }
+        } else {
+            let payload = root.payload_json.clone().ok_or(ErrorCode::StoreCorrupt)?;
+            let selected_query = query.clone();
+            writer
+                .read_handle()
+                .read_blocking(move |cancel| {
+                    let check = || {
+                        cancel.check().map_err(|_| ErrorCode::ResourceExhausted)?;
+                        if Instant::now() >= deadline {
+                            return Err(ErrorCode::ResourceExhausted);
+                        }
+                        Ok(())
+                    };
+                    let read = || {
+                        check()?;
+                        let payload =
+                            serde_json::from_str(&payload).map_err(|_| ErrorCode::StoreCorrupt)?;
+                        let data = record_data(payload, &selected_query, &check)?;
+                        check()?;
+                        Ok(data)
+                    };
+                    Ok(read())
+                })
+                .await
+                .map_err(|_| ErrorCode::ResourceExhausted)??
+        };
         let Outcome::Page(current) = writer
             .read_stored_fields_context(request, cancelled, deadline, effective_config_hash)
             .await

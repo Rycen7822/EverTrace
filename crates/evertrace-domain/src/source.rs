@@ -259,6 +259,46 @@ pub struct SourceRecordMetadata {
     pub presentation: SourceRecordPresentation,
 }
 impl SourceRecordMetadata {
+    pub fn from_records(
+        receipt: &crate::evidence::SourceReceipt,
+        observation: &crate::evidence::SourceObservation,
+    ) -> Option<Self> {
+        use crate::evidence::ProtectedPresentation as P;
+        if receipt.source_observation_id != observation.source_observation_id
+            || receipt.source_receipt_id != observation.source_receipt_ref
+            || receipt.source_instance_id != observation.source_instance_id
+            || receipt.source_revision != observation.source_revision
+            || receipt.source_record_identity != observation.source_record_identity
+        {
+            return None;
+        }
+        Some(Self {
+            stable_key: format!(
+                "object:evidence:source_observation:{}",
+                observation.source_observation_id
+            ),
+            observation_id: observation.source_observation_id,
+            receipt_id: receipt.source_receipt_id,
+            record_identity: receipt.source_record_identity.clone(),
+            sequence: receipt.source_sequence,
+            byte_range: receipt.source_byte_range.clone(),
+            observation_role: receipt.observation_role,
+            source_role: observation.source_role,
+            content_trust: observation.content_trust,
+            completeness: receipt.capture_completeness,
+            archive_mode: receipt.archive_mode,
+            event_time_us: receipt.event_time_us,
+            recorded_at_us: receipt.recorded_at_us,
+            event_time_provenance: receipt.event_time_provenance,
+            presentation: match &receipt.protected_presentation {
+                Some(P::Inline { .. }) => SourceRecordPresentation::Inline,
+                Some(P::Preview { .. }) => SourceRecordPresentation::Preview,
+                Some(P::Unavailable { .. }) => SourceRecordPresentation::NonText,
+                None => SourceRecordPresentation::NotRecorded,
+            },
+        })
+    }
+
     pub fn validate(&self) -> bool {
         self.stable_key == format!("object:evidence:source_observation:{}", self.observation_id)
             && self

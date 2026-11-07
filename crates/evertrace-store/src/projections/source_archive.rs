@@ -212,40 +212,13 @@ impl JournalAdmissionState {
                         if !is_after || records.len() > usize::from(limit) {
                             continue;
                         }
-                        let presentation = match &receipt.protected_presentation {
-                            Some(evertrace_domain::evidence::ProtectedPresentation::Inline {
-                                ..
-                            }) => SourceRecordPresentation::Inline,
-                            Some(evertrace_domain::evidence::ProtectedPresentation::Preview {
-                                ..
-                            }) => SourceRecordPresentation::Preview,
-                            Some(
-                                evertrace_domain::evidence::ProtectedPresentation::Unavailable {
-                                    ..
-                                },
-                            ) => SourceRecordPresentation::NonText,
-                            None => SourceRecordPresentation::NotRecorded,
-                        };
-                        records.push(SourceRecordMetadata {
-                            stable_key: format!(
-                                "object:evidence:source_observation:{}",
-                                observation.source_observation_id
-                            ),
-                            observation_id: observation.source_observation_id,
-                            receipt_id: *id,
-                            record_identity: receipt.source_record_identity.clone(),
-                            sequence: *sequence,
-                            byte_range: receipt.source_byte_range.clone(),
-                            observation_role: receipt.observation_role,
-                            source_role: observation.source_role,
-                            content_trust: observation.content_trust,
-                            completeness: receipt.capture_completeness,
-                            archive_mode: receipt.archive_mode,
-                            event_time_us: receipt.event_time_us,
-                            recorded_at_us: receipt.recorded_at_us,
-                            event_time_provenance: receipt.event_time_provenance,
-                            presentation,
-                        });
+                        records.push(
+                            SourceRecordMetadata::from_records(
+                                receipt.as_ref(),
+                                observation.as_ref(),
+                            )
+                            .ok_or(StoreError::StoreCorrupt)?,
+                        );
                     }
                 }
                 if records.len() > usize::from(limit) {

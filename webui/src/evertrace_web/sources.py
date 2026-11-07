@@ -1,6 +1,7 @@
 """Source and revision reading models. Native owns identities, visibility, metadata counts and keyset selection."""
 import json
 from datetime import datetime, timezone
+from pathlib import PurePosixPath
 
 from .backend import BackendError, _decode, _read_boundary, normalize_source_query, normalize_archive_query
 from .memories import _metadata_card
@@ -81,6 +82,116 @@ async def read_source_catalog(backend, query=None, after=None, frontier=None, li
         "frontier":batch["state"]["frontier"], "next_cursor":next_cursor, "matching_count":page["matching_count"],
         "count_basis":{"unit":"source_instance", "range":"committed_catalogue", "time_kind":"current", "accuracy":"exact"}}}
 
+
+
+def _inline_directory(text, info, total):
+    if info["source_kind"] != "codex_hook" or info["record"]["presentation"] != "inline" or total > 32768:
+        return None
+    if total != info["source"]["protected_bytes"] or len(text.encode()) != total:
+        return None
+    try:
+        value = _decode(text.encode())
+    except (BackendError, ValueError, UnicodeError):
+        return None
+    if not isinstance(value, dict) or value.get("session_id") != info["source_session_ref"]:
+        return None
+    directory = value.get("cwd")
+    if (not isinstance(directory, str) or not directory.startswith("/") or len(directory.encode()) > 4096
+        or ".." in PurePosixPath(directory).parts or any(ord(char) < 32 or 127 <= ord(char) < 160 for char in directory)):
+        return None
+    return directory
+
+
+async def _source_preview(backend, reference, revision, meta):
+    info, identity = meta["info"], meta["state"]["data_identity"]
+    chunks, offset, total = [], 0, None
+    # At most 64KiB of the stored presentation, not the CAS record; UTF-8 boundaries may require a ninth window.
+    for _ in range(9):
+        reply = await backend.read_source_window(reference, revision, {"offset":offset, "length":8192},
+            identity, info["source"], field="presentation")
+        if reply["kind"] == "conflict":
+            return "conflict", None, None
+        page = reply["page"]
+        if page["content_state"] != "ready":
+            return page["content_state"], None, None
+        window = page["window"]
+        if (page["source"] != info["source"] or page["selection"] != meta["selection"]
+            or page["state"]["data_identity"] != identity):
+            return "conflict", None, None
+        if (window is None or window["start"] != offset or window["end"] - offset != len(window["text"].encode())
+            or total is not None and total != window["total_bytes"] or window["end"] <= offset < window["total_bytes"]):
+            raise BackendError("invalid_read_response")
+        chunks.append(window["text"])
+        offset, total = window["end"], window["total_bytes"]
+        if offset >= min(total, 65536):
+            text = "".join(chunks).encode()[:65536].decode("utf-8", errors="ignore")
+            return "ready", text, total
+    raise BackendError("invalid_read_response")
+
+
+async def read_source_detail(backend, reference, frontier, revision, object_kind):
+    """A gated immutable source pair; labels and stored-text preview are Python projections, not source authority."""
+    if object_kind not in ("source_receipt", "source_observation"):
+        raise BackendError("invalid_input")
+    reply = await backend.read_record_window(reference, revision)
+    if reply["kind"] == "conflict":
+        return reply
+    meta = reply["page"]
+    if meta["state"]["frontier"] < frontier:
+        return {"kind":"conflict"}
+    row = meta["metadata"]
+    if row is None:
+        return {"kind":"detail", "items":[]}
+    if row["object_kind"] != object_kind or revision is not None and row["current_revision_id"] != revision:
+        raise BackendError("invalid_input")
+    revision, state, info = row["current_revision_id"], meta["content_state"], meta["info"]
+    evidence, context = None, None
+    if state == "ready":
+        if info is None or info["kind"] != "source":
+            raise BackendError("invalid_read_response")
+        record, source = info["record"], info["source"]
+        text, total, presentation = None, None, None
+        if record["presentation"] in ("inline", "preview"):
+            state, text, total = await _source_preview(backend, reference, revision, meta)
+            if state == "conflict":
+                return {"kind":"conflict"}
+            if state == "ready":
+                presentation = {"kind":"inline" if record["presentation"] == "inline" and len(text.encode()) == total else "preview",
+                                "text":text}
+        elif record["presentation"] == "non_text":
+            presentation = {"kind":"unavailable"}
+        if state == "ready":
+            directory = None
+            catalog = await backend.read_batch([{"kind":"sources", "query":{
+                "session_id":None, "source_instance_id":source["source_instance_ref"], "unassigned_only":False}, "limit":2}],
+                expected_data_identity=meta["state"]["data_identity"])
+            if catalog["kind"] == "conflict":
+                return catalog
+            records = catalog["page"]["items"][0]["page"]["records"]
+            if len(records) == 1 and records[0]["source_revision"] == source["source_revision"]:
+                directory = records[0]["workspace_hint"]
+            if directory is None and text is not None:
+                directory = _inline_directory(text, info, total)
+            context = {"directory":directory, "session":info["source_session_ref"], "event_time_us":record["event_time_us"],
+                "recorded_at_us":record["recorded_at_us"], "event_time_provenance":record.get("event_time_provenance")}
+            evidence = {"source_kind":info["source_kind"], "observation_role":record["observation_role"],
+                "source_role":record["source_role"], "content_trust":record["content_trust"],
+                "capture_completeness":record["completeness"], "protected_length":source["protected_bytes"],
+                "original_length":source["original_bytes"], "archive_mode":record["archive_mode"],
+                "protected_presentation":presentation}
+    final = await backend.read_record_window(reference, revision,
+        data_identity=meta["state"]["data_identity"], selection=meta["selection"])
+    if final["kind"] == "conflict":
+        return final
+    current = final["page"]
+    if current["metadata"] != row or current["selection"] != meta["selection"]:
+        return {"kind":"conflict"}
+    if current["content_state"] != "ready":
+        state, evidence, context = current["content_state"], None, None
+    elif current["info"] != info or current["state"]["data_identity"] != meta["state"]["data_identity"]:
+        return {"kind":"conflict"}
+    return {"kind":"detail", "items":[{**row, "stable_key":row["row_id"], "object_ref":row["object_id"],
+        "revision_ref":revision, "evidence_detail":evidence, "source_context":context, "source_state":state}]}
 
 
 async def read_source_archive(backend, query, after=None, frontier=None, limit=32):
