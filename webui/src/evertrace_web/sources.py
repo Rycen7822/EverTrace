@@ -6,6 +6,7 @@ from pathlib import PurePosixPath
 from .backend import BackendError, _decode, _read_boundary, normalize_source_query, normalize_archive_query
 from .memories import _metadata_card
 
+_REFERENCE_ALGORITHM = "direct_reference_metadata_v1"
 _ARCHIVE_ALGORITHM = "source_archive_metadata_v1"
 _CATALOG_ALGORITHM = "source_metadata_v1"
 _BODY_LABELS = {
@@ -192,6 +193,61 @@ async def read_source_detail(backend, reference, frontier, revision, object_kind
         return {"kind":"conflict"}
     return {"kind":"detail", "items":[{**row, "stable_key":row["row_id"], "object_ref":row["object_id"],
         "revision_ref":revision, "evidence_detail":evidence, "source_context":context, "source_state":state}]}
+
+
+async def read_source_links(backend, reference, frontier, revision, after=None, limit=32):
+    if type(limit) is not int or not 1 <= limit <= 32:
+        raise BackendError("invalid_input")
+    expected, identity = _read_boundary(frontier, None)
+    position, bound = None, {"stable_key":reference, "revision_ref":revision}
+    if after is not None:
+        if not isinstance(after, str) or not 0 < len(after.encode()) <= 4096:
+            raise BackendError("invalid_input")
+        cursor = _decode(after.encode())
+        if (not isinstance(cursor, dict) or set(cursor) != {"algorithm", "reference", "frontier", "data_identity", "position"}
+            or cursor["algorithm"] != _REFERENCE_ALGORITHM or cursor["reference"] != bound):
+            raise BackendError("invalid_input")
+        selected, identity = _read_boundary(cursor["frontier"], cursor["data_identity"])
+        if selected is None or identity is None or selected != expected or not isinstance(cursor["position"], str):
+            raise BackendError("invalid_input")
+        position = cursor["position"]
+    item = {"kind":"references", "reference":bound, "after":position, "limit":limit}
+    # The first page chooses the current watermark of an exact immutable source; a continuation keeps it fixed.
+    result = await backend.read_batch([item], expected if position is not None else None, identity)
+    if result["kind"] == "conflict":
+        return result
+    batch = result["page"]
+    if len(batch["items"]) != 1 or batch["items"][0]["kind"] != "references":
+        raise BackendError("invalid_read_response")
+    state, page = batch["state"], batch["items"][0]["page"]
+    if expected is not None and state["frontier"] < expected:
+        return {"kind":"conflict"}
+    final = await backend.read_batch([item], state["frontier"], state["data_identity"])
+    if final["kind"] == "conflict":
+        return final
+    current = final["page"]["items"][0]["page"]
+    if (final["page"]["state"] != state
+        or current["content_state"] == "ready" and current["selection"] != page["selection"]):
+        return {"kind":"conflict"}
+    page = current
+    items, unavailable = [], []
+    for record in page["records"]:
+        if record["content_state"] == "ready":
+            row = _metadata_card(record["metadata"])
+            row["declared_references"] = record["references"]
+            items.append(row)
+        else:
+            unavailable.append({"references":record["references"], "state":record["content_state"]})
+    next_cursor = None
+    if page["next"] is not None:
+        next_cursor = json.dumps({"algorithm":_REFERENCE_ALGORITHM, "reference":bound, "frontier":state["frontier"],
+            "data_identity":state["data_identity"], "position":page["next"]}, ensure_ascii=False, separators=(",", ":"))
+        if len(next_cursor.encode()) > 4096:
+            raise BackendError("invalid_read_response")
+    return {"kind":"source_links", "frontier":state["frontier"], "status":page["content_state"], "items":items,
+        "unavailable":unavailable, "matching_count":page["matching_count"], "next_cursor":next_cursor,
+        "count_basis":{"unit":"direct_reference_result", "accuracy":"exact" if page["matching_count"] is not None else "unknown",
+                       "time_kind":"current", "range":{"reference":bound}}}
 
 
 async def read_source_archive(backend, query, after=None, frontier=None, limit=32):

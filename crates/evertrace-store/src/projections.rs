@@ -78,10 +78,12 @@ mod recall_ledger;
 #[path = "recall_projection.rs"]
 mod recall_projection;
 mod recovery;
+mod references;
 mod scenario_core;
 mod segmentation;
 mod semantic;
 mod source_archive;
+pub use references::{ReferenceReadContext, select_object_row_rows, source_references_for};
 mod source_catalog;
 pub use source_archive::SourceArchiveMetadataContext;
 pub(crate) mod synthesis;
@@ -6341,7 +6343,6 @@ impl JournalAdmissionState {
         deadline: std::time::Instant,
         budget: &mut ReadDependencyBudget,
     ) -> Result<evertrace_domain::query::MetadataReadOutcome<StoredFieldsContext>, StoreError> {
-        use evertrace_domain::query::MetadataReadOutcome as Outcome;
         let selected = self
             .stored_reference_rows(revision_ref)?
             .into_iter()
@@ -6370,13 +6371,31 @@ impl JournalAdmissionState {
         if selected.len() > 1 {
             return Err(StoreError::StoreCorrupt);
         }
+        self.stored_fields_context_for_row(
+            selected.into_iter().next(),
+            state,
+            cancelled,
+            deadline,
+            budget,
+        )
+    }
+
+    fn stored_fields_context_for_row(
+        &self,
+        selected: Option<ObjectRow>,
+        state: evertrace_domain::query::ObjectReadState,
+        cancelled: &std::sync::atomic::AtomicBool,
+        deadline: std::time::Instant,
+        budget: &mut ReadDependencyBudget,
+    ) -> Result<evertrace_domain::query::MetadataReadOutcome<StoredFieldsContext>, StoreError> {
+        use evertrace_domain::query::MetadataReadOutcome as Outcome;
         let mut context = StoredFieldsContext {
             state,
             selected: None,
             rows: Vec::new(),
             source_suppressed: false,
         };
-        let Some(root) = selected.into_iter().next() else {
+        let Some(root) = selected else {
             return Ok(Outcome::Page(Box::new(context)));
         };
         let root_id = root.row_id.clone();

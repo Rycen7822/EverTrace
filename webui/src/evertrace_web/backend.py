@@ -425,6 +425,19 @@ class Backend:
                     "after": after,
                     "limit": item.get("limit", 32),
                 }
+            elif kind == "references":
+                if set(item) - {"kind", "reference", "after", "limit"}:
+                    raise BackendError("invalid_input")
+                reference, after = item.get("reference"), item.get("after")
+                if (not isinstance(reference, dict) or set(reference) != {"stable_key", "revision_ref"}
+                    or any(not isinstance(value, str) or not 0 < len(value.encode()) <= 512
+                        or any(ord(char) < 32 or 127 <= ord(char) < 160 for char in value) for value in reference.values())):
+                    raise BackendError("invalid_input")
+                if after is not None and (frontier is None or identity is None or not isinstance(after, str)
+                    or not 0 < len(after.encode()) <= 512 or any(ord(char) < 32 or 127 <= ord(char) < 160 for char in after)):
+                    raise BackendError("invalid_input")
+                value = {"kind":kind, "reference":{"stable_key":reference["stable_key"], "revision_ref":reference["revision_ref"]},
+                    "after":after, "limit":item.get("limit", 32)}
             elif kind == "archive":
                 if set(item) - {"kind", "query", "after", "limit"}:
                     raise BackendError("invalid_input")
@@ -623,19 +636,6 @@ class Backend:
         if page["right"]["state"] != page["left"]["state"]:
             raise BackendError("invalid_read_response")
         return page
-
-    async def sources(self, reference, frontier, revision, after=None):
-        return await self._request(
-            {
-                "kind": "related",
-                "relation": "object_sources",
-                "source_stable_key": reference,
-                "expected_source_revision_ref": revision,
-                "expected_frontier": frontier,
-                "after": after,
-                "limit": 32,
-            }
-        )
 
     async def _request(self, read):
         async def execute():

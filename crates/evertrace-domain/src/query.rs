@@ -3025,6 +3025,11 @@ impl RevisionPairFields {
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
 pub enum MetadataReadQuery {
+    References {
+        reference: ExactRecordRef,
+        after: Option<String>,
+        limit: u16,
+    },
     Archive {
         query: crate::source::SourceArchiveQuery,
         after: Option<crate::source::SourceArchivePosition>,
@@ -3072,7 +3077,8 @@ impl MetadataReadQuery {
             | Self::Revisions { limit, .. }
             | Self::Scopes { limit, .. }
             | Self::Sources { limit, .. }
-            | Self::Archive { limit, .. } => *limit,
+            | Self::Archive { limit, .. }
+            | Self::References { limit, .. } => *limit,
         }
     }
 
@@ -3087,6 +3093,31 @@ impl MetadataReadQuery {
                     && (1..=32).contains(limit)
                     && after.as_ref().is_none_or(|position| {
                         position.validate_for(query)
+                            && batch.expected_frontier.is_some()
+                            && batch.expected_data_identity.is_some()
+                    })
+            }
+            Self::References {
+                reference,
+                after,
+                limit,
+            } => {
+                !reference.stable_key.is_empty()
+                    && reference.stable_key.len() <= 512
+                    && !reference.stable_key.chars().any(char::is_control)
+                    && reference.revision_ref.as_ref().is_some_and(|revision| {
+                        (ExactFieldsQuery {
+                            revision_ref: revision.clone(),
+                        })
+                        .validate()
+                            || revision.parse::<AnyPublicId>().is_ok()
+                            || parse_operation_revision(revision).is_some()
+                    })
+                    && (1..=32).contains(limit)
+                    && after.as_ref().is_none_or(|key| {
+                        !key.is_empty()
+                            && key.len() <= 512
+                            && !key.chars().any(char::is_control)
                             && batch.expected_frontier.is_some()
                             && batch.expected_data_identity.is_some()
                     })
@@ -3195,6 +3226,9 @@ pub struct MemoryMetadataPage {
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
 pub enum MetadataReadPage {
+    References {
+        page: Box<ReferenceMetadataPage>,
+    },
     Archive {
         page: Box<crate::source::SourceArchiveMetadataPage>,
     },
@@ -3259,6 +3293,77 @@ impl RevisionMetadataPage {
             } else {
                 self.records.is_empty() && self.matching_count.is_none() && self.next.is_none()
             }
+    }
+}
+
+/// Canonical targets, or unresolved tokens declared by the selected source; never arbitrary client proof refs.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct ReferenceMetadataRecord {
+    pub stable_key: String,
+    pub references: Vec<String>,
+    pub content_state: HumanContentState,
+    pub metadata: Option<serde_json::Value>,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct ReferenceMetadataPage {
+    pub selection: Option<ExactFieldIdentity>,
+    pub content_state: HumanContentState,
+    pub records: Vec<ReferenceMetadataRecord>,
+    /// Distinct resolved targets or unresolved declared tokens, not a readable-object count.
+    pub matching_count: Option<u64>,
+    pub next: Option<String>,
+}
+
+impl ReferenceMetadataPage {
+    pub fn clear(&mut self, state: HumanContentState) {
+        self.content_state = state;
+        self.selection = None;
+        self.records.clear();
+        self.matching_count = None;
+        self.next = None;
+    }
+
+    pub fn validate(&self) -> bool {
+        let valid_ref = |value: &str| {
+            !value.is_empty() && value.len() <= 512 && !value.chars().any(char::is_control)
+        };
+        if self.content_state == HumanContentState::Ready {
+            self.selection.as_ref().is_some_and(|selected| {
+                valid_ref(&selected.object_ref)
+                    && valid_ref(&selected.revision_ref)
+                    && valid_ref(&selected.object_kind)
+            }) && self
+                .matching_count
+                .is_some_and(|count| count >= self.records.len() as u64)
+                && self
+                    .records
+                    .windows(2)
+                    .all(|pair| pair[0].stable_key < pair[1].stable_key)
+                && self.records.iter().all(|record| {
+                    valid_ref(&record.stable_key)
+                        && !record.references.is_empty()
+                        && record.references.iter().all(|value| valid_ref(value))
+                        && record.references.windows(2).all(|pair| pair[0] < pair[1])
+                        && if record.content_state == HumanContentState::Ready {
+                            record.metadata.as_ref().is_some_and(|row| {
+                                row["row_id"].as_str() == Some(record.stable_key.as_str())
+                                    && row.get("payload_json").is_none()
+                            })
+                        } else {
+                            record.metadata.is_none()
+                        }
+                })
+                && self.next.as_ref().is_none_or(|key| {
+                    self.records
+                        .last()
+                        .is_some_and(|row| &row.stable_key == key)
+                })
+        } else {
+            self.records.is_empty() && self.matching_count.is_none() && self.next.is_none()
+        }
     }
 }
 
@@ -3362,6 +3467,10 @@ impl ObjectReadBatch {
         self.state.validate()
             && (1..=METADATA_BATCH_LIMIT).contains(&self.items.len())
             && self.items.iter().all(|item| match item {
+                MetadataReadPage::References { page } => {
+                    count += page.records.len();
+                    page.validate()
+                }
                 MetadataReadPage::Archive { page } => {
                     count += page.len();
                     page.validate()

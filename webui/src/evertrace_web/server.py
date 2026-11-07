@@ -18,7 +18,7 @@ from .backend import Backend, BackendError, _decode
 from .jobs import read_jobs
 from .comparison import read_comparison
 from .content import DETAIL_KINDS, read_record_content, read_record_detail, read_source_content
-from .sources import read_revisions, read_source_catalog, read_source_archive, read_source_detail
+from .sources import read_revisions, read_source_catalog, read_source_archive, read_source_detail, read_source_links
 from .scopes import read_scopes
 from .memories import read_memories, read_overview
 
@@ -532,7 +532,7 @@ class App:
                             for key in ("total_bytes", "range_start", "range_end")
                         },
                     }
-            elif payload.get("kind") == "sources" and set(payload) == {
+            elif payload.get("kind") == "sources" and set(payload) - {"limit"} == {
                 "kind",
                 "reference",
                 "frontier",
@@ -546,21 +546,18 @@ class App:
                     or not valid_ref(payload["after"], optional=True)
                 ):
                     return JSONResponse({"error": "invalid_read"}, 400)
-                result = await self.backend.sources(
-                    payload["reference"], frontier, payload["revision"], payload["after"]
-                )
+                result = await read_source_links(self.backend, payload["reference"], frontier,
+                    payload["revision"], payload["after"], payload.get("limit", 32))
                 if result["kind"] == "conflict":
                     data = {"conflict": True}
                 else:
                     data = {
-                        "html": self.templates.get_template("sources.html").render(
-                            items=result["items"],
-                            status=result["status"],
-                            reasons=result["degraded_reasons"],
-                        ),
+                        "html": self.templates.get_template("sources.html").render(**result),
                         "frontier": str(result["frontier"]),
                         "next_cursor": result["next_cursor"],
-                        "degraded_reasons": result["degraded_reasons"],
+                        "status": result["status"],
+                        "matching_count": str(result["matching_count"]) if result["matching_count"] is not None else None,
+                        "count_basis": result["count_basis"],
                     }
             elif payload.get("kind") == "revisions" and set(payload) - {"limit"} == {
                 "kind",

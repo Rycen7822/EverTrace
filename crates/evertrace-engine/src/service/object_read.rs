@@ -1361,6 +1361,70 @@ impl EngineService {
         Ok(O::Page(Box::new(page)))
     }
 
+    async fn read_reference_metadata(
+        writer: &crate::WriterHandle,
+        reference: &evertrace_domain::query::ExactRecordRef,
+        after: Option<&str>,
+        limit: u16,
+        state: &evertrace_domain::query::ObjectReadState,
+        config_hash: [u8; 32],
+        cancelled: &std::sync::Arc<std::sync::atomic::AtomicBool>,
+        deadline: Instant,
+        report: &std::sync::Arc<tokio::sync::RwLock<Option<evertrace_codex::HostProbeReport>>>,
+    ) -> Result<
+        evertrace_domain::query::MetadataReadOutcome<
+            evertrace_domain::query::ReferenceMetadataPage,
+        >,
+        crate::WriterActorError,
+    > {
+        use evertrace_domain::query::{HumanContentState as S, MetadataReadOutcome as O};
+        let context = match writer
+            .read_reference_metadata_context(
+                reference,
+                after,
+                limit,
+                cancelled.clone(),
+                deadline,
+                config_hash,
+            )
+            .await?
+        {
+            O::Page(context) => *context,
+            O::TooLarge => return Ok(O::TooLarge),
+            O::Conflict(frontier) => return Ok(O::Conflict(frontier)),
+        };
+        if context.source.state != *state {
+            return Ok(O::Conflict(context.source.state.frontier));
+        }
+        let mut page = context.page;
+        if page.content_state == S::Ready {
+            if let Err(error) = fields_access(writer, &context.source, report, deadline).await {
+                page.clear(if error == ErrorCode::Untrusted {
+                    S::AccessDenied
+                } else {
+                    S::Unavailable
+                });
+            } else {
+                for (record, context) in page.records.iter_mut().zip(context.targets.iter()) {
+                    if let Some(context) = context
+                        && let Err(error) = fields_access(writer, context, report, deadline).await
+                    {
+                        record.content_state = if error == ErrorCode::Untrusted {
+                            S::AccessDenied
+                        } else {
+                            S::Unavailable
+                        };
+                        record.metadata = None;
+                    }
+                }
+            }
+        }
+        if Instant::now() >= deadline {
+            return Ok(O::TooLarge);
+        }
+        Ok(O::Page(Box::new(page)))
+    }
+
     pub async fn read_metadata_batch(
         writer: crate::WriterHandle,
         query: Box<evertrace_domain::query::MetadataBatchQuery>,
@@ -1381,11 +1445,12 @@ impl EngineService {
         let deadline = Instant::now() + std::time::Duration::from_secs(2);
         let (cancelled, _cancel_on_drop) = evertrace_store::StoreReadHandle::cancellation_scope();
         let read = async {
-            if !query
-                .items
-                .iter()
-                .any(|item| matches!(item, Q::Scopes { .. } | Q::Archive { .. }))
-            {
+            if !query.items.iter().any(|item| {
+                matches!(
+                    item,
+                    Q::Scopes { .. } | Q::Archive { .. } | Q::References { .. }
+                )
+            }) {
                 return Self::read_stored_metadata_batch(
                     writer,
                     query,
@@ -1410,7 +1475,12 @@ impl EngineService {
             let stored = query
                 .items
                 .iter()
-                .filter(|item| !matches!(item, Q::Scopes { .. } | Q::Archive { .. }))
+                .filter(|item| {
+                    !matches!(
+                        item,
+                        Q::Scopes { .. } | Q::Archive { .. } | Q::References { .. }
+                    )
+                })
                 .cloned()
                 .collect::<Vec<_>>();
             let mut stored = if stored.is_empty() {
@@ -1484,6 +1554,29 @@ impl EngineService {
                         .await?
                         {
                             O::Page(page) => P::Archive { page },
+                            O::TooLarge => return Ok(O::TooLarge),
+                            O::Conflict(frontier) => return Ok(O::Conflict(frontier)),
+                        }
+                    } else if let Q::References {
+                        reference,
+                        after,
+                        limit,
+                    } = item
+                    {
+                        match Self::read_reference_metadata(
+                            &writer,
+                            reference,
+                            after.as_deref(),
+                            *limit,
+                            &state,
+                            effective_config_hash,
+                            &cancelled,
+                            deadline,
+                            &report,
+                        )
+                        .await?
+                        {
+                            O::Page(page) => P::References { page },
                             O::TooLarge => return Ok(O::TooLarge),
                             O::Conflict(frontier) => return Ok(O::Conflict(frontier)),
                         }

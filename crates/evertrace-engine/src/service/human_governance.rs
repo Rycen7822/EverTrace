@@ -1447,7 +1447,7 @@ impl HumanGovernanceService {
                         .ok_or(HumanGovernanceError::Store)?,
                 )
                 .map_err(|_| HumanGovernanceError::Store)?;
-                source_link_refs(source, &payload)
+                evertrace_store::projections::source_references_for(source, &payload)
             }
             HumanRelationKind::ProposalEvidence => {
                 let proposal_id = source
@@ -3834,54 +3834,6 @@ fn related_page<'a>(
 
 // Navigation is not the export/permission closure. Every target is independently
 // checked before pagination, so an Episode does not authorize all its Attempts.
-fn source_link_refs(row: &ObjectRow, payload: &JournalPayload) -> BTreeSet<String> {
-    let mut refs = evertrace_store::projections::read_dependencies_for(row, payload);
-    match payload {
-        JournalPayload::WorkEpisodeRecorded(value) => {
-            refs.insert(value.workstream_id.to_string());
-            refs.extend(value.attempt_ids.iter().map(ToString::to_string));
-            refs.extend(
-                value
-                    .competing_attempt_group_ids
-                    .iter()
-                    .map(ToString::to_string),
-            );
-            refs.extend(value.checkpoint_refs.iter().cloned());
-            refs.extend(value.completed_outcome_refs.iter().cloned());
-            refs.extend(value.selected_outcome_refs.iter().cloned());
-            refs.extend(value.interruption_refs.iter().cloned());
-        }
-        JournalPayload::OperationBurstRecorded(value) => {
-            for member in &value.members {
-                refs.insert(format!(
-                    "{}@{}",
-                    member.operation_id, member.operation_revision
-                ));
-                refs.extend(member.attempt_revision_id.map(|id| id.to_string()));
-            }
-        }
-        JournalPayload::AttemptRecorded(value) => {
-            refs.insert(value.workstream_id.to_string());
-            refs.extend(value.episode_id.map(|id| id.to_string()));
-            refs.extend(value.resumes_from_attempt_id.map(|id| id.to_string()));
-            refs.extend(
-                value
-                    .composed_from_attempt_ids
-                    .iter()
-                    .map(ToString::to_string),
-            );
-            refs.extend(
-                value
-                    .work_binding_revision_refs
-                    .iter()
-                    .map(ToString::to_string),
-            );
-        }
-        _ => {}
-    }
-    refs
-}
-
 // Explicit revisions remain exact; logical references use the existing canonical
 // current selector at this frontier. A shared alias never chooses between objects.
 fn resolve_source_links<'a>(

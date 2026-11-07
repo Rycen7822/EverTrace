@@ -122,6 +122,22 @@ enum WriterRequest {
             >,
         >,
     },
+    ReadReferenceMetadata {
+        reference: evertrace_domain::query::ExactRecordRef,
+        after: Option<String>,
+        limit: u16,
+        cancelled: std::sync::Arc<std::sync::atomic::AtomicBool>,
+        deadline: std::time::Instant,
+        config_hash: [u8; 32],
+        reply: oneshot::Sender<
+            Result<
+                evertrace_domain::query::MetadataReadOutcome<
+                    evertrace_store::projections::ReferenceReadContext,
+                >,
+                WriterActorError,
+            >,
+        >,
+    },
     ReadArchiveMetadata {
         query: evertrace_domain::source::SourceArchiveQuery,
         after: Option<evertrace_domain::source::SourceArchivePosition>,
@@ -821,6 +837,36 @@ impl WriterHandle {
         self.sender
             .send(WriterRequest::ReadStoredFields {
                 query,
+                cancelled,
+                deadline,
+                config_hash,
+                reply,
+            })
+            .await
+            .map_err(|_| WriterActorError::Stopped)?;
+        response.await.map_err(|_| WriterActorError::Stopped)?
+    }
+
+    pub(crate) async fn read_reference_metadata_context(
+        &self,
+        reference: &evertrace_domain::query::ExactRecordRef,
+        after: Option<&str>,
+        limit: u16,
+        cancelled: std::sync::Arc<std::sync::atomic::AtomicBool>,
+        deadline: std::time::Instant,
+        config_hash: [u8; 32],
+    ) -> Result<
+        evertrace_domain::query::MetadataReadOutcome<
+            evertrace_store::projections::ReferenceReadContext,
+        >,
+        WriterActorError,
+    > {
+        let (reply, response) = oneshot::channel();
+        self.sender
+            .send(WriterRequest::ReadReferenceMetadata {
+                reference: reference.clone(),
+                after: after.map(str::to_owned),
+                limit,
                 cancelled,
                 deadline,
                 config_hash,
@@ -1654,6 +1700,33 @@ async fn run_writer(
                     let result = match writer.as_ref() {
                         Some(writer) => writer
                             .stored_fields_context(&query, &cancelled, deadline, config_hash)
+                            .map_err(map_store_error),
+                        None => Err(WriterActorError::Stopped),
+                    };
+                    let _ = reply.send(result);
+                }
+                WriterRequest::ReadReferenceMetadata {
+                    reference,
+                    after,
+                    limit,
+                    cancelled,
+                    deadline,
+                    config_hash,
+                    reply,
+                } => {
+                    if reply.is_closed() {
+                        continue;
+                    }
+                    let result = match writer.as_ref() {
+                        Some(writer) => writer
+                            .read_reference_metadata_context(
+                                &reference,
+                                after.as_deref(),
+                                limit,
+                                &cancelled,
+                                deadline,
+                                config_hash,
+                            )
                             .map_err(map_store_error),
                         None => Err(WriterActorError::Stopped),
                     };

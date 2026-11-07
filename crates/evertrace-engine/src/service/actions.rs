@@ -28,7 +28,7 @@ use evertrace_domain::{
 };
 use evertrace_store::{
     JournalCommand, JournalEventDraft, JournalPayload, ObjectDeletionCurrentView, ObjectRow,
-    ObjectRowClass, ObjectRowKind, ProjectionSnapshot, SearchIndex, SemanticCurrentView,
+    ObjectRowKind, ProjectionSnapshot, SearchIndex, SemanticCurrentView,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -546,59 +546,7 @@ pub(super) fn select_object_row<'a>(
     select_object_row_rows(&snapshot.rows, identifier)
 }
 
-pub(super) fn select_object_row_rows<'a>(
-    rows: &'a [ObjectRow],
-    identifier: &str,
-) -> Result<Option<(&'a ObjectRow, bool)>, ()> {
-    let eligible = |row: &&ObjectRow| {
-        row.row_kind == ObjectRowKind::Data && row.row_class == Some(ObjectRowClass::Object)
-    };
-    let mut exact = rows
-        .iter()
-        .filter(eligible)
-        .filter(|row| row.current_revision_id.as_deref() == Some(identifier));
-    if let Some(row) = exact.next() {
-        if exact.next().is_some() {
-            return Err(());
-        }
-        let object_id = row.object_id.as_deref().ok_or(())?;
-        let current = current_object_row_rows(rows, object_id)?.ok_or(())?;
-        return Ok(Some((row, current == row)));
-    }
-    Ok(current_object_row_rows(rows, identifier)?.map(|row| (row, true)))
-}
-
-fn current_object_row_rows<'a>(
-    rows: &'a [ObjectRow],
-    object_id: &str,
-) -> Result<Option<&'a ObjectRow>, ()> {
-    let mut rows = rows.iter().filter(|row| {
-        row.row_kind == ObjectRowKind::Data
-            && row.row_class == Some(ObjectRowClass::Object)
-            && row.object_id.as_deref() == Some(object_id)
-    });
-    let Some(mut current) = rows.next() else {
-        return Ok(None);
-    };
-    if current.object_id.is_none() || current.current_revision_id.is_none() {
-        return Err(());
-    }
-    let mut tied = false;
-    for row in rows {
-        if row.object_id.is_none() || row.current_revision_id.is_none() {
-            return Err(());
-        }
-        match row.source_event_seq.cmp(&current.source_event_seq) {
-            std::cmp::Ordering::Greater => {
-                current = row;
-                tied = false;
-            }
-            std::cmp::Ordering::Equal => tied = true,
-            std::cmp::Ordering::Less => {}
-        }
-    }
-    (!tied).then_some(Some(current)).ok_or(())
-}
+pub(super) use evertrace_store::projections::select_object_row_rows;
 
 fn classify_object_row(
     row: &ObjectRow,
@@ -946,7 +894,7 @@ mod tests {
         ObjectRow {
             row_id: format!("atom:{}", atom.revision_id),
             row_kind: ObjectRowKind::Data,
-            row_class: Some(ObjectRowClass::Object),
+            row_class: Some(evertrace_store::ObjectRowClass::Object),
             object_family: Some(evertrace_store::ObjectFamily::Atom),
             object_kind: Some("atom_revision".into()),
             object_id: Some(atom.atom_id.to_string()),

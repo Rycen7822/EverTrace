@@ -1479,6 +1479,26 @@ impl JournalWriter {
         Ok(O::Page(Box::new((state, context))))
     }
 
+    pub fn read_reference_metadata_context(
+        &self,
+        reference: &evertrace_domain::query::ExactRecordRef,
+        after: Option<&str>,
+        limit: u16,
+        cancelled: &std::sync::atomic::AtomicBool,
+        deadline: std::time::Instant,
+        config_hash: [u8; 32],
+    ) -> Result<
+        evertrace_domain::query::MetadataReadOutcome<crate::projections::ReferenceReadContext>,
+        StoreError,
+    > {
+        let (before, state) = self.metadata_read_boundary(config_hash)?;
+        let context = self
+            .admission_state
+            .reference_metadata_context(reference, after, limit, state, cancelled, deadline)?;
+        self.finish_metadata_read(before, cancelled)?;
+        Ok(context)
+    }
+
     pub fn read_archive_metadata_context(
         &self,
         query: &evertrace_domain::source::SourceArchiveQuery,
@@ -1681,7 +1701,9 @@ impl JournalWriter {
                 }
                 let page = match item {
                     // Source-authorized directory matching is performed by the Native async read owner.
-                    MetadataReadQuery::Scopes { .. } | MetadataReadQuery::Archive { .. } => {
+                    MetadataReadQuery::Scopes { .. }
+                    | MetadataReadQuery::Archive { .. }
+                    | MetadataReadQuery::References { .. } => {
                         return Err(StoreError::InvalidInput);
                     }
                     MetadataReadQuery::Sources {
@@ -1872,7 +1894,8 @@ impl JournalWriter {
             | MetadataReadQuery::Revisions { .. }
             | MetadataReadQuery::Scopes { .. }
             | MetadataReadQuery::Sources { .. }
-            | MetadataReadQuery::Archive { .. } => false,
+            | MetadataReadQuery::Archive { .. }
+            | MetadataReadQuery::References { .. } => false,
         });
         let result = if needs_times {
             self.lock_sqlite()?

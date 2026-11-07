@@ -1,0 +1,343 @@
+use super::*;
+
+pub fn select_object_row_rows<'a>(
+    rows: &'a [ObjectRow],
+    identifier: &str,
+) -> Result<Option<(&'a ObjectRow, bool)>, ()> {
+    let eligible = |row: &&ObjectRow| {
+        row.row_kind == ObjectRowKind::Data && row.row_class == Some(ObjectRowClass::Object)
+    };
+    let mut exact = rows
+        .iter()
+        .filter(eligible)
+        .filter(|row| row.current_revision_id.as_deref() == Some(identifier));
+    if let Some(row) = exact.next() {
+        if exact.next().is_some() {
+            return Err(());
+        }
+        let object_id = row.object_id.as_deref().ok_or(())?;
+        let current = current_object_row_rows(rows, object_id)?.ok_or(())?;
+        return Ok(Some((row, current == row)));
+    }
+    Ok(current_object_row_rows(rows, identifier)?.map(|row| (row, true)))
+}
+
+fn current_object_row_rows<'a>(
+    rows: &'a [ObjectRow],
+    object_id: &str,
+) -> Result<Option<&'a ObjectRow>, ()> {
+    let mut rows = rows.iter().filter(|row| {
+        row.row_kind == ObjectRowKind::Data
+            && row.row_class == Some(ObjectRowClass::Object)
+            && row.object_id.as_deref() == Some(object_id)
+    });
+    let Some(mut current) = rows.next() else {
+        return Ok(None);
+    };
+    if current.object_id.is_none() || current.current_revision_id.is_none() {
+        return Err(());
+    }
+    let mut tied = false;
+    for row in rows {
+        if row.object_id.is_none() || row.current_revision_id.is_none() {
+            return Err(());
+        }
+        match row.source_event_seq.cmp(&current.source_event_seq) {
+            std::cmp::Ordering::Greater => {
+                current = row;
+                tied = false;
+            }
+            std::cmp::Ordering::Equal => tied = true,
+            std::cmp::Ordering::Less => {}
+        }
+    }
+    (!tied).then_some(Some(current)).ok_or(())
+}
+
+pub fn source_references_for(row: &ObjectRow, payload: &JournalPayload) -> BTreeSet<String> {
+    let mut refs = read_dependencies_for(row, payload);
+    match payload {
+        JournalPayload::WorkEpisodeRecorded(value) => {
+            refs.insert(value.workstream_id.to_string());
+            refs.extend(value.attempt_ids.iter().map(ToString::to_string));
+            refs.extend(
+                value
+                    .competing_attempt_group_ids
+                    .iter()
+                    .map(ToString::to_string),
+            );
+            refs.extend(value.checkpoint_refs.iter().cloned());
+            refs.extend(value.completed_outcome_refs.iter().cloned());
+            refs.extend(value.selected_outcome_refs.iter().cloned());
+            refs.extend(value.interruption_refs.iter().cloned());
+        }
+        JournalPayload::OperationBurstRecorded(value) => {
+            for member in &value.members {
+                refs.insert(format!(
+                    "{}@{}",
+                    member.operation_id, member.operation_revision
+                ));
+                refs.extend(member.attempt_revision_id.map(|id| id.to_string()));
+            }
+        }
+        JournalPayload::AttemptRecorded(value) => {
+            refs.insert(value.workstream_id.to_string());
+            refs.extend(value.episode_id.map(|id| id.to_string()));
+            refs.extend(value.resumes_from_attempt_id.map(|id| id.to_string()));
+            refs.extend(
+                value
+                    .composed_from_attempt_ids
+                    .iter()
+                    .map(ToString::to_string),
+            );
+            refs.extend(
+                value
+                    .work_binding_revision_refs
+                    .iter()
+                    .map(ToString::to_string),
+            );
+        }
+        _ => {}
+    }
+    refs
+}
+
+#[derive(Debug)]
+pub struct ReferenceReadContext {
+    pub source: StoredFieldsContext,
+    pub page: evertrace_domain::query::ReferenceMetadataPage,
+    pub targets: Vec<Option<StoredFieldsContext>>,
+}
+
+impl JournalAdmissionState {
+    pub(crate) fn reference_metadata_context(
+        &self,
+        reference: &evertrace_domain::query::ExactRecordRef,
+        after: Option<&str>,
+        limit: u16,
+        state: evertrace_domain::query::ObjectReadState,
+        cancelled: &std::sync::atomic::AtomicBool,
+        deadline: std::time::Instant,
+    ) -> Result<evertrace_domain::query::MetadataReadOutcome<ReferenceReadContext>, StoreError>
+    {
+        use evertrace_domain::query::{
+            ExactFieldIdentity, HumanContentState as S, MetadataReadOutcome as O,
+            ReferenceMetadataPage, ReferenceMetadataRecord,
+        };
+        let mut budget = ReadDependencyBudget {
+            references: 0,
+            rows: 0,
+            bytes: 0,
+        };
+        let revision = reference
+            .revision_ref
+            .as_deref()
+            .ok_or(StoreError::InvalidInput)?;
+        let source = match self.stored_fields_context_with_budget(
+            revision,
+            state.clone(),
+            cancelled,
+            deadline,
+            &mut budget,
+        )? {
+            O::Page(value) => *value,
+            O::TooLarge => return Ok(O::TooLarge),
+            O::Conflict(frontier) => return Ok(O::Conflict(frontier)),
+        };
+        let mut page = ReferenceMetadataPage {
+            selection: None,
+            content_state: S::Missing,
+            records: Vec::new(),
+            matching_count: None,
+            next: None,
+        };
+        let Some(root) = source.selected.as_ref() else {
+            return Ok(O::Page(Box::new(ReferenceReadContext {
+                source,
+                page,
+                targets: Vec::new(),
+            })));
+        };
+        if root.row_id != reference.stable_key
+            && root.object_id.as_deref() != Some(reference.stable_key.as_str())
+            && root.current_revision_id.as_deref() != Some(reference.stable_key.as_str())
+        {
+            return Ok(O::Page(Box::new(ReferenceReadContext {
+                source,
+                page,
+                targets: Vec::new(),
+            })));
+        }
+        page.selection = match (
+            &root.object_id,
+            &root.current_revision_id,
+            &root.object_kind,
+        ) {
+            (Some(object), Some(revision), Some(kind)) => Some(ExactFieldIdentity {
+                object_ref: object.clone(),
+                revision_ref: revision.clone(),
+                object_kind: kind.clone(),
+                source_event_seq: root.source_event_seq,
+            }),
+            _ => return Err(StoreError::StoreCorrupt),
+        };
+        if !matches!(
+            root.object_kind.as_deref(),
+            Some(
+                "atom_revision"
+                    | "procedure_revision"
+                    | "core_membership"
+                    | "semantic_digest"
+                    | "revision_proposal_revision"
+                    | "source_receipt"
+                    | "source_observation"
+                    | "work_episode"
+                    | "attempt"
+                    | "operation_burst"
+                    | "operation"
+            )
+        ) {
+            page.clear(S::Unsupported);
+            return Ok(O::Page(Box::new(ReferenceReadContext {
+                source,
+                page,
+                targets: Vec::new(),
+            })));
+        }
+        let payload = serde_json::from_str::<JournalPayload>(
+            root.payload_json
+                .as_deref()
+                .ok_or(StoreError::StoreCorrupt)?,
+        )
+        .map_err(|_| StoreError::StoreCorrupt)?;
+        let mut refs = source_references_for(root, &payload);
+        refs.remove(&root.row_id);
+        if let Some(value) = &root.object_id {
+            refs.remove(value);
+        }
+        if let Some(value) = &root.current_revision_id {
+            refs.remove(value);
+        }
+        if refs.len() > READ_DEPENDENCY_LIMIT {
+            return Ok(O::TooLarge);
+        }
+        let mut records = BTreeMap::<String, ReferenceMetadataRecord>::new();
+        for reference in refs {
+            if cancelled.load(std::sync::atomic::Ordering::Relaxed) {
+                return Err(StoreError::Io);
+            }
+            if std::time::Instant::now() >= deadline {
+                return Ok(O::TooLarge);
+            }
+            // A dependency subset may contain an old revision; resolve logical current from the canonical lookup.
+            let mut candidates =
+                self.capture_product_rows(self.stored_reference_rows(&reference)?)?;
+            for row in &candidates {
+                budget.rows += 1;
+                budget.bytes += row.payload_json.as_ref().map_or(0, |value| value.len()) as u64;
+            }
+            if budget.rows > READ_DEPENDENCY_LIMIT || budget.bytes > READ_DEPENDENCY_BYTES {
+                return Ok(O::TooLarge);
+            }
+            candidates.retain(|row| {
+                row.row_id == reference
+                    || row.object_id.as_deref() == Some(reference.as_str())
+                    || row.current_revision_id.as_deref() == Some(reference.as_str())
+            });
+            if candidates
+                .iter()
+                .any(|row| row.row_class == Some(ObjectRowClass::Object))
+            {
+                candidates.retain(|row| row.row_class == Some(ObjectRowClass::Object));
+            }
+            let selected = if candidates.len() == 1 {
+                Ok(Some(&candidates[0]))
+            } else {
+                select_object_row_rows(&candidates, &reference)
+                    .map(|value| value.map(|value| value.0))
+            };
+            let (key, status, metadata) = match selected {
+                Ok(Some(row)) => (
+                    row.row_id.clone(),
+                    S::Ready,
+                    Some(crate::JournalWriter::metadata_record(row, None)),
+                ),
+                Ok(None) => (reference.clone(), S::Missing, None),
+                Err(()) => (reference.clone(), S::Unavailable, None),
+            };
+            records
+                .entry(key.clone())
+                .or_insert_with(|| ReferenceMetadataRecord {
+                    stable_key: key,
+                    references: Vec::new(),
+                    content_state: status,
+                    metadata,
+                })
+                .references
+                .push(reference);
+        }
+        if after.is_some_and(|key| !records.contains_key(key)) {
+            return Err(StoreError::InvalidInput);
+        }
+        page.content_state = S::Ready;
+        page.matching_count = Some(records.len() as u64);
+        page.records = records
+            .into_values()
+            .filter(|record| after.is_none_or(|key| record.stable_key.as_str() > key))
+            .take(usize::from(limit) + 1)
+            .collect();
+        if page.records.len() > usize::from(limit) {
+            page.records.truncate(usize::from(limit));
+            page.next = page.records.last().map(|record| record.stable_key.clone());
+        }
+        let mut targets = Vec::with_capacity(page.records.len());
+        for record in &mut page.records {
+            if std::time::Instant::now() >= deadline {
+                return Ok(O::TooLarge);
+            }
+            if record.metadata.is_none() {
+                targets.push(None);
+                continue;
+            }
+            let selected = source
+                .rows
+                .iter()
+                .find(|row| row.row_id == record.stable_key)
+                .cloned();
+            let selected = match selected {
+                Some(row) => Some(row),
+                None => self
+                    .capture_product_rows(self.stored_reference_rows(&record.references[0])?)?
+                    .into_iter()
+                    .find(|row| row.row_id == record.stable_key),
+            };
+            let context = match self.stored_fields_context_for_row(
+                selected,
+                state.clone(),
+                cancelled,
+                deadline,
+                &mut budget,
+            )? {
+                O::Page(value) => *value,
+                O::TooLarge => return Ok(O::TooLarge),
+                O::Conflict(frontier) => return Ok(O::Conflict(frontier)),
+            };
+            if !context
+                .rows
+                .iter()
+                .any(|row| row.row_id == record.stable_key)
+            {
+                record.content_state = S::Missing;
+                record.metadata = None;
+                targets.push(None);
+            } else {
+                targets.push(Some(context));
+            }
+        }
+        Ok(O::Page(Box::new(ReferenceReadContext {
+            source,
+            page,
+            targets,
+        })))
+    }
+}
