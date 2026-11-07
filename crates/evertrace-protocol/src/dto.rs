@@ -1329,11 +1329,11 @@ impl HumanGovernanceResponse {
                     ) => {
                         records.len() <= 32
                             && records.iter().all(|record| {
-                                record.validate() && page.query.includes(record.sequence)
+                                record.validate() && page.query.includes(record.metadata.sequence)
                             })
                             && records.windows(2).all(|pair| {
-                                (pair[0].sequence, pair[0].receipt_id)
-                                    < (pair[1].sequence, pair[1].receipt_id)
+                                (pair[0].metadata.sequence, pair[0].metadata.receipt_id)
+                                    < (pair[1].metadata.sequence, pair[1].metadata.receipt_id)
                             })
                     }
                     _ => false,
@@ -1361,8 +1361,8 @@ impl HumanGovernanceResponse {
                                                 SourceArchivePosition::Record { sequence, receipt },
                                                 SourceArchiveEntries::Records { records },
                                             ) => records.last().is_some_and(|record| {
-                                                record.sequence == *sequence
-                                                    && record.receipt_id == *receipt
+                                                record.metadata.sequence == *sequence
+                                                    && record.metadata.receipt_id == *receipt
                                             }),
                                             _ => false,
                                         }

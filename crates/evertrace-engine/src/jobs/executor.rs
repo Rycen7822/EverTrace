@@ -129,6 +129,23 @@ enum WriterRequest {
             >,
         >,
     },
+    ReadArchiveMetadata {
+        query: evertrace_domain::source::SourceArchiveQuery,
+        after: Option<evertrace_domain::source::SourceArchivePosition>,
+        limit: u16,
+        cancelled: std::sync::Arc<std::sync::atomic::AtomicBool>,
+        deadline: std::time::Instant,
+        config_hash: [u8; 32],
+        reply: oneshot::Sender<
+            Result<
+                evertrace_domain::query::MetadataReadOutcome<(
+                    evertrace_domain::query::ObjectReadState,
+                    evertrace_store::projections::SourceArchiveMetadataContext,
+                )>,
+                WriterActorError,
+            >,
+        >,
+    },
     ReadScopeMetadata {
         query: evertrace_domain::query::ScopeDirectoryQuery,
         after: Option<String>,
@@ -830,6 +847,37 @@ impl WriterHandle {
         self.sender
             .send(WriterRequest::ReadStoredFields {
                 query,
+                cancelled,
+                deadline,
+                config_hash,
+                reply,
+            })
+            .await
+            .map_err(|_| WriterActorError::Stopped)?;
+        response.await.map_err(|_| WriterActorError::Stopped)?
+    }
+
+    pub(crate) async fn read_archive_metadata_context(
+        &self,
+        query: &evertrace_domain::source::SourceArchiveQuery,
+        after: Option<&evertrace_domain::source::SourceArchivePosition>,
+        limit: u16,
+        cancelled: std::sync::Arc<std::sync::atomic::AtomicBool>,
+        deadline: std::time::Instant,
+        config_hash: [u8; 32],
+    ) -> Result<
+        evertrace_domain::query::MetadataReadOutcome<(
+            evertrace_domain::query::ObjectReadState,
+            evertrace_store::projections::SourceArchiveMetadataContext,
+        )>,
+        WriterActorError,
+    > {
+        let (reply, response) = oneshot::channel();
+        self.sender
+            .send(WriterRequest::ReadArchiveMetadata {
+                query: query.clone(),
+                after: after.cloned(),
+                limit,
                 cancelled,
                 deadline,
                 config_hash,
@@ -1656,6 +1704,33 @@ async fn run_writer(
                     let result = match writer.as_ref() {
                         Some(writer) => writer
                             .stored_fields_context(&query, &cancelled, deadline, config_hash)
+                            .map_err(map_store_error),
+                        None => Err(WriterActorError::Stopped),
+                    };
+                    let _ = reply.send(result);
+                }
+                WriterRequest::ReadArchiveMetadata {
+                    query,
+                    after,
+                    limit,
+                    cancelled,
+                    deadline,
+                    config_hash,
+                    reply,
+                } => {
+                    if reply.is_closed() {
+                        continue;
+                    }
+                    let result = match writer.as_ref() {
+                        Some(writer) => writer
+                            .read_archive_metadata_context(
+                                &query,
+                                after.as_ref(),
+                                limit,
+                                &cancelled,
+                                deadline,
+                                config_hash,
+                            )
                             .map_err(map_store_error),
                         None => Err(WriterActorError::Stopped),
                     };

@@ -1479,6 +1479,34 @@ impl JournalWriter {
         Ok(O::Page(Box::new((state, context))))
     }
 
+    pub fn read_archive_metadata_context(
+        &self,
+        query: &evertrace_domain::source::SourceArchiveQuery,
+        after: Option<&evertrace_domain::source::SourceArchivePosition>,
+        limit: u16,
+        cancelled: &std::sync::atomic::AtomicBool,
+        deadline: std::time::Instant,
+        config_hash: [u8; 32],
+    ) -> Result<
+        evertrace_domain::query::MetadataReadOutcome<(
+            evertrace_domain::query::ObjectReadState,
+            crate::projections::SourceArchiveMetadataContext,
+        )>,
+        StoreError,
+    > {
+        use evertrace_domain::query::MetadataReadOutcome as O;
+        let (before, state) = self.metadata_read_boundary(config_hash)?;
+        let context = self
+            .admission_state
+            .source_archive_metadata(query, after, limit, cancelled, deadline)?;
+        self.finish_metadata_read(before, cancelled)?;
+        Ok(match context {
+            O::Page(context) => O::Page(Box::new((state, *context))),
+            O::TooLarge => O::TooLarge,
+            O::Conflict(frontier) => O::Conflict(frontier),
+        })
+    }
+
     pub async fn source_archive_context(
         &self,
         query: &evertrace_domain::source::SourceArchiveQuery,
@@ -1665,7 +1693,9 @@ impl JournalWriter {
                 }
                 let page = match item {
                     // Source-authorized directory matching is performed by the Native async read owner.
-                    MetadataReadQuery::Scopes { .. } => return Err(StoreError::InvalidInput),
+                    MetadataReadQuery::Scopes { .. } | MetadataReadQuery::Archive { .. } => {
+                        return Err(StoreError::InvalidInput);
+                    }
                     MetadataReadQuery::Sources {
                         query,
                         after,
@@ -1853,7 +1883,8 @@ impl JournalWriter {
             MetadataReadQuery::Jobs { .. }
             | MetadataReadQuery::Revisions { .. }
             | MetadataReadQuery::Scopes { .. }
-            | MetadataReadQuery::Sources { .. } => false,
+            | MetadataReadQuery::Sources { .. }
+            | MetadataReadQuery::Archive { .. } => false,
         });
         let result = if needs_times {
             self.lock_sqlite()?

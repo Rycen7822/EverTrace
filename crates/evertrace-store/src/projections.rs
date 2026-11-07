@@ -83,7 +83,7 @@ mod segmentation;
 mod semantic;
 mod source_archive;
 mod source_catalog;
-pub use source_archive::SourceArchiveCurrentContext;
+pub use source_archive::{SourceArchiveCurrentContext, SourceArchiveMetadataContext};
 pub(crate) mod synthesis;
 pub use autoresearch::AutoresearchCurrentView;
 use autoresearch::{record_artifact, record_result, record_run};

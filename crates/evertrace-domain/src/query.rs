@@ -2655,10 +2655,19 @@ impl ExactReadQuery {
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct ExactSourceTextQuery {
+    pub field: SourceTextField,
     pub reference: HumanRevisionRef,
     pub range: Option<ExactUtf8Range>,
     pub expected_data_identity: Option<ReadDataIdentity>,
     pub expected_source: Option<ExactSourceIdentity>,
+}
+
+/// Closed stored source text fields; not preview length, title policy or an arbitrary JSON path.
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SourceTextField {
+    Protected,
+    Presentation,
 }
 
 impl ExactSourceTextQuery {
@@ -2875,6 +2884,7 @@ pub struct ExactUtf8Window {
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct ExactSourceWindow {
+    pub field: SourceTextField,
     pub state: ObjectReadState,
     pub selection: Option<ExactFieldIdentity>,
     pub content_state: HumanContentState,
@@ -2975,6 +2985,11 @@ impl RevisionPairFields {
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
 pub enum MetadataReadQuery {
+    Archive {
+        query: crate::source::SourceArchiveQuery,
+        after: Option<crate::source::SourceArchivePosition>,
+        limit: u16,
+    },
     Sources {
         query: crate::source::SourceCatalogQuery,
         after: Option<String>,
@@ -3016,12 +3031,26 @@ impl MetadataReadQuery {
             | Self::Jobs { limit, .. }
             | Self::Revisions { limit, .. }
             | Self::Scopes { limit, .. }
-            | Self::Sources { limit, .. } => *limit,
+            | Self::Sources { limit, .. }
+            | Self::Archive { limit, .. } => *limit,
         }
     }
 
     fn validate(&self, batch: &MetadataBatchQuery) -> bool {
         match self {
+            Self::Archive {
+                query,
+                after,
+                limit,
+            } => {
+                query.validate().is_ok()
+                    && (1..=32).contains(limit)
+                    && after.as_ref().is_none_or(|position| {
+                        position.validate_for(query)
+                            && batch.expected_frontier.is_some()
+                            && batch.expected_data_identity.is_some()
+                    })
+            }
             Self::Sources { query, after, .. } => {
                 query.validate().is_ok()
                     && after.as_ref().is_none_or(|key| {
@@ -3126,6 +3155,9 @@ pub struct MemoryMetadataPage {
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
 pub enum MetadataReadPage {
+    Archive {
+        page: Box<crate::source::SourceArchiveMetadataPage>,
+    },
     Sources {
         page: Box<crate::source::SourceMetadataPage>,
     },
@@ -3290,6 +3322,10 @@ impl ObjectReadBatch {
         self.state.validate()
             && (1..=METADATA_BATCH_LIMIT).contains(&self.items.len())
             && self.items.iter().all(|item| match item {
+                MetadataReadPage::Archive { page } => {
+                    count += page.len();
+                    page.validate()
+                }
                 MetadataReadPage::Sources { page } => {
                     count += page.records.len();
                     page.validate()

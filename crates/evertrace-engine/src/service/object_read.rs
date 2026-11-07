@@ -479,7 +479,9 @@ impl EngineService {
         evertrace_domain::query::MetadataReadOutcome<evertrace_domain::query::ExactSourceWindow>,
         ErrorCode,
     > {
-        use evertrace_domain::query::{ExactReadQuery, ExactSourceIdentity, ExactSourceWindow};
+        use evertrace_domain::query::{
+            ExactReadQuery, ExactSourceIdentity, ExactSourceWindow, SourceTextField,
+        };
         use evertrace_domain::query::{HumanContentState as State, MetadataReadOutcome as Outcome};
         if !query.validate() {
             return Err(ErrorCode::InvalidInput);
@@ -507,6 +509,7 @@ impl EngineService {
         }
         let metadata = fields_metadata(&before)?;
         let mut result = ExactSourceWindow {
+            field: query.field,
             state: metadata.state,
             selection: metadata.selection,
             content_state: State::Missing,
@@ -555,9 +558,30 @@ impl EngineService {
             result.content_state = State::Unsupported;
             return Ok(Outcome::Page(Box::new(result)));
         }
-        evertrace_capture::cas::SourceArchiveVerifier::new(&receipt, &observation)
-            .map_err(|_| ErrorCode::StoreCorrupt)?;
-        let read = if let Some(range) = query.range.clone() {
+        let presentation = if query.field == SourceTextField::Presentation {
+            use evertrace_domain::evidence::ProtectedPresentation as P;
+            let text = match &receipt.protected_presentation {
+                Some(P::Inline { text } | P::Preview { text }) => text,
+                _ => {
+                    result.content_state = State::Unsupported;
+                    return Ok(Outcome::Page(Box::new(result)));
+                }
+            };
+            query
+                .range
+                .as_ref()
+                .map(|range| record_text(text, range))
+                .transpose()?
+        } else {
+            evertrace_capture::cas::SourceArchiveVerifier::new(&receipt, &observation)
+                .map_err(|_| ErrorCode::StoreCorrupt)?;
+            None
+        };
+        let read = if let Some(range) = query
+            .range
+            .clone()
+            .filter(|_| query.field == SourceTextField::Protected)
+        {
             let bytes = range.offset..range.offset + u64::from(range.length) + 1;
             Some(
                 writer
@@ -625,6 +649,9 @@ impl EngineService {
                     range.length,
                     window.total_bytes,
                 )?);
+            }
+            if query.field == SourceTextField::Presentation {
+                result.window = presentation;
             }
             result.source = Some(source);
             result.content_state = State::Ready;
@@ -1230,6 +1257,80 @@ impl EngineService {
         Ok(O::Page(Box::new(page)))
     }
 
+    async fn read_archive_metadata(
+        writer: &crate::WriterHandle,
+        query: &evertrace_domain::source::SourceArchiveQuery,
+        after: Option<&evertrace_domain::source::SourceArchivePosition>,
+        limit: u16,
+        state: &evertrace_domain::query::ObjectReadState,
+        config_hash: [u8; 32],
+        cancelled: &std::sync::Arc<std::sync::atomic::AtomicBool>,
+        deadline: Instant,
+        report: &std::sync::Arc<tokio::sync::RwLock<Option<evertrace_codex::HostProbeReport>>>,
+    ) -> Result<
+        evertrace_domain::query::MetadataReadOutcome<
+            evertrace_domain::source::SourceArchiveMetadataPage,
+        >,
+        crate::WriterActorError,
+    > {
+        use evertrace_domain::{
+            query::{HumanContentState as S, MetadataReadOutcome as O},
+            source::SourceArchiveQuery as Q,
+        };
+        let (current, context) = match writer
+            .read_archive_metadata_context(
+                query,
+                after,
+                limit,
+                cancelled.clone(),
+                deadline,
+                config_hash,
+            )
+            .await?
+        {
+            O::Page(context) => *context,
+            O::TooLarge => return Ok(O::TooLarge),
+            O::Conflict(frontier) => return Ok(O::Conflict(frontier)),
+        };
+        if current != *state {
+            return Ok(O::Conflict(current.frontier));
+        }
+        let mut page = context.page;
+        if page.state == S::Ready && matches!(query, Q::Records { .. }) {
+            let host = report.read().await.clone();
+            let sources = [(query.source().to_owned(), query.source().to_owned())]
+                .into_iter()
+                .collect();
+            let source = crate::session_import::source_instance_read_assessment(
+                writer,
+                host.as_ref(),
+                sources,
+                Some(deadline),
+            )
+            .await
+            .map_err(|_| crate::WriterActorError::StoreCorrupt)?;
+            let references = context.references.iter().collect::<Vec<_>>();
+            let scopes = crate::repository::row_repository_contexts_from_scopes(
+                context.scope_rows.iter(),
+                &references,
+            )?;
+            let repositories = crate::repository::repository_read_assessment(
+                writer,
+                scopes.values().flatten().copied().collect(),
+                host.as_ref(),
+                deadline,
+            )
+            .await?;
+            if context.suppressed || !source.0.is_empty() || !repositories.0.is_empty() {
+                page.clear(S::AccessDenied);
+            }
+            if Instant::now() >= deadline {
+                return Ok(O::TooLarge);
+            }
+        }
+        Ok(O::Page(Box::new(page)))
+    }
+
     pub async fn read_metadata_batch(
         writer: crate::WriterHandle,
         query: Box<evertrace_domain::query::MetadataBatchQuery>,
@@ -1253,7 +1354,7 @@ impl EngineService {
             if !query
                 .items
                 .iter()
-                .any(|item| matches!(item, Q::Scopes { .. }))
+                .any(|item| matches!(item, Q::Scopes { .. } | Q::Archive { .. }))
             {
                 return Self::read_stored_metadata_batch(
                     writer,
@@ -1279,7 +1380,7 @@ impl EngineService {
             let stored = query
                 .items
                 .iter()
-                .filter(|item| !matches!(item, Q::Scopes { .. }))
+                .filter(|item| !matches!(item, Q::Scopes { .. } | Q::Archive { .. }))
                 .cloned()
                 .collect::<Vec<_>>();
             let mut stored = if stored.is_empty() {
@@ -1330,6 +1431,29 @@ impl EngineService {
                         .await?
                         {
                             O::Page(page) => P::Scopes { page },
+                            O::TooLarge => return Ok(O::TooLarge),
+                            O::Conflict(frontier) => return Ok(O::Conflict(frontier)),
+                        }
+                    } else if let Q::Archive {
+                        query,
+                        after,
+                        limit,
+                    } = item
+                    {
+                        match Self::read_archive_metadata(
+                            &writer,
+                            query,
+                            after.as_ref(),
+                            *limit,
+                            &state,
+                            effective_config_hash,
+                            &cancelled,
+                            deadline,
+                            &report,
+                        )
+                        .await?
+                        {
+                            O::Page(page) => P::Archive { page },
                             O::TooLarge => return Ok(O::TooLarge),
                             O::Conflict(frontier) => return Ok(O::Conflict(frontier)),
                         }

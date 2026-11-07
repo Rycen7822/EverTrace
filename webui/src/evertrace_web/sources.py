@@ -2,9 +2,10 @@
 import json
 from datetime import datetime, timezone
 
-from .backend import BackendError, _decode, _read_boundary, normalize_source_query
+from .backend import BackendError, _decode, _read_boundary, normalize_source_query, normalize_archive_query
 from .memories import _metadata_card
 
+_ARCHIVE_ALGORITHM = "source_archive_metadata_v1"
 _CATALOG_ALGORITHM = "source_metadata_v1"
 _BODY_LABELS = {
     "not_imported":"尚未导入", "queued":"已排队", "importing":"正在导入", "imported":"已记录导入完成",
@@ -80,6 +81,79 @@ async def read_source_catalog(backend, query=None, after=None, frontier=None, li
         "frontier":batch["state"]["frontier"], "next_cursor":next_cursor, "matching_count":page["matching_count"],
         "count_basis":{"unit":"source_instance", "range":"committed_catalogue", "time_kind":"current", "accuracy":"exact"}}}
 
+
+
+async def read_source_archive(backend, query, after=None, frontier=None, limit=32):
+    if type(limit) is not int or not 1 <= limit <= 32:
+        raise BackendError("invalid_input")
+    query = normalize_archive_query(query)
+    expected, identity = _read_boundary(frontier, None)
+    position = None
+    if after is not None:
+        if not isinstance(after, str) or not 0 < len(after.encode()) <= 4096:
+            raise BackendError("invalid_input")
+        cursor = _decode(after.encode())
+        if (not isinstance(cursor, dict) or set(cursor) != {"algorithm", "query", "frontier", "data_identity", "position"}
+            or cursor["algorithm"] != _ARCHIVE_ALGORITHM or cursor["query"] != query):
+            raise BackendError("invalid_input")
+        expected, identity = _read_boundary(cursor["frontier"], cursor["data_identity"])
+        if expected is None or identity is None or expected != frontier or not isinstance(cursor["position"], dict):
+            raise BackendError("invalid_input")
+        position = cursor["position"]
+    item = {"kind":"archive", "query":query, "after":position, "limit":limit}
+    result = await backend.read_batch([item], expected, identity)
+    if result["kind"] == "conflict":
+        return result
+    batch = result["page"]
+    if len(batch["items"]) != 1 or batch["items"][0]["kind"] != "archive":
+        raise BackendError("invalid_read_response")
+    original = batch["items"][0]["page"]
+    if original["query"] != query:
+        raise BackendError("invalid_read_response")
+    page = {**original}
+    identity, expected = batch["state"]["data_identity"], batch["state"]["frontier"]
+    if page["state"] == "ready" and query["kind"] == "records":
+        records = []
+        for record in page["entries"]["records"]:
+            row = {**record, "preview":None, "preview_truncated":False}
+            if record["presentation"] in ("inline", "preview"):
+                reply = await backend.read_source_window(record["stable_key"], record["observation_id"],
+                    {"offset":0, "length":512}, identity, field="presentation")
+                if reply["kind"] == "conflict":
+                    return reply
+                value = reply["page"]
+                if value["content_state"] != "ready":
+                    page.update(state=value["content_state"], matching_count=None, next=None)
+                    records.clear()
+                    break
+                source, window = value["source"], value["window"]
+                if (source["source_instance_ref"] != query["source_instance_id"] or source["source_revision"] != query["source_revision"]
+                    or source["observation_ref"] != record["observation_id"] or source["receipt_ref"] != record["receipt_id"]
+                    or value["state"]["data_identity"] != identity):
+                    return {"kind":"conflict"}
+                if window is None or window["start"] != 0 or window["end"] != len(window["text"].encode()) or window["end"] > 512:
+                    raise BackendError("invalid_read_response")
+                row["preview"], row["preview_truncated"] = window["text"], window["end"] < window["total_bytes"]
+            records.append(row)
+        page["entries"] = {"kind":"records", "records":records}
+        # The list is fixed-watermark metadata. Recheck after all finite field projections, including current permissions.
+        final = await backend.read_batch([item], expected, identity)
+        if final["kind"] == "conflict":
+            return final
+        current = final["page"]["items"][0]["page"]
+        if current["state"] != "ready":
+            page = {**current}
+        elif current != original or final["page"]["state"] != batch["state"]:
+            return {"kind":"conflict"}
+    next_cursor = None
+    if page["next"] is not None:
+        next_cursor = json.dumps({"algorithm":_ARCHIVE_ALGORITHM, "query":query, "frontier":expected,
+            "data_identity":identity, "position":page["next"]}, ensure_ascii=False, separators=(",", ":"))
+        if len(next_cursor.encode()) > 4096:
+            raise BackendError("invalid_read_response")
+    return {"kind":"source_archive", "page":{**page, "frontier":expected, "next_cursor":next_cursor,
+        "count_basis":{"unit":"archive_revision" if query["kind"] == "revisions" else "retained_source_record",
+                       "range":query, "time_kind":"current", "accuracy":"exact" if page["matching_count"] is not None else "unknown"}}}
 
 
 async def read_revisions(backend, reference, frontier, revision, after=None, limit=32):

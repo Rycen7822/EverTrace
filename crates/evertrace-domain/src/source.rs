@@ -223,9 +223,14 @@ pub struct SourceArchiveCursor {
 }
 impl SourceArchiveCursor {
     pub fn validate_for(&self, query: &SourceArchiveQuery) -> bool {
+        &self.query == query && self.position.validate_for(query)
+    }
+}
+
+impl SourceArchivePosition {
+    pub fn validate_for(&self, query: &SourceArchiveQuery) -> bool {
         query.validate().is_ok()
-            && &self.query == query
-            && match (&self.query, &self.position) {
+            && match (query, self) {
                 (
                     SourceArchiveQuery::Revisions { .. },
                     SourceArchivePosition::Revision { revision },
@@ -248,7 +253,7 @@ pub enum SourceRecordPresentation {
 }
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
-pub struct SourceRecordSummary {
+pub struct SourceRecordMetadata {
     pub stable_key: String,
     pub observation_id: crate::ids::SourceObservationId,
     pub receipt_id: crate::ids::SourceReceiptId,
@@ -265,10 +270,8 @@ pub struct SourceRecordSummary {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub event_time_provenance: Option<crate::evidence::EventTimeProvenance>,
     pub presentation: SourceRecordPresentation,
-    pub preview: Option<String>,
-    pub preview_truncated: bool,
 }
-impl SourceRecordSummary {
+impl SourceRecordMetadata {
     pub fn validate(&self) -> bool {
         self.stable_key == format!("object:evidence:source_observation:{}", self.observation_id)
             && self
@@ -282,10 +285,24 @@ impl SourceRecordSummary {
                     .validate(self.event_time_us, self.recorded_at_us)
                     .is_ok()
             })
+    }
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct SourceRecordSummary {
+    #[serde(flatten)]
+    pub metadata: SourceRecordMetadata,
+    pub preview: Option<String>,
+    pub preview_truncated: bool,
+}
+impl SourceRecordSummary {
+    pub fn validate(&self) -> bool {
+        self.metadata.validate()
             && self.preview.as_ref().is_none_or(|text| text.len() <= 512)
             && (self.preview.is_some()
                 == matches!(
-                    self.presentation,
+                    self.metadata.presentation,
                     SourceRecordPresentation::Inline | SourceRecordPresentation::Preview
                 ))
             && (!self.preview_truncated || self.preview.is_some())
@@ -297,6 +314,86 @@ pub enum SourceArchiveEntries {
     Revisions { revisions: Vec<SourceRevision> },
     Records { records: Vec<SourceRecordSummary> },
 }
+/// Exact source-local identities/provenance only; stored text is read via ReadExact.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
+pub enum SourceArchiveMetadataEntries {
+    Revisions { revisions: Vec<SourceRevision> },
+    Records { records: Vec<SourceRecordMetadata> },
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct SourceArchiveMetadataPage {
+    pub query: SourceArchiveQuery,
+    pub state: crate::query::HumanContentState,
+    pub entries: SourceArchiveMetadataEntries,
+    /// Exact retained product-visible identities in this instance/revision/range; unknown when denied or missing.
+    pub matching_count: Option<u64>,
+    pub next: Option<SourceArchivePosition>,
+}
+impl SourceArchiveMetadataPage {
+    pub fn len(&self) -> usize {
+        match &self.entries {
+            SourceArchiveMetadataEntries::Revisions { revisions } => revisions.len(),
+            SourceArchiveMetadataEntries::Records { records } => records.len(),
+        }
+    }
+    pub fn clear(&mut self, state: crate::query::HumanContentState) {
+        self.state = state;
+        self.matching_count = None;
+        self.next = None;
+        match &mut self.entries {
+            SourceArchiveMetadataEntries::Revisions { revisions } => revisions.clear(),
+            SourceArchiveMetadataEntries::Records { records } => records.clear(),
+        }
+    }
+    pub fn validate(&self) -> bool {
+        self.query.validate().is_ok()
+            && match (&self.query, &self.entries) {
+                (
+                    SourceArchiveQuery::Revisions { .. },
+                    SourceArchiveMetadataEntries::Revisions { revisions },
+                ) => revisions.windows(2).all(|pair| pair[0] < pair[1]),
+                (
+                    SourceArchiveQuery::Records { .. },
+                    SourceArchiveMetadataEntries::Records { records },
+                ) => {
+                    records
+                        .iter()
+                        .all(|row| row.validate() && self.query.includes(row.sequence))
+                        && records.windows(2).all(|pair| {
+                            (pair[0].sequence, pair[0].receipt_id)
+                                < (pair[1].sequence, pair[1].receipt_id)
+                        })
+                }
+                _ => false,
+            }
+            && if self.state == crate::query::HumanContentState::Ready {
+                self.matching_count
+                    .is_some_and(|count| count >= self.len() as u64)
+                    && self.next.as_ref().is_none_or(|key| {
+                        key.validate_for(&self.query)
+                            && match (&self.entries, key) {
+                                (
+                                    SourceArchiveMetadataEntries::Revisions { revisions },
+                                    SourceArchivePosition::Revision { revision },
+                                ) => revisions.last() == Some(revision),
+                                (
+                                    SourceArchiveMetadataEntries::Records { records },
+                                    SourceArchivePosition::Record { sequence, receipt },
+                                ) => records.last().is_some_and(|row| {
+                                    row.sequence == *sequence && row.receipt_id == *receipt
+                                }),
+                                _ => false,
+                            }
+                    })
+            } else {
+                self.len() == 0 && self.matching_count.is_none() && self.next.is_none()
+            }
+    }
+}
+
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct SourceArchivePage {

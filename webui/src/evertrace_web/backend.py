@@ -186,6 +186,37 @@ def normalize_source_query(query):
     return {"session_id":session, "source_instance_id":source, "unassigned_only":unassigned}
 
 
+def normalize_archive_query(query):
+    if not isinstance(query, dict) or query.get("kind") not in ("revisions", "records"):
+        raise BackendError("invalid_input")
+    source = query.get("source_instance_id")
+    if (not isinstance(source, str) or not 0 < len(source.encode()) <= 1024
+        or any(ord(char) < 32 or 127 <= ord(char) < 160 for char in source)):
+        raise BackendError("invalid_input")
+    value = {"kind":query["kind"], "source_instance_id":source}
+    allowed = set(value)
+    if value["kind"] == "records":
+        allowed |= {"source_revision", "from_sequence", "until_sequence"}
+        revision = query.get("source_revision")
+        if not isinstance(revision, str) or len(revision) != 64 or any(char not in "0123456789abcdef" for char in revision):
+            raise BackendError("invalid_input")
+        value["source_revision"] = revision
+        for key in ("from_sequence", "until_sequence"):
+            number = query.get(key)
+            if isinstance(number, str):
+                if not number or not number.isascii() or not number.isdecimal() or len(number) > 20:
+                    raise BackendError("invalid_input")
+                number = int(number)
+            if number is not None and (type(number) is not int or not 0 <= number < 2**64):
+                raise BackendError("invalid_input")
+            value[key] = number
+        if value["from_sequence"] is not None and value["until_sequence"] is not None and value["from_sequence"] >= value["until_sequence"]:
+            raise BackendError("invalid_input")
+    if set(query) - allowed:
+        raise BackendError("invalid_input")
+    return value
+
+
 class Backend:
     def __init__(self, socket_path, config_hash, build_id):
         self.path = Path(socket_path)
@@ -298,7 +329,7 @@ class Backend:
             raise BackendError("inactive_configuration")
         return result
 
-    async def read_source_window(self, reference, revision, byte_range=None, data_identity=None, source=None):
+    async def read_source_window(self, reference, revision, byte_range=None, data_identity=None, source=None, field="protected"):
         if any(not isinstance(value, str) or not value or len(value.encode()) > 512
                or any(ord(char) < 32 for char in value) for value in (reference, revision)):
             raise BackendError("invalid_input")
@@ -308,6 +339,8 @@ class Backend:
                 or type(byte_range["length"]) is not int or not 4 <= byte_range["length"] <= 8192):
                 raise BackendError("invalid_input")
             byte_range = {key: byte_range[key] for key in ("offset", "length")}
+        if field not in ("protected", "presentation"):
+            raise BackendError("invalid_input")
         _, data_identity = _read_boundary(None, data_identity)
         if source is not None:
             keys = ("observation_ref", "receipt_ref", "source_instance_ref", "source_revision",
@@ -320,12 +353,12 @@ class Backend:
             if any(type(source[key]) is not int or not 0 <= source[key] < 2**64 for key in keys[6:]):
                 raise BackendError("invalid_input")
             source = {key: source[key] for key in keys}
-        result = await self._request({"kind": "read_exact", "query": {"kind": "source_text",
+        result = await self._request({"kind": "read_exact", "query": {"kind": "source_text", "field":field,
             "reference": {"stable_key": reference, "revision_ref": revision}, "range": byte_range,
             "expected_data_identity": data_identity, "expected_source": source}})
         if result["kind"] == "conflict":
             return result
-        if result["kind"] != "source_window":
+        if result["kind"] != "source_window" or result["page"]["field"] != field:
             raise BackendError("invalid_read_response")
         if result["page"]["state"]["effective_config_hash"] != self.config_hash:
             raise BackendError("inactive_configuration")
@@ -392,6 +425,28 @@ class Backend:
                     "after": after,
                     "limit": item.get("limit", 32),
                 }
+            elif kind == "archive":
+                if set(item) - {"kind", "query", "after", "limit"}:
+                    raise BackendError("invalid_input")
+                query, after = normalize_archive_query(item.get("query")), item.get("after")
+                if after is not None:
+                    if not isinstance(after, dict) or frontier is None or identity is None:
+                        raise BackendError("invalid_input")
+                    if query["kind"] == "revisions":
+                        revision = after.get("revision")
+                        if (set(after) != {"kind", "revision"} or after["kind"] != "revision" or not isinstance(revision, str)
+                            or len(revision) != 64 or any(char not in "0123456789abcdef" for char in revision)):
+                            raise BackendError("invalid_input")
+                    else:
+                        receipt, sequence = after.get("receipt"), after.get("sequence")
+                        if (set(after) != {"kind", "sequence", "receipt"} or after["kind"] != "record"
+                            or type(sequence) is not int or not 0 <= sequence < 2**64 or not isinstance(receipt, str)
+                            or not receipt.startswith("src:") or len(receipt) != 68
+                            or any(char not in "0123456789abcdef" for char in receipt[4:])):
+                            raise BackendError("invalid_input")
+                    after = ({"kind":"revision", "revision":after["revision"]} if query["kind"] == "revisions"
+                             else {"kind":"record", "sequence":after["sequence"], "receipt":after["receipt"]})
+                value = {"kind":kind, "query":query, "after":after, "limit":item.get("limit", 32)}
             elif kind == "sources":
                 if set(item) - {"kind", "query", "after", "limit"}:
                     raise BackendError("invalid_input")
@@ -505,41 +560,6 @@ class Backend:
             "time_range": normalize_time_range(query.get("time_range")),
             "limit": limit,
         }
-
-    async def source_archive(self, query, after=None, expected_frontier=None):
-        if not isinstance(query, dict) or query.get("kind") not in ("revisions", "records"):
-            raise BackendError("invalid_input")
-        source = query.get("source_instance_id")
-        if not isinstance(source, str) or not source or len(source.encode("utf-8")) > 1024:
-            raise BackendError("invalid_input")
-        normalized = {"kind": query["kind"], "source_instance_id": source}
-        allowed = {"kind", "source_instance_id"}
-        if query["kind"] == "records":
-            allowed |= {"source_revision", "from_sequence", "until_sequence"}
-            revision = query.get("source_revision")
-            if not isinstance(revision, str) or not revision or len(revision.encode("utf-8")) > 256:
-                raise BackendError("invalid_input")
-            normalized["source_revision"] = revision
-            for key in ("from_sequence", "until_sequence"):
-                value = query.get(key)
-                if isinstance(value, str):
-                    if not value or not value.isascii() or not value.isdecimal() or len(value) > 20:
-                        raise BackendError("invalid_input")
-                    value = int(value)
-                if value is not None and (type(value) is not int or not 0 <= value <= 2**64 - 1):
-                    raise BackendError("invalid_input")
-                normalized[key] = value
-        if set(query) - allowed:
-            raise BackendError("invalid_input")
-        return await self._request(
-            {
-                "kind": "source_archive",
-                "query": normalized,
-                "expected_frontier": expected_frontier,
-                "after": after,
-                "limit": 32,
-            }
-        )
 
     async def observations(self, after=None, expected_frontier=None):
         return await self._request({
