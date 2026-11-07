@@ -455,37 +455,55 @@ async fn protected_export_cli_and_system_publish_complete_cas() {
         assert!(tokio::time::Instant::now() < deadline);
         tokio::time::sleep(Duration::from_millis(100)).await;
     };
-    let HumanGovernanceResponse::Snapshot {
-        items, frontier, ..
-    } = &snapshot
-    else {
+    let HumanGovernanceResponse::Snapshot { items, .. } = &snapshot else {
         unreachable!()
     };
     let selected = &items[index];
-    let Response::HumanGovernance(HumanGovernanceResponse::Snapshot { items: details, .. }) =
-        client
+    let mut protected_text = String::new();
+    let mut offset = 0;
+    loop {
+        let Response::HumanGovernance(HumanGovernanceResponse::SourceWindow { page }) = client
             .request(
                 RequestId::new_v7(),
                 Rpc::HumanGovernance(HumanGovernanceRequest::Read {
-                    request: HumanReadRequest::Detail {
-                        surface: HumanSurface::Explorer,
-                        object_ref: selected.stable_key.clone(),
-                        expected_frontier: *frontier,
-                        expected_revision_ref: selected.revision_ref.clone(),
+                    request: HumanReadRequest::ReadExact {
+                        query: Box::new(evertrace_domain::query::ExactReadQuery::SourceText(
+                            evertrace_domain::query::ExactSourceTextQuery {
+                                field: evertrace_domain::query::SourceTextField::Protected,
+                                reference: evertrace_domain::query::HumanRevisionRef {
+                                    stable_key: selected.stable_key.clone(),
+                                    revision_ref: selected.revision_ref.clone().unwrap(),
+                                },
+                                range: Some(evertrace_domain::query::ExactUtf8Range {
+                                    offset,
+                                    length: 8192,
+                                }),
+                                expected_data_identity: None,
+                                expected_source: None,
+                            },
+                        )),
                     },
                 }),
             )
             .await
             .unwrap()
-    else {
-        panic!("source detail");
-    };
-    let evidence = details[0].evidence_detail.as_ref().unwrap();
-    let cas = evertrace_capture::CasStore::open_existing(paths.data_root.join("cas")).unwrap();
-    let digest = evertrace_capture::CasStore::parse_digest(&evidence.cas_ref).unwrap();
-    let protected = cas.read(&digest).unwrap();
-    assert!(protected.len() > 65_536);
-    let protected_text = String::from_utf8(protected).unwrap();
+        else {
+            panic!("protected source window")
+        };
+        assert_eq!(
+            page.content_state,
+            evertrace_domain::query::HumanContentState::Ready
+        );
+        let window = page.window.unwrap();
+        assert_eq!(window.start, offset);
+        assert!(window.end > offset);
+        protected_text.push_str(&window.text);
+        offset = window.end;
+        if offset == window.total_bytes {
+            break;
+        }
+    }
+    assert!(protected_text.len() > 65_536);
     assert!(!protected_text.contains(secret));
     let output = Command::new(&paths.cli)
         .arg("--config")
@@ -553,6 +571,10 @@ async fn protected_export_cli_and_system_publish_complete_cas() {
     assert_eq!(system_result.status, HumanExportStatus::Published);
     assert_ne!(system_result.path, cli_result.path);
     verify(system_result);
+    // Locate the owned blob from the complete, Native-verified protected bytes, not an old UI CAS locator.
+    let cas = evertrace_capture::CasStore::open_existing(paths.data_root.join("cas")).unwrap();
+    let digest = evertrace_capture::CasDigest::for_protected_bytes(protected_text.as_bytes());
+    assert_eq!(cas.read(&digest).unwrap(), protected_text.as_bytes());
     // The same real daemon path rejects a corrupt CAS rather than publishing a preview.
     fs::write(cas.blob_path(&digest), b"corrupt").unwrap();
     let Response::HumanGovernance(HumanGovernanceResponse::Export { result }) = client
@@ -1721,11 +1743,7 @@ async fn ordinary_daemon_keeps_explorer_and_doctor_readable_with_unowned_spool_f
         .await
         .unwrap();
         loop {
-            let Response::HumanGovernance(HumanGovernanceResponse::Snapshot {
-                frontier,
-                items,
-                ..
-            }) = client
+            let Response::HumanGovernance(HumanGovernanceResponse::Snapshot { items, .. }) = client
                 .request(
                     RequestId::new_v7(),
                     Rpc::HumanGovernance(HumanGovernanceRequest::Read {
@@ -1754,33 +1772,24 @@ async fn ordinary_daemon_keeps_explorer_and_doctor_readable_with_unowned_spool_f
                 .count()
                 == 2
             {
-                let result = client
-                    .request(
-                        RequestId::new_v7(),
-                        Rpc::HumanGovernance(HumanGovernanceRequest::Read {
-                            request: HumanReadRequest::Detail {
-                                surface: HumanSurface::Explorer,
-                                object_ref: saved.clone(),
-                                expected_frontier: frontier,
-                                expected_revision_ref: None,
-                            },
-                        }),
-                    )
-                    .await
-                    .unwrap();
-                if let Response::HumanGovernance(HumanGovernanceResponse::Snapshot {
-                    items, ..
-                }) = result
+                let result = client.request(RequestId::new_v7(),
+                    Rpc::HumanGovernance(HumanGovernanceRequest::Read {
+                        request: HumanReadRequest::ReadExact {
+                            query: Box::new(evertrace_domain::query::ExactReadQuery::SourceText(
+                                evertrace_domain::query::ExactSourceTextQuery {
+                                    field: evertrace_domain::query::SourceTextField::Presentation,
+                                    reference: evertrace_domain::query::HumanRevisionRef {
+                                        stable_key: saved.clone(), revision_ref: saved.clone(),
+                                    },
+                                    range: Some(evertrace_domain::query::ExactUtf8Range { offset: 0, length: 8192 }),
+                                    expected_data_identity: None, expected_source: None,
+                                })),
+                        },
+                    })).await.unwrap();
+                if let Response::HumanGovernance(HumanGovernanceResponse::SourceWindow { page }) =
+                    result
                 {
-                    assert!(
-                        items
-                            .iter()
-                            .any(|item| item.evidence_detail.as_ref().is_some_and(|detail| {
-                                serde_json::to_string(detail)
-                                    .unwrap()
-                                    .contains("preserved memory")
-                            }))
-                    );
+                    assert!(page.window.unwrap().text.contains("preserved memory"));
                     break;
                 }
             }
@@ -2294,7 +2303,6 @@ async fn submitted_inputs_are_weak_independent_and_visible_after_automatic_inges
                     let mut observed = false;
                     while Instant::now() < deadline {
                         let Response::HumanGovernance(HumanGovernanceResponse::Snapshot {
-                            frontier,
                             items,
                             ..
                         }) = client
@@ -2316,48 +2324,96 @@ async fn submitted_inputs_are_weak_independent_and_visible_after_automatic_inges
                         else {
                             panic!("explorer list");
                         };
-                        assert!(items.iter().all(|item| item.evidence_detail.is_none()));
+                        let list = serde_json::to_string(&items).unwrap();
+                        assert!(!list.contains("protected_presentation"));
+                        use evertrace_domain::query::{
+                            ExactReadQuery, ExactRecordInfo, ExactRecordQuery, ExactRecordRef,
+                            ExactSourceTextQuery, ExactUtf8Range, HumanContentState,
+                            HumanRevisionRef, SourceTextField,
+                        };
                         let response = client
                             .request(
                                 RequestId::new_v7(),
                                 Rpc::HumanGovernance(HumanGovernanceRequest::Read {
-                                    request: HumanReadRequest::Detail {
-                                        surface: HumanSurface::Explorer,
-                                        object_ref: object.clone(),
-                                        expected_frontier: frontier,
-                                        expected_revision_ref: None,
+                                    request: HumanReadRequest::ReadExact {
+                                        query: Box::new(ExactReadQuery::Record(ExactRecordQuery {
+                                            reference: ExactRecordRef {
+                                                stable_key: object.clone(),
+                                                revision_ref: Some(
+                                                    largest.source_receipt_id.to_string(),
+                                                ),
+                                            },
+                                            field: None,
+                                            range: None,
+                                            expected_data_identity: None,
+                                            expected_selection: None,
+                                        })),
                                     },
                                 }),
                             )
                             .await
                             .unwrap();
-                        match response {
-                            Response::HumanGovernance(HumanGovernanceResponse::Conflict {
-                                ..
-                            }) => continue,
-                            Response::HumanGovernance(HumanGovernanceResponse::Snapshot {
-                                items,
-                                ..
-                            }) => {
-                                assert_eq!(items.len(), 1);
-                                let detail = items[0].evidence_detail.as_ref().unwrap();
-                                assert_eq!(detail.observation_role, ObservationRole::Message);
-                                assert_eq!(detail.content_trust, ContentTrust::Observed);
-                                assert_eq!(
-                                    detail.capture_completeness,
-                                    CaptureCompleteness::Partial
-                                );
-                                assert!(
-                                    matches!(&detail.protected_presentation, Some(evertrace_domain::evidence::ProtectedPresentation::Preview { text }) if text.len() <= 65_536)
-                                );
-                                assert_eq!(detail.protected_length, largest.protected_length);
-                                let encoded = serde_json::to_string(&items).unwrap();
-                                assert!(!encoded.contains("secret-canary-value"));
-                                observed = true;
-                                break;
-                            }
-                            other => panic!("unexpected detail: {other:?}"),
+                        let Response::HumanGovernance(HumanGovernanceResponse::RecordWindow {
+                            page,
+                        }) = response
+                        else {
+                            panic!("source facts")
+                        };
+                        if page.content_state == HumanContentState::Missing {
+                            continue;
                         }
+                        assert_eq!(page.content_state, HumanContentState::Ready);
+                        let encoded = serde_json::to_string(&page).unwrap();
+                        assert!(
+                            !encoded.contains("secret-canary-value")
+                                && !encoded.contains("protected_presentation")
+                        );
+                        let ExactRecordInfo::Source { record, source, .. } = page.info.unwrap()
+                        else {
+                            panic!("source")
+                        };
+                        assert_eq!(record.observation_role, ObservationRole::Message);
+                        assert_eq!(record.content_trust, ContentTrust::Observed);
+                        assert_eq!(record.completeness, CaptureCompleteness::Partial);
+                        assert_eq!(source.protected_bytes, largest.protected_length);
+                        let Response::HumanGovernance(HumanGovernanceResponse::SourceWindow {
+                            page,
+                        }) = client
+                            .request(
+                                RequestId::new_v7(),
+                                Rpc::HumanGovernance(HumanGovernanceRequest::Read {
+                                    request: HumanReadRequest::ReadExact {
+                                        query: Box::new(ExactReadQuery::SourceText(
+                                            ExactSourceTextQuery {
+                                                field: SourceTextField::Presentation,
+                                                reference: HumanRevisionRef {
+                                                    stable_key: object.clone(),
+                                                    revision_ref: largest
+                                                        .source_receipt_id
+                                                        .to_string(),
+                                                },
+                                                range: Some(ExactUtf8Range {
+                                                    offset: 0,
+                                                    length: 8192,
+                                                }),
+                                                expected_data_identity: None,
+                                                expected_source: None,
+                                            },
+                                        )),
+                                    },
+                                }),
+                            )
+                            .await
+                            .unwrap()
+                        else {
+                            panic!("source presentation")
+                        };
+                        assert_eq!(page.content_state, HumanContentState::Ready);
+                        let window = page.window.unwrap();
+                        assert!(window.text.len() <= 8192 && window.total_bytes > 65_536);
+                        assert!(!window.text.contains("secret-canary-value"));
+                        observed = true;
+                        break;
                     }
                     assert!(observed);
                     break;

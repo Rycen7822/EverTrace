@@ -767,7 +767,6 @@ fn human_wire_is_closed_and_tui_renders_daemon_snapshot() {
         source_context: None,
         semantic_detail: None,
         proposal_base: None,
-        evidence_detail: None,
         work_detail: None,
         item_kind: HumanItemKind::RevisionProposal,
         proposal: Some(proposal),
@@ -2160,18 +2159,31 @@ async fn plain_accept_uses_one_real_command_for_atom_procedure_and_core_inner() 
         .find(|row| row.row_id == format!("projection:evidence_surface:{observation_ref}"))
         .unwrap();
     let reads = HumanGovernanceService::new(handle.clone(), CONFIG);
-    let by_reference = reads
-        .detail(
-            HumanSurface::Explorer,
-            &observation_ref,
-            snapshot.frontier,
-            None,
+    let evertrace_domain::query::MetadataReadOutcome::Page(by_reference) =
+        evertrace_engine::EngineService::read_exact_record(
+            handle.clone(),
+            Box::new(evertrace_domain::query::ExactRecordQuery {
+                reference: evertrace_domain::query::ExactRecordRef {
+                    stable_key: observation_ref.clone(),
+                    revision_ref: None,
+                },
+                field: None,
+                range: None,
+                expected_data_identity: None,
+                expected_selection: None,
+            }),
+            CONFIG,
+            std::sync::Arc::new(tokio::sync::RwLock::new(None)),
         )
         .await
         .unwrap()
-        .unwrap();
-    assert_eq!(by_reference.items.len(), 1);
-    assert_eq!(by_reference.items[0].stable_key, fact.row_id);
+    else {
+        panic!("source record")
+    };
+    assert_eq!(
+        by_reference.metadata.as_ref().unwrap()["row_id"],
+        fact.row_id
+    );
     let by_projection = reads
         .detail(
             HumanSurface::Explorer,
@@ -5421,12 +5433,33 @@ async fn plain_accept_uses_one_real_command_for_atom_procedure_and_core_inner() 
         )
         .await
         .unwrap();
-    let surface_allowed = reopened_service
-        .detail(HumanSurface::Explorer, &surface_ref, 0, Some(&surface_ref))
+    let reference = &surface_ref;
+    let evertrace_domain::query::MetadataReadOutcome::Page(surface_allowed) =
+        evertrace_engine::EngineService::read_exact_record(
+            reopened_handle.clone(),
+            Box::new(evertrace_domain::query::ExactRecordQuery {
+                reference: evertrace_domain::query::ExactRecordRef {
+                    stable_key: reference.clone(),
+                    revision_ref: Some(reference.clone()),
+                },
+                field: None,
+                range: None,
+                expected_data_identity: None,
+                expected_selection: None,
+            }),
+            CONFIG,
+            report.clone(),
+        )
         .await
         .unwrap()
-        .unwrap();
-    assert!(surface_allowed.items[0].source_context.is_some());
+    else {
+        panic!("surface source facts")
+    };
+    assert_eq!(
+        surface_allowed.content_state,
+        evertrace_domain::query::HumanContentState::Ready
+    );
+    assert!(surface_allowed.info.is_some());
     // Trust revocation is durable; exercise it after the acceptance scenario.
     std::fs::write(
         adapter.join("config.toml"),
@@ -5471,15 +5504,32 @@ async fn plain_accept_uses_one_real_command_for_atom_procedure_and_core_inner() 
         evertrace_engine::HumanContentState::AccessDenied
     );
     for reference in [&observation_ref, &surface_ref] {
-        let source_denied = reopened_service
-            .detail(HumanSurface::Explorer, reference, 0, Some(reference))
+        let evertrace_domain::query::MetadataReadOutcome::Page(source_denied) =
+            evertrace_engine::EngineService::read_exact_record(
+                reopened_handle.clone(),
+                Box::new(evertrace_domain::query::ExactRecordQuery {
+                    reference: evertrace_domain::query::ExactRecordRef {
+                        stable_key: reference.clone(),
+                        revision_ref: Some(reference.clone()),
+                    },
+                    field: None,
+                    range: None,
+                    expected_data_identity: None,
+                    expected_selection: None,
+                }),
+                CONFIG,
+                report.clone(),
+            )
             .await
             .unwrap()
-            .unwrap();
-        assert!(
-            source_denied.items[0].source_context.is_none(),
-            "direct receipt or surface scope must remain enforced"
+        else {
+            panic!("source read")
+        };
+        assert_eq!(
+            source_denied.content_state,
+            evertrace_domain::query::HumanContentState::AccessDenied
         );
+        assert!(source_denied.info.is_none() && source_denied.window.is_none());
     }
     let snapshot = reopened_handle.project().await.unwrap();
     let target = evertrace_domain::purge::ObjectDeletionTarget::Procedure { procedure_id };
@@ -5579,6 +5629,72 @@ async fn protected_archive_export(
         GlobalPromotionConfig::default(),
     )
     .with_session_report(report.clone());
+    use evertrace_domain::query::{
+        ExactRecordQuery, ExactRecordRef, ExactSourceTextQuery, ExactUtf8Range,
+        HumanContentState as ReadState, HumanRevisionRef, MetadataReadOutcome, SourceTextField,
+    };
+    let read_record = |stable_key: String, revision_ref: String| {
+        let writer = import_handle.clone();
+        let report = report.clone();
+        async move {
+            let MetadataReadOutcome::Page(page) =
+                evertrace_engine::EngineService::read_exact_record(
+                    writer,
+                    Box::new(ExactRecordQuery {
+                        reference: ExactRecordRef {
+                            stable_key,
+                            revision_ref: Some(revision_ref),
+                        },
+                        field: None,
+                        range: None,
+                        expected_data_identity: None,
+                        expected_selection: None,
+                    }),
+                    CONFIG,
+                    report,
+                )
+                .await
+                .unwrap()
+            else {
+                panic!("exact source record")
+            };
+            *page
+        }
+    };
+    let preview_cas = import_runtime.cas_dir.clone();
+    let read_preview = |stable_key: String, revision_ref: String| {
+        let writer = import_handle.clone();
+        let report = report.clone();
+        let cas = preview_cas.clone();
+        async move {
+            let MetadataReadOutcome::Page(page) =
+                evertrace_engine::EngineService::read_exact_source(
+                    writer,
+                    Box::new(ExactSourceTextQuery {
+                        reference: HumanRevisionRef {
+                            stable_key,
+                            revision_ref,
+                        },
+                        field: SourceTextField::Presentation,
+                        range: Some(ExactUtf8Range {
+                            offset: 0,
+                            length: 8192,
+                        }),
+                        expected_data_identity: None,
+                        expected_source: None,
+                    }),
+                    CONFIG,
+                    report,
+                    cas,
+                )
+                .await
+                .unwrap()
+            else {
+                panic!("exact source presentation")
+            };
+            *page
+        }
+    };
     let catalog =
         evertrace_engine::session_import::SessionCatalogService::new(import_handle.clone(), CONFIG);
     catalog
@@ -5644,17 +5760,16 @@ async fn protected_archive_export(
         expected_revision_ref: archived.current_revision_id.clone(),
     }];
     std::fs::remove_file(transcript).unwrap();
-    let readable = import_service
-        .detail(
-            HumanSurface::Explorer,
-            &archived.row_id,
-            imported.frontier,
-            archived.current_revision_id.as_deref(),
-        )
+    let legacy_page = import_service
+        .list(HumanSurface::Explorer, None, None, 64)
         .await
         .unwrap()
         .unwrap();
-    let context = readable.items[0]
+    let context = legacy_page
+        .items
+        .iter()
+        .find(|item| item.stable_key == archived.row_id)
+        .unwrap()
         .source_context
         .as_ref()
         .expect("archived source context");
@@ -5667,11 +5782,6 @@ async fn protected_archive_export(
     };
     assert_eq!(context.recorded_at_us, receipt.recorded_at_us);
     assert_eq!(context.event_time_us, receipt.event_time_us);
-    let legacy_page = import_service
-        .list(HumanSurface::Explorer, None, None, 64)
-        .await
-        .unwrap()
-        .unwrap();
     let legacy_capture = legacy_page
         .items
         .iter()
@@ -5731,56 +5841,58 @@ async fn protected_archive_export(
             else {
                 panic!("receipt")
             };
-            let expected_evidence = evertrace_engine::HumanEvidenceDetail {
-                source_kind: receipt.source_kind,
-                observation_role: observation.observation_role,
-                source_role: observation.source_role,
-                content_trust: observation.content_trust,
-                capture_completeness: receipt.capture_completeness,
-                protected_presentation: receipt.protected_presentation.clone(),
-                protected_length: receipt.protected_length,
-                cas_ref: receipt.cas_ref.clone(),
+            let detail =
+                read_record(item.stable_key.clone(), item.revision_ref.clone().unwrap()).await;
+            assert_eq!(detail.content_state, ReadState::Ready);
+            assert!(detail.state.frontier >= capture.frontier);
+            let evertrace_domain::query::ExactRecordInfo::Source {
+                record,
+                source,
+                source_kind,
+                source_session_ref,
+            } = detail.info.as_ref().unwrap()
+            else {
+                panic!("source facts")
             };
-            let detail = import_service
-                .detail(
-                    HumanSurface::Explorer,
-                    &item.stable_key,
-                    capture.frontier,
-                    item.revision_ref.as_deref(),
-                )
-                .await
-                .unwrap()
-                .unwrap();
-            let mut expected_detail = item.clone();
-            expected_detail.evidence_detail = Some(expected_evidence.clone());
-            assert_eq!(detail.items, vec![expected_detail]);
-            let receipt_detail = import_service
-                .detail(
-                    HumanSurface::Explorer,
-                    receipt_row.object_id.as_deref().unwrap(),
-                    capture.frontier,
-                    receipt_row.current_revision_id.as_deref(),
-                )
-                .await
-                .unwrap()
-                .unwrap();
+            assert_eq!(*source_kind, receipt.source_kind);
+            assert_eq!(*source_session_ref, receipt.source_session_ref);
+            assert_eq!(record.observation_id, observation.source_observation_id);
+            assert_eq!(record.receipt_id, receipt.source_receipt_id);
+            assert_eq!(record.observation_role, observation.observation_role);
+            assert_eq!(record.source_role, observation.source_role);
+            assert_eq!(record.content_trust, observation.content_trust);
+            assert_eq!(record.completeness, receipt.capture_completeness);
+            assert_eq!(record.event_time_us, receipt.event_time_us);
+            assert_eq!(record.recorded_at_us, receipt.recorded_at_us);
+            assert_eq!(record.event_time_provenance, receipt.event_time_provenance);
+            assert_eq!(source.protected_bytes, receipt.protected_length);
+            assert_eq!(source.original_bytes, receipt.original_length);
+            assert_eq!(source.payload_fingerprint, observation.payload_fingerprint);
+            let receipt_detail = read_record(
+                receipt_row.object_id.clone().unwrap(),
+                receipt_row.current_revision_id.clone().unwrap(),
+            )
+            .await;
+            assert_eq!(receipt_detail.info, detail.info);
             assert_eq!(
-                receipt_detail.items[0].evidence_detail,
-                Some(expected_evidence.clone())
-            );
-            let mut expected_receipt = legacy_page
-                .items
-                .iter()
-                .find(|item| item.stable_key == receipt_row.row_id)
-                .unwrap()
-                .clone();
-            expected_receipt.evidence_detail = Some(expected_evidence);
-            assert_eq!(receipt_detail.items, vec![expected_receipt]);
-            assert_eq!(receipt_detail.items[0].source_context, item.source_context);
-            assert_eq!(
-                receipt_detail.items[0].source_event_seq,
+                receipt_detail.selection.as_ref().unwrap().source_event_seq,
                 receipt_row.source_event_seq
             );
+            let preview =
+                read_preview(item.stable_key.clone(), item.revision_ref.clone().unwrap()).await;
+            match &receipt.protected_presentation {
+                Some(
+                    evertrace_domain::evidence::ProtectedPresentation::Inline { text }
+                    | evertrace_domain::evidence::ProtectedPresentation::Preview { text },
+                ) => {
+                    assert_eq!(preview.content_state, ReadState::Ready);
+                    let window = preview.window.unwrap();
+                    assert_eq!(window.start, 0);
+                    assert_eq!(window.total_bytes, text.len() as u64);
+                    assert_eq!(window.text, text[..window.end as usize]);
+                }
+                _ => assert!(preview.window.is_none()),
+            }
         }
     }
     assert!(cursor.is_none());
@@ -5895,25 +6007,30 @@ async fn protected_archive_export(
         )
         .await
         .unwrap();
-    let independent_before = import_service
-        .detail(
+    let independent_before = read_record(independent_ref.clone(), independent_ref.clone()).await;
+    assert_eq!(independent_before.content_state, ReadState::Ready);
+    let independent_preview = read_preview(independent_ref.clone(), independent_ref.clone()).await;
+    assert_eq!(
+        independent_preview.window.as_ref().unwrap().text,
+        "reviewed evidence"
+    );
+    let independent_context = import_service
+        .list_selected(
             HumanSurface::Explorer,
-            &independent_ref,
-            imported.frontier,
-            Some(&independent_ref),
+            None,
+            None,
+            64,
+            Some(evertrace_engine::HumanExplorerListSelection::Capture),
         )
         .await
         .unwrap()
+        .unwrap()
+        .items
+        .into_iter()
+        .find(|item| item.object_ref.as_deref() == Some(independent_ref.as_str()))
+        .unwrap()
+        .source_context
         .unwrap();
-    assert!(independent_before.items[0].source_context.is_some());
-    assert!(matches!(
-        independent_before.items[0]
-            .evidence_detail
-            .as_ref()
-            .unwrap()
-            .protected_presentation,
-        Some(evertrace_domain::evidence::ProtectedPresentation::Inline { .. })
-    ));
     assert_eq!(
         admin
             .handle(
@@ -5933,50 +6050,35 @@ async fn protected_archive_export(
         "{revoked_export:?}"
     );
     assert!(revoked_export.path.is_none());
-    let denied = import_service
-        .detail(
-            HumanSurface::Explorer,
-            &archived.row_id,
-            import_handle.project().await.unwrap().frontier,
-            archived.current_revision_id.as_deref(),
-        )
-        .await
-        .unwrap()
-        .unwrap();
-    assert!(denied.items[0].source_context.is_none());
-    assert!(denied.items[0].evidence_detail.is_none());
-    let independent_after = import_service
-        .detail(
-            HumanSurface::Explorer,
-            &independent_ref,
-            imported.frontier,
-            Some(&independent_ref),
-        )
-        .await
-        .unwrap()
-        .unwrap();
+    let denied = read_record(
+        archived.row_id.clone(),
+        archived.current_revision_id.clone().unwrap(),
+    )
+    .await;
+    assert_eq!(denied.content_state, ReadState::AccessDenied);
+    assert!(denied.info.is_none() && denied.window.is_none());
+    let denied_preview = read_preview(
+        archived.row_id.clone(),
+        archived.current_revision_id.clone().unwrap(),
+    )
+    .await;
+    assert_eq!(denied_preview.content_state, ReadState::AccessDenied);
+    assert!(denied_preview.window.is_none() && denied_preview.source.is_none());
+    let independent_after = read_record(independent_ref.clone(), independent_ref.clone()).await;
+    assert_eq!(independent_after.content_state, ReadState::Ready);
     assert_eq!(
-        independent_after.items[0].evidence_detail,
-        independent_before.items[0].evidence_detail
+        independent_after.info, independent_before.info,
+        "unrelated revoked Task request root must not hide the selected source facts"
     );
-    assert_eq!(
-        independent_after.items[0].source_context, independent_before.items[0].source_context,
-        "unrelated revoked Task request root must not hide the selected source context"
-    );
-    let independent_receipt_after = import_service
-        .detail(
-            HumanSurface::Explorer,
-            &independent_receipt_ref,
-            imported.frontier,
-            Some(&independent_receipt_ref),
-        )
-        .await
-        .unwrap()
-        .unwrap();
-    assert_eq!(
-        independent_receipt_after.items[0].source_context,
-        independent_after.items[0].source_context
-    );
+    let independent_preview_after =
+        read_preview(independent_ref.clone(), independent_ref.clone()).await;
+    assert_eq!(independent_preview_after.window, independent_preview.window);
+    let independent_receipt_after = read_record(
+        independent_receipt_ref.clone(),
+        independent_receipt_ref.clone(),
+    )
+    .await;
+    assert_eq!(independent_receipt_after.info, independent_after.info);
     let independent_export = import_service
         .export(vec![evertrace_engine::HumanExportSelection {
             object_ref: independent_ref.clone(),
@@ -6023,7 +6125,7 @@ async fn protected_archive_export(
             .find(|item| item.object_ref.as_deref() == Some(independent_ref.as_str()))
             .unwrap()
             .source_context,
-        independent_before.items[0].source_context
+        Some(independent_context)
     );
     import_handle.shutdown().await.unwrap();
     import_task.await.unwrap().unwrap();

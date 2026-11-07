@@ -1326,8 +1326,24 @@ fn source_digest(
 }
 
 fn presentation_text(receipt: &evertrace_domain::evidence::SourceReceipt) -> String {
-    serde_json::to_string(&serde_json::json!({"protected_presentation":super::super::human_governance::bounded_evidence_presentation(receipt.protected_presentation.clone()),
-        "protected_length":receipt.protected_length,"cas_ref":receipt.cas_ref})).unwrap_or_default()
+    use evertrace_domain::evidence::ProtectedPresentation;
+    let presentation = receipt
+        .protected_presentation
+        .clone()
+        .map(|value| match value {
+            ProtectedPresentation::Inline { mut text } if text.len() > 65_536 => {
+                let mut end = 65_536;
+                while !text.is_char_boundary(end) {
+                    end -= 1;
+                }
+                text.truncate(end);
+                ProtectedPresentation::Preview { text }
+            }
+            value => value,
+        });
+    serde_json::to_string(&serde_json::json!({
+        "protected_presentation":presentation, "protected_length":receipt.protected_length, "cas_ref":receipt.cas_ref,
+    })).unwrap_or_default()
 }
 
 fn evidence_item(row: &ObjectRow, text: String, trust: ContentTrust) -> McpServiceItem {

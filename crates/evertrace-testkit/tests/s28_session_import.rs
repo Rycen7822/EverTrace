@@ -2259,19 +2259,40 @@ async fn source_only_archive_later_restriction_closes_reads_and_purge_after_rest
         .map(|row| (row.row_id.clone(), row.payload_json.clone().unwrap()))
         .collect::<Vec<_>>();
     assert_eq!(originals.len(), 2);
-    let human = evertrace_engine::HumanGovernanceService::new(writer.clone(), CONFIG)
-        .with_session_report(Arc::clone(&report));
-    let detail = human
-        .detail(
-            evertrace_engine::HumanSurface::Explorer,
-            &originals[0].0,
-            snapshot.frontier,
-            None,
-        )
-        .await
-        .unwrap()
-        .unwrap();
-    assert!(detail.items[0].evidence_detail.is_some());
+    let read_source = |reference: String| {
+        let writer = writer.clone();
+        let report = report.clone();
+        async move {
+            let stable_key = reference
+                .strip_prefix("object:evidence:source_receipt:")
+                .unwrap()
+                .to_owned();
+            let evertrace_domain::query::MetadataReadOutcome::Page(page) =
+                evertrace_engine::EngineService::read_exact_record(
+                    writer,
+                    Box::new(evertrace_domain::query::ExactRecordQuery {
+                        reference: evertrace_domain::query::ExactRecordRef {
+                            stable_key,
+                            revision_ref: None,
+                        },
+                        field: None,
+                        range: None,
+                        expected_data_identity: None,
+                        expected_selection: None,
+                    }),
+                    CONFIG,
+                    report,
+                )
+                .await
+                .unwrap()
+            else {
+                panic!("source metadata")
+            };
+            *page
+        }
+    };
+    let detail = read_source(originals[0].0.clone()).await;
+    assert!(detail.info.is_some());
     assert!(originals.iter().all(|(_, raw)| {
         matches!(serde_json::from_str::<JournalPayload>(raw).unwrap(), JournalPayload::SourceReceiptRecorded(receipt)
             if receipt.repository_instance_id.is_none() && receipt.worktree_instance_id.is_none())
@@ -2296,8 +2317,7 @@ async fn source_only_archive_later_restriction_closes_reads_and_purge_after_rest
         let report_value = &report_value;
         let workspace = &workspace;
         let originals = &originals;
-        let human = &human;
-        let writer = &writer;
+        let read_source = &read_source;
         async move {
             let mut texts = Vec::new();
             for (action, input) in [
@@ -2359,18 +2379,8 @@ async fn source_only_archive_later_restriction_closes_reads_and_purge_after_rest
                         .map(|item| (item.object_ref, item.text)),
                 );
             }
-            let snapshot = writer.project().await.unwrap();
-            let detail = human
-                .detail(
-                    evertrace_engine::HumanSurface::Explorer,
-                    &originals[0].0,
-                    snapshot.frontier,
-                    None,
-                )
-                .await
-                .unwrap()
-                .unwrap();
-            assert_eq!(detail.items[0].evidence_detail.is_none(), restricted);
+            let detail = read_source(originals[0].0.clone()).await;
+            assert_eq!(detail.info.is_none(), restricted);
             texts
         }
     };
@@ -2540,18 +2550,8 @@ async fn source_only_archive_later_restriction_closes_reads_and_purge_after_rest
                 .as_ref()
                 .is_some_and(|state| state.trust_revoked)
     }));
-    let snapshot = writer.project().await.unwrap();
-    let detail = human
-        .detail(
-            evertrace_engine::HumanSurface::Explorer,
-            &originals[0].0,
-            snapshot.frontier,
-            None,
-        )
-        .await
-        .unwrap()
-        .unwrap();
-    assert!(detail.items[0].evidence_detail.is_none());
+    let detail = read_source(originals[0].0.clone()).await;
+    assert!(detail.info.is_none() && detail.window.is_none());
     read(true).await;
     let repository_revision = after
         .read_repositories
@@ -2559,6 +2559,7 @@ async fn source_only_archive_later_restriction_closes_reads_and_purge_after_rest
         .find(|value| value.repository_id == repository)
         .unwrap()
         .repository_revision;
+    let snapshot = writer.project().await.unwrap();
     let preview = evertrace_store::projections::repository_scope_purge_preview(
         &snapshot,
         repository,
@@ -2757,23 +2758,39 @@ async fn nearest_git_restricts_nested_source_and_external_linked_worktree_conver
         .unwrap()
         .row_id
         .clone();
-    let human = evertrace_engine::HumanGovernanceService::new(writer.clone(), CONFIG)
-        .with_session_report(Arc::clone(&report));
-    assert!(
-        human
-            .detail(
-                evertrace_engine::HumanSurface::Explorer,
-                &receipt_row,
-                snapshot.frontier,
-                None
-            )
-            .await
-            .unwrap()
-            .unwrap()
-            .items[0]
-            .evidence_detail
-            .is_some()
-    );
+    let read_source = |reference: String| {
+        let writer = writer.clone();
+        let report = report.clone();
+        async move {
+            let stable_key = reference
+                .strip_prefix("object:evidence:source_receipt:")
+                .unwrap()
+                .to_owned();
+            let evertrace_domain::query::MetadataReadOutcome::Page(page) =
+                evertrace_engine::EngineService::read_exact_record(
+                    writer,
+                    Box::new(evertrace_domain::query::ExactRecordQuery {
+                        reference: evertrace_domain::query::ExactRecordRef {
+                            stable_key,
+                            revision_ref: None,
+                        },
+                        field: None,
+                        range: None,
+                        expected_data_identity: None,
+                        expected_selection: None,
+                    }),
+                    CONFIG,
+                    report,
+                )
+                .await
+                .unwrap()
+            else {
+                panic!("source metadata")
+            };
+            *page
+        }
+    };
+    assert!(read_source(receipt_row.clone()).await.info.is_some());
     let body = fs::read_to_string(&files[1]).unwrap();
     fs::write(&files[1], format!("{body}{{\"type\":\"event_msg\",\"payload\":{{\"type\":\"user_message\",\"message\":\"later\"}}}}\n")).unwrap();
     assert_eq!(catalog.refresh(&report_value).await.unwrap(), 1);
@@ -2793,21 +2810,7 @@ async fn nearest_git_restricts_nested_source_and_external_linked_worktree_conver
         .await
         .unwrap()
         .unwrap();
-    assert!(
-        human
-            .detail(
-                evertrace_engine::HumanSurface::Explorer,
-                &receipt_row,
-                before.frontier,
-                None
-            )
-            .await
-            .unwrap()
-            .unwrap()
-            .items[0]
-            .evidence_detail
-            .is_none()
-    );
+    assert!(read_source(receipt_row.clone()).await.info.is_none());
     assert_eq!(
         writer
             .session_import_context(&sources[1])
@@ -2961,18 +2964,9 @@ async fn nearest_git_restricts_nested_source_and_external_linked_worktree_conver
             && row.payload_json.as_ref().is_some_and(|raw| matches!(serde_json::from_str::<JournalPayload>(raw).unwrap(), JournalPayload::SourceReceiptRecorded(receipt) if receipt.source_instance_id.as_str() == sources[2]))
     }).unwrap();
     assert!(
-        human
-            .detail(
-                evertrace_engine::HumanSurface::Explorer,
-                &external_receipt.row_id,
-                snapshot.frontier,
-                None
-            )
+        read_source(external_receipt.row_id.clone())
             .await
-            .unwrap()
-            .unwrap()
-            .items[0]
-            .evidence_detail
+            .info
             .is_some()
     );
     let repositories =
@@ -3048,7 +3042,6 @@ async fn nearest_git_restricts_nested_source_and_external_linked_worktree_conver
     drop(worker);
     drop(admin);
     drop(catalog);
-    drop(human);
     drop(writer);
     task.await.unwrap().unwrap();
 }

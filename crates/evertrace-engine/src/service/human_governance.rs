@@ -167,7 +167,6 @@ pub struct HumanSummary {
     pub source_context: Option<HumanSourceContext>,
     pub semantic_detail: Option<HumanSemanticDetail>,
     pub proposal_base: Option<HumanSemanticDetail>,
-    pub evidence_detail: Option<HumanEvidenceDetail>,
     pub work_detail: Option<HumanWorkDetail>,
     pub proposal: Option<HumanProposalSummary>,
     pub proposal_review: Option<HumanProposalReview>,
@@ -205,18 +204,6 @@ pub struct HumanSourceContext {
     pub recorded_at_us: i64,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub event_time_provenance: Option<evertrace_domain::evidence::EventTimeProvenance>,
-}
-
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub struct HumanEvidenceDetail {
-    pub source_kind: evertrace_domain::evidence::EvidenceSourceKind,
-    pub observation_role: evertrace_domain::evidence::ObservationRole,
-    pub source_role: evertrace_domain::evidence::SourceRole,
-    pub content_trust: evertrace_domain::evidence::ContentTrust,
-    pub capture_completeness: evertrace_domain::evidence::CaptureCompleteness,
-    pub protected_presentation: Option<evertrace_domain::evidence::ProtectedPresentation>,
-    pub protected_length: u64,
-    pub cas_ref: String,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, serde::Serialize)]
@@ -892,7 +879,6 @@ impl HumanGovernanceService {
         );
         for item in items {
             if blocked.contains(&item.stable_key) {
-                item.evidence_detail = None;
                 item.source_context = None;
                 item.work_detail = None;
                 item.proposal_review = None;
@@ -1054,7 +1040,7 @@ impl HumanGovernanceService {
             if expected_frontier.is_some_and(|frontier| frontier != context.frontier) {
                 return Ok(Err(context.frontier));
             }
-            return Ok(Ok(Box::pin(self.capture_page(context, false)).await?));
+            return Ok(Ok(Box::pin(self.capture_page(context)).await?));
         }
         if selection == Some(HumanExplorerListSelection::Memories) {
             let context = self
@@ -1196,24 +1182,7 @@ impl HumanGovernanceService {
                     .parse::<evertrace_domain::ids::SourceReceiptId>()
                     .is_ok())
         {
-            let context = self
-                .writer
-                .capture_current_context(None, Some(object_ref.to_owned()), 1)
-                .await
-                .map_err(|_| HumanGovernanceError::Store)?;
-            if context.frontier < expected_frontier {
-                return Ok(Err((context.frontier, None)));
-            }
-            if let Some(expected) = expected_revision_ref
-                && let Some(current) = context
-                    .items
-                    .first()
-                    .and_then(|item| item.selected.current_revision_id.as_ref())
-                && current != expected
-            {
-                return Ok(Err((context.frontier, Some(current.clone()))));
-            }
-            return Ok(Ok(Box::pin(self.capture_page(context, true)).await?));
+            return Err(HumanGovernanceError::InvalidInput);
         }
         let snapshot = self
             .writer
@@ -1233,6 +1202,14 @@ impl HumanGovernanceService {
                     || row.current_revision_id.as_deref() == Some(object_ref)
             })
             .collect::<Vec<_>>();
+        if matching.iter().any(|row| {
+            matches!(
+                row.object_kind.as_deref(),
+                Some("source_receipt" | "source_observation")
+            )
+        }) {
+            return Err(HumanGovernanceError::InvalidInput);
+        }
         // Stable row locators are exact. A logical fact reference must not be
         // made ambiguous by derived projections carrying the same revision.
         if matching.iter().any(|row| row.row_id == object_ref) {
@@ -3977,11 +3954,6 @@ fn summary(
     surface: HumanSurface,
     include_detail: bool,
 ) -> Result<HumanSummary, HumanGovernanceError> {
-    let evidence_detail = if include_detail && surface == HumanSurface::Explorer {
-        source_evidence_detail(snapshot, row)?
-    } else {
-        None
-    };
     let work_detail = if include_detail && surface == HumanSurface::Explorer {
         work_evidence_detail(snapshot, row)?
     } else {
@@ -4252,7 +4224,6 @@ fn summary(
         } else {
             human_item_category(surface, row)
         },
-        evidence_detail,
         work_detail,
         proposal,
         proposal_review,
@@ -4317,7 +4288,6 @@ fn summary_fields(row: &ObjectRow, surface: HumanSurface) -> HumanSummary {
         source_context: None,
         semantic_detail: None,
         proposal_base: None,
-        evidence_detail: None,
         work_detail: None,
         proposal: None,
         proposal_review: None,
@@ -4393,90 +4363,6 @@ pub(crate) fn work_evidence_detail(
         phase: stream.as_ref().map(|value| value.phase_contract.clone()),
         acceptance: stream.map(|value| value.acceptance_boundary),
     }))
-}
-
-fn source_evidence_detail(
-    snapshot: &ProjectionSnapshot,
-    row: &ObjectRow,
-) -> Result<Option<HumanEvidenceDetail>, HumanGovernanceError> {
-    source_evidence_detail_from_rows(row, |id| snapshot.row(id))
-}
-
-fn source_evidence_detail_from_rows<'a>(
-    row: &ObjectRow,
-    lookup: impl Fn(&str) -> Option<&'a ObjectRow>,
-) -> Result<Option<HumanEvidenceDetail>, HumanGovernanceError> {
-    if !matches!(
-        row.object_kind.as_deref(),
-        Some("source_receipt" | "source_observation")
-    ) {
-        return Ok(None);
-    }
-    let decode = |row: &ObjectRow| {
-        serde_json::from_str::<JournalPayload>(
-            row.payload_json
-                .as_deref()
-                .ok_or(HumanGovernanceError::Store)?,
-        )
-        .map_err(|_| HumanGovernanceError::Store)
-    };
-    let (receipt, observation) = match decode(row)? {
-        JournalPayload::SourceReceiptRecorded(receipt) => {
-            let other = lookup(&format!(
-                "object:evidence:source_observation:{}",
-                receipt.source_observation_id
-            ))
-            .ok_or(HumanGovernanceError::Store)?;
-            let JournalPayload::SourceObservationRecorded(observation) = decode(other)? else {
-                return Err(HumanGovernanceError::Store);
-            };
-            (receipt, observation)
-        }
-        JournalPayload::SourceObservationRecorded(observation) => {
-            let other = lookup(&format!(
-                "object:evidence:source_receipt:{}",
-                observation.source_receipt_ref
-            ))
-            .ok_or(HumanGovernanceError::Store)?;
-            let JournalPayload::SourceReceiptRecorded(receipt) = decode(other)? else {
-                return Err(HumanGovernanceError::Store);
-            };
-            (receipt, observation)
-        }
-        _ => return Err(HumanGovernanceError::Store),
-    };
-    if receipt.source_observation_id != observation.source_observation_id
-        || receipt.source_receipt_id != observation.source_receipt_ref
-    {
-        return Err(HumanGovernanceError::Store);
-    }
-    Ok(Some(HumanEvidenceDetail {
-        source_kind: receipt.source_kind,
-        observation_role: observation.observation_role,
-        source_role: observation.source_role,
-        content_trust: observation.content_trust,
-        capture_completeness: receipt.capture_completeness,
-        protected_presentation: bounded_evidence_presentation(receipt.protected_presentation),
-        protected_length: receipt.protected_length,
-        cas_ref: receipt.cas_ref,
-    }))
-}
-
-pub(crate) fn bounded_evidence_presentation(
-    presentation: Option<evertrace_domain::evidence::ProtectedPresentation>,
-) -> Option<evertrace_domain::evidence::ProtectedPresentation> {
-    use evertrace_domain::evidence::ProtectedPresentation;
-    presentation.map(|presentation| match presentation {
-        ProtectedPresentation::Inline { mut text } if text.len() > 65_536 => {
-            let mut end = 65_536;
-            while !text.is_char_boundary(end) {
-                end -= 1;
-            }
-            text.truncate(end);
-            ProtectedPresentation::Preview { text }
-        }
-        presentation => presentation,
-    })
 }
 
 fn forget_target(row: &ObjectRow) -> Result<Option<ObjectDeletionTarget>, HumanGovernanceError> {

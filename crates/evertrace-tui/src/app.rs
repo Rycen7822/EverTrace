@@ -3534,7 +3534,6 @@ mod tests {
             source_context: None,
             semantic_detail: None,
             proposal_base: None,
-            evidence_detail: None,
             work_detail: None,
             item_kind: HumanItemKind::RevisionProposal,
             proposal: Some(HumanProposalMetadata {
@@ -4078,50 +4077,6 @@ mod tests {
             },
         });
         assert_eq!(app.state.route, crate::Route::Explorer);
-        assert!(matches!(
-            human_request(&app.state, UiCommand::Detail),
-            Some(evertrace_protocol::dto::HumanGovernanceRequest::Read {
-                request: evertrace_protocol::dto::HumanReadRequest::Detail { .. }
-            })
-        ));
-        let mut source = selected_item(&app.state).unwrap().clone();
-        source.evidence_detail = Some(evertrace_protocol::dto::HumanEvidenceDetail {
-            source_kind: evertrace_domain::evidence::EvidenceSourceKind::CodexHook,
-            observation_role: evertrace_domain::evidence::ObservationRole::Message,
-            source_role: evertrace_domain::evidence::SourceRole::Host,
-            content_trust: evertrace_domain::evidence::ContentTrust::Observed,
-            capture_completeness: evertrace_domain::evidence::CaptureCompleteness::Partial,
-            protected_presentation: Some(
-                evertrace_domain::evidence::ProtectedPresentation::Preview {
-                    text: "Keep this source text / 保留原始正文".into(),
-                },
-            ),
-            protected_length: 64,
-            cas_ref: "a".repeat(64),
-        });
-        let source_locator = HumanReadLocator::Detail {
-            expected_frontier: 10,
-            stable_key: source.stable_key.clone(),
-            expected_revision_ref: source.revision_ref.clone(),
-        };
-        app.handle(AppEvent::HumanRead {
-            surface: evertrace_protocol::dto::HumanSurface::Explorer,
-            locator: source_locator,
-            response: HumanGovernanceResponse::Snapshot {
-                diagnostics: None,
-                frontier: 10,
-                status: HumanSnapshotStatus::Ready,
-                degraded_reasons: vec![],
-                items: vec![source],
-                next_cursor: None,
-            },
-        });
-        for language in [crate::Language::Chinese, crate::Language::English] {
-            app.dispatch(UiCommand::Language(language));
-            assert!(render_app(&app, 80, 24).contains("Keep this source text"));
-        }
-        app.dispatch(UiCommand::CancelModal);
-        assert!(app.state.detail.is_none());
         assert!(app.state.related_context.is_some());
         app.dispatch(UiCommand::CancelModal);
         assert_eq!(app.state.route, crate::Route::Inbox);
@@ -4440,91 +4395,6 @@ mod tests {
     }
 
     #[test]
-    fn submitted_evidence_detail_is_authority_free_and_control_safe() {
-        use evertrace_domain::evidence::{
-            CaptureCompleteness, ContentTrust, EvidenceSourceKind, ObservationRole,
-            ProtectedPresentation, SourceRole,
-        };
-        let mut app = App::with_language(crate::Language::English);
-        app.state.route = crate::Route::Explorer;
-        let mut item = snapshot_item("source_receipt", "receipt-test".into());
-        assert!(
-            !String::from_utf8(evertrace_protocol::frame::canonical_json(&item).unwrap())
-                .unwrap()
-                .contains("evidence_detail")
-        );
-        item.evidence_detail = Some(evertrace_protocol::dto::HumanEvidenceDetail {
-            source_kind: EvidenceSourceKind::CodexHook,
-            observation_role: ObservationRole::Message,
-            source_role: SourceRole::Host,
-            content_trust: ContentTrust::Observed,
-            capture_completeness: CaptureCompleteness::Partial,
-            protected_presentation: Some(ProtectedPresentation::Preview {
-                text: "submitted \u{1b}[31m".into(),
-            }),
-            protected_length: 100,
-            cas_ref: "a".repeat(64),
-        });
-        app.state.detail = Some(item);
-        app.state.detail_frontier = None;
-        let rendered = render_app(&app, 140, 40);
-        assert!(rendered.contains("Message / Observed"));
-        assert!(rendered.contains("capture: Partial; instruction authority: none"));
-        assert!(rendered.contains("acceptance or task intent not established"));
-        assert!(rendered.contains("protected preview (partial): submitted"));
-        assert!(!rendered.contains('\u{1b}'));
-        app.state
-            .detail
-            .as_mut()
-            .unwrap()
-            .evidence_detail
-            .as_mut()
-            .unwrap()
-            .protected_presentation = Some(ProtectedPresentation::Preview {
-            text: format!("{} submitted-tail", "prefix ".repeat(30)),
-        });
-        assert!(render_app(&app, 140, 40).contains("submitted-tail"));
-        assert!(render_app(&app, 70, 40).contains("submitted-tail"));
-        let mut item = app.state.detail.take().unwrap();
-        item.evidence_detail
-            .as_mut()
-            .unwrap()
-            .protected_presentation = Some(ProtectedPresentation::Preview {
-            text: "\0".repeat(65_536),
-        });
-        item.evidence_detail.as_mut().unwrap().protected_length = 1_048_576;
-        let response = evertrace_protocol::envelope::ServerEnvelope::Response(
-            evertrace_protocol::response::ResponseEnvelope {
-                request_id: evertrace_domain::ids::RequestId::new_v7(),
-                response: evertrace_protocol::response::Response::HumanGovernance(
-                    evertrace_protocol::dto::HumanGovernanceResponse::Snapshot {
-                        diagnostics: None,
-                        frontier: 1,
-                        status: evertrace_protocol::dto::HumanSnapshotStatus::Ready,
-                        degraded_reasons: vec![],
-                        items: vec![item],
-                        next_cursor: None,
-                    },
-                ),
-            },
-        );
-        let mut framed = Vec::new();
-        evertrace_protocol::frame::write_frame_sync(
-            &mut framed,
-            &response,
-            evertrace_protocol::dto::MAX_FRAME_SIZE,
-        )
-        .unwrap();
-        assert!(framed.len() > 6 * 65_536);
-        let mut rejected = Vec::new();
-        assert!(matches!(
-            evertrace_protocol::frame::write_frame_sync(&mut rejected, &response, 65_536),
-            Err(evertrace_protocol::frame::FrameError::Oversize)
-        ));
-        assert!(rejected.is_empty());
-    }
-
-    #[test]
     fn provisional_work_detail_remains_a_protected_plan() {
         let mut app = App::with_language(crate::Language::English);
         app.state.route = crate::Route::Explorer;
@@ -4564,7 +4434,6 @@ mod tests {
             source_context: None,
             semantic_detail: None,
             proposal_base: None,
-            evidence_detail: None,
             work_detail: None,
             item_kind: HumanItemKind::Generic,
             proposal: None,

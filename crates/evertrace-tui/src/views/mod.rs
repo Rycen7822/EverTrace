@@ -880,66 +880,6 @@ pub(crate) fn content_lines(
             detail.source_refs.join(", ").escape_debug()
         ));
     }
-    if let Some(detail) = &item.evidence_detail {
-        use evertrace_domain::evidence::ProtectedPresentation;
-        lines.extend([
-            crate::locale::format!(
-                language,
-                "source/role: {:?} / {:?}",
-                "来源／角色: {:?} / {:?}",
-                detail.source_kind,
-                detail.source_role
-            ),
-            crate::locale::format!(
-                language,
-                "observation/trust: {:?} / {:?}",
-                "观测／可信度: {:?} / {:?}",
-                detail.observation_role,
-                detail.content_trust
-            ),
-            crate::locale::format!(
-                language,
-                "capture: {:?}; instruction authority: none",
-                "采集: {:?}; 不具备指令权限",
-                detail.capture_completeness
-            ),
-            crate::locale::format!(
-                language,
-                "protected bytes: {}",
-                "受保护字节数: {}",
-                detail.protected_length
-            ),
-            format!("CAS: {}", detail.cas_ref),
-        ]);
-        if detail.observation_role == evertrace_domain::evidence::ObservationRole::Message {
-            lines.push(
-                language
-                    .label("Observed message; acceptance or task intent not established")
-                    .into(),
-            );
-        }
-        lines.push(match &detail.protected_presentation {
-            Some(ProtectedPresentation::Inline { text }) => {
-                crate::locale::format!(
-                    language,
-                    "protected inline: {}",
-                    "受保护内联内容: {}",
-                    text.escape_debug()
-                )
-            }
-            Some(ProtectedPresentation::Preview { text }) => {
-                format!("protected preview (partial): {}", text.escape_debug())
-            }
-            Some(ProtectedPresentation::Unavailable { reason }) => {
-                crate::locale::format!(
-                    language,
-                    "protected presentation unavailable: {reason:?}",
-                    "受保护内容不可显示: {reason:?}"
-                )
-            }
-            None => language.label("protected presentation unavailable").into(),
-        });
-    }
     if let Some(proposal) = &item.proposal {
         lines.extend([
             crate::locale::format!(

@@ -1756,13 +1756,6 @@ fn map_human_item(item: evertrace_engine::HumanSummary) -> HumanSnapshotItem {
                     source_refs: detail.source_refs, workstream_goal: detail.workstream_goal,
                     phase: detail.phase, acceptance: detail.acceptance,
                 }),
-                evidence_detail: item.evidence_detail.map(|detail| evertrace_protocol::dto::HumanEvidenceDetail {
-                    source_kind: detail.source_kind, observation_role: detail.observation_role,
-                    source_role: detail.source_role, content_trust: detail.content_trust,
-                    capture_completeness: detail.capture_completeness,
-                    protected_presentation: detail.protected_presentation,
-                    protected_length: detail.protected_length, cas_ref: detail.cas_ref,
-                }),
                 item_kind: if item.proposal.is_some() {
                     HumanItemKind::RevisionProposal
                 } else {

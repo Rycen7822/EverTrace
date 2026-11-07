@@ -285,7 +285,6 @@ mod tests {
             source_context: None,
             semantic_detail: None,
             proposal_base: None,
-            evidence_detail: None,
             work_detail: None,
             item_kind: HumanItemKind::Generic,
             proposal: None,

@@ -43,7 +43,7 @@ pub use service::{
     HealthDispatchError, HealthSnapshot, HumanActionOutcome, HumanBackupSummary,
     HumanBackupTableState, HumanBackupValidationResult, HumanCompetingDetail, HumanCompiledEntry,
     HumanCompiledPage, HumanContentState, HumanDegradedReason, HumanDiagnosticCheck,
-    HumanDiagnosticState, HumanDiagnostics, HumanEvidenceDetail, HumanExecutionIntegrityDetail,
+    HumanDiagnosticState, HumanDiagnostics, HumanExecutionIntegrityDetail,
     HumanExplorerListSelection, HumanExportResult, HumanExportSelection, HumanExportStatus,
     HumanForgetPreview, HumanGovernanceError, HumanGovernanceService, HumanItemCategory,
     HumanJobBudget, HumanJobDetail, HumanJobState, HumanJobTerminalReason, HumanMemoryBrowsePage,

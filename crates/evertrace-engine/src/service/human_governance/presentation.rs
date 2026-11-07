@@ -97,21 +97,11 @@ impl HumanGovernanceService {
     pub(super) async fn capture_page(
         &self,
         context: evertrace_store::CaptureCurrentContext,
-        detail: bool,
     ) -> Result<HumanPage, HumanGovernanceError> {
         let deadline = std::time::Instant::now() + READ_DEADLINE;
-        let report = match &self.session_report {
-            Some(report) => report.read().await.clone(),
-            None => None,
-        };
         let mut items = Vec::with_capacity(context.items.len());
         for current in context.items {
             let mut item = summary_fields(&current.selected, HumanSurface::Explorer);
-            if detail {
-                item.evidence_detail = source_evidence_detail_from_rows(&current.selected, |id| {
-                    current.source_rows.iter().find(|row| row.row_id == id)
-                })?;
-            }
             let mut sources = BTreeMap::new();
             let mut receipt = None;
             let mut observation = None;
@@ -153,36 +143,7 @@ impl HumanGovernanceService {
                     );
                 }
             }
-            let (blocked, _) = crate::session_import::source_instance_read_assessment(
-                &self.writer,
-                report.as_ref(),
-                sources
-                    .get(&current.selected.row_id)
-                    .map(|source| (current.selected.row_id.clone(), source.clone()))
-                    .into_iter()
-                    .collect(),
-                None,
-            )
-            .await
-            .map_err(|_| HumanGovernanceError::Store)?;
             let rows = current.source_rows.iter().collect::<Vec<_>>();
-            let selected_rows = [&current.selected];
-            let selected_scopes = crate::repository::row_repository_contexts_from_scopes(
-                current.scope_rows.iter(),
-                &selected_rows,
-            )
-            .map_err(|_| HumanGovernanceError::Store)?;
-            let (selected_repositories, _) = crate::repository::repository_read_assessment(
-                &self.writer,
-                selected_scopes.values().flatten().copied().collect(),
-                report.as_ref(),
-                std::time::Instant::now() + crate::repository::SESSION_ROOT_PROBE_BUDGET,
-            )
-            .await
-            .map_err(|_| HumanGovernanceError::Store)?;
-            if blocked.contains(&current.selected.row_id) || !selected_repositories.is_empty() {
-                item.evidence_detail = None;
-            }
             let paired =
                 receipt
                     .as_ref()

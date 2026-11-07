@@ -6380,6 +6380,10 @@ impl JournalAdmissionState {
             return Ok(Outcome::Page(Box::new(context)));
         };
         let root_id = root.row_id.clone();
+        let source_record = matches!(
+            root.object_kind.as_deref(),
+            Some("source_receipt" | "source_observation")
+        );
         let payload: JournalPayload = serde_json::from_str(
             root.payload_json
                 .as_deref()
@@ -6422,7 +6426,18 @@ impl JournalAdmissionState {
                         .ok_or(StoreError::StoreCorrupt)?,
                 )
                 .map_err(|_| StoreError::StoreCorrupt)?;
-                pending.extend(read_dependencies_for(&row, &payload));
+                // Source reads use only their receipt/observation/surface cohort plus direct Task/Worktree scope facts.
+                // Following a Task's unrelated request roots would incorrectly inherit their revocation or suppression.
+                if !source_record
+                    || matches!(
+                        &payload,
+                        JournalPayload::SourceReceiptRecorded(_)
+                            | JournalPayload::SourceObservationRecorded(_)
+                            | JournalPayload::EvidenceSurfaceRecorded(_)
+                    )
+                {
+                    pending.extend(read_dependencies_for(&row, &payload));
+                }
                 budget.rows += 1;
                 budget.bytes += row.payload_json.as_ref().map_or(0, |v| v.len()) as u64;
                 if budget.rows >= READ_DEPENDENCY_LIMIT || budget.bytes > READ_DEPENDENCY_BYTES {
