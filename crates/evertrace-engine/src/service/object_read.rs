@@ -1303,10 +1303,7 @@ impl EngineService {
         >,
         crate::WriterActorError,
     > {
-        use evertrace_domain::{
-            query::{HumanContentState as S, MetadataReadOutcome as O},
-            source::SourceArchiveQuery as Q,
-        };
+        use evertrace_domain::query::{HumanContentState as S, MetadataReadOutcome as O};
         let (current, context) = match writer
             .read_archive_metadata_context(
                 query,
@@ -1326,7 +1323,7 @@ impl EngineService {
             return Ok(O::Conflict(current.frontier));
         }
         let mut page = context.page;
-        if page.state == S::Ready && matches!(query, Q::Records { .. }) {
+        if page.state == S::Ready {
             let host = report.read().await.clone();
             let sources = [(query.source().to_owned(), query.source().to_owned())]
                 .into_iter()

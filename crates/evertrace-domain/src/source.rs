@@ -369,12 +369,52 @@ pub enum SourceArchiveMetadataEntries {
     Records { records: Vec<SourceRecordMetadata> },
 }
 
+/// Committed coordinates and last observed metadata, not current-file access or a capture-gap proof.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct SourceArchiveProgress {
+    pub catalog_source_revision: SourceRevision,
+    pub observed_file_bytes: Option<u64>,
+    pub metadata_state: Option<MetadataState>,
+    pub body_state: Option<SessionBodyState>,
+    pub observed_end: Option<u64>,
+    pub record_start: Option<u64>,
+    pub origin_closed: Option<bool>,
+    pub confirmed_through: Option<u64>,
+    pub earlier_fence: Option<u64>,
+    pub earlier_through: Option<u64>,
+    pub forward_commitment: bool,
+    pub earlier_commitment: bool,
+    pub replacement_recorded: bool,
+}
+
+impl SourceArchiveProgress {
+    fn validate(&self) -> bool {
+        self.observed_file_bytes.is_some() == self.metadata_state.is_some()
+            && self.observed_file_bytes.is_some() == self.body_state.is_some()
+            && self.observed_end.is_some() == self.origin_closed.is_some()
+            && self
+                .record_start
+                .is_none_or(|start| self.observed_end.is_some_and(|end| start >= end))
+            && self.earlier_fence.is_some() == self.earlier_through.is_some()
+            && self.earlier_fence.is_none_or(|fence| {
+                self.earlier_through.is_some_and(|through| through <= fence)
+                    && self
+                        .confirmed_through
+                        .is_some_and(|through| fence <= through)
+            })
+            && (!self.forward_commitment || self.confirmed_through.is_some())
+            && (!self.earlier_commitment || self.earlier_through.is_some())
+    }
+}
+
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct SourceArchiveMetadataPage {
     pub query: SourceArchiveQuery,
     pub state: crate::query::HumanContentState,
     pub entries: SourceArchiveMetadataEntries,
+    pub progress: Option<SourceArchiveProgress>,
     /// Exact retained product-visible identities in this instance/revision/range; unknown when denied or missing.
     pub matching_count: Option<u64>,
     pub next: Option<SourceArchivePosition>,
@@ -388,6 +428,7 @@ impl SourceArchiveMetadataPage {
     }
     pub fn clear(&mut self, state: crate::query::HumanContentState) {
         self.state = state;
+        self.progress = None;
         self.matching_count = None;
         self.next = None;
         match &mut self.entries {
@@ -397,6 +438,10 @@ impl SourceArchiveMetadataPage {
     }
     pub fn validate(&self) -> bool {
         self.query.validate().is_ok()
+            && self
+                .progress
+                .as_ref()
+                .is_none_or(SourceArchiveProgress::validate)
             && match (&self.query, &self.entries) {
                 (
                     SourceArchiveQuery::Revisions { .. },
@@ -436,7 +481,10 @@ impl SourceArchiveMetadataPage {
                             }
                     })
             } else {
-                self.len() == 0 && self.matching_count.is_none() && self.next.is_none()
+                self.len() == 0
+                    && self.matching_count.is_none()
+                    && self.next.is_none()
+                    && self.progress.is_none()
             }
     }
 }

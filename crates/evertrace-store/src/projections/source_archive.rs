@@ -12,6 +12,44 @@ pub struct SourceArchiveMetadataContext {
 }
 
 impl JournalAdmissionState {
+    fn source_archive_progress(
+        &self,
+        current: &crate::SessionImportCurrent,
+        instance: &SourceInstanceId,
+        revision: &SourceRevision,
+    ) -> SourceArchiveProgress {
+        let metadata = &current.metadata;
+        let selected_current = &metadata.source_revision == revision;
+        let watermark = self
+            .source_watermarks
+            .get(instance.as_str())
+            .and_then(|state| state.revisions.get(revision));
+        let earlier = watermark.and_then(|value| value.earlier_prefix.as_ref());
+        let origin = metadata
+            .prospective_origin
+            .as_ref()
+            .filter(|_| selected_current);
+        SourceArchiveProgress {
+            catalog_source_revision: metadata.source_revision.clone(),
+            observed_file_bytes: selected_current.then_some(metadata.file_size),
+            metadata_state: selected_current.then_some(metadata.metadata_state),
+            body_state: selected_current.then_some(current.body_state),
+            observed_end: origin.map(|value| value.observed_end),
+            record_start: origin.and_then(|value| value.record_start),
+            origin_closed: origin.map(|value| value.closed),
+            confirmed_through: watermark.map(|value| value.source_sequence),
+            earlier_fence: earlier.map(|value| value.fence_byte),
+            earlier_through: earlier.map(|value| value.through_byte),
+            forward_commitment: watermark
+                .is_some_and(|value| value.confirmed_prefix_digest.is_some()),
+            earlier_commitment: earlier.is_some_and(|value| value.digest.is_some()),
+            replacement_recorded: self
+                .source_watermarks
+                .get(instance.as_str())
+                .is_some_and(|state| state.revision_admissions.contains_key(revision)),
+        }
+    }
+
     pub(crate) fn source_archive_metadata(
         &self,
         query: &SourceArchiveQuery,
@@ -41,6 +79,7 @@ impl JournalAdmissionState {
                 query: query.clone(),
                 state: HumanContentState::Missing,
                 entries,
+                progress: None,
                 matching_count: None,
                 next: None,
             },
@@ -56,9 +95,9 @@ impl JournalAdmissionState {
             }
         };
         check()?;
-        if !self.source_catalog_contains(query.source())? {
+        let Some(current) = self.source_catalog_current(query.source())? else {
             return Ok(O::Page(Box::new(context)));
-        }
+        };
         match query {
             SourceArchiveQuery::Revisions { source_instance_id } => {
                 let Some(source) = self.source_watermarks.get(source_instance_id) else {
@@ -103,16 +142,16 @@ impl JournalAdmissionState {
                 source_revision,
                 ..
             } => {
-                let Some(known) =
-                    evertrace_domain::evidence::SourceInstanceId::parse(source_instance_id.clone())
-                        .ok()
-                        .and_then(|id| {
-                            self.source_ranges
-                                .get(&source_revision_ref(&id, source_revision))
-                        })
+                let instance = SourceInstanceId::parse(source_instance_id.clone())
+                    .map_err(|_| StoreError::StoreCorrupt)?;
+                let Some(known) = self
+                    .source_ranges
+                    .get(&source_revision_ref(&instance, source_revision))
                 else {
                     return Ok(O::Page(Box::new(context)));
                 };
+                context.page.progress =
+                    Some(self.source_archive_progress(current, &instance, source_revision));
                 if let Some(SourceArchivePosition::Record { sequence, receipt }) = after
                     && !known
                         .receipt_ids

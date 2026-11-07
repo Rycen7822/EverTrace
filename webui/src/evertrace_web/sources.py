@@ -269,6 +269,55 @@ async def read_source_links(backend, reference, frontier, revision, after=None, 
                        "time_kind":"current", "range":{"reference":bound}}}
 
 
+def _archive_progress(query, facts):
+    if facts is None:
+        return None
+    end, fence, earlier = (facts[key] for key in ("confirmed_through", "earlier_fence", "earlier_through"))
+    length = facts["observed_file_bytes"]
+    historical = query["source_revision"] != facts["catalog_source_revision"]
+    notes = []
+    if historical:
+        notes.append("这是保留的历史修订。目录已观测另一个修订，不能把新文件的末尾或状态套到这里。")
+    if facts["replacement_recorded"]:
+        notes.append("该修订有 replacement 准入记录；单凭这条记录不能确定前驱顺序。")
+    if facts["observed_end"] is not None:
+        start = facts["record_start"]
+        notes.append(f"前瞻观察边界 {facts['observed_end']}；" +
+            (f"后续完整记录起点 {start}。" if start is not None else "后续完整记录起点还未确定。"))
+        notes.append("观察前的内容不会因前瞻许可自动获批；" + ("该前瞻区间已关闭。" if facts["origin_closed"] else "该前瞻区间未关闭。"))
+    if fence is not None:
+        notes.append(f"较早段已提交 [0, {earlier})。" if facts["earlier_commitment"]
+            else f"较早段水位 {earlier}，尚无已入账的前缀承诺。")
+        if earlier < fence:
+            notes.append(f"较早段 [{earlier}, {fence}) 尚未处理；不能因为后续排空就称整份来源已导完。")
+    if facts["forward_commitment"]:
+        notes.append(f"后续段已提交 [{fence}, {end})。" if fence is not None else f"已提交连续前缀 [0, {end})。")
+    elif end is not None:
+        notes.append(f"后续水位 {end} 尚无对应前缀承诺，不能把它当已处理字节。")
+    else:
+        notes.append("没有该修订已提交的导入水位，不补成已处理 0 字节。")
+    if length is not None:
+        notes.append(f"目录上次观测文件长度 {length} 字节；此读取没有重新打开原文件。")
+        if end is not None and end < length:
+            notes.append(f"后续水位之后的 [{end}, {length}) 尚未处理，可能仍有未结束记录。")
+        elif end is not None and end > length:
+            notes.append("观测长度已短于原提交水位；保留旧归档，不把缩短后的文件当同一连续前缀。")
+    if historical:
+        status, label = "historical_revision", "保留的历史修订"
+    elif facts["body_state"] == "source_replaced" or length is not None and end is not None and length < end:
+        status, label = "source_changed", "已观测来源改写或缩短"
+    elif (facts["body_state"] == "imported" and facts["metadata_state"] == "indexed" and end == length
+          and facts["forward_commitment"] and (fence is None or earlier == fence)):
+        status, label = "observed_eof", "已处理到目录上次观测的末尾"
+    elif facts["observed_end"] is not None and facts["record_start"] is None:
+        status, label = "boundary_pending", "等待完整记录边界"
+    elif end is None:
+        status, label = "unprocessed", "尚无已提交导入水位"
+    else:
+        status, label = "partial", "仅有部分已提交区间"
+    return {"status":status, "label":label, "notes":notes}
+
+
 async def read_source_archive(backend, query, after=None, frontier=None, limit=32):
     if type(limit) is not int or not 1 <= limit <= 32:
         raise BackendError("invalid_input")
@@ -337,7 +386,8 @@ async def read_source_archive(backend, query, after=None, frontier=None, limit=3
             "data_identity":identity, "position":page["next"]}, ensure_ascii=False, separators=(",", ":"))
         if len(next_cursor.encode()) > 4096:
             raise BackendError("invalid_read_response")
-    return {"kind":"source_archive", "page":{**page, "frontier":expected, "next_cursor":next_cursor,
+    return {"kind":"source_archive", "page":{**page, "progress":_archive_progress(query, page["progress"]),
+        "frontier":expected, "next_cursor":next_cursor,
         "count_basis":{"unit":"archive_revision" if query["kind"] == "revisions" else "retained_source_record",
                        "range":query, "time_kind":"current", "accuracy":"exact" if page["matching_count"] is not None else "unknown"}}}
 

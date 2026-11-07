@@ -9,13 +9,16 @@ use evertrace_domain::{
 
 impl JournalAdmissionState {
     /// Archive visibility depends on the owning canonical catalogue fact, not a human page or current job.
-    pub(super) fn source_catalog_contains(&self, source: &str) -> Result<bool, StoreError> {
+    pub(super) fn source_catalog_current(
+        &self,
+        source: &str,
+    ) -> Result<Option<&crate::SessionImportCurrent>, StoreError> {
         for current in self.session_imports.values() {
             if current.source_instance() == source && self.source_catalog_visible(current)? {
-                return Ok(true);
+                return Ok(Some(current));
             }
         }
-        Ok(false)
+        Ok(None)
     }
 
     fn source_catalog_visible(

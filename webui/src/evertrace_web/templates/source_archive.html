@@ -19,6 +19,14 @@
 {% else %}<p>没有可列出的已提交归档修订；不表示宿主没有原始记录。</p>{% endfor %}
 {% else %}
 <h2>来源记录</h2><p>归档修订：{{ page.query.source_revision }}</p>
+{% if page.progress %}
+<section class="reading-note" aria-label="来源导入区间" data-archive-progress="{{ page.progress.status }}">
+<h3>{{ page.progress.label }}</h3>
+<p>下列是该修订的整体导入进度，不是本次区间筛选的覆盖证明。</p>
+{% for note in page.progress.notes %}<p>{{ note }}</p>{% endfor %}
+<p>分页结束不是原文件 EOF。未处理区间不等于已证 capture gap；缺口是否存在或已调和，要看独立入账证据，不能只凭序号差补结论。</p>
+</section>
+{% endif %}
 <form id="archive-range" class="time-filter">
   <label>原生序号起点（含）<input id="archive-from" type="text" inputmode="numeric" pattern="[0-9]*" maxlength="20"
     value="{{ page.query.from_sequence if page.query.from_sequence is not none else '' }}"></label>
@@ -33,7 +41,7 @@
 <button class="linked-record" type="button" data-archive-record data-link-key="{{ record.stable_key }}"
   data-revision="{{ record.observation_id }}" data-object="{{ record.observation_id }}" data-kind="source_observation">
   <strong>{{ record.observation_role }} · {{ record.sequence }}</strong>
-  <span>{{ record.source_role }} · {{ record.content_trust }} · {{ record.completeness }} · {{ record.archive_mode }}</span>
+  <span>{{ record.source_role }} · {{ record.content_trust }} · 单条记录完整度 {{ record.completeness }} · {{ record.archive_mode }}</span>
   <span>{{ source_time(record) }}</span>
   {% if record.byte_range is not none %}
   <span>来源字节 [{{ record.byte_range.start }}, {{ record.byte_range.end }})</span>
