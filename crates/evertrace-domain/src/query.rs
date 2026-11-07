@@ -368,6 +368,14 @@ pub fn parse_operation_revision(value: &str) -> Option<(OperationId, u32)> {
     (value == format!("{id}@{revision}")).then_some((id, revision))
 }
 
+/// Immutable normalization coordinates, accepted only by the bounded stored-record readers.
+pub fn parse_host_occurrence_revision(value: &str) -> Option<(crate::ids::HostOccurrenceId, u32)> {
+    let (id, revision) = value.rsplit_once('@')?;
+    let id = id.parse::<crate::ids::HostOccurrenceId>().ok()?;
+    let revision = revision.parse::<u32>().ok().filter(|value| *value > 0)?;
+    (value == format!("{id}@{revision}")).then_some((id, revision))
+}
+
 pub fn valid_object_reference(value: &str) -> bool {
     value.parse::<AnyPublicId>().is_ok()
         || value.parse::<RevisionId>().is_ok()
@@ -2739,6 +2747,8 @@ impl ExactRecordQuery {
                 .validate()
                     || revision.parse::<crate::ids::CaptureReceiptId>().is_ok()
                     || parse_operation_revision(revision).is_some()
+                    || parse_host_occurrence_revision(revision).is_some()
+                    || revision.parse::<crate::ids::ScopeEffectId>().is_ok()
                     || revision.parse::<crate::ids::SourceObservationId>().is_ok()
                     || revision.parse::<crate::ids::SourceReceiptId>().is_ok()
             }
@@ -2752,6 +2762,11 @@ impl ExactRecordQuery {
                     || key.parse::<crate::ids::WorkEpisodeId>().is_ok()
                     || key.parse::<crate::ids::TaskId>().is_ok()
                     || key.parse::<crate::ids::WorkstreamId>().is_ok()
+                    || key.parse::<crate::ids::AttemptId>().is_ok()
+                    || key.parse::<crate::ids::OperationBurstId>().is_ok()
+                    || key.parse::<crate::ids::OperationId>().is_ok()
+                    || key.parse::<crate::ids::HostOccurrenceId>().is_ok()
+                    || key.parse::<crate::ids::ScopeEffectId>().is_ok()
                     || key.parse::<crate::ids::SourceObservationId>().is_ok()
                     || key.parse::<crate::ids::SourceReceiptId>().is_ok()
             }
@@ -3114,6 +3129,7 @@ impl MetadataReadQuery {
                         .validate()
                             || revision.parse::<AnyPublicId>().is_ok()
                             || parse_operation_revision(revision).is_some()
+                            || parse_host_occurrence_revision(revision).is_some()
                     })
                     && (1..=32).contains(limit)
                     && after.as_ref().is_none_or(|key| {

@@ -405,10 +405,7 @@ fn semantic_lines(
             "Read capture receipt content in Web",
             "请在 Web 中阅读采集覆盖凭证"
         )],
-        HumanSemanticContent::WorkEpisode(_)
-        | HumanSemanticContent::Attempt(_)
-        | HumanSemanticContent::OperationBurst(_)
-        | HumanSemanticContent::Operation(_) => vec![crate::locale::format!(
+        HumanSemanticContent::WorkEpisode(_) => vec![crate::locale::format!(
             language,
             "Read work content in Web",
             "请在 Web 中阅读工作记录内容"

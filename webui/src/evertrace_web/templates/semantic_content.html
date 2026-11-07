@@ -189,10 +189,8 @@
   {% if value.predecessor_revision_id %}<button class="button" type="button"
     data-link-key="{{ value.predecessor_revision_id }}" data-revision="{{ value.predecessor_revision_id }}"
     data-object="{{ value.predecessor_revision_id }}" data-kind="capture_receipt">读取原前序凭证</button>{% endif %}
-{% elif content.kind in ('attempt', 'operation_burst', 'operation') %}
-  <h2>{{ {'attempt': '工作尝试', 'operation_burst': '操作段', 'operation': '操作记录'}[content.kind] }}</h2>
-  <p class="muted">以下为所选修订的原生结构，状态不代表执行许可或已核实结论。原消息须从来源与直接关联中按权限读取。</p>
-  <pre class="memory-prose">{{ value|pretty }}</pre>
+{% elif content.kind in ('attempt', 'operation_burst', 'operation', 'host_occurrence', 'scope_effect') %}
+  {% include 'work_records.html' %}
 {% elif content.kind == 'work_episode' %}
   <h2>工作片段</h2>
   <p class="muted">原片段记录仅作上下文和来源；目标、状态或结果引用不等于已验证结论，也不授予执行资格。</p>

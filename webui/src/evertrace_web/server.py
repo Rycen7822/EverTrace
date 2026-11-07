@@ -17,7 +17,7 @@ from uvicorn.protocols.http.h11_impl import H11Protocol
 from .backend import Backend, BackendError, _decode
 from .jobs import read_jobs
 from .comparison import read_comparison
-from .content import DETAIL_KINDS, read_record_content, read_record_detail, read_source_content
+from .content import DETAIL_KINDS, WORK_DETAIL_KINDS, read_record_content, read_record_detail, read_source_content
 from .sources import read_revisions, read_source_catalog, read_source_archive, read_source_detail, read_source_links
 from .scopes import read_scopes
 from .memories import read_memories, read_overview
@@ -612,7 +612,7 @@ class App:
                     result = await read_source_detail(self.backend, payload["reference"], frontier,
                         payload["revision"], payload["object_kind"])
                 elif payload["object_kind"] in DETAIL_KINDS and (
-                    surface == "explorer" or payload["object_kind"] in ("task", "workstream")
+                    surface == "explorer" or payload["object_kind"] in WORK_DETAIL_KINDS
                 ):
                     result = await read_record_detail(self.backend, payload["reference"], frontier,
                         payload["revision"], payload["object_kind"])
@@ -651,7 +651,8 @@ def present_detail(templates, result, surface):
         semantic_text = content["value"]["value"]["text"]
     elif content and content["kind"] == "procedure":
         semantic_text = content["value"]["draft"]["summary"]
-    reading_record = item and item["object_kind"] in ("source_receipt", "source_observation", "task", "workstream")
+    reading_record = item and (item["object_kind"] in WORK_DETAIL_KINDS
+                               or item["object_kind"] in ("source_receipt", "source_observation"))
     template = "detail.html" if surface == "explorer" or reading_record else "observation_detail.html"
     selection = (
         {

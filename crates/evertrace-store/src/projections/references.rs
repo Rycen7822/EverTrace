@@ -206,6 +206,8 @@ impl JournalAdmissionState {
                     | "attempt"
                     | "operation_burst"
                     | "operation"
+                    | "host_occurrence"
+                    | "scope_effect"
                     | "task"
                     | "workstream"
             )

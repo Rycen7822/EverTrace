@@ -97,7 +97,11 @@ async def read_source_content(backend, reference, frontier, revision, after=None
 
 DETAIL_KINDS = {"atom_revision": "atom", "procedure_revision": "procedure", "core_membership": "core_membership",
                 "semantic_digest": "digest", "revision_proposal_revision": None,
-                "work_episode": "work_episode", "capture_receipt": "capture_receipt", "task": "task", "workstream": "workstream"}
+                "work_episode": "work_episode", "capture_receipt": "capture_receipt", "task": "task", "workstream": "workstream",
+                "attempt": "attempt", "operation_burst": "operation_burst", "operation": "operation",
+                "host_occurrence": "host_occurrence", "scope_effect": "scope_effect"}
+WORK_DETAIL_KINDS = {"task", "workstream", "work_episode", "attempt", "operation_burst", "operation",
+                     "host_occurrence", "scope_effect"}
 
 
 async def read_record_detail(backend, reference, frontier, revision, object_kind):

@@ -1,0 +1,101 @@
+{% if content.kind == 'attempt' %}
+<h2>策略尝试</h2>
+<dl class="semantic-fields">
+  <dt>执行</dt><dd>{{ value.execution_status }}</dd>
+  <dt>采用</dt><dd>{{ value.adoption_status }}</dd>
+  <dt>验证</dt><dd>{{ value.verification }}</dd>
+  <dt>尝试生命周期</dt><dd>{{ value.lifecycle_status }}</dd>
+  <dt>结果是否已知</dt><dd>{{ value.outcome_state }}</dd>
+</dl>
+<p class="reading-note">完成执行不等于结果已采用或验证通过。中断不是验证失败；被替代也不等于策略失败。</p>
+<h3>记录的策略</h3>
+<p class="memory-prose">假设：{{ value.strategy_contract.hypothesis }}</p>
+<p class="memory-prose">干预：{{ value.strategy_contract.intervention }}</p>
+<p>干预族：{{ value.strategy_contract.intervention_family }}</p>
+<p class="memory-prose">预期效果：{{ value.strategy_contract.expected_effect }}</p>
+<p>验收引用：{{ value.strategy_contract.acceptance_boundary_ref }}</p>
+{{ text_list('策略对象', value.strategy_contract.target_refs) }}
+<p>Task：{{ value.task_id }} · Workstream：{{ value.workstream_id }}</p>
+<p>Episode：{{ value.episode_id or '未记录' }} · 来源水位：{{ value.source_watermark }}</p>
+{{ text_list('执行通道', value.execution_lane_ids) }}
+<section class="semantic-section"><h3>中断与恢复</h3>
+  <p>中断原因：{{ value.interruption_reason or '未记录' }}</p>
+  {{ text_list('中断证据', value.interruption_refs) }}
+  <p>恢复评估：{{ value.resume_state_assessment or '未记录' }} · 恢复自：{{ value.resumes_from_attempt_id or '无' }}</p>
+  <p>源快照：{{ value.resume_source_snapshot_id or '未记录' }} · 目标快照：{{ value.resume_target_snapshot_id or '未记录' }}</p>
+  {{ text_list('恢复事件', value.resume_event_refs) }}
+  {{ text_list('组合自其他尝试', value.composed_from_attempt_ids) }}
+  {{ text_list('显式放弃证据', value.explicit_abandon_refs) }}
+</section>
+{{ text_list('局部结果证据', value.local_outcome_refs) }}
+{{ text_list('父级验证证据', value.parent_verification_refs) }}
+{{ text_list('结果引用', value.outcome_refs) }}
+<p class="muted">没有保存的命令、diff 或 verifier 不会由状态名称补造；相关记录在下方逐项读取。</p>
+{% elif content.kind == 'operation_burst' %}
+<h2>操作片段</h2>
+<p>类型：{{ value.operation_kind }} · 生命周期：{{ value.lifecycle }} · 来源水位：{{ value.source_watermark }}</p>
+<p>状态变化：{{ value.state_delta }} · verifier 变化：{{ value.verifier_delta }}</p>
+<p>阶段候选：{{ value.phase_candidate or '无' }} · 客观边界信号：{{ '有' if value.has_objective_boundary else '无' }}</p>
+<p>通道：{{ value.execution_lane_id }} · Attempt：{{ value.attempt_id or '未记录' }}</p>
+<p>对象族：{{ value.target_family }} · 错误特征：{{ value.error_signature or '未记录' }}</p>
+<p>归属 Task：{{ value.primary_binding.task_id or '未记录' }} · 工作线：{{ value.primary_binding.workstream_id or '未记录' }}</p>
+<p>归属片段：{{ value.primary_binding.episode_id or '未记录' }} · 尝试：{{ value.primary_binding.attempt_id or '未记录' }}</p>
+<p class="reading-note">这是已保存的成员顺序，不是按时间或命令文本拼出的因果链；工作归属不改变物理身份。</p>
+<h3>保存的操作成员</h3>
+{% for member in value.members %}
+<section class="semantic-section">
+  <p>顺序：{{ member.sequence }} · 来源水位：{{ member.source_watermark }}</p>
+  <p>Operation：{{ member.operation_id }} · 精确操作版本：{{ member.operation_revision }}</p>
+  <p>HostOccurrence：{{ member.host_occurrence_id }} · 归属修订：{{ member.work_binding_revision_id }}</p>
+  <p>Attempt 修订：{{ member.attempt_revision_id or '未记录' }}</p>
+  {{ text_list('成员来源观测', member.source_observation_refs) }}
+  {{ text_list('作用引用', member.scope_effect_refs) }}
+  {{ text_list('产物引用', member.artifact_refs) }}
+</section>
+{% endfor %}
+{% elif content.kind == 'operation' %}
+<h2>操作记录</h2>
+<p>类型：{{ value.operation_kind }} · 操作版本：{{ value.operation_revision }}</p>
+<p>物理配对状态：{{ value.pairing_state }}</p>
+<p>HostOccurrence：{{ value.host_occurrence_id }} · 执行通道：{{ value.execution_lane_id or '未记录' }}</p>
+{% if value.source_local_pairing %}
+<section class="semantic-section"><h3>来源内配对</h3>
+  <p>状态：{{ value.source_local_pairing.state }} · 来源请求 ID：{{ value.source_local_pairing.request_id }}</p>
+  <p>来源线程：{{ value.source_local_pairing.namespace.thread }} · rollout：{{ value.source_local_pairing.namespace.rollout }}</p>
+  {{ text_list('来源内配对的输入观测', value.source_local_pairing.intent_observation_refs) }}
+  {{ text_list('来源内配对的结果观测', value.source_local_pairing.result_observation_refs) }}
+  {{ text_list('命名空间见证', value.source_local_pairing.namespace_witness_refs) }}
+  <p class="reading-note">source_paired 仅是受见证来源中的配对，不升级为物理 Exact。conflicted 不按时间或文本强配。</p>
+</section>
+{% else %}<p>未记录来源内配对；相同请求名、命令或相邻时间都不补成一对。</p>{% endif %}
+{{ text_list('输入来源观测', value.input_source_observation_refs) }}
+{{ text_list('结果来源观测', value.result_source_observation_refs) }}
+{{ text_list('作用引用', value.scope_effect_ids) }}
+{{ text_list('产物引用', value.artifact_refs) }}
+<p class="reading-note">命令与响应若保存在来源正文中，可从下方关联读取受保护的原文；不回读原文件，也不把来源报告当已验证结果。</p>
+{% elif content.kind == 'host_occurrence' %}
+<h2>来源观测的物理归一化记录</h2>
+<p>关联强度：{{ value.correlation_strength }} · 归一化状态：{{ value.normalization_state }}</p>
+<p>配对状态：{{ value.pairing_state }} · 归一化版本：{{ value.normalization_revision }}</p>
+<p>事件族：{{ value.canonical_event_family or '未记录' }} · 物理执行序号：
+  {{ value.physical_execution_ordinal if value.physical_execution_ordinal is not none else '未记录' }}</p>
+<p>Host：{{ value.host_instance_id or '未记录' }} · trace：{{ value.host_trace_lineage_id or '未记录' }}</p>
+<p>lane：{{ value.host_lane_key or '未记录' }} · native request：{{ value.native_request_id or '未记录' }}</p>
+<p>可能重复组：{{ value.possible_duplicate_group_id or '无' }}</p>
+{{ text_list('已归入的来源观测', value.source_observation_refs) }}
+<details><summary>字段来源</summary>
+{% for field in value.field_provenance %}
+  <p>{{ field.field }} ← {{ field.source_observation_ref }}</p>
+{% else %}<p>没有额外字段来源记录。</p>{% endfor %}
+</details>
+<p class="reading-note">unavailable、ambiguous 或 conflicted 不升级为 Exact；single_source 不证明跨来源身份，不按命令、CWD 或时间去重。</p>
+{% elif content.kind == 'scope_effect' %}
+<h2>作用与范围</h2>
+<p>记录的作用：{{ value.effect_role }} · Operation：{{ value.operation_id }}</p>
+<p>仓库：{{ value.repository_instance_id or '未记录' }} · 工作树：{{ value.worktree_instance_id or '未记录' }}</p>
+<p>前快照：{{ value.pre_snapshot_id or '未记录' }} · 后快照：{{ value.post_snapshot_id or '未记录' }}</p>
+{{ text_list('作用证据', value.evidence_refs) }}
+{{ text_list('实验运行', value.experiment_run_ids) }}
+{{ text_list('产物引用', value.artifact_refs) }}
+<p class="reading-note">范围、前后快照与产物分别读取；没有快照就不补造 diff，没有 verifier 就不声称验证通过。</p>
+{% endif %}

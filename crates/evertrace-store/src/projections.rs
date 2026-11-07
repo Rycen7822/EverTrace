@@ -3381,6 +3381,14 @@ pub fn read_dependencies_for(row: &ObjectRow, payload: &JournalPayload) -> BTree
     .flatten()
     .collect::<BTreeSet<_>>();
     match payload {
+        JournalPayload::HostOccurrenceNormalized(value) => {
+            refs.extend(
+                value
+                    .source_observation_refs
+                    .iter()
+                    .map(ToString::to_string),
+            );
+        }
         JournalPayload::OperationDerived(value) => {
             refs.insert(value.host_occurrence_id.to_string());
             refs.extend(value.execution_lane_id.map(|id| id.to_string()));
@@ -3393,6 +3401,16 @@ pub fn read_dependencies_for(row: &ObjectRow, payload: &JournalPayload) -> BTree
             );
             refs.extend(value.scope_effect_ids.iter().map(ToString::to_string));
             refs.extend(value.artifact_refs.iter().map(ToString::to_string));
+            if let Some(pairing) = &value.source_local_pairing {
+                refs.extend(
+                    pairing
+                        .intent_observation_refs
+                        .iter()
+                        .chain(&pairing.result_observation_refs)
+                        .chain(&pairing.namespace_witness_refs)
+                        .map(ToString::to_string),
+                );
+            }
         }
         JournalPayload::ScopeEffectDerived(value) => {
             refs.insert(value.operation_id.to_string());
@@ -5964,14 +5982,24 @@ impl JournalAdmissionState {
             ObjectFamily::Work,
             "scope_effect"
         );
-        if let Ok(id) = reference.parse::<HostOccurrenceId>()
-            && let Some((value, seq)) = self.host_occurrences.get(&id)
-        {
+        let occurrence =
+            if let Some(key) = evertrace_domain::query::parse_host_occurrence_revision(reference) {
+                self.host_occurrence_revisions.get(&key)
+            } else {
+                reference
+                    .parse::<HostOccurrenceId>()
+                    .ok()
+                    .and_then(|id| self.host_occurrences.get(&id))
+            };
+        if let Some((value, seq)) = occurrence {
             rows.push(physical_object_row(
                 ObjectFamily::Evidence,
                 "host_occurrence",
-                id.to_string(),
-                format!("{}@{}", id, value.normalization_revision),
+                value.host_occurrence_id.to_string(),
+                format!(
+                    "{}@{}",
+                    value.host_occurrence_id, value.normalization_revision
+                ),
                 &JournalPayload::HostOccurrenceNormalized(Box::new(value.clone())),
                 *seq,
             )?);
@@ -6099,6 +6127,22 @@ impl JournalAdmissionState {
                 self.episodes
                     .get(&id)
                     .map(|(value, _)| value.revision_id.to_string())
+            } else if let Ok(id) = reference.parse::<AttemptId>() {
+                self.attempts
+                    .get(&id)
+                    .map(|(value, _)| value.revision_id.to_string())
+            } else if let Ok(id) = reference.parse::<OperationBurstId>() {
+                self.operation_bursts
+                    .get(&id)
+                    .map(|(value, _)| value.revision_id.to_string())
+            } else if let Ok(id) = reference.parse::<OperationId>() {
+                self.operations
+                    .get(&id)
+                    .map(|(value, _)| format!("{id}@{}", value.operation_revision))
+            } else if let Ok(id) = reference.parse::<HostOccurrenceId>() {
+                self.host_occurrences
+                    .get(&id)
+                    .map(|(value, _)| format!("{id}@{}", value.normalization_revision))
             } else {
                 None
             }
@@ -6374,6 +6418,8 @@ impl JournalAdmissionState {
                                 | "attempt"
                                 | "operation_burst"
                                 | "operation"
+                                | "host_occurrence"
+                                | "scope_effect"
                                 | "capture_receipt"
                                 | "capture_receipt_revision"
                         )
