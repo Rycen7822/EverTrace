@@ -214,19 +214,6 @@ pub enum SourceArchivePosition {
         receipt: crate::ids::SourceReceiptId,
     },
 }
-#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
-#[serde(deny_unknown_fields)]
-pub struct SourceArchiveCursor {
-    pub frontier: u64,
-    pub query: SourceArchiveQuery,
-    pub position: SourceArchivePosition,
-}
-impl SourceArchiveCursor {
-    pub fn validate_for(&self, query: &SourceArchiveQuery) -> bool {
-        &self.query == query && self.position.validate_for(query)
-    }
-}
-
 impl SourceArchivePosition {
     pub fn validate_for(&self, query: &SourceArchiveQuery) -> bool {
         query.validate().is_ok()
@@ -288,32 +275,6 @@ impl SourceRecordMetadata {
     }
 }
 
-#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
-#[serde(deny_unknown_fields)]
-pub struct SourceRecordSummary {
-    #[serde(flatten)]
-    pub metadata: SourceRecordMetadata,
-    pub preview: Option<String>,
-    pub preview_truncated: bool,
-}
-impl SourceRecordSummary {
-    pub fn validate(&self) -> bool {
-        self.metadata.validate()
-            && self.preview.as_ref().is_none_or(|text| text.len() <= 512)
-            && (self.preview.is_some()
-                == matches!(
-                    self.metadata.presentation,
-                    SourceRecordPresentation::Inline | SourceRecordPresentation::Preview
-                ))
-            && (!self.preview_truncated || self.preview.is_some())
-    }
-}
-#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
-#[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
-pub enum SourceArchiveEntries {
-    Revisions { revisions: Vec<SourceRevision> },
-    Records { records: Vec<SourceRecordSummary> },
-}
 /// Exact source-local identities/provenance only; stored text is read via ReadExact.
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
@@ -392,14 +353,4 @@ impl SourceArchiveMetadataPage {
                 self.len() == 0 && self.matching_count.is_none() && self.next.is_none()
             }
     }
-}
-
-#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
-#[serde(deny_unknown_fields)]
-pub struct SourceArchivePage {
-    pub frontier: u64,
-    pub query: SourceArchiveQuery,
-    pub state: crate::query::HumanContentState,
-    pub entries: SourceArchiveEntries,
-    pub next_cursor: Option<String>,
 }

@@ -12,7 +12,6 @@ pub use compiled::{HumanCompiledEntry, HumanCompiledPage};
 mod presentation;
 mod reading;
 mod searching;
-mod source_archive;
 pub use diagnostics::{
     HumanDiagnosticCheck, HumanDiagnosticState, HumanDiagnostics, HumanTableDiagnostic,
 };

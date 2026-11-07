@@ -497,7 +497,6 @@ impl App {
                         | HumanGovernanceResponse::Search { .. }
                         | HumanGovernanceResponse::MemoryPage { .. }
                         | HumanGovernanceResponse::CompiledProjections { .. }
-                        | HumanGovernanceResponse::SourceArchive { .. }
                         | HumanGovernanceResponse::Export { .. },
                     ) => UiCommand::None,
                     (HumanReadLocator::Page { .. } | HumanReadLocator::View { .. }, _) => {
@@ -536,8 +535,9 @@ impl App {
                     | HumanGovernanceResponse::Snapshot { .. }
                     | HumanGovernanceResponse::Search { .. }
                     | HumanGovernanceResponse::MemoryPage { .. }
-                    | HumanGovernanceResponse::CompiledProjections { .. }
-                    | HumanGovernanceResponse::SourceArchive { .. } => return UiCommand::None,
+                    | HumanGovernanceResponse::CompiledProjections { .. } => {
+                        return UiCommand::None;
+                    }
                 };
                 if result.reason.as_deref() != Some("local_busy") {
                     self.state.write_queued = false;

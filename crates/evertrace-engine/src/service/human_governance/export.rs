@@ -186,23 +186,6 @@ impl HumanGovernanceService {
         check_deadline(deadline)
     }
 
-    /// A complete named Capture cohort and its direct scope facts, not an export graph.
-    pub(super) async fn readable_directory_sources(
-        &self,
-        all_rows: &[ObjectRow],
-        rows: &[&ObjectRow],
-        suppressed: bool,
-        deadline: Instant,
-    ) -> ExportResult<()> {
-        source_metadata_budget(rows, deadline)?;
-        self.source_repository_access(all_rows, rows, deadline)
-            .await?;
-        if suppressed {
-            return Err(Failure::Denied);
-        }
-        check_deadline(deadline)
-    }
-
     async fn source_repository_access(
         &self,
         all_rows: &[ObjectRow],

@@ -1507,18 +1507,6 @@ impl JournalWriter {
         })
     }
 
-    pub async fn source_archive_context(
-        &self,
-        query: &evertrace_domain::source::SourceArchiveQuery,
-        after: Option<&evertrace_domain::source::SourceArchiveCursor>,
-        limit: usize,
-    ) -> Result<crate::SourceArchiveCurrentContext, StoreError> {
-        self.validated_current_read(|state, stamp| {
-            state.source_archive_context(query, after, limit, stamp.has_failed_job)
-        })
-        .await
-    }
-
     pub async fn compiled_entries_context(
         &self,
         query: &evertrace_domain::query::CompiledProjectionQuery,

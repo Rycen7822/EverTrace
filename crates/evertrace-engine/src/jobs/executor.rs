@@ -78,13 +78,6 @@ enum WriterRequest {
         limit: usize,
         reply: oneshot::Sender<Result<evertrace_store::MemoriesCurrentContext, WriterActorError>>,
     },
-    SourceArchive {
-        query: evertrace_domain::source::SourceArchiveQuery,
-        after: Option<evertrace_domain::source::SourceArchiveCursor>,
-        limit: usize,
-        reply:
-            oneshot::Sender<Result<evertrace_store::SourceArchiveCurrentContext, WriterActorError>>,
-    },
     CompiledDirectory {
         query: evertrace_domain::query::CompiledProjectionQuery,
         after: Option<String>,
@@ -718,25 +711,6 @@ impl WriterHandle {
         self.sender
             .send(WriterRequest::MemoriesCurrent {
                 after,
-                limit,
-                reply,
-            })
-            .await
-            .map_err(|_| WriterActorError::Stopped)?;
-        response.await.map_err(|_| WriterActorError::Stopped)?
-    }
-
-    pub(crate) async fn source_archive_context(
-        &self,
-        query: &evertrace_domain::source::SourceArchiveQuery,
-        after: Option<&evertrace_domain::source::SourceArchiveCursor>,
-        limit: usize,
-    ) -> Result<evertrace_store::SourceArchiveCurrentContext, WriterActorError> {
-        let (reply, response) = oneshot::channel();
-        self.sender
-            .send(WriterRequest::SourceArchive {
-                query: query.clone(),
-                after: after.cloned(),
                 limit,
                 reply,
             })
@@ -1598,30 +1572,6 @@ async fn run_writer(
                         .await
                         .map_err(map_store_error);
                     let fatal = result.is_err();
-                    let _ = reply.send(result);
-                    if fatal {
-                        return Err(WriterActorError::Store);
-                    }
-                }
-                WriterRequest::SourceArchive {
-                    query,
-                    after,
-                    limit,
-                    reply,
-                } => {
-                    if reply.is_closed() {
-                        continue;
-                    }
-                    let result = writer
-                        .as_ref()
-                        .ok_or(WriterActorError::Stopped)?
-                        .source_archive_context(&query, after.as_ref(), limit)
-                        .await
-                        .map_err(map_store_error);
-                    let fatal = matches!(
-                        &result,
-                        Err(WriterActorError::Store | WriterActorError::StoreCorrupt)
-                    );
                     let _ = reply.send(result);
                     if fatal {
                         return Err(WriterActorError::Store);
