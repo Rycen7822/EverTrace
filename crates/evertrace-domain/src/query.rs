@@ -2975,6 +2975,11 @@ impl RevisionPairFields {
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
 pub enum MetadataReadQuery {
+    Revisions {
+        reference: HumanRevisionRef,
+        after: Option<RevisionMetadataKey>,
+        limit: u16,
+    },
     Work {
         query: Box<MemoryOverviewQuery>,
     },
@@ -2997,12 +3002,30 @@ impl MetadataReadQuery {
     pub fn limit(&self) -> u16 {
         match self {
             Self::Work { query } | Self::Review { query } => query.limit,
-            Self::Memories { limit, .. } | Self::Jobs { limit, .. } => *limit,
+            Self::Memories { limit, .. }
+            | Self::Jobs { limit, .. }
+            | Self::Revisions { limit, .. } => *limit,
         }
     }
 
     fn validate(&self, batch: &MetadataBatchQuery) -> bool {
         match self {
+            Self::Revisions {
+                reference, after, ..
+            } => {
+                !reference.stable_key.is_empty()
+                    && reference.stable_key.len() <= 512
+                    && !reference.stable_key.chars().any(char::is_control)
+                    && (ExactFieldsQuery {
+                        revision_ref: reference.revision_ref.clone(),
+                    })
+                    .validate()
+                    && after.as_ref().is_none_or(|key| {
+                        key.validate()
+                            && batch.expected_frontier.is_some()
+                            && batch.expected_data_identity.is_some()
+                    })
+            }
             Self::Work { query } | Self::Review { query } => query.validate().is_ok(),
             Self::Memories { query, after, .. } => {
                 query.validate().is_ok()
@@ -3071,10 +3094,52 @@ pub struct MemoryMetadataPage {
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
 pub enum MetadataReadPage {
+    Revisions { page: Box<RevisionMetadataPage> },
     Memories { page: Box<MemoryMetadataPage> },
     Jobs { page: Box<ObjectReadJobs> },
     Work { page: Box<ScopedWorkMetadata> },
     Review { page: Box<ScopedReviewMetadata> },
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct RevisionMetadataKey {
+    pub source_event_seq: u64,
+    pub row_id: String,
+}
+
+impl RevisionMetadataKey {
+    pub fn validate(&self) -> bool {
+        self.source_event_seq > 0
+            && !self.row_id.is_empty()
+            && self.row_id.len() <= 512
+            && !self.row_id.chars().any(char::is_control)
+    }
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct RevisionMetadataPage {
+    pub reference: HumanRevisionRef,
+    pub content_state: HumanContentState,
+    pub records: Vec<serde_json::Value>,
+    /// Exact retained, deletion/purge-visible revision count for this object; unknown when not readable.
+    pub matching_count: Option<u64>,
+    pub next: Option<RevisionMetadataKey>,
+}
+
+impl RevisionMetadataPage {
+    pub fn validate(&self) -> bool {
+        valid_metadata_records(&self.records)
+            && self.next.as_ref().is_none_or(RevisionMetadataKey::validate)
+            && if self.content_state == HumanContentState::Ready {
+                self.matching_count
+                    .is_some_and(|count| count >= self.records.len() as u64)
+                    && (self.next.is_none() || !self.records.is_empty())
+            } else {
+                self.records.is_empty() && self.matching_count.is_none() && self.next.is_none()
+            }
+    }
 }
 
 /// Scoped domain counts and the original input-matching derivation record, not generation explanations.
@@ -3117,6 +3182,10 @@ impl ObjectReadBatch {
         self.state.validate()
             && (1..=METADATA_BATCH_LIMIT).contains(&self.items.len())
             && self.items.iter().all(|item| match item {
+                MetadataReadPage::Revisions { page } => {
+                    count += page.records.len();
+                    page.validate()
+                }
                 MetadataReadPage::Jobs { page } => {
                     count += page.records.len();
                     page.state == self.state && page.validate()

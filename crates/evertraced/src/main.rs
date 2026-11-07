@@ -886,7 +886,11 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
                         if let HumanGovernanceRequest::Read { request: HumanReadRequest::ReadBatch { query } } = &command {
                             let outcome = EngineService::read_metadata_batch(
                                 writer.clone(), query.clone(), config_snapshot.hash(), &config_snapshot.config().llm,
-                            ).await.map_err(|_| ErrorCode::Internal)?;
+                                Arc::clone(&session_catalog_report),
+                            ).await.map_err(|error| match error {
+                                evertrace_engine::WriterActorError::InvalidInput => ErrorCode::InvalidInput,
+                                _ => ErrorCode::Internal,
+                            })?;
                             use evertrace_protocol::dto::MetadataReadOutcome;
                             return Ok(Response::HumanGovernance(match outcome {
                                 MetadataReadOutcome::Page(page) => HumanGovernanceResponse::MetadataBatch { page },

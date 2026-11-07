@@ -18,6 +18,7 @@ from .backend import Backend, BackendError, _decode
 from .jobs import read_jobs
 from .comparison import read_comparison
 from .content import DETAIL_KINDS, read_record_content, read_record_detail, read_source_content
+from .sources import read_revisions
 from .memories import read_memories, read_overview
 
 ROOT = Path(__file__).resolve().parent
@@ -554,7 +555,7 @@ class App:
                         "next_cursor": result["next_cursor"],
                         "degraded_reasons": result["degraded_reasons"],
                     }
-            elif payload.get("kind") == "revisions" and set(payload) == {
+            elif payload.get("kind") == "revisions" and set(payload) - {"limit"} == {
                 "kind",
                 "reference",
                 "frontier",
@@ -568,20 +569,21 @@ class App:
                     or not valid_ref(payload["after"], optional=True)
                 ):
                     return JSONResponse({"error": "invalid_read"}, 400)
-                result = await self.backend.revisions(
-                    payload["reference"], frontier, payload["revision"], payload["after"]
+                result = await read_revisions(self.backend,
+                    payload["reference"], frontier, payload["revision"], payload["after"], payload.get("limit", 32)
                 )
                 if result["kind"] == "conflict":
                     data = {"conflict": True}
                 else:
                     data = {
                         "html": self.templates.get_template("revisions.html").render(
-                            items=result["items"],
-                            source_revision=payload["revision"],
-                            status=result["status"],
+                            items=result["items"], source_revision=payload["revision"],
+                            status=result["status"], matching_count=result["matching_count"],
                         ),
                         "frontier": str(result["frontier"]),
                         "next_cursor": result["next_cursor"],
+                        "matching_count": str(result["matching_count"]) if result["matching_count"] is not None else None,
+                        "state": result["status"],
                     }
             elif payload.get("kind") == "detail" and set(payload) == {
                 "kind",

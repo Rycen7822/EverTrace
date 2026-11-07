@@ -6103,6 +6103,202 @@ impl JournalAdmissionState {
         )
     }
 
+    /// Same-object historical metadata; borrow candidates and retain only limit+1 selected references.
+    pub(crate) fn revision_metadata(
+        &self,
+        reference: &evertrace_domain::query::HumanRevisionRef,
+        after: Option<&evertrace_domain::query::RevisionMetadataKey>,
+        limit: u16,
+        state: evertrace_domain::query::ObjectReadState,
+        cancelled: &std::sync::atomic::AtomicBool,
+        deadline: std::time::Instant,
+    ) -> Result<
+        evertrace_domain::query::MetadataReadOutcome<evertrace_domain::query::RevisionMetadataPage>,
+        StoreError,
+    > {
+        use evertrace_domain::query::{
+            ExactFieldsQuery, ExactReadQuery, HumanContentState as S, MetadataReadOutcome as O,
+            RevisionMetadataKey, RevisionMetadataPage,
+        };
+        let context = self.stored_fields_context(
+            &ExactReadQuery::Fields(ExactFieldsQuery {
+                revision_ref: reference.revision_ref.clone(),
+            }),
+            state,
+            cancelled,
+            deadline,
+        )?;
+        let context = match context {
+            O::Page(context) => context,
+            O::TooLarge => return Ok(O::TooLarge),
+            O::Conflict(frontier) => return Ok(O::Conflict(frontier)),
+        };
+        let mut page = RevisionMetadataPage {
+            reference: reference.clone(),
+            content_state: S::Missing,
+            records: Vec::new(),
+            matching_count: None,
+            next: None,
+        };
+        let Some(root) = context.selected.as_ref() else {
+            return Ok(O::Page(Box::new(page)));
+        };
+        if root.row_id != reference.stable_key
+            || root.current_revision_id.as_deref() != Some(&reference.revision_ref)
+        {
+            page.content_state = S::Unavailable;
+            return Ok(O::Page(Box::new(page)));
+        }
+        let id = root.object_id.as_deref().ok_or(StoreError::StoreCorrupt)?;
+        let candidates: Box<
+            dyn Iterator<Item = (bool, Result<MemoriesCandidate<'_>, StoreError>)> + '_,
+        > =
+            match root.object_kind.as_deref() {
+                Some("atom_revision") => {
+                    let id = id.parse::<AtomId>().map_err(|_| StoreError::StoreCorrupt)?;
+                    Box::new(self.atom_revisions.values().map(move |(v, seq)| {
+                        (v.atom_id == id, Ok(MemoriesCandidate::Atom(v, *seq)))
+                    }))
+                }
+                Some("revision_proposal_revision") => {
+                    let id = id
+                        .parse::<RevisionProposalId>()
+                        .map_err(|_| StoreError::StoreCorrupt)?;
+                    Box::new(self.proposal_revisions.values().map(move |(v, seq)| {
+                        (
+                            v.proposal_id == id,
+                            Ok(MemoriesCandidate::Proposal(v, *seq)),
+                        )
+                    }))
+                }
+                Some("procedure_revision") => {
+                    let id = id
+                        .parse::<ProcedureId>()
+                        .map_err(|_| StoreError::StoreCorrupt)?;
+                    Box::new(self.procedure.all_revisions().map(move |v| {
+                        (
+                            v.procedure_id == id,
+                            self.procedure
+                                .revision_entry(v.revision_id)
+                                .map(|(_, seq)| MemoriesCandidate::Procedure(v, seq))
+                                .ok_or(StoreError::StoreCorrupt),
+                        )
+                    }))
+                }
+                Some("core_membership") => {
+                    let id = id
+                        .parse::<evertrace_domain::ids::CoreMembershipId>()
+                        .map_err(|_| StoreError::StoreCorrupt)?;
+                    Box::new(self.scenario_core.all_membership_revisions().map(move |v| {
+                        (
+                            v.core_membership_id == id,
+                            self.scenario_core
+                                .membership_revision_entry(v.membership_revision_id)
+                                .map(|(_, seq)| MemoriesCandidate::Membership(v, seq))
+                                .ok_or(StoreError::StoreCorrupt),
+                        )
+                    }))
+                }
+                Some("semantic_digest") => {
+                    let id = id
+                        .parse::<evertrace_domain::ids::SemanticDigestId>()
+                        .map_err(|_| StoreError::StoreCorrupt)?;
+                    Box::new(
+                        self.synthesis
+                            .digests()
+                            .get(&id)
+                            .into_iter()
+                            .map(|(v, seq)| (true, Ok(MemoriesCandidate::Digest(v, *seq)))),
+                    )
+                }
+                _ => {
+                    page.content_state = S::Unsupported;
+                    return Ok(O::Page(Box::new(page)));
+                }
+            };
+        let deleted = product_deletion_ids(&self.deletions);
+        let contracts = self
+            .scenario_core
+            .deletion_owned_contracts(&deleted.revision_ids, &deleted.membership_ids);
+        let purged = self
+            .scope_purges
+            .events()
+            .map(|v| v.target.repository_id())
+            .collect::<BTreeSet<_>>();
+        let rank = |seq, key| (std::cmp::Reverse(seq), key);
+        let after_rank = after.map(|v| rank(v.source_event_seq, v.row_id.clone()));
+        let mut found_after = after.is_none();
+        let mut selected = BTreeMap::new();
+        let mut count = 0_u64;
+        for (belongs, candidate) in candidates {
+            if cancelled.load(std::sync::atomic::Ordering::SeqCst) {
+                return Err(StoreError::Io);
+            }
+            if std::time::Instant::now() >= deadline {
+                return Ok(O::TooLarge);
+            }
+            if !belongs {
+                continue;
+            }
+            let candidate = candidate?;
+            if candidate.product_deleted(
+                &deleted.revision_ids,
+                &deleted.atom_ids,
+                &deleted.procedure_ids,
+                &deleted.membership_ids,
+            ) || (!purged.is_empty()
+                && (candidate
+                    .repository_id()
+                    .is_some_and(|id| purged.contains(&id))
+                    || self
+                        .repository_closures
+                        .values()
+                        .any(|closure| closure.references_memory(candidate))))
+            {
+                continue;
+            }
+            count = count.checked_add(1).ok_or(StoreError::StoreCorrupt)?;
+            let position = rank(candidate.source_event_seq(), candidate.row_id());
+            found_after |= after_rank.as_ref() == Some(&position);
+            if after_rank.as_ref().is_some_and(|after| position <= *after) {
+                continue;
+            }
+            selected.insert(position, candidate);
+            if selected.len() > usize::from(limit) + 1 {
+                selected.pop_last();
+            }
+        }
+        if !found_after {
+            return Err(StoreError::InvalidInput);
+        }
+        if selected.len() > usize::from(limit) {
+            let ((seq, key), _) = selected
+                .iter()
+                .nth(usize::from(limit) - 1)
+                .ok_or(StoreError::StoreCorrupt)?;
+            page.next = Some(RevisionMetadataKey {
+                source_event_seq: seq.0,
+                row_id: key.clone(),
+            });
+            selected.pop_last();
+        }
+        for candidate in selected.into_values() {
+            if cancelled.load(std::sync::atomic::Ordering::SeqCst) {
+                return Err(StoreError::Io);
+            }
+            if std::time::Instant::now() >= deadline {
+                return Ok(O::TooLarge);
+            }
+            // Only canonical scalar/status columns leave this scope; no selected payload survives in the page.
+            let row = self.memory_candidate_row(candidate, &contracts)?;
+            page.records
+                .push(crate::JournalWriter::metadata_record(&row, None));
+        }
+        page.content_state = S::Ready;
+        page.matching_count = Some(count);
+        Ok(O::Page(Box::new(page)))
+    }
+
     pub(crate) fn stored_fields_pair_context(
         &self,
         query: &evertrace_domain::query::RevisionCompareQuery,

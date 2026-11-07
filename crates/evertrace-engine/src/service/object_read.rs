@@ -1009,21 +1009,93 @@ impl EngineService {
         query: Box<evertrace_domain::query::MetadataBatchQuery>,
         effective_config_hash: [u8; 32],
         llm: &evertrace_domain::config::LlmConfig,
+        report: std::sync::Arc<tokio::sync::RwLock<Option<evertrace_codex::HostProbeReport>>>,
     ) -> Result<
         evertrace_domain::query::MetadataReadOutcome<evertrace_domain::query::ObjectReadBatch>,
         crate::WriterActorError,
     > {
+        use evertrace_domain::query::{
+            ExactFieldsQuery, ExactReadQuery, HumanContentState as S, MetadataReadOutcome as O,
+            MetadataReadPage as P,
+        };
+        let deadline = Instant::now() + std::time::Duration::from_secs(2);
         let (cancelled, _cancel_on_drop) = evertrace_store::StoreReadHandle::cancellation_scope();
         let mut outcome = writer
-            .read_metadata_batch(query, cancelled, effective_config_hash)
+            .read_metadata_batch(query, cancelled.clone(), effective_config_hash)
             .await?;
         if let evertrace_domain::query::MetadataReadOutcome::Page(batch) = &mut outcome {
             for item in &mut batch.items {
+                if let P::Revisions { page } = item {
+                    if page.content_state != S::Ready {
+                        continue;
+                    }
+                    let context = writer
+                        .read_stored_fields_context(
+                            Box::new(ExactReadQuery::Fields(ExactFieldsQuery {
+                                revision_ref: page.reference.revision_ref.clone(),
+                            })),
+                            cancelled.clone(),
+                            deadline,
+                            effective_config_hash,
+                        )
+                        .await?;
+                    let context = match context {
+                        O::Page(context) => context,
+                        O::TooLarge => return Ok(O::TooLarge),
+                        O::Conflict(frontier) => return Ok(O::Conflict(frontier)),
+                    };
+                    if context.state != batch.state {
+                        return Ok(O::Conflict(context.state.frontier));
+                    }
+                    let state = if context.selected.as_ref().is_none_or(|row| {
+                        row.row_id != page.reference.stable_key
+                            || row.current_revision_id.as_deref()
+                                != Some(&page.reference.revision_ref)
+                    }) {
+                        Some(S::Missing)
+                    } else {
+                        fields_access(&writer, &context, &report, deadline)
+                            .await
+                            .err()
+                            .map(|code| {
+                                if code == ErrorCode::Untrusted {
+                                    S::AccessDenied
+                                } else {
+                                    S::Unavailable
+                                }
+                            })
+                    };
+                    if let Some(state) = state {
+                        page.content_state = state;
+                        page.records.clear();
+                        page.matching_count = None;
+                        page.next = None;
+                    }
+                }
                 if let evertrace_domain::query::MetadataReadPage::Work { page } = item {
                     page.llm_enabled = Some(llm.enabled);
                     page.episode_enrichment_enabled = Some(
                         llm.episode_enrichment != evertrace_domain::config::EpisodeEnrichment::Off,
                     );
+                }
+            }
+            // Counts and membership are fixed at batch.state, including across current-source assessments.
+            if batch
+                .items
+                .iter()
+                .any(|item| matches!(item, P::Revisions { .. }))
+            {
+                let current = match tokio::time::timeout_at(
+                    tokio::time::Instant::from_std(deadline),
+                    Self::read_state(writer.read_handle(), effective_config_hash),
+                )
+                .await
+                {
+                    Ok(state) => state.map_err(|_| crate::WriterActorError::Store)?,
+                    Err(_) => return Ok(O::TooLarge),
+                };
+                if current != batch.state {
+                    return Ok(O::Conflict(current.frontier));
                 }
             }
             if !batch.validate() {

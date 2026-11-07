@@ -366,6 +366,26 @@ class Backend:
                     "after": after,
                     "limit": item.get("limit", 32),
                 }
+            elif kind == "revisions":
+                if set(item) - {"kind", "reference", "after", "limit"}:
+                    raise BackendError("invalid_input")
+                reference, after = item.get("reference"), item.get("after")
+                if not isinstance(reference, dict) or set(reference) != {"stable_key", "revision_ref"}:
+                    raise BackendError("invalid_input")
+                if any(not isinstance(value, str) or not 0 < len(value.encode()) <= 512
+                       or any(ord(char) < 32 for char in value) for value in reference.values()):
+                    raise BackendError("invalid_input")
+                if after is not None:
+                    if not isinstance(after, dict) or set(after) != {"source_event_seq", "row_id"}:
+                        raise BackendError("invalid_input")
+                    if type(after["source_event_seq"]) is not int or not 0 < after["source_event_seq"] < 2**64:
+                        raise BackendError("invalid_input")
+                    key = after["row_id"]
+                    if not isinstance(key, str) or not 0 < len(key.encode()) <= 512 or any(ord(char) < 32 for char in key):
+                        raise BackendError("invalid_input")
+                    if frontier is None or identity is None:
+                        raise BackendError("invalid_input")
+                value = {"kind":kind, "reference":reference, "after":after, "limit":item.get("limit", 32)}
             elif kind in ("work", "review"):
                 if set(item) - {"kind", "query"}:
                     raise BackendError("invalid_input")
@@ -602,19 +622,6 @@ class Backend:
             {
                 "kind": "related",
                 "relation": "object_sources",
-                "source_stable_key": reference,
-                "expected_source_revision_ref": revision,
-                "expected_frontier": frontier,
-                "after": after,
-                "limit": 32,
-            }
-        )
-
-    async def revisions(self, reference, frontier, revision, after=None):
-        return await self._request(
-            {
-                "kind": "related",
-                "relation": "object_revisions",
                 "source_stable_key": reference,
                 "expected_source_revision_ref": revision,
                 "expected_frontier": frontier,

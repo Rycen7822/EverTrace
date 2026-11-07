@@ -844,7 +844,7 @@ impl<'a> MemoriesCandidate<'a> {
         }
     }
 
-    fn repository_id(self) -> Option<RepositoryId> {
+    pub(super) fn repository_id(self) -> Option<RepositoryId> {
         match self {
             Self::Atom(v, _) => v.scope.repository_id(),
             Self::Membership(v, _) => core_scope(&v.scope_identity).repository_id(),

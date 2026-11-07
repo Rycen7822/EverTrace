@@ -1649,13 +1649,35 @@ impl JournalWriter {
         {
             return Ok(Outcome::Conflict(state.frontier));
         }
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
         let build = |mut times: Option<&mut crate::sqlite_state::JournalTimeReader<'_>>| {
             let mut items = Vec::with_capacity(query.items.len());
             for item in &query.items {
                 if cancelled.load(std::sync::atomic::Ordering::SeqCst) {
                     return Err(StoreError::Io);
                 }
+                if std::time::Instant::now() >= deadline {
+                    return Ok(Outcome::TooLarge);
+                }
                 let page = match item {
+                    MetadataReadQuery::Revisions {
+                        reference,
+                        after,
+                        limit,
+                    } => {
+                        match self.admission_state.revision_metadata(
+                            reference,
+                            after.as_ref(),
+                            *limit,
+                            state.clone(),
+                            cancelled,
+                            deadline,
+                        )? {
+                            Outcome::Page(page) => MetadataReadPage::Revisions { page },
+                            Outcome::TooLarge => return Ok(Outcome::TooLarge),
+                            Outcome::Conflict(frontier) => return Ok(Outcome::Conflict(frontier)),
+                        }
+                    }
                     MetadataReadQuery::Work { query } => {
                         let context = self.admission_state.memory_overview_work_context(
                             query,
@@ -1805,7 +1827,7 @@ impl JournalWriter {
             MetadataReadQuery::Work { query } | MetadataReadQuery::Review { query } => {
                 query.time_range.is_some()
             }
-            MetadataReadQuery::Jobs { .. } => false,
+            MetadataReadQuery::Jobs { .. } | MetadataReadQuery::Revisions { .. } => false,
         });
         let result = if needs_times {
             self.lock_sqlite()?
