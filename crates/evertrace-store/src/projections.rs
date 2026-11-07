@@ -6063,8 +6063,39 @@ impl JournalAdmissionState {
         if !query.validate() {
             return Err(StoreError::InvalidInput);
         }
+        // Bind a typed public ID using its existing canonical-current owner, then read that immutable revision.
+        let reference = query.lookup_ref();
+        let current = if matches!(query, evertrace_domain::query::ExactReadQuery::Record(record)
+            if record.reference.revision_ref.is_none())
+        {
+            if let Ok(id) = reference.parse::<AtomId>() {
+                self.atoms
+                    .get(&id)
+                    .map(|(value, _)| value.revision_id.to_string())
+            } else if let Ok(id) = reference.parse::<ProcedureId>() {
+                self.procedure
+                    .current_revision(id)
+                    .map(|value| value.revision_id.to_string())
+            } else if let Ok(id) = reference.parse::<evertrace_domain::ids::CoreMembershipId>() {
+                self.scenario_core
+                    .current_membership(id)
+                    .map(|value| value.membership_revision_id.to_string())
+            } else if let Ok(id) = reference.parse::<RevisionProposalId>() {
+                self.proposals
+                    .get(&id)
+                    .map(|(value, _)| value.proposal_revision_id.to_string())
+            } else if let Ok(id) = reference.parse::<WorkEpisodeId>() {
+                self.episodes
+                    .get(&id)
+                    .map(|(value, _)| value.revision_id.to_string())
+            } else {
+                None
+            }
+        } else {
+            None
+        };
         self.stored_fields_context_with_budget(
-            query.revision_ref(),
+            current.as_deref().unwrap_or(reference),
             state,
             cancelled,
             deadline,

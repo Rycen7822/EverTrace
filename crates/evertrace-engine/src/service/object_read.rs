@@ -675,6 +675,7 @@ impl EngineService {
         let mut result = ExactRecordWindow {
             state: metadata.state,
             selection: metadata.selection,
+            metadata: None,
             content_state: State::Missing,
             info: None,
             window: None,
@@ -684,11 +685,12 @@ impl EngineService {
         };
         if root.row_id != query.reference.stable_key
             && root.object_id.as_deref() != Some(&query.reference.stable_key)
-            && query.reference.stable_key != query.reference.revision_ref
+            && query.reference.revision_ref.as_deref() != Some(query.reference.stable_key.as_str())
         {
             result.content_state = State::Unavailable;
             return Ok(Outcome::Page(Box::new(result)));
         }
+        result.metadata = Some(evertrace_store::JournalWriter::metadata_record(root, None));
         if query
             .expected_selection
             .as_ref()
@@ -737,6 +739,10 @@ impl EngineService {
         };
         result.state = current.state.clone();
         result.selection = fields_metadata(&current)?.selection;
+        result.metadata = current
+            .selected
+            .as_ref()
+            .map(|row| evertrace_store::JournalWriter::metadata_record(row, None));
         if let Err(code) = fields_access(&writer, &current, &report, deadline).await {
             result.content_state = if code == ErrorCode::Untrusted {
                 State::AccessDenied

@@ -17,7 +17,7 @@ from uvicorn.protocols.http.h11_impl import H11Protocol
 from .backend import Backend, BackendError, _decode
 from .jobs import read_jobs
 from .comparison import read_comparison
-from .content import read_record_content, read_source_content
+from .content import DETAIL_KINDS, read_record_content, read_record_detail, read_source_content
 from .memories import read_memories, read_overview
 
 ROOT = Path(__file__).resolve().parent
@@ -589,18 +589,25 @@ class App:
                 "frontier",
                 "revision",
                 "surface",
+                "object_kind",
             }:
                 frontier = parse_frontier(payload["frontier"])
                 surface = payload["surface"]
                 if (
                     surface not in ("explorer", "inbox", "system")
+                    or not isinstance(payload["object_kind"], str)
+                    or not 0 < len(payload["object_kind"]) <= 64
                     or not valid_ref(payload["reference"])
                     or not valid_ref(payload["revision"], optional=True)
                 ):
                     return JSONResponse({"error": "invalid_read"}, status_code=400)
-                result = await self.backend.detail(
-                    payload["reference"], frontier, payload["revision"], surface
-                )
+                if surface == "explorer" and payload["object_kind"] in DETAIL_KINDS:
+                    result = await read_record_detail(self.backend, payload["reference"], frontier,
+                        payload["revision"], payload["object_kind"])
+                else:
+                    result = await self.backend.detail(
+                        payload["reference"], frontier, payload["revision"], surface
+                    )
                 data = present_detail(self.templates, result, surface)
             else:
                 return JSONResponse({"error": "read_unavailable"}, status_code=400)
@@ -625,6 +632,13 @@ def present_detail(templates, result, surface):
         if presentation and presentation.get("kind") in ("inline", "preview")
         else None
     )
+    semantic = item.get("semantic_detail") if item else None
+    content = semantic.get("content") if semantic and semantic.get("state") == "ready" else None
+    semantic_text = None
+    if content and content["kind"] == "atom":
+        semantic_text = content["value"]["value"]["text"]
+    elif content and content["kind"] == "procedure":
+        semantic_text = content["value"]["draft"]["summary"]
     template = "detail.html" if surface == "explorer" else "observation_detail.html"
     selection = (
         {
@@ -640,6 +654,7 @@ def present_detail(templates, result, surface):
     return {
         "html": templates.get_template(template).render(items=result["items"], surface=surface),
         "source_preview": preview,
+        "semantic_text": semantic_text,
         "selection": selection,
     }
 

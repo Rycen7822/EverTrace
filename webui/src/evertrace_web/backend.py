@@ -306,8 +306,10 @@ class Backend:
         return result
 
     async def read_record_window(self, reference, revision, field=None, byte_range=None, data_identity=None, selection=None):
+        # An omitted expected revision asks Native to bind a typed public ID to canonical-current.
+        values = (reference,) if revision is None else (reference, revision)
         if any(not isinstance(value, str) or not value or len(value.encode()) > 512
-               or any(ord(char) < 32 for char in value) for value in (reference, revision)):
+               or any(ord(char) < 32 for char in value) for value in values):
             raise BackendError("invalid_input")
         if (field is None) != (byte_range is None):
             raise BackendError("invalid_input")

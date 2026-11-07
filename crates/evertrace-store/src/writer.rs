@@ -1667,7 +1667,7 @@ impl JournalWriter {
                             .into_iter()
                             .map(|row| {
                                 let event = context.event_times.get(&row.source_event_seq).copied();
-                                Self::metadata_record(row, event)
+                                Self::metadata_record(&row, event)
                             })
                             .collect();
                         MetadataReadPage::Work {
@@ -1705,7 +1705,7 @@ impl JournalWriter {
                             .into_iter()
                             .map(|row| {
                                 let event = context.event_times.get(&row.source_event_seq).copied();
-                                Self::metadata_record(row, event)
+                                Self::metadata_record(&row, event)
                             })
                             .collect();
                         MetadataReadPage::Review {
@@ -1770,7 +1770,7 @@ impl JournalWriter {
                             .into_iter()
                             .map(|row| {
                                 let event = context.event_times.get(&row.source_event_seq).copied();
-                                Self::metadata_record(row, event)
+                                Self::metadata_record(&row, event)
                             })
                             .collect();
                         MetadataReadPage::Memories {
@@ -1817,7 +1817,8 @@ impl JournalWriter {
         Ok(result)
     }
 
-    fn metadata_record(row: ObjectRow, event_time_us: Option<i64>) -> serde_json::Value {
+    /// Stored metadata columns only; no payload or permission decision.
+    pub fn metadata_record(row: &ObjectRow, event_time_us: Option<i64>) -> serde_json::Value {
         serde_json::json!({
             "row_id": row.row_id, "object_kind": row.object_kind, "object_id": row.object_id,
             "current_revision_id": row.current_revision_id, "lifecycle": row.lifecycle,

@@ -244,6 +244,7 @@ async function detail(item, frontier, controller, scroll = 0) {
       frontier,
       revision: item.revision || null,
       surface: item.surface || "explorer",
+      object_kind: item.kind,
     },
     controller.signal,
   );
@@ -257,8 +258,10 @@ async function detail(item, frontier, controller, scroll = 0) {
   if (result.selection) state.selected = { ...state.selected, ...result.selection };
   const source = $("detail-body").querySelector(".source-presentation");
   if (source) source.textContent = result.source_preview || "";
+  const semantic = $("detail-body").querySelector(".semantic-body");
+  if (semantic && typeof result.semantic_text === "string") semantic.textContent = result.semantic_text;
   navigationControls();
-  $("detail-ref").textContent = item.surface && !result.selection ? "" : item.revision || item.key;
+  $("detail-ref").textContent = item.surface && !result.selection ? "" : result.selection?.revision || item.revision || item.key;
   $("detail-body").scrollTop = scroll;
   if (item.surface && !result.selection) state.selected = null;
 }

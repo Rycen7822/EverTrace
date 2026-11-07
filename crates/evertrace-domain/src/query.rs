@@ -2639,11 +2639,15 @@ impl ExactReadQuery {
         }
     }
 
-    pub fn revision_ref(&self) -> &str {
+    pub fn lookup_ref(&self) -> &str {
         match self {
             Self::Fields(query) => &query.revision_ref,
             Self::SourceText(query) => &query.reference.revision_ref,
-            Self::Record(query) => &query.reference.revision_ref,
+            Self::Record(query) => query
+                .reference
+                .revision_ref
+                .as_deref()
+                .unwrap_or(&query.reference.stable_key),
         }
     }
 }
@@ -2700,28 +2704,47 @@ impl ExactUtf8Range {
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct ExactRecordQuery {
-    pub reference: HumanRevisionRef,
+    pub reference: ExactRecordRef,
     pub field: Option<ExactRecordField>,
     pub range: Option<ExactUtf8Range>,
     pub expected_data_identity: Option<ReadDataIdentity>,
     pub expected_selection: Option<ExactFieldIdentity>,
 }
 
+/// An omitted expected revision binds only a typed public ID to its Native canonical-current revision.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct ExactRecordRef {
+    pub stable_key: String,
+    pub revision_ref: Option<String>,
+}
+
 impl ExactRecordQuery {
     pub fn validate(&self) -> bool {
         let reference = &self.reference;
-        !reference.stable_key.is_empty()
+        let identity = match &reference.revision_ref {
+            Some(revision) => {
+                (ExactFieldsQuery {
+                    revision_ref: revision.clone(),
+                })
+                .validate()
+                    || revision.parse::<crate::ids::CaptureReceiptId>().is_ok()
+                    || parse_operation_revision(revision).is_some()
+            }
+            None => {
+                let key = &reference.stable_key;
+                key.parse::<crate::ids::AtomId>().is_ok()
+                    || key.parse::<crate::ids::ProcedureId>().is_ok()
+                    || key.parse::<crate::ids::CoreMembershipId>().is_ok()
+                    || key.parse::<crate::ids::RevisionProposalId>().is_ok()
+                    || key.parse::<crate::ids::SemanticDigestId>().is_ok()
+                    || key.parse::<crate::ids::WorkEpisodeId>().is_ok()
+            }
+        };
+        identity
+            && !reference.stable_key.is_empty()
             && reference.stable_key.len() <= 512
             && !reference.stable_key.chars().any(char::is_control)
-            && (ExactFieldsQuery {
-                revision_ref: reference.revision_ref.clone(),
-            }
-            .validate()
-                || reference
-                    .revision_ref
-                    .parse::<crate::ids::CaptureReceiptId>()
-                    .is_ok()
-                || parse_operation_revision(&reference.revision_ref).is_some())
             && self.field.is_some() == self.range.is_some()
             && self.range.as_ref().is_none_or(ExactUtf8Range::validate)
             && self.expected_selection.as_ref().is_none_or(|selected| {
@@ -2765,6 +2788,7 @@ pub enum ExactRecordInfo {
 pub struct ExactRecordWindow {
     pub state: ObjectReadState,
     pub selection: Option<ExactFieldIdentity>,
+    pub metadata: Option<serde_json::Value>,
     pub content_state: HumanContentState,
     pub info: Option<ExactRecordInfo>,
     pub window: Option<ExactUtf8Window>,
@@ -2773,8 +2797,22 @@ pub struct ExactRecordWindow {
 impl ExactRecordWindow {
     pub fn validate(&self) -> bool {
         self.state.validate()
+            && self.metadata.as_ref().is_none_or(|row| {
+                row.is_object()
+                    && row.get("payload_json").is_none()
+                    && self.selection.as_ref().is_some_and(|selected| {
+                        row["object_kind"].as_str() == Some(selected.object_kind.as_str())
+                            && row["object_id"].as_str() == Some(selected.object_ref.as_str())
+                            && row["current_revision_id"].as_str()
+                                == Some(selected.revision_ref.as_str())
+                            && row["source_event_seq"].as_u64() == Some(selected.source_event_seq)
+                    })
+                    && serde_json::to_vec(row)
+                        .is_ok_and(|bytes| bytes.len() <= METADATA_REPLY_BYTES)
+            })
             && if self.content_state == HumanContentState::Ready {
                 self.selection.is_some()
+                    && self.metadata.is_some()
                     && self.info.as_ref().is_some_and(|info| match info {
                         ExactRecordInfo::Semantic { .. } => true,
                         ExactRecordInfo::Work {

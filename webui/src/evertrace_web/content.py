@@ -95,6 +95,70 @@ async def read_source_content(backend, reference, frontier, revision, after=None
     return {"kind": "content", "content": content}
 
 
+DETAIL_KINDS = {"atom_revision": "atom", "procedure_revision": "procedure", "core_membership": "core_membership",
+                "semantic_digest": "digest", "revision_proposal_revision": None, "work_episode": "work_episode"}
+
+
+async def read_record_detail(backend, reference, frontier, revision, object_kind):
+    """A selected reading detail, never an Inbox/action or Work/System qualification projection."""
+    if object_kind not in DETAIL_KINDS:
+        raise BackendError("invalid_input")
+    reply = await backend.read_record_window(reference, revision)
+    if reply["kind"] == "conflict":
+        return reply
+    meta = reply["page"]
+    if meta["state"]["frontier"] < frontier:
+        return {"kind": "conflict"}
+    row = meta["metadata"]
+    if row is None:
+        return {"kind": "detail", "items": []}
+    if row["object_kind"] != object_kind or revision is not None and row["current_revision_id"] != revision:
+        raise BackendError("invalid_input")
+    revision = row["current_revision_id"]
+    identity, selection = meta["state"]["data_identity"], meta["selection"]
+    state, record, total = meta["content_state"], None, None
+    if state == "ready" and DETAIL_KINDS[object_kind] is not None:
+        reply = await backend.read_record_window(reference, revision, {"kind": "json"},
+            {"offset": 0, "length": _LIMIT}, identity, selection)
+        if reply["kind"] == "conflict":
+            return reply
+        page = reply["page"]
+        state = page["content_state"]
+        if page["metadata"] != row or page["selection"] != selection:
+            return {"kind": "conflict"}
+        if state == "ready":
+            if page["info"] != meta["info"]:
+                return {"kind": "conflict"}
+            window = page["window"]
+            total = window["total_bytes"]
+            if total > _LIMIT:
+                state = "too_large"
+            elif window["start"] != 0 or window["end"] != total:
+                raise BackendError("invalid_read_response")
+            else:
+                record = _decode(window["text"].encode())
+                if not isinstance(record, dict):
+                    raise BackendError("invalid_read_response")
+    # Recheck after decoding/projection, under the same immutable identity and current access rules.
+    reply = await backend.read_record_window(reference, revision, data_identity=identity, selection=selection)
+    if reply["kind"] == "conflict":
+        return reply
+    final = reply["page"]
+    if final["metadata"] != row or final["selection"] != selection:
+        return {"kind": "conflict"}
+    if final["content_state"] != "ready":
+        state, record, total = final["content_state"], None, None
+    elif final["info"] != meta["info"] or final["state"]["data_identity"] != identity:
+        return {"kind": "conflict"}
+    detail = None if object_kind == "revision_proposal_revision" and state == "ready" else {
+        "object_ref": row["object_id"], "revision_ref": revision, "state": state,
+        "preview": None, "original_bytes": total,
+        "content": {"kind": DETAIL_KINDS[object_kind], "value": record} if record is not None else None}
+    item = {**row, "stable_key": row["row_id"], "object_ref": row["object_id"], "revision_ref": revision,
+            "semantic_detail": detail, "proposal": None}
+    return {"kind": "detail", "items": [item]}
+
+
 _RECORD_ALGORITHM = "exact_record_utf8_v1"
 _RECORD_KEYS = {"algorithm", "reference", "revision", "representation", "data_identity", "selection", "offset", "backwards"}
 
