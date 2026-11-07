@@ -3427,6 +3427,31 @@ pub fn read_dependencies_for(row: &ObjectRow, payload: &JournalPayload) -> BTree
             refs.extend(value.artifact_refs.iter().map(ToString::to_string));
             refs.extend(value.evidence_refs.iter().map(ToString::to_string));
         }
+        JournalPayload::RecoveryCaptureRequestRecorded(value) => {
+            refs.insert(value.repository_instance_id.to_string());
+            refs.insert(value.worktree_instance_id.to_string());
+            refs.extend(value.pre_operation_snapshot_id.map(|id| id.to_string()));
+            refs.extend(value.recovery_bundle_id.map(|id| id.to_string()));
+        }
+        JournalPayload::RecoveryBundleRecorded(value) => {
+            refs.insert(value.source_worktree_instance_id.to_string());
+            refs.insert(value.source_snapshot_id.to_string());
+            refs.extend(value.trigger_request_ids.iter().map(ToString::to_string));
+            refs.extend(
+                value
+                    .untracked_work_artifact_refs
+                    .iter()
+                    .map(ToString::to_string),
+            );
+            refs.extend(
+                value
+                    .metadata_only_work_artifact_refs
+                    .iter()
+                    .map(ToString::to_string),
+            );
+            refs.extend(value.config_and_run_refs.iter().cloned());
+            refs.extend(value.attempt_anchor_ids.iter().map(ToString::to_string));
+        }
         JournalPayload::WorktreeInstanceRecorded(value) => {
             refs.insert(value.repository_instance_id.to_string());
             refs.extend(value.current_snapshot_id.map(|id| id.to_string()));
@@ -6020,6 +6045,38 @@ impl JournalAdmissionState {
                 *seq,
             )?);
         }
+        let request = reference
+            .parse::<evertrace_domain::revision::RevisionId>()
+            .ok()
+            .and_then(|id| self.recovery_request_revisions.get(&id))
+            .or_else(|| {
+                reference
+                    .parse::<RecoveryCaptureRequestId>()
+                    .ok()
+                    .and_then(|id| self.recovery_requests.get(&id))
+            });
+        if let Some((value, seq)) = request {
+            rows.push(physical_object_row(
+                ObjectFamily::Work,
+                "recovery_capture_request",
+                value.recovery_capture_request_id.to_string(),
+                value.request_revision_id.to_string(),
+                &JournalPayload::RecoveryCaptureRequestRecorded(Box::new(value.clone())),
+                *seq,
+            )?);
+        }
+        if let Ok(id) = reference.parse::<RecoveryBundleId>()
+            && let Some((value, seq)) = self.recovery_bundles.get(&id)
+        {
+            rows.push(physical_object_row(
+                ObjectFamily::Work,
+                "recovery_bundle",
+                id.to_string(),
+                id.to_string(),
+                &JournalPayload::RecoveryBundleRecorded(Box::new(value.clone())),
+                *seq,
+            )?);
+        }
         if let Some((id, revision)) = evertrace_domain::query::parse_operation_revision(reference) {
             if let Some((value, seq)) = self.operation_revisions.get(&(id, revision)) {
                 rows.push(physical_object_row(
@@ -6143,6 +6200,10 @@ impl JournalAdmissionState {
                 self.host_occurrences
                     .get(&id)
                     .map(|(value, _)| format!("{id}@{}", value.normalization_revision))
+            } else if let Ok(id) = reference.parse::<RecoveryCaptureRequestId>() {
+                self.recovery_requests
+                    .get(&id)
+                    .map(|(value, _)| value.request_revision_id.to_string())
             } else if let Ok(id) = reference.parse::<WorktreeId>() {
                 self.worktrees
                     .get(&id)
@@ -6426,6 +6487,8 @@ impl JournalAdmissionState {
                                 | "scope_effect"
                                 | "worktree"
                                 | "worktree_snapshot"
+                                | "recovery_capture_request"
+                                | "recovery_bundle"
                                 | "capture_receipt"
                                 | "capture_receipt_revision"
                         )
@@ -6631,7 +6694,12 @@ impl JournalAdmissionState {
         // These exact-read rows are transient. Derive physical scope here without changing business projections.
         for row in rows.values_mut() {
             let repository = match row.object_kind.as_deref() {
-                Some("worktree" | "worktree_snapshot") => {
+                Some(
+                    "worktree"
+                    | "worktree_snapshot"
+                    | "recovery_capture_request"
+                    | "recovery_bundle",
+                ) => {
                     let payload: JournalPayload = serde_json::from_str(
                         row.payload_json
                             .as_deref()
@@ -6642,6 +6710,14 @@ impl JournalAdmissionState {
                         JournalPayload::WorktreeInstanceRecorded(value) => {
                             value.repository_instance_id
                         }
+                        JournalPayload::RecoveryCaptureRequestRecorded(value) => {
+                            value.repository_instance_id
+                        }
+                        JournalPayload::RecoveryBundleRecorded(value) => self
+                            .worktrees
+                            .get(&value.source_worktree_instance_id)
+                            .map(|(tree, _)| tree.repository_instance_id)
+                            .ok_or(StoreError::StoreCorrupt)?,
                         JournalPayload::WorktreeSnapshotRecorded(value) => self
                             .worktrees
                             .get(&value.worktree_instance_id)

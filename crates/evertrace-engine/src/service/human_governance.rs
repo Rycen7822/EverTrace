@@ -31,16 +31,11 @@ use evertrace_domain::{
     ids::{
         AtomId, AttemptId, CaptureReceiptId, CommandId, CoreMembershipId, ExecutionLaneId, JobId,
         ProcedureId, ProcedureNegativeEvidenceId, RecoveryApplicationId, RecoveryBundleId,
-        RecoveryCaptureRequestId, RepositoryId, RequestId, RevisionProposalId, WorktreeId,
-        WorktreeSnapshotId,
+        RepositoryId, RequestId, RevisionProposalId, WorktreeId, WorktreeSnapshotId,
     },
     procedure::{ProcedureNegativeReviewEvent, ProcedureNegativeReviewStatus},
     purge::{ObjectDeletionTarget, ObjectReauthorizationRef, RepositoryPurgeBlocker},
-    repository::{
-        DestructiveClass, OrderingIntegrity as RecoveryOrderingIntegrity, RecoveryApplicationKind,
-        RecoveryApplicationStatus, RecoveryCaptureStatus, RecoveryInputDeliveryState,
-        RecoveryOmissionReason, RecoveryReasonCode, RecoveryRequestStatus, UntrackedCaptureScope,
-    },
+    repository::{RecoveryApplicationKind, RecoveryApplicationStatus, RecoveryInputDeliveryState},
     revision::RevisionId,
     semantic::{
         AtomProposalPayload, GlobalSuccessorSupportContract, GlobalSupportState,
@@ -395,34 +390,6 @@ pub enum HumanSystemDetail {
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum HumanRecoveryDetail {
-    CaptureRequest {
-        request_id: RecoveryCaptureRequestId,
-        revision_id: RevisionId,
-        repository_id: RepositoryId,
-        worktree_id: WorktreeId,
-        destructive_class: DestructiveClass,
-        untracked_scope: UntrackedCaptureScope,
-        status: RecoveryRequestStatus,
-        bundle_id: Option<RecoveryBundleId>,
-        reason_codes: Vec<RecoveryReasonCode>,
-    },
-    Bundle {
-        bundle_id: RecoveryBundleId,
-        source_worktree_id: WorktreeId,
-        source_snapshot_id: WorktreeSnapshotId,
-        capture_status: RecoveryCaptureStatus,
-        ordering_integrity: RecoveryOrderingIntegrity,
-        captured_bytes: u64,
-        tracked_diff_count: u32,
-        tracked_file_count: u32,
-        index_state_count: u32,
-        untracked_file_count: u32,
-        untracked_artifact_count: u32,
-        metadata_artifact_count: u32,
-        config_run_count: u32,
-        attempt_anchor_count: u32,
-        omission_counts: Vec<HumanRecoveryOmissionCount>,
-    },
     Application {
         application_id: RecoveryApplicationId,
         revision_id: RevisionId,
@@ -437,12 +404,6 @@ pub enum HumanRecoveryDetail {
         result_count: u32,
         verifier_count: u32,
     },
-}
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub struct HumanRecoveryOmissionCount {
-    pub reason: RecoveryOmissionReason,
-    pub count: u32,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -4118,9 +4079,7 @@ fn typed_current_detail(row: &ObjectRow) -> Result<HumanTypedDetails, HumanGover
     };
     if !matches!(
         kind,
-        "recovery_capture_request_revision"
-            | "recovery_bundle"
-            | "recovery_application_revision"
+        "recovery_application_revision"
             | "execution_lane"
             | "capture_receipt"
             | "runtime_event"
@@ -4171,68 +4130,6 @@ fn typed_current_detail(row: &ObjectRow) -> Result<HumanTypedDetails, HumanGover
                 asset_names: Vec::new(),
             }),
         )),
-        (
-            "recovery_capture_request_revision",
-            JournalPayload::RecoveryCaptureRequestRecorded(value),
-        ) => Ok((
-            Some(HumanRecoveryDetail::CaptureRequest {
-                request_id: value.recovery_capture_request_id,
-                revision_id: value.request_revision_id,
-                repository_id: value.repository_instance_id,
-                worktree_id: value.worktree_instance_id,
-                destructive_class: value.destructive_class,
-                untracked_scope: value.untracked_capture_scope,
-                status: value.request_status,
-                bundle_id: value.recovery_bundle_id,
-                reason_codes: sorted_reason_codes(&value.reason_codes),
-            }),
-            None,
-            None,
-        )),
-        ("recovery_bundle", JournalPayload::RecoveryBundleRecorded(value)) => {
-            let mut omission_counts = Vec::<HumanRecoveryOmissionCount>::new();
-            for omission in &value.omissions {
-                if let Some(current) = omission_counts
-                    .iter_mut()
-                    .find(|current| current.reason == omission.reason)
-                {
-                    current.count = current
-                        .count
-                        .checked_add(1)
-                        .ok_or(HumanGovernanceError::Store)?;
-                } else {
-                    omission_counts.push(HumanRecoveryOmissionCount {
-                        reason: omission.reason,
-                        count: 1,
-                    });
-                }
-            }
-            Ok((
-                Some(HumanRecoveryDetail::Bundle {
-                    bundle_id: value.recovery_bundle_id,
-                    source_worktree_id: value.source_worktree_instance_id,
-                    source_snapshot_id: value.source_snapshot_id,
-                    capture_status: value.capture_status,
-                    ordering_integrity: value.ordering_integrity,
-                    captured_bytes: value.captured_bytes,
-                    tracked_diff_count: bounded_count(value.tracked_diff_blob_refs.len())?,
-                    tracked_file_count: bounded_count(value.tracked_file_blob_refs.len())?,
-                    index_state_count: bounded_count(value.index_state_refs.len())?,
-                    untracked_file_count: bounded_count(value.untracked_file_blob_refs.len())?,
-                    untracked_artifact_count: bounded_count(
-                        value.untracked_work_artifact_refs.len(),
-                    )?,
-                    metadata_artifact_count: bounded_count(
-                        value.metadata_only_work_artifact_refs.len(),
-                    )?,
-                    config_run_count: bounded_count(value.config_and_run_refs.len())?,
-                    attempt_anchor_count: bounded_count(value.attempt_anchor_ids.len())?,
-                    omission_counts,
-                }),
-                None,
-                None,
-            ))
-        }
         ("recovery_application_revision", JournalPayload::RecoveryApplicationRecorded(value)) => {
             Ok((
                 Some(HumanRecoveryDetail::Application {
@@ -4395,12 +4292,6 @@ fn typed_current_detail(row: &ObjectRow) -> Result<HumanTypedDetails, HumanGover
 
 fn bounded_count(value: usize) -> Result<u32, HumanGovernanceError> {
     u32::try_from(value).map_err(|_| HumanGovernanceError::Store)
-}
-
-fn sorted_reason_codes(values: &[RecoveryReasonCode]) -> Vec<RecoveryReasonCode> {
-    let mut values = values.to_vec();
-    values.sort();
-    values
 }
 
 fn sorted_reasoning_visibility(values: &[ReasoningVisibility]) -> Vec<ReasoningVisibility> {
@@ -4730,22 +4621,6 @@ mod tests {
             };
             assert!(page(&snapshot, HumanSurface::System, None, 64, true).is_err());
         }
-    }
-
-    #[test]
-    fn recovery_reason_codes_are_stably_sorted() {
-        assert_eq!(
-            sorted_reason_codes(&[
-                RecoveryReasonCode::LateTimeout,
-                RecoveryReasonCode::CaptureComplete,
-                RecoveryReasonCode::DaemonCaptureFailed,
-            ]),
-            vec![
-                RecoveryReasonCode::CaptureComplete,
-                RecoveryReasonCode::DaemonCaptureFailed,
-                RecoveryReasonCode::LateTimeout,
-            ]
-        );
     }
 
     #[test]

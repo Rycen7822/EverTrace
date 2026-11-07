@@ -1,5 +1,6 @@
 """Source reading projection and stateless UTF-8 pagination; authority remains in Native exact reads."""
 import json
+import time
 
 from . import BackendError
 from .backend import _decode
@@ -100,9 +101,11 @@ DETAIL_KINDS = {"atom_revision": "atom", "procedure_revision": "procedure", "cor
                 "work_episode": "work_episode", "capture_receipt": "capture_receipt", "task": "task", "workstream": "workstream",
                 "attempt": "attempt", "operation_burst": "operation_burst", "operation": "operation",
                 "host_occurrence": "host_occurrence", "scope_effect": "scope_effect",
-                "worktree": "worktree", "worktree_snapshot": "worktree_snapshot"}
+                "worktree": "worktree", "worktree_snapshot": "worktree_snapshot",
+                "recovery_capture_request": "recovery_capture_request", "recovery_bundle": "recovery_bundle"}
 WORK_DETAIL_KINDS = {"task", "workstream", "work_episode", "attempt", "operation_burst", "operation",
-                     "host_occurrence", "scope_effect", "worktree", "worktree_snapshot"}
+                     "host_occurrence", "scope_effect", "worktree", "worktree_snapshot",
+                     "recovery_capture_request", "recovery_bundle"}
 
 
 async def read_record_detail(backend, reference, frontier, revision, object_kind):
@@ -124,27 +127,39 @@ async def read_record_detail(backend, reference, frontier, revision, object_kind
     identity, selection = meta["state"]["data_identity"], meta["selection"]
     state, record, total = meta["content_state"], None, None
     if state == "ready" and DETAIL_KINDS[object_kind] is not None:
-        reply = await backend.read_record_window(reference, revision, {"kind": "json"},
-            {"offset": 0, "length": _LIMIT}, identity, selection)
-        if reply["kind"] == "conflict":
-            return reply
-        page = reply["page"]
-        state = page["content_state"]
-        if page["metadata"] != row or page["selection"] != selection:
-            return {"kind": "conflict"}
-        if state == "ready":
+        maximum = 65536 if object_kind == "recovery_bundle" else _LIMIT
+        deadline, encoded = time.monotonic()+2, bytearray()
+        while True:
+            if time.monotonic() >= deadline:
+                state = "too_large"
+                break
+            reply = await backend.read_record_window(reference, revision, {"kind": "json"},
+                {"offset": len(encoded), "length": _LIMIT}, identity, selection)
+            if reply["kind"] == "conflict":
+                return reply
+            page = reply["page"]
+            state = page["content_state"]
+            if page["metadata"] != row or page["selection"] != selection:
+                return {"kind": "conflict"}
+            if state != "ready":
+                break
             if page["info"] != meta["info"]:
                 return {"kind": "conflict"}
             window = page["window"]
             total = window["total_bytes"]
-            if total > _LIMIT:
+            if total > maximum:
                 state = "too_large"
-            elif window["start"] != 0 or window["end"] != total:
+                break
+            if window["start"] != len(encoded) or not window["start"] < window["end"] <= total:
                 raise BackendError("invalid_read_response")
-            else:
-                record = _decode(window["text"].encode())
+            encoded.extend(window["text"].encode())
+            if window["end"] != len(encoded):
+                raise BackendError("invalid_read_response")
+            if len(encoded) == total:
+                record = _decode(encoded)
                 if not isinstance(record, dict):
                     raise BackendError("invalid_read_response")
+                break
     # Recheck after decoding/projection, under the same immutable identity and current access rules.
     reply = await backend.read_record_window(reference, revision, data_identity=identity, selection=selection)
     if reply["kind"] == "conflict":

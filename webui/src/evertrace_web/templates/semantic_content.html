@@ -191,6 +191,8 @@
     data-object="{{ value.predecessor_revision_id }}" data-kind="capture_receipt">读取原前序凭证</button>{% endif %}
 {% elif content.kind in ('attempt', 'operation_burst', 'operation', 'host_occurrence', 'scope_effect', 'worktree', 'worktree_snapshot') %}
   {% include 'work_records.html' %}
+{% elif content.kind in ('recovery_capture_request', 'recovery_bundle') %}
+  {% include 'recovery_records.html' %}
 {% elif content.kind == 'work_episode' %}
   <h2>工作片段</h2>
   <p class="muted">原片段记录仅作上下文和来源；目标、状态或结果引用不等于已验证结论，也不授予执行资格。</p>

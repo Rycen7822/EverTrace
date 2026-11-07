@@ -456,6 +456,8 @@ fn record_data(
         P::ScopeEffectDerived(value) => semantic_record(&value, None, query, check),
         P::WorktreeInstanceRecorded(value) => semantic_record(&value, None, query, check),
         P::WorktreeSnapshotRecorded(value) => semantic_record(&value, None, query, check),
+        P::RecoveryCaptureRequestRecorded(value) => semantic_record(&value, None, query, check),
+        P::RecoveryBundleRecorded(value) => semantic_record(&value, None, query, check),
         P::CaptureReceiptRecorded(value) => semantic_record(&value, None, query, check),
         P::TaskRecorded(value) => {
             semantic_record(&value, Some(&value.canonical_goal), query, check)

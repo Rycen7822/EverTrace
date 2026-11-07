@@ -1,0 +1,54 @@
+{% if content.kind == 'recovery_capture_request' %}
+<h2>恢复捕获请求</h2>
+<p>请求状态：{{ value.request_status }} · 检测状态：{{ value.detection_status }}</p>
+<p>变更分类：{{ value.destructive_class }} · untracked 范围：{{ value.untracked_capture_scope }}</p>
+<p>仓库：{{ value.repository_instance_id }} · 工作树：{{ value.worktree_instance_id }}</p>
+<p>操作前快照：{{ value.pre_operation_snapshot_id or '未记录' }}</p>
+<p>恢复包：{{ value.recovery_bundle_id or '未记录' }}</p>
+<p>触发事件：{{ value.trigger_event_id }}</p>
+<p>命令指纹：{{ value.command_fingerprint }}</p>
+<p>开始：{{ value.started_at_us }} · 结束：{{ value.finished_at_us if value.finished_at_us is not none else '未记录' }}</p>
+{{ text_list('原因记录', value.reason_codes) }}
+<p class="reading-note">Pending 只是请求已记录；终态、恢复包完整性和是否可执行恢复分别判断。这里只读所选修订。</p>
+{% elif content.kind == 'recovery_bundle' %}
+<h2>恢复包</h2>
+<p>捕获状态：{{ value.capture_status }} · 顺序完整性：{{ value.ordering_integrity }}</p>
+<p>来源工作树：{{ value.source_worktree_instance_id }} · 来源快照：{{ value.source_snapshot_id }}</p>
+<p>已捕获字节：{{ value.captured_bytes }} · 捕获时刻：{{ value.captured_at_us }}</p>
+<p>adapter manifest：{{ value.adapter_manifest_id }} · 变更清单版本：{{ value.eligible_mutation_manifest_version }}</p>
+<p>变更域：{{ value.eligible_mutation_domain }}</p>
+{{ text_list('触发请求', value.trigger_request_ids) }}
+{% for title, entries in (
+  ('已跟踪 diff 条目', value.tracked_diff_blob_refs), ('已跟踪文件条目', value.tracked_file_blob_refs),
+  ('index 条目', value.index_state_refs), ('untracked 文件条目', value.untracked_file_blob_refs)
+) %}
+<section class="semantic-section">
+  <h3>{{ title }} · {{ entries|length }}</h3>
+  {% for entry in entries %}
+  <details>
+    <summary class="memory-prose">{{ entry.item_ref }}</summary>
+    <p>受保护内容：{{ entry.payload.cas_ref }}</p>
+    <p>已存字节：{{ entry.payload.protected_length }} · 原始字节：{{ entry.payload.original_length }}</p>
+    <p>脱敏段数：{{ entry.payload.redaction_spans }} · 密钥摘要：{{ entry.payload.protected_secret_digest or '未记录' }}</p>
+    {% if entry.protected_relative_path %}
+    <p>受保护路径收据：{{ entry.protected_relative_path.cas_ref }} · 脱敏段数：{{ entry.protected_relative_path.redaction_spans }}</p>
+    {% else %}<p>没有记录文件路径收据。</p>{% endif %}
+  </details>
+  {% else %}<p class="muted">未记录。</p>{% endfor %}
+</section>
+{% endfor %}
+<h3>捕获缺项</h3>
+{% for omission in value.omissions %}
+<p class="memory-prose">{{ omission.item_ref }}：{{ omission.reason }} · {{ omission.metadata_ref or '无额外元数据' }}</p>
+{% else %}<p>没有记录额外缺项。</p>{% endfor %}
+{{ text_list('捕获产物', value.untracked_work_artifact_refs) }}
+{{ text_list('仅元数据产物', value.metadata_only_work_artifact_refs) }}
+{{ text_list('配置与运行记录', value.config_and_run_refs) }}
+{{ text_list('尝试锚点', value.attempt_anchor_ids) }}
+<h3>锚点声明</h3>
+{% for claim in value.attempt_anchor_claims %}
+<p class="memory-prose">{{ claim.attempt_id }} · 修订：{{ claim.attempt_revision_id }} · 来源快照：{{ claim.source_snapshot_id }}</p>
+<p>受保护路径收据：{{ claim.affected_relative_path.cas_ref }} · 竞争组：{{ claim.competing_groups|length }}</p>
+{% else %}<p>未记录。</p>{% endfor %}
+<p class="reading-note">Partial、BestEffort 与脱敏缺项不会升级为可精确恢复。这里列的是受保护条目收据，不是原始文件或恢复许可。</p>
+{% endif %}

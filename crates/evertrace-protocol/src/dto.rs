@@ -6,16 +6,12 @@ use evertrace_domain::{
     evidence::IdentityStrength,
     ids::{
         AttemptId, CaptureReceiptId, ExecutionLaneId, JobId, ProcedureNegativeEvidenceId,
-        RecoveryApplicationId, RecoveryBundleId, RecoveryCaptureRequestId, RepositoryId,
-        RevisionProposalId, WorktreeId, WorktreeSnapshotId,
+        RecoveryApplicationId, RecoveryBundleId, RepositoryId, RevisionProposalId, WorktreeId,
+        WorktreeSnapshotId,
     },
     procedure::ProcedureNegativeReviewStatus,
     purge::{ObjectDeletionTarget, ObjectReauthorizationRef},
-    repository::{
-        DestructiveClass, OrderingIntegrity, RecoveryApplicationKind, RecoveryApplicationStatus,
-        RecoveryCaptureStatus, RecoveryInputDeliveryState, RecoveryOmissionReason,
-        RecoveryReasonCode, RecoveryRequestStatus, UntrackedCaptureScope,
-    },
+    repository::{RecoveryApplicationKind, RecoveryApplicationStatus, RecoveryInputDeliveryState},
     revision::RevisionId,
     semantic::{
         AtomProposalPayload, CoreMembershipProposalPayload, GlobalSupportState,
@@ -794,34 +790,6 @@ impl ConfigReloadAudit {
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
 pub enum HumanRecoveryDetail {
-    CaptureRequest {
-        request_id: RecoveryCaptureRequestId,
-        revision_id: RevisionId,
-        repository_id: RepositoryId,
-        worktree_id: WorktreeId,
-        destructive_class: DestructiveClass,
-        untracked_scope: UntrackedCaptureScope,
-        status: RecoveryRequestStatus,
-        bundle_id: Option<RecoveryBundleId>,
-        reason_codes: Vec<RecoveryReasonCode>,
-    },
-    Bundle {
-        bundle_id: RecoveryBundleId,
-        source_worktree_id: WorktreeId,
-        source_snapshot_id: WorktreeSnapshotId,
-        capture_status: RecoveryCaptureStatus,
-        ordering_integrity: OrderingIntegrity,
-        captured_bytes: u64,
-        tracked_diff_count: u32,
-        tracked_file_count: u32,
-        index_state_count: u32,
-        untracked_file_count: u32,
-        untracked_artifact_count: u32,
-        metadata_artifact_count: u32,
-        config_run_count: u32,
-        attempt_anchor_count: u32,
-        omission_counts: Vec<HumanRecoveryOmissionCount>,
-    },
     Application {
         application_id: RecoveryApplicationId,
         revision_id: RevisionId,
@@ -836,13 +804,6 @@ pub enum HumanRecoveryDetail {
         result_count: u32,
         verifier_count: u32,
     },
-}
-
-#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
-#[serde(deny_unknown_fields)]
-pub struct HumanRecoveryOmissionCount {
-    pub reason: RecoveryOmissionReason,
-    pub count: u32,
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -2147,33 +2108,6 @@ impl HumanRecoveryDetail {
         revision_ref: Option<&str>,
     ) -> bool {
         match self {
-            Self::CaptureRequest {
-                request_id,
-                revision_id,
-                reason_codes,
-                ..
-            } => {
-                object_kind == "recovery_capture_request_revision"
-                    && object_ref == Some(request_id.to_string().as_str())
-                    && revision_ref == Some(revision_id.to_string().as_str())
-                    && reason_codes.len() <= 8
-                    && reason_codes.windows(2).all(|pair| pair[0] < pair[1])
-            }
-            Self::Bundle {
-                bundle_id,
-                omission_counts,
-                ..
-            } => {
-                object_kind == "recovery_bundle"
-                    && object_ref == Some(bundle_id.to_string().as_str())
-                    && omission_counts.len() <= 14
-                    && omission_counts.iter().all(|entry| entry.count > 0)
-                    && omission_counts.iter().enumerate().all(|(index, entry)| {
-                        omission_counts[..index]
-                            .iter()
-                            .all(|prior| prior.reason != entry.reason)
-                    })
-            }
             Self::Application {
                 application_id,
                 revision_id,

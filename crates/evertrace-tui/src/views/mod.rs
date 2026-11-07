@@ -1097,52 +1097,6 @@ pub(crate) fn content_lines(
     if let Some(detail) = &item.recovery_detail {
         use evertrace_protocol::dto::HumanRecoveryDetail;
         match detail {
-            HumanRecoveryDetail::CaptureRequest {
-                request_id,
-                revision_id,
-                repository_id,
-                worktree_id,
-                destructive_class,
-                untracked_scope,
-                status,
-                bundle_id,
-                reason_codes,
-            } => lines.extend([
-                crate::locale::format!(language, "request/revision: {request_id} / {revision_id}", "请求／修订: {request_id} / {revision_id}"),
-                crate::locale::format!(language, "repository/worktree: {repository_id} / {worktree_id}", "仓库／工作树: {repository_id} / {worktree_id}"),
-                crate::locale::format!(language, "destructive/untracked: {destructive_class:?} / {untracked_scope:?}", "破坏性／未跟踪: {destructive_class:?} / {untracked_scope:?}"),
-                crate::locale::format!(language, "request status: {status:?}", "请求状态: {status:?}"),
-                crate::locale::format!(language, "bundle: {}", "恢复包: {}",
-                    bundle_id.map_or_else(|| "-".into(), |value| value.to_string())
-                ),
-                crate::locale::format!(language, "reason codes: {reason_codes:?}", "原因码: {reason_codes:?}"),
-            ]),
-            HumanRecoveryDetail::Bundle {
-                bundle_id,
-                source_worktree_id,
-                source_snapshot_id,
-                capture_status,
-                ordering_integrity,
-                captured_bytes,
-                tracked_diff_count,
-                tracked_file_count,
-                index_state_count,
-                untracked_file_count,
-                untracked_artifact_count,
-                metadata_artifact_count,
-                config_run_count,
-                attempt_anchor_count,
-                omission_counts,
-            } => lines.extend([
-                crate::locale::format!(language, "bundle: {bundle_id}", "恢复包: {bundle_id}"),
-                crate::locale::format!(language, "source worktree/snapshot: {source_worktree_id} / {source_snapshot_id}", "来源工作树／快照: {source_worktree_id} / {source_snapshot_id}"),
-                crate::locale::format!(language, "capture/order: {capture_status:?} / {ordering_integrity:?}", "采集／顺序: {capture_status:?} / {ordering_integrity:?}"),
-                crate::locale::format!(language, "captured bytes: {captured_bytes}", "采集字节数: {captured_bytes}"),
-                crate::locale::format!(language, "content counts: diff {tracked_diff_count}, files {tracked_file_count}, index {index_state_count}, untracked {untracked_file_count}, artifacts {untracked_artifact_count}, metadata {metadata_artifact_count}, config/run {config_run_count}", "内容计数：差异 {tracked_diff_count}，文件 {tracked_file_count}，索引 {index_state_count}，未跟踪 {untracked_file_count}，产物 {untracked_artifact_count}，元数据 {metadata_artifact_count}，配置／运行 {config_run_count}"
-                ),
-                crate::locale::format!(language, "attempt anchors: {attempt_anchor_count}", "尝试锚点: {attempt_anchor_count}"),
-                crate::locale::format!(language, "omissions: {omission_counts:?}", "缺失: {omission_counts:?}"),
-            ]),
             HumanRecoveryDetail::Application {
                 application_id,
                 revision_id,

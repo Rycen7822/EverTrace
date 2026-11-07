@@ -2731,7 +2731,9 @@ mod tests {
         ids::{ProcedureNegativeEvidenceId, RepositoryId, WorktreeSnapshotId},
         procedure::ProcedureNegativeReviewStatus,
         purge::ObjectDeletionTarget,
-        repository::{OrderingIntegrity, RecoveryCaptureStatus},
+        repository::{
+            RecoveryApplicationKind, RecoveryApplicationStatus, RecoveryInputDeliveryState,
+        },
         revision::RevisionId,
         work::{
             CoverageLevel, LaneStatus, LivenessState, OrderingIntegrity as WorkOrderingIntegrity,
@@ -3129,33 +3131,25 @@ mod tests {
         assert!(app.take_recovery_confirmation().is_none());
 
         let source_snapshot_id = WorktreeSnapshotId::new_v7();
-        let mut bundle_detail = snapshot_item("recovery_bundle", bundle_two.to_string());
-        bundle_detail.recovery_detail = Some(HumanRecoveryDetail::Bundle {
-            bundle_id: bundle_two,
-            source_worktree_id: worktree_two,
-            source_snapshot_id,
-            capture_status: RecoveryCaptureStatus::Complete,
-            ordering_integrity: OrderingIntegrity::Complete,
-            captured_bytes: 12,
-            tracked_diff_count: 1,
-            tracked_file_count: 0,
-            index_state_count: 0,
-            untracked_file_count: 0,
-            untracked_artifact_count: 0,
-            metadata_artifact_count: 0,
-            config_run_count: 0,
-            attempt_anchor_count: 0,
-            omission_counts: Vec::new(),
-        });
+        let bundle_detail = snapshot_item("recovery_bundle", bundle_two.to_string());
         app.state.detail = Some(bundle_detail.clone());
         app.state.detail_frontier = None;
-        let rendered = render_app(&app, 100, 30);
-        assert!(rendered.contains(&bundle_two.to_string()));
-        assert!(rendered.contains("source worktree/snapshot"));
-        assert!(rendered.contains("captured bytes: 12"));
 
         let mut worktree_detail = snapshot_item("worktree", worktree_one.to_string());
-        worktree_detail.recovery_detail = bundle_detail.recovery_detail;
+        worktree_detail.recovery_detail = Some(HumanRecoveryDetail::Application {
+            application_id: evertrace_domain::ids::RecoveryApplicationId::new_v7(),
+            revision_id: RevisionId::new_v7(),
+            bundle_id: bundle_two,
+            target_worktree_id: worktree_one,
+            application_kind: RecoveryApplicationKind::FileRestore,
+            input_delivery_state: RecoveryInputDeliveryState::Delivered,
+            status: RecoveryApplicationStatus::Applied,
+            pre_snapshot_id: source_snapshot_id,
+            post_snapshot_id: Some(source_snapshot_id),
+            selected_input_count: 1,
+            result_count: 1,
+            verifier_count: 1,
+        });
         assert!(
             !HumanGovernanceResponse::Snapshot {
                 diagnostics: None,
