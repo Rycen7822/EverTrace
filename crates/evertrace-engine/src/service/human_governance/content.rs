@@ -25,59 +25,6 @@ pub struct HumanContentChunk {
     pub next_cursor: Option<String>,
 }
 
-/// Classifies the complete archive while retaining at most one partial UTF-8 character.
-struct Utf8Check {
-    valid: bool,
-    pending: [u8; 4],
-    pending_len: usize,
-}
-
-impl Default for Utf8Check {
-    fn default() -> Self {
-        Self {
-            valid: true,
-            pending: [0; 4],
-            pending_len: 0,
-        }
-    }
-}
-
-impl Utf8Check {
-    fn update(&mut self, mut bytes: &[u8]) {
-        if !self.valid {
-            return;
-        }
-        if bytes.contains(&0) {
-            self.valid = false;
-            return;
-        }
-        if self.pending_len != 0 {
-            let needed = self.pending[0].leading_ones() as usize;
-            let take = bytes.len().min(needed - self.pending_len);
-            self.pending[self.pending_len..self.pending_len + take].copy_from_slice(&bytes[..take]);
-            self.pending_len += take;
-            if self.pending_len < needed {
-                return;
-            }
-            if std::str::from_utf8(&self.pending[..needed]).is_err() {
-                self.valid = false;
-                return;
-            }
-            self.pending_len = 0;
-            bytes = &bytes[take..];
-        }
-        if let Err(error) = std::str::from_utf8(bytes) {
-            if error.error_len().is_some() {
-                self.valid = false;
-                return;
-            }
-            let tail = &bytes[error.valid_up_to()..];
-            self.pending[..tail.len()].copy_from_slice(tail);
-            self.pending_len = tail.len();
-        }
-    }
-}
-
 impl HumanGovernanceService {
     async fn source_window(
         &self,
@@ -154,36 +101,13 @@ impl HumanGovernanceService {
                 check()?;
                 let cas = evertrace_capture::CasStore::open_existing(cas_dir)
                     .map_err(|_| evertrace_store::StoreError::Io)?;
-                let digest = evertrace_capture::CasStore::parse_digest(&receipt.cas_ref)
-                    .map_err(|_| evertrace_store::StoreError::StoreCorrupt)?;
-                let mut verifier =
-                    evertrace_capture::cas::SourceArchiveVerifier::new(&receipt, &observation)
-                        .map_err(|_| evertrace_store::StoreError::StoreCorrupt)?;
-                let mut utf8 = Utf8Check::default();
-                let window = cas
-                    .read_bounded_window_checked(
-                        &digest,
-                        export::MAX_ENCODED_BYTES,
-                        export::MAX_DECODED_BYTES,
-                        range,
-                        &mut || check().map_err(|_| evertrace_capture::CasError::ReadCancelled),
-                        &mut |bytes| {
-                            verifier.update(bytes)?;
-                            utf8.update(bytes);
-                            Ok(())
-                        },
-                    )
+                let (window, is_text) = cas
+                    .read_source_text_window_checked(&receipt, &observation, range, &mut || {
+                        check().map_err(|_| evertrace_capture::CasError::ReadCancelled)
+                    })
                     .map_err(|_| evertrace_store::StoreError::Io)?;
                 check()?;
-                verifier
-                    .finish()
-                    .map_err(|_| evertrace_store::StoreError::StoreCorrupt)?;
-                check()?;
-                Ok((
-                    window.bytes,
-                    window.total_bytes,
-                    utf8.valid && utf8.pending_len == 0,
-                ))
+                Ok((window.bytes, window.total_bytes, is_text))
             })
             .await
             .map_err(|_| HumanContentState::Unavailable)

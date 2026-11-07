@@ -2621,6 +2621,148 @@ impl ExactFieldsQuery {
     }
 }
 
+/// Closed modes of the same bounded exact-read interface; no paths or caller-defined selectors.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
+pub enum ExactReadQuery {
+    Fields(ExactFieldsQuery),
+    SourceText(ExactSourceTextQuery),
+}
+
+impl ExactReadQuery {
+    pub fn validate(&self) -> bool {
+        match self {
+            Self::Fields(query) => query.validate(),
+            Self::SourceText(query) => query.validate(),
+        }
+    }
+
+    pub fn revision_ref(&self) -> &str {
+        match self {
+            Self::Fields(query) => &query.revision_ref,
+            Self::SourceText(query) => &query.reference.revision_ref,
+        }
+    }
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct ExactSourceTextQuery {
+    pub reference: HumanRevisionRef,
+    pub range: Option<ExactSourceRange>,
+    pub expected_data_identity: Option<ReadDataIdentity>,
+    pub expected_source: Option<ExactSourceIdentity>,
+}
+
+impl ExactSourceTextQuery {
+    pub fn validate(&self) -> bool {
+        let reference = &self.reference;
+        !reference.stable_key.is_empty()
+            && reference.stable_key.len() <= 512
+            && !reference.stable_key.chars().any(char::is_control)
+            && (reference
+                .revision_ref
+                .parse::<crate::ids::SourceObservationId>()
+                .is_ok()
+                || reference
+                    .revision_ref
+                    .parse::<crate::ids::SourceReceiptId>()
+                    .is_ok())
+            && self.range.as_ref().is_none_or(|range| {
+                (4..=HUMAN_CONTENT_LIMIT).contains(&range.length)
+                    && range
+                        .offset
+                        .checked_add(u64::from(range.length) + 1)
+                        .is_some()
+            })
+            && self
+                .expected_source
+                .as_ref()
+                .is_none_or(ExactSourceIdentity::validate)
+    }
+}
+
+/// None in ExactSourceTextQuery requests metadata/current gates only, not a CAS read.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct ExactSourceRange {
+    pub offset: u64,
+    pub length: u16,
+}
+
+/// Existing immutable source coordinates; no CAS locator or transferable authorization.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct ExactSourceIdentity {
+    pub observation_ref: crate::ids::SourceObservationId,
+    pub receipt_ref: crate::ids::SourceReceiptId,
+    pub source_instance_ref: crate::evidence::SourceInstanceId,
+    pub source_revision: crate::evidence::SourceRevision,
+    pub source_record_identity: crate::evidence::SourceRecordIdentity,
+    pub payload_fingerprint: String,
+    pub protected_bytes: u64,
+    pub original_bytes: u64,
+}
+
+impl ExactSourceIdentity {
+    pub fn validate(&self) -> bool {
+        self.protected_bytes > 0
+            && crate::evidence::SourceInstanceId::parse(self.source_instance_ref.as_str()).is_ok()
+            && crate::evidence::SourceRevision::parse(self.source_revision.as_str()).is_ok()
+            && crate::evidence::SourceRecordIdentity::parse(self.source_record_identity.as_str())
+                .is_ok()
+            && self.payload_fingerprint.len() == 64
+            && self
+                .payload_fingerprint
+                .bytes()
+                .all(|byte| byte.is_ascii_hexdigit() && !byte.is_ascii_uppercase())
+    }
+}
+
+/// UTF-8 boundaries are data facts; direction and next/previous cursors belong to Python.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct ExactUtf8Window {
+    pub start: u64,
+    pub end: u64,
+    pub total_bytes: u64,
+    pub start_boundary: bool,
+    pub end_boundary: bool,
+    pub text: String,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct ExactSourceWindow {
+    pub state: ObjectReadState,
+    pub selection: Option<ExactFieldIdentity>,
+    pub content_state: HumanContentState,
+    pub source: Option<ExactSourceIdentity>,
+    pub window: Option<ExactUtf8Window>,
+}
+
+impl ExactSourceWindow {
+    pub fn validate(&self) -> bool {
+        self.state.validate()
+            && match self.content_state {
+                HumanContentState::Ready => {
+                    self.selection.is_some()
+                        && self
+                            .source
+                            .as_ref()
+                            .is_some_and(ExactSourceIdentity::validate)
+                        && self.window.as_ref().is_none_or(|window| {
+                            window.start <= window.end
+                                && window.end <= window.total_bytes
+                                && window.end - window.start == window.text.len() as u64
+                                && window.text.len() <= usize::from(HUMAN_CONTENT_LIMIT)
+                        })
+                }
+                _ => self.source.is_none() && self.window.is_none(),
+            }
+    }
+}
+
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct ExactFieldIdentity {

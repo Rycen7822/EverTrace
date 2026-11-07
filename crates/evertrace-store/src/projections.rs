@@ -5768,6 +5768,25 @@ impl JournalAdmissionState {
 
     /// Exact typed facts in the existing authority graph, without building derived views or a global row index.
     fn stored_reference_rows(&self, reference: &str) -> Result<Vec<ObjectRow>, StoreError> {
+        // Source coordinates are typed map keys, never a reason to walk unrelated Work/Semantic families.
+        if let Ok(id) = reference.parse::<SourceReceiptId>() {
+            return self
+                .source_receipts
+                .get(&id)
+                .map(|(value, seq)| source_receipt_row(value, *seq))
+                .transpose()
+                .map(|row| row.into_iter().collect());
+        }
+        if let Ok(id) = reference.parse::<SourceObservationId>() {
+            let mut rows = Vec::new();
+            if let Some((value, seq)) = self.source_observations.get(&id) {
+                rows.push(source_observation_row(value, *seq)?);
+            }
+            if let Some((value, seq)) = self.evidence_surfaces.get(&id) {
+                rows.push(surface_row(id, value, *seq)?);
+            }
+            return Ok(rows);
+        }
         let refs = BTreeSet::from([reference.to_owned()]);
         let mut rows = self.reference_rows_unfiltered(&refs, false)?;
         let burst_row = |value: &OperationBurst, seq| -> Result<ObjectRow, StoreError> {
@@ -6028,13 +6047,16 @@ impl JournalAdmissionState {
 
     pub(crate) fn stored_fields_context(
         &self,
-        query: &evertrace_domain::query::ExactFieldsQuery,
+        query: &evertrace_domain::query::ExactReadQuery,
         state: evertrace_domain::query::ObjectReadState,
         cancelled: &std::sync::atomic::AtomicBool,
         deadline: std::time::Instant,
     ) -> Result<evertrace_domain::query::MetadataReadOutcome<StoredFieldsContext>, StoreError> {
+        if !query.validate() {
+            return Err(StoreError::InvalidInput);
+        }
         self.stored_fields_context_with_budget(
-            query,
+            query.revision_ref(),
             state,
             cancelled,
             deadline,
@@ -6058,8 +6080,11 @@ impl JournalAdmissionState {
             let exact = ExactFieldsQuery {
                 revision_ref: reference.revision_ref.clone(),
             };
+            if !exact.validate() {
+                return Err(StoreError::InvalidInput);
+            }
             match self.stored_fields_context_with_budget(
-                &exact,
+                &exact.revision_ref,
                 state.clone(),
                 cancelled,
                 deadline,
@@ -6075,21 +6100,18 @@ impl JournalAdmissionState {
 
     fn stored_fields_context_with_budget(
         &self,
-        query: &evertrace_domain::query::ExactFieldsQuery,
+        revision_ref: &str,
         state: evertrace_domain::query::ObjectReadState,
         cancelled: &std::sync::atomic::AtomicBool,
         deadline: std::time::Instant,
         budget: &mut ReadDependencyBudget,
     ) -> Result<evertrace_domain::query::MetadataReadOutcome<StoredFieldsContext>, StoreError> {
         use evertrace_domain::query::MetadataReadOutcome as Outcome;
-        if !query.validate() {
-            return Err(StoreError::InvalidInput);
-        }
         let selected = self
-            .stored_reference_rows(&query.revision_ref)?
+            .stored_reference_rows(revision_ref)?
             .into_iter()
             .filter(|row| {
-                row.current_revision_id.as_deref() == Some(query.revision_ref.as_str())
+                row.current_revision_id.as_deref() == Some(revision_ref)
                     && matches!(
                         row.object_kind.as_deref(),
                         Some(
@@ -6099,6 +6121,8 @@ impl JournalAdmissionState {
                                 | "revision_proposal_revision"
                                 | "semantic_digest"
                                 | "work_episode"
+                                | "source_receipt"
+                                | "source_observation"
                         )
                     )
             })

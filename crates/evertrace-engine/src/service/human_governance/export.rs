@@ -9,11 +9,13 @@ use std::{
 };
 
 const MAX_SELECTIONS: usize = 64;
+pub(super) use evertrace_capture::cas::{
+    SOURCE_ARCHIVE_MAX_DECODED_BYTES as MAX_DECODED_BYTES,
+    SOURCE_ARCHIVE_MAX_ENCODED_BYTES as MAX_ENCODED_BYTES,
+};
 use evertrace_store::projections::{
     READ_DEPENDENCY_BYTES as MAX_METADATA_BYTES, READ_DEPENDENCY_LIMIT as MAX_DEPENDENCIES,
 };
-pub(super) const MAX_ENCODED_BYTES: u64 = 64 * 1024 * 1024;
-pub(super) const MAX_DECODED_BYTES: u64 = 128 * 1024 * 1024;
 const MAX_OUTPUT_BYTES: u64 = 160 * 1024 * 1024;
 const EXPORT_DEADLINE: Duration = Duration::from_secs(30);
 

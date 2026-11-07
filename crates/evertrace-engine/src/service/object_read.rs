@@ -241,7 +241,260 @@ fn denied_fields(result: &mut evertrace_domain::query::ExactStoredFields, code: 
     result.source_observation_refs.clear();
 }
 
+fn source_records(
+    context: &evertrace_store::projections::StoredFieldsContext,
+) -> Result<
+    (
+        evertrace_domain::evidence::SourceReceipt,
+        evertrace_domain::evidence::SourceObservation,
+    ),
+    ErrorCode,
+> {
+    use evertrace_store::JournalPayload as P;
+    let decode = |row: &ObjectRow| {
+        serde_json::from_str::<P>(row.payload_json.as_deref().ok_or(ErrorCode::StoreCorrupt)?)
+            .map_err(|_| ErrorCode::StoreCorrupt)
+    };
+    let root = context.selected.as_ref().ok_or(ErrorCode::StoreCorrupt)?;
+    match decode(root)? {
+        P::SourceReceiptRecorded(receipt) => {
+            let row = context
+                .rows
+                .iter()
+                .find(|row| {
+                    row.object_kind.as_deref() == Some("source_observation")
+                        && row.object_id.as_deref()
+                            == Some(receipt.source_observation_id.to_string().as_str())
+                })
+                .ok_or(ErrorCode::StoreCorrupt)?;
+            let P::SourceObservationRecorded(observation) = decode(row)? else {
+                return Err(ErrorCode::StoreCorrupt);
+            };
+            Ok((*receipt, *observation))
+        }
+        P::SourceObservationRecorded(observation) => {
+            let row = context
+                .rows
+                .iter()
+                .find(|row| {
+                    row.object_kind.as_deref() == Some("source_receipt")
+                        && row.object_id.as_deref()
+                            == Some(observation.source_receipt_ref.to_string().as_str())
+                })
+                .ok_or(ErrorCode::StoreCorrupt)?;
+            let P::SourceReceiptRecorded(receipt) = decode(row)? else {
+                return Err(ErrorCode::StoreCorrupt);
+            };
+            Ok((*receipt, *observation))
+        }
+        _ => Err(ErrorCode::InvalidInput),
+    }
+}
+
+fn source_utf8_window(
+    mut bytes: Vec<u8>,
+    offset: u64,
+    length: u16,
+    total_bytes: u64,
+) -> Result<evertrace_domain::query::ExactUtf8Window, ErrorCode> {
+    if offset > total_bytes {
+        return Err(ErrorCode::InvalidInput);
+    }
+    let span = u64::from(length).min(total_bytes - offset) as usize;
+    if bytes.len() < span {
+        return Err(ErrorCode::StoreCorrupt);
+    }
+    let continuation = |byte: &u8| byte & 0xc0 == 0x80;
+    let start_boundary = bytes.first().is_none_or(|byte| !continuation(byte));
+    let end_boundary = bytes.get(span).is_none_or(|byte| !continuation(byte));
+    let mut leading = 0;
+    while leading < span && continuation(&bytes[leading]) {
+        leading += 1;
+    }
+    let mut trailing = span;
+    while trailing > leading && bytes.get(trailing).is_some_and(continuation) {
+        trailing -= 1;
+    }
+    bytes.truncate(trailing);
+    bytes.drain(..leading);
+    Ok(evertrace_domain::query::ExactUtf8Window {
+        start: offset + leading as u64,
+        end: offset + trailing as u64,
+        total_bytes,
+        start_boundary,
+        end_boundary,
+        text: String::from_utf8(bytes).map_err(|_| ErrorCode::StoreCorrupt)?,
+    })
+}
+
 impl EngineService {
+    /// One immutable, gated source byte range. No global projection, page state or persistent read ticket.
+    pub async fn read_exact_source(
+        writer: crate::WriterHandle,
+        query: Box<evertrace_domain::query::ExactSourceTextQuery>,
+        effective_config_hash: [u8; 32],
+        report: std::sync::Arc<tokio::sync::RwLock<Option<evertrace_codex::HostProbeReport>>>,
+        cas_dir: std::path::PathBuf,
+    ) -> Result<
+        evertrace_domain::query::MetadataReadOutcome<evertrace_domain::query::ExactSourceWindow>,
+        ErrorCode,
+    > {
+        use evertrace_domain::query::{ExactReadQuery, ExactSourceIdentity, ExactSourceWindow};
+        use evertrace_domain::query::{HumanContentState as State, MetadataReadOutcome as Outcome};
+        if !query.validate() {
+            return Err(ErrorCode::InvalidInput);
+        }
+        let deadline = Instant::now() + std::time::Duration::from_secs(2);
+        let (cancelled, _cancel_on_drop) = evertrace_store::StoreReadHandle::cancellation_scope();
+        let request = Box::new(ExactReadQuery::SourceText((*query).clone()));
+        let Outcome::Page(before) = writer
+            .read_stored_fields_context(
+                request.clone(),
+                cancelled.clone(),
+                deadline,
+                effective_config_hash,
+            )
+            .await
+            .map_err(|_| ErrorCode::Internal)?
+        else {
+            return Err(ErrorCode::ResourceExhausted);
+        };
+        if query
+            .expected_data_identity
+            .is_some_and(|identity| identity != before.state.data_identity)
+        {
+            return Ok(Outcome::Conflict(before.state.frontier));
+        }
+        let metadata = fields_metadata(&before)?;
+        let mut result = ExactSourceWindow {
+            state: metadata.state,
+            selection: metadata.selection,
+            content_state: State::Missing,
+            source: None,
+            window: None,
+        };
+        let Some(root) = &before.selected else {
+            return Ok(Outcome::Page(Box::new(result)));
+        };
+        if root.row_id != query.reference.stable_key
+            && root.object_id.as_deref() != Some(&query.reference.stable_key)
+        {
+            result.content_state = State::Unavailable;
+            return Ok(Outcome::Page(Box::new(result)));
+        }
+        if let Err(code) = fields_access(&writer, &before, &report, deadline).await {
+            result.content_state = if code == ErrorCode::Untrusted {
+                State::AccessDenied
+            } else {
+                State::Unavailable
+            };
+            return Ok(Outcome::Page(Box::new(result)));
+        }
+        let (receipt, observation) = source_records(&before)?;
+        let source = ExactSourceIdentity {
+            observation_ref: observation.source_observation_id,
+            receipt_ref: receipt.source_receipt_id,
+            source_instance_ref: receipt.source_instance_id.clone(),
+            source_revision: receipt.source_revision.clone(),
+            source_record_identity: receipt.source_record_identity.clone(),
+            payload_fingerprint: observation.payload_fingerprint.clone(),
+            protected_bytes: receipt.protected_length,
+            original_bytes: receipt.original_length,
+        };
+        if query
+            .expected_source
+            .as_ref()
+            .is_some_and(|expected| *expected != source)
+        {
+            return Ok(Outcome::Conflict(before.state.frontier));
+        }
+        if matches!(
+            receipt.protected_presentation,
+            Some(evertrace_domain::evidence::ProtectedPresentation::Unavailable { .. })
+        ) {
+            result.content_state = State::Unsupported;
+            return Ok(Outcome::Page(Box::new(result)));
+        }
+        evertrace_capture::cas::SourceArchiveVerifier::new(&receipt, &observation)
+            .map_err(|_| ErrorCode::StoreCorrupt)?;
+        let read = if let Some(range) = query.range.clone() {
+            let bytes = range.offset..range.offset + u64::from(range.length) + 1;
+            Some(
+                writer
+                    .read_handle()
+                    .read_blocking(move |cancel| {
+                        let check = || {
+                            cancel.check()?;
+                            if Instant::now() >= deadline {
+                                return Err(evertrace_store::StoreError::Io);
+                            }
+                            Ok(())
+                        };
+                        check()?;
+                        let cas = evertrace_capture::CasStore::open_existing(cas_dir)
+                            .map_err(|_| evertrace_store::StoreError::Io)?;
+                        let result = cas
+                            .read_source_text_window_checked(
+                                &receipt,
+                                &observation,
+                                bytes,
+                                &mut || {
+                                    check().map_err(|_| evertrace_capture::CasError::ReadCancelled)
+                                },
+                            )
+                            .map_err(|_| evertrace_store::StoreError::StoreCorrupt)?;
+                        check()?;
+                        Ok(result)
+                    })
+                    .await,
+            )
+        } else {
+            None
+        };
+        let Outcome::Page(current) = writer
+            .read_stored_fields_context(request, cancelled, deadline, effective_config_hash)
+            .await
+            .map_err(|_| ErrorCode::Internal)?
+        else {
+            return Err(ErrorCode::ResourceExhausted);
+        };
+        result.state = current.state.clone();
+        result.selection = fields_metadata(&current)?.selection;
+        if let Err(code) = fields_access(&writer, &current, &report, deadline).await {
+            result.content_state = if code == ErrorCode::Untrusted {
+                State::AccessDenied
+            } else {
+                State::Unavailable
+            };
+        } else if current.selected.is_none() {
+            result.content_state = State::Missing;
+        } else if before.state.data_identity != current.state.data_identity
+            || before.selected != current.selected
+            || before.rows != current.rows
+        {
+            return Ok(Outcome::Conflict(current.state.frontier));
+        } else if matches!(read, Some(Err(_))) {
+            result.content_state = State::Unavailable;
+        } else if matches!(read, Some(Ok((_, false)))) {
+            result.content_state = State::Unsupported;
+        } else {
+            if let (Some(Ok((window, _))), Some(range)) = (read, query.range.as_ref()) {
+                result.window = Some(source_utf8_window(
+                    window.bytes,
+                    range.offset,
+                    range.length,
+                    window.total_bytes,
+                )?);
+            }
+            result.source = Some(source);
+            result.content_state = State::Ready;
+        }
+        if !result.validate() {
+            return Err(ErrorCode::ResourceExhausted);
+        }
+        Ok(Outcome::Page(Box::new(result)))
+    }
+
     /// Immutable stored fields only. Recheck the same finite dependency closure before disclosure.
     pub async fn read_exact_fields(
         writer: crate::WriterHandle,
@@ -249,7 +502,10 @@ impl EngineService {
         effective_config_hash: [u8; 32],
         report: std::sync::Arc<tokio::sync::RwLock<Option<evertrace_codex::HostProbeReport>>>,
     ) -> Result<evertrace_domain::query::ExactStoredFields, ErrorCode> {
-        use evertrace_domain::query::{HumanContentState as State, MetadataReadOutcome};
+        use evertrace_domain::query::{
+            ExactReadQuery, HumanContentState as State, MetadataReadOutcome,
+        };
+        let query = Box::new(ExactReadQuery::Fields(*query));
         let deadline = Instant::now() + std::time::Duration::from_secs(2);
         let (cancelled, _cancel_on_drop) = evertrace_store::StoreReadHandle::cancellation_scope();
         let context = writer

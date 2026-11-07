@@ -131,7 +131,7 @@ enum WriterRequest {
         >,
     },
     ReadStoredFields {
-        query: Box<evertrace_domain::query::ExactFieldsQuery>,
+        query: Box<evertrace_domain::query::ExactReadQuery>,
         cancelled: std::sync::Arc<std::sync::atomic::AtomicBool>,
         deadline: Instant,
         config_hash: [u8; 32],
@@ -852,7 +852,7 @@ impl WriterHandle {
 
     pub(crate) async fn read_stored_fields_context(
         &self,
-        query: Box<evertrace_domain::query::ExactFieldsQuery>,
+        query: Box<evertrace_domain::query::ExactReadQuery>,
         cancelled: std::sync::Arc<std::sync::atomic::AtomicBool>,
         deadline: Instant,
         config_hash: [u8; 32],

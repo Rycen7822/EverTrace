@@ -854,10 +854,24 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
                             return Ok(Response::HumanGovernance(HumanGovernanceResponse::RevisionPair { page: Box::new(page) }));
                         }
                         if let HumanGovernanceRequest::Read { request: HumanReadRequest::ReadExact { query } } = &command {
-                            let page = EngineService::read_exact_fields(
-                                writer.clone(), query.clone(), config_snapshot.hash(), Arc::clone(&session_catalog_report),
-                            ).await?;
-                            return Ok(Response::HumanGovernance(HumanGovernanceResponse::StoredFields { page: Box::new(page) }));
+                            use evertrace_protocol::dto::{ExactReadQuery, MetadataReadOutcome};
+                            let reply = match query.as_ref() {
+                                ExactReadQuery::Fields(fields) => HumanGovernanceResponse::StoredFields {
+                                    page: Box::new(EngineService::read_exact_fields(writer.clone(), Box::new(fields.clone()),
+                                        config_snapshot.hash(), Arc::clone(&session_catalog_report)).await?),
+                                },
+                                ExactReadQuery::SourceText(source) => match EngineService::read_exact_source(
+                                    writer.clone(), Box::new(source.clone()), config_snapshot.hash(),
+                                    Arc::clone(&session_catalog_report), runtime_snapshot.cas_dir.clone(),
+                                ).await? {
+                                    MetadataReadOutcome::Page(page) => HumanGovernanceResponse::SourceWindow { page },
+                                    MetadataReadOutcome::Conflict(current_frontier) => HumanGovernanceResponse::Conflict {
+                                        current_frontier, current_revision_ref: None,
+                                    },
+                                    MetadataReadOutcome::TooLarge => return Err(ErrorCode::ResourceExhausted),
+                                },
+                            };
+                            return Ok(Response::HumanGovernance(reply));
                         }
                         if let HumanGovernanceRequest::Read { request: HumanReadRequest::ReadBatch { query } } = &command {
                             let outcome = EngineService::read_metadata_batch(
@@ -884,6 +898,11 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
                                 MetadataReadOutcome::TooLarge => return Err(ErrorCode::ResourceExhausted),
                             }));
                         }
+                        if context.client_kind == ClientKind::Web && matches!(&command,
+                            HumanGovernanceRequest::Read { request: HumanReadRequest::Content {
+                                representation: evertrace_protocol::dto::HumanContentRepresentation::SourceText, ..
+                            }}
+                        ) { return Err(ErrorCode::InvalidInput); }
                         let human_governance = HumanGovernanceService::with_acceptance(
                             writer,
                             runtime_snapshot.effective_config_hash,

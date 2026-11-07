@@ -1544,7 +1544,7 @@ impl JournalWriter {
 
     pub fn stored_fields_context(
         &self,
-        query: &evertrace_domain::query::ExactFieldsQuery,
+        query: &evertrace_domain::query::ExactReadQuery,
         cancelled: &std::sync::atomic::AtomicBool,
         deadline: Instant,
         effective_config_hash: [u8; 32],

@@ -28,6 +28,8 @@ const CAS_MAGIC: &[u8; 8] = b"ETCAS001";
 const FORMAT_VERSION: u16 = 1;
 const COMPRESSION_VERSION: u16 = 1;
 const HEADER_LENGTH: usize = 64;
+pub const SOURCE_ARCHIVE_MAX_ENCODED_BYTES: u64 = 64 * 1024 * 1024;
+pub const SOURCE_ARCHIVE_MAX_DECODED_BYTES: u64 = 128 * 1024 * 1024;
 const CREATE_ATTEMPTS: u8 = 16;
 
 #[derive(Clone, Copy, Eq, Hash, Ord, PartialEq, PartialOrd)]
@@ -574,6 +576,35 @@ impl CasStore {
         })
     }
 
+    /// Exact protected source text. Complete archive and text classification are
+    /// verified before returning any selected bytes; no locator comes from a read client.
+    pub fn read_source_text_window_checked(
+        &self,
+        receipt: &SourceReceipt,
+        observation: &SourceObservation,
+        range: Range<u64>,
+        check: &mut dyn FnMut() -> Result<(), CasError>,
+    ) -> Result<(CasReadWindow, bool), CasError> {
+        let digest = receipt.cas_ref.parse::<CasDigest>()?;
+        let mut verifier = SourceArchiveVerifier::new(receipt, observation)?;
+        let mut utf8 = Utf8Check::default();
+        let window = self.read_bounded_window_checked(
+            &digest,
+            SOURCE_ARCHIVE_MAX_ENCODED_BYTES,
+            SOURCE_ARCHIVE_MAX_DECODED_BYTES,
+            range,
+            check,
+            &mut |bytes| {
+                verifier.update(bytes)?;
+                utf8.update(bytes);
+                Ok(())
+            },
+        )?;
+        check()?;
+        verifier.finish()?;
+        Ok((window, utf8.valid && utf8.pending_len == 0))
+    }
+
     /// Verifies the same envelope/digest without retaining decoded bytes.
     /// This does not assert a format-independent bound on the decoder window.
     pub fn verify_envelope(&self, digest: &CasDigest) -> Result<u64, CasError> {
@@ -784,6 +815,59 @@ impl CasStore {
     fn validate_root(&self) -> Result<(), CasError> {
         validate_directory(&self.root)?;
         validate_directory(&self.root.join("blobs"))
+    }
+}
+
+/// Classifies the complete archive while retaining at most one partial UTF-8 character.
+struct Utf8Check {
+    valid: bool,
+    pending: [u8; 4],
+    pending_len: usize,
+}
+
+impl Default for Utf8Check {
+    fn default() -> Self {
+        Self {
+            valid: true,
+            pending: [0; 4],
+            pending_len: 0,
+        }
+    }
+}
+
+impl Utf8Check {
+    fn update(&mut self, mut bytes: &[u8]) {
+        if !self.valid {
+            return;
+        }
+        if bytes.contains(&0) {
+            self.valid = false;
+            return;
+        }
+        if self.pending_len != 0 {
+            let needed = self.pending[0].leading_ones() as usize;
+            let take = bytes.len().min(needed - self.pending_len);
+            self.pending[self.pending_len..self.pending_len + take].copy_from_slice(&bytes[..take]);
+            self.pending_len += take;
+            if self.pending_len < needed {
+                return;
+            }
+            if std::str::from_utf8(&self.pending[..needed]).is_err() {
+                self.valid = false;
+                return;
+            }
+            self.pending_len = 0;
+            bytes = &bytes[take..];
+        }
+        if let Err(error) = std::str::from_utf8(bytes) {
+            if error.error_len().is_some() {
+                self.valid = false;
+                return;
+            }
+            let tail = &bytes[error.valid_up_to()..];
+            self.pending[..tail.len()].copy_from_slice(tail);
+            self.pending_len = tail.len();
+        }
     }
 }
 

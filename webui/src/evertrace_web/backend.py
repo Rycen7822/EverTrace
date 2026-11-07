@@ -265,8 +265,41 @@ class Backend:
     async def read_exact(self, revision_ref):
         if not isinstance(revision_ref, str) or not revision_ref or len(revision_ref.encode()) > 2048:
             raise BackendError("invalid_input")
-        result = await self._request({"kind": "read_exact", "query": {"revision_ref": revision_ref}})
+        result = await self._request({"kind": "read_exact", "query": {"kind": "fields", "revision_ref": revision_ref}})
         if result["kind"] != "stored_fields":
+            raise BackendError("invalid_read_response")
+        if result["page"]["state"]["effective_config_hash"] != self.config_hash:
+            raise BackendError("inactive_configuration")
+        return result
+
+    async def read_source_window(self, reference, revision, byte_range=None, data_identity=None, source=None):
+        if any(not isinstance(value, str) or not value or len(value.encode()) > 512
+               or any(ord(char) < 32 for char in value) for value in (reference, revision)):
+            raise BackendError("invalid_input")
+        if byte_range is not None:
+            if (not isinstance(byte_range, dict) or set(byte_range) != {"offset", "length"}
+                or type(byte_range["offset"]) is not int or not 0 <= byte_range["offset"] < 2**64 - 8193
+                or type(byte_range["length"]) is not int or not 4 <= byte_range["length"] <= 8192):
+                raise BackendError("invalid_input")
+            byte_range = {key: byte_range[key] for key in ("offset", "length")}
+        _, data_identity = _read_boundary(None, data_identity)
+        if source is not None:
+            keys = ("observation_ref", "receipt_ref", "source_instance_ref", "source_revision",
+                    "source_record_identity", "payload_fingerprint", "protected_bytes", "original_bytes")
+            if not isinstance(source, dict) or set(source) != set(keys):
+                raise BackendError("invalid_input")
+            if any(not isinstance(source[key], str) or not source[key] or len(source[key].encode()) > 512
+                   for key in keys[:6]):
+                raise BackendError("invalid_input")
+            if any(type(source[key]) is not int or not 0 <= source[key] < 2**64 for key in keys[6:]):
+                raise BackendError("invalid_input")
+            source = {key: source[key] for key in keys}
+        result = await self._request({"kind": "read_exact", "query": {"kind": "source_text",
+            "reference": {"stable_key": reference, "revision_ref": revision}, "range": byte_range,
+            "expected_data_identity": data_identity, "expected_source": source}})
+        if result["kind"] == "conflict":
+            return result
+        if result["kind"] != "source_window":
             raise BackendError("invalid_read_response")
         if result["page"]["state"]["effective_config_hash"] != self.config_hash:
             raise BackendError("inactive_configuration")
@@ -552,7 +585,7 @@ class Backend:
         )
 
     async def content(self, reference, frontier, revision, representation, after=None):
-        if representation not in ("text", "semantic_json", "source_text"):
+        if representation not in ("text", "semantic_json"):
             raise BackendError("invalid_input")
         return await self._request(
             {
@@ -655,6 +688,7 @@ class Backend:
                     "jobs",
                     "metadata_batch",
                     "stored_fields",
+                    "source_window",
                     "revision_pair",
                     "snapshot",
                     "memory_page",
