@@ -404,7 +404,6 @@ fn missing_stream_fields(value: Option<&StreamDeclaration>) -> Vec<String> {
 
 fn stream_matches(stream: &Workstream, value: &StreamDeclaration, task: &Task) -> bool {
     stream.task_id == task.task_id
-        && stream.root_goal == task.canonical_goal
         && !stream.status.is_terminal()
         && stream.parent_workstream_id == value.parent_workstream_id
         && Some(stream.workstream_goal.as_str()) == value.goal.as_deref()
@@ -436,7 +435,10 @@ fn build_stream(
         dependency_workstream_ids: previous
             .map_or_else(Vec::new, |value| value.dependency_workstream_ids.clone()),
         status: previous.map_or(WorkstreamStatus::Active, |value| value.status),
-        root_goal: task.canonical_goal.clone(),
+        root_goal: previous.map_or_else(
+            || task.canonical_goal.clone(),
+            |stream| stream.root_goal.clone(),
+        ),
         workstream_goal: value.goal.clone().expect("complete declaration"),
         target_family: value.target_family.clone().expect("complete declaration"),
         hypothesis_or_failure_family: value
