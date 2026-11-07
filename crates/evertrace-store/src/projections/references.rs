@@ -143,7 +143,9 @@ impl JournalAdmissionState {
         reference: &evertrace_domain::query::ExactRecordRef,
         after: Option<&str>,
         limit: u16,
-        state: evertrace_domain::query::ObjectReadState,
+        source: StoredFieldsContext,
+        mut budget: ReadDependencyBudget,
+        historical: Option<&ObjectRow>,
         cancelled: &std::sync::atomic::AtomicBool,
         deadline: std::time::Instant,
     ) -> Result<evertrace_domain::query::MetadataReadOutcome<ReferenceReadContext>, StoreError>
@@ -152,26 +154,7 @@ impl JournalAdmissionState {
             ExactFieldIdentity, HumanContentState as S, MetadataReadOutcome as O,
             ReferenceMetadataPage, ReferenceMetadataRecord,
         };
-        let mut budget = ReadDependencyBudget {
-            references: 0,
-            rows: 0,
-            bytes: 0,
-        };
-        let revision = reference
-            .revision_ref
-            .as_deref()
-            .ok_or(StoreError::InvalidInput)?;
-        let source = match self.stored_fields_context_with_budget(
-            revision,
-            state.clone(),
-            cancelled,
-            deadline,
-            &mut budget,
-        )? {
-            O::Page(value) => *value,
-            O::TooLarge => return Ok(O::TooLarge),
-            O::Conflict(frontier) => return Ok(O::Conflict(frontier)),
-        };
+        let state = source.state.clone();
         let mut page = ReferenceMetadataPage {
             selection: None,
             content_state: S::Missing,
@@ -320,6 +303,12 @@ impl JournalAdmissionState {
             // A dependency subset may contain an old revision; resolve logical current from the canonical lookup.
             let mut candidates =
                 self.capture_product_rows(self.stored_reference_rows(&reference)?)?;
+            if candidates.is_empty()
+                && let Some(row) = historical
+                    .filter(|row| row.current_revision_id.as_deref() == Some(reference.as_str()))
+            {
+                candidates.push(row.clone());
+            }
             for row in &candidates {
                 budget.rows += 1;
                 budget.bytes += row.payload_json.as_ref().map_or(0, |value| value.len()) as u64;
@@ -387,17 +376,29 @@ impl JournalAdmissionState {
                 targets.push(None);
                 continue;
             }
+            let revision = record
+                .metadata
+                .as_ref()
+                .and_then(|value| value.get("current_revision_id"))
+                .and_then(serde_json::Value::as_str);
+            let matches = |row: &&ObjectRow| {
+                row.row_id == record.stable_key && row.current_revision_id.as_deref() == revision
+            };
             let selected = source
                 .rows
                 .iter()
-                .find(|row| row.row_id == record.stable_key)
+                .find(matches)
+                .or_else(|| historical.filter(|row| matches(row)))
                 .cloned();
             let selected = match selected {
                 Some(row) => Some(row),
                 None => self
                     .capture_product_rows(self.stored_reference_rows(&record.references[0])?)?
                     .into_iter()
-                    .find(|row| row.row_id == record.stable_key),
+                    .find(|row| {
+                        row.row_id == record.stable_key
+                            && row.current_revision_id.as_deref() == revision
+                    }),
             };
             let context = match self.stored_fields_context_for_row(
                 selected,
@@ -410,11 +411,9 @@ impl JournalAdmissionState {
                 O::TooLarge => return Ok(O::TooLarge),
                 O::Conflict(frontier) => return Ok(O::Conflict(frontier)),
             };
-            if !context
-                .rows
-                .iter()
-                .any(|row| row.row_id == record.stable_key)
-            {
+            if !context.rows.iter().any(|row| {
+                row.row_id == record.stable_key && row.current_revision_id.as_deref() == revision
+            }) {
                 record.content_state = S::Missing;
                 record.metadata = None;
                 targets.push(None);

@@ -6,7 +6,7 @@ from pathlib import PurePosixPath
 from .backend import BackendError, _decode, _read_boundary, normalize_source_query, normalize_archive_query
 from .memories import _metadata_card
 
-_REFERENCE_ALGORITHM = "source_revision_reference_metadata_v2"
+_REFERENCE_ALGORITHM = "source_revision_reference_metadata_v3"
 _ARCHIVE_ALGORITHM = "source_archive_metadata_v1"
 _CATALOG_ALGORITHM = "scoped_source_metadata_v1"
 _SOURCE_SELECTION_LABELS = {

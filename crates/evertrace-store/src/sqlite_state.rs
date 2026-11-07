@@ -564,6 +564,83 @@ impl SqliteState {
         })
     }
 
+    /// On-demand immutable Work lookup. No projection synchronization, statement cache or resident history map.
+    pub(crate) fn work_revision(
+        &self,
+        revision: &str,
+        frontier: u64,
+        cancelled: &std::sync::atomic::AtomicBool,
+        deadline: std::time::Instant,
+    ) -> Result<evertrace_domain::query::MetadataReadOutcome<Option<JournalRow>>, StoreError> {
+        use evertrace_domain::query::MetadataReadOutcome as O;
+        self.with_connection(|connection| {
+            connection.progress_handler(1000, Some(move || std::time::Instant::now() >= deadline))
+                .map_err(|_| StoreError::Io)?;
+            let result = (|| {
+                if cancelled.load(std::sync::atomic::Ordering::Relaxed) {
+                    return Err(StoreError::Io);
+                }
+                // Logical journal envelope identity columns are intentionally empty; the admitted payload owns revision identity.
+                // A too-large Work payload is a budget failure, never an absent target or an unchecked JSON allocation.
+                let mut statement = connection.prepare(
+                    "SELECT seq, length(CAST(payload_json AS BLOB)), content_hash FROM journal_events \
+                     WHERE seq <= ?2 AND event_type IN ('task_recorded_v1','workstream_recorded_v1') AND \
+                     CASE WHEN length(CAST(payload_json AS BLOB)) > ?3 THEN 1 \
+                     ELSE json_extract(payload_json,'$.value.revision_id') = ?1 END ORDER BY seq LIMIT ?4"
+                ).map_err(|_| StoreError::StoreCorrupt)?;
+                let mut queried = statement.query(params![
+                    revision, frontier.to_be_bytes().as_slice(), i64::try_from(crate::projections::READ_DEPENDENCY_BYTES)
+                        .map_err(|_| StoreError::StoreCorrupt)?,
+                    i64::try_from(crate::projections::READ_DEPENDENCY_LIMIT + 1).map_err(|_| StoreError::StoreCorrupt)?
+                ]).map_err(|_| StoreError::StoreCorrupt)?;
+                let mut selected: Option<(u64, Vec<u8>)> = None;
+                let mut matches = 0;
+                while let Some(row) = queried.next().map_err(|_| StoreError::StoreCorrupt)? {
+                    if cancelled.load(std::sync::atomic::Ordering::Relaxed) {
+                        return Err(StoreError::Io);
+                    }
+                    let bytes = u64::try_from(sql_value::<i64>(row, 1)?).map_err(|_| StoreError::StoreCorrupt)?;
+                    if bytes > crate::projections::READ_DEPENDENCY_BYTES {
+                        return Ok(O::TooLarge);
+                    }
+                    matches += 1;
+                    if matches > crate::projections::READ_DEPENDENCY_LIMIT {
+                        return Ok(O::TooLarge);
+                    }
+                    let seq: Vec<u8> = sql_value(row, 0)?;
+                    let hash: Vec<u8> = sql_value(row, 2)?;
+                    if hash.len() != 32 || selected.as_ref().is_some_and(|(_, previous)| *previous != hash) {
+                        return Err(StoreError::StoreCorrupt);
+                    }
+                    // Admission permits equivalent fact replays; retain the earliest canonical event, like the current map.
+                    if selected.is_none() {
+                        selected = Some((seq_from_blob(&seq)?, hash));
+                    }
+                }
+                let Some((seq, _)) = selected else { return Ok(O::Page(Box::new(None))); };
+                let mut exact = connection.prepare(SELECT_ROWS_PAGE).map_err(|_| StoreError::StoreCorrupt)?;
+                let mut queried = exact.query(params![
+                    seq.checked_sub(1).ok_or(StoreError::StoreCorrupt)?.to_be_bytes().as_slice(),
+                    seq.to_be_bytes().as_slice()
+                ]).map_err(|_| StoreError::StoreCorrupt)?;
+                let row = journal_row_from_sql(queried.next().map_err(|_| StoreError::StoreCorrupt)?
+                    .ok_or(StoreError::StoreCorrupt)?)?;
+                if queried.next().map_err(|_| StoreError::StoreCorrupt)?.is_some() {
+                    return Err(StoreError::StoreCorrupt);
+                }
+                Ok(O::Page(Box::new(Some(row))))
+            })();
+            connection.progress_handler(0, None::<fn() -> bool>).map_err(|_| StoreError::StoreCorrupt)?;
+            if cancelled.load(std::sync::atomic::Ordering::Relaxed) {
+                Err(StoreError::Io)
+            } else if std::time::Instant::now() >= deadline {
+                Ok(O::TooLarge)
+            } else {
+                result
+            }
+        })
+    }
+
     pub(crate) fn rows_after(&self, seq: u64) -> Result<Vec<JournalRow>, StoreError> {
         self.with_connection(|connection| {
             let mut statement = connection

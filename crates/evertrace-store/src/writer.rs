@@ -1491,10 +1491,75 @@ impl JournalWriter {
         evertrace_domain::query::MetadataReadOutcome<crate::projections::ReferenceReadContext>,
         StoreError,
     > {
+        use evertrace_domain::query::{ExactFieldsQuery, ExactReadQuery, MetadataReadOutcome as O};
         let (before, state) = self.metadata_read_boundary(config_hash)?;
-        let context = self
-            .admission_state
-            .reference_metadata_context(reference, after, limit, state, cancelled, deadline)?;
+        let mut budget = crate::projections::ReadDependencyBudget::default();
+        let context = (|| {
+            let query = ExactReadQuery::Fields(ExactFieldsQuery {
+                revision_ref: reference
+                    .revision_ref
+                    .clone()
+                    .ok_or(StoreError::InvalidInput)?,
+            });
+            // Reference selectors also admit native physical revision IDs (for example capture receipts),
+            // which are not the Fields wire contract. Only a missing UUID Work revision needs the historical path.
+            let cached = self.admission_state.stored_fields_context_with_budget(
+                query.lookup_ref(),
+                state.clone(),
+                cancelled,
+                deadline,
+                &mut budget,
+            )?;
+            let source = if matches!(&cached, O::Page(context) if context.selected.is_none())
+                && query
+                    .lookup_ref()
+                    .parse::<evertrace_domain::revision::RevisionId>()
+                    .is_ok()
+            {
+                self.stored_fields_at_state(&query, state, cancelled, deadline, &mut budget)?
+            } else {
+                cached
+            };
+            let source = match source {
+                O::Page(source) => *source,
+                O::TooLarge => return Ok(O::TooLarge),
+                O::Conflict(frontier) => return Ok(O::Conflict(frontier)),
+            };
+            let predecessor = match source
+                .selected
+                .as_ref()
+                .filter(|row| matches!(row.object_kind.as_deref(), Some("task" | "workstream")))
+                .and_then(|row| row.payload_json.as_deref())
+            {
+                Some(json) => match serde_json::from_str::<JournalPayload>(json)
+                    .map_err(|_| StoreError::StoreCorrupt)?
+                {
+                    JournalPayload::TaskRecorded(value) => value.predecessor_revision_id,
+                    JournalPayload::WorkstreamRecorded(value) => value.predecessor_revision_id,
+                    _ => None,
+                },
+                None => None,
+            };
+            let historical = if let Some(revision) = predecessor {
+                match self.historical_work_row(&revision.to_string(), cancelled, deadline)? {
+                    O::Page(row) => *row,
+                    O::TooLarge => return Ok(O::TooLarge),
+                    O::Conflict(frontier) => return Ok(O::Conflict(frontier)),
+                }
+            } else {
+                None
+            };
+            self.admission_state.reference_metadata_context(
+                reference,
+                after,
+                limit,
+                source,
+                budget,
+                historical.as_ref(),
+                cancelled,
+                deadline,
+            )
+        })()?;
         self.finish_metadata_read(before, cancelled)?;
         Ok(context)
     }
@@ -1593,11 +1658,101 @@ impl JournalWriter {
         StoreError,
     > {
         let (before, state) = self.metadata_read_boundary(effective_config_hash)?;
-        let result = self
-            .admission_state
-            .stored_fields_context(query, state, cancelled, deadline)?;
+        let result = self.stored_fields_at_state(
+            query,
+            state,
+            cancelled,
+            deadline,
+            &mut crate::projections::ReadDependencyBudget::default(),
+        )?;
         self.finish_metadata_read(before, cancelled)?;
         Ok(result)
+    }
+
+    fn stored_fields_at_state(
+        &self,
+        query: &evertrace_domain::query::ExactReadQuery,
+        state: evertrace_domain::query::ObjectReadState,
+        cancelled: &std::sync::atomic::AtomicBool,
+        deadline: Instant,
+        budget: &mut crate::projections::ReadDependencyBudget,
+    ) -> Result<
+        evertrace_domain::query::MetadataReadOutcome<crate::projections::StoredFieldsContext>,
+        StoreError,
+    > {
+        use evertrace_domain::query::MetadataReadOutcome as O;
+        let current = self.admission_state.stored_fields_context(
+            query,
+            state.clone(),
+            cancelled,
+            deadline,
+            budget,
+        )?;
+        if !matches!(&current, O::Page(context) if context.selected.is_none()) {
+            return Ok(current);
+        }
+        match self.historical_work_row(query.lookup_ref(), cancelled, deadline)? {
+            O::Page(row) if row.is_some() => self
+                .admission_state
+                .stored_fields_context_for_row(*row, state, cancelled, deadline, budget),
+            O::Page(_) => Ok(current),
+            O::TooLarge => Ok(O::TooLarge),
+            O::Conflict(frontier) => Ok(O::Conflict(frontier)),
+        }
+    }
+
+    fn historical_work_row(
+        &self,
+        reference: &str,
+        cancelled: &std::sync::atomic::AtomicBool,
+        deadline: Instant,
+    ) -> Result<evertrace_domain::query::MetadataReadOutcome<Option<ObjectRow>>, StoreError> {
+        use evertrace_domain::query::MetadataReadOutcome as O;
+        if reference
+            .parse::<evertrace_domain::revision::RevisionId>()
+            .is_err()
+        {
+            return Ok(O::Page(Box::new(None)));
+        }
+        match self
+            .lock_sqlite()?
+            .work_revision(reference, self.frontier(), cancelled, deadline)?
+        {
+            O::Page(row) => {
+                let Some(row) = *row else {
+                    return Ok(O::Page(Box::new(None)));
+                };
+                let payload = row.payload()?;
+                payload.validate()?;
+                use evertrace_domain::canonical::sha256;
+                if row.payload_schema != crate::command::JOURNAL_PAYLOAD_SCHEMA
+                    || row.event_type != payload.event_type()
+                    || row.record_class != payload.record_class()
+                    || row.content_hash
+                        != sha256(
+                            "journal_payload_v1",
+                            u32::from(row.payload_schema),
+                            &payload.canonical_value(),
+                        )
+                        .map_err(|_| StoreError::StoreCorrupt)?
+                {
+                    return Err(StoreError::StoreCorrupt);
+                }
+                let revision = match &payload {
+                    JournalPayload::TaskRecorded(value) => value.revision_id,
+                    JournalPayload::WorkstreamRecorded(value) => value.revision_id,
+                    _ => return Err(StoreError::StoreCorrupt),
+                };
+                if revision.to_string() != reference || row.seq > self.frontier() {
+                    return Err(StoreError::StoreCorrupt);
+                }
+                Ok(O::Page(Box::new(
+                    self.admission_state.scope_fact_row(&payload, row.seq)?,
+                )))
+            }
+            O::TooLarge => Ok(O::TooLarge),
+            O::Conflict(frontier) => Ok(O::Conflict(frontier)),
+        }
     }
 
     pub fn stored_fields_pair_context(

@@ -2724,7 +2724,7 @@ pub const READ_DEPENDENCY_LIMIT: usize = 4096;
 pub const READ_DEPENDENCY_BYTES: u64 = 64 * 1024 * 1024;
 
 #[derive(Default)]
-struct ReadDependencyBudget {
+pub(crate) struct ReadDependencyBudget {
     references: usize,
     rows: usize,
     bytes: u64,
@@ -6061,6 +6061,7 @@ impl JournalAdmissionState {
         state: evertrace_domain::query::ObjectReadState,
         cancelled: &std::sync::atomic::AtomicBool,
         deadline: std::time::Instant,
+        budget: &mut ReadDependencyBudget,
     ) -> Result<evertrace_domain::query::MetadataReadOutcome<StoredFieldsContext>, StoreError> {
         if !query.validate() {
             return Err(StoreError::InvalidInput);
@@ -6109,7 +6110,7 @@ impl JournalAdmissionState {
             state,
             cancelled,
             deadline,
-            &mut ReadDependencyBudget::default(),
+            budget,
         )
     }
 
@@ -6137,6 +6138,7 @@ impl JournalAdmissionState {
             state,
             cancelled,
             deadline,
+            &mut ReadDependencyBudget::default(),
         )?;
         let context = match context {
             O::Page(context) => context,
@@ -6343,7 +6345,7 @@ impl JournalAdmissionState {
         Ok(Outcome::Page(Box::new(sides)))
     }
 
-    fn stored_fields_context_with_budget(
+    pub(crate) fn stored_fields_context_with_budget(
         &self,
         revision_ref: &str,
         state: evertrace_domain::query::ObjectReadState,
@@ -6458,7 +6460,7 @@ impl JournalAdmissionState {
         Ok(Some(refs))
     }
 
-    fn stored_fields_context_for_row(
+    pub(crate) fn stored_fields_context_for_row(
         &self,
         selected: Option<ObjectRow>,
         state: evertrace_domain::query::ObjectReadState,
@@ -6592,7 +6594,7 @@ impl JournalAdmissionState {
         Ok(self.scope_fact_row(payload, seq)?.is_some())
     }
 
-    fn scope_fact_row(
+    pub(crate) fn scope_fact_row(
         &self,
         payload: &JournalPayload,
         seq: u64,

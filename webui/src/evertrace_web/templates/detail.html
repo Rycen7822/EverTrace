@@ -15,6 +15,9 @@
     ] if item[field] %}<span class="badge">{{ label }}：{{ item[field] }}</span>{% endfor %}
   </div>
   <p>{{ item.object_kind }} · 所选修订：{{ item.revision_ref or item.object_ref }}</p>
+  {% if item.object_kind in ('task', 'workstream') %}
+  <p class="reading-note">当前固定读取此修订。上方真值和生命周期来自这份记录，不表示它是该工作的最新版本。</p>
+  {% endif %}
 </div>
 {% if not detail %}
   {% if item.object_kind not in ('source_receipt', 'source_observation') %}
