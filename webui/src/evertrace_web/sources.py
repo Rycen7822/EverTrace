@@ -42,7 +42,9 @@ def _source_entry(record):
             progress += f"；后续水位 {through}；较早前缀水位 " + (str(earlier) if earlier is not None else "未记录")
         else:
             progress += "；此修订尚无已提交归档水位"
+    retained_note = "这个范围命中的是保留的归档记录，不能据此认定当前文件也属于这里。"
     return {**record, "selection_label":_SOURCE_SELECTION_LABELS[record["selection_basis"]],
+            "selection_note":retained_note if record["selection_basis"] == "retained_record" else None,
             "body_label":_BODY_LABELS.get(record["body_state"], record["body_state"]), "progress_label":progress,
             "started_label":_source_time(record["started_at_us"]), "ended_label":_source_time(record["ended_at_us"])}
 

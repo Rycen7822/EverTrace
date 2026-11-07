@@ -12,6 +12,7 @@
     <span class="source-progress">历史归属：{{ item.workspace_resolution_kind }} · 目录修订 {{ item.catalog_revision }}</span>
     <span class="source-progress">匹配依据：{{ item.selection_label }}</span>
   </div>
+  {% if item.selection_note %}<p class="muted" data-source-selection-note>{{ item.selection_note }}</p>{% endif %}
 </button>
 {% endfor %}
 </section>
