@@ -144,10 +144,27 @@ enum WriterRequest {
             >,
         >,
     },
+    ReadScopeMetadata {
+        query: evertrace_domain::query::ScopeDirectoryQuery,
+        after: Option<String>,
+        cancelled: std::sync::Arc<std::sync::atomic::AtomicBool>,
+        deadline: std::time::Instant,
+        config_hash: [u8; 32],
+        reply: oneshot::Sender<
+            Result<
+                evertrace_domain::query::MetadataReadOutcome<(
+                    evertrace_domain::query::ObjectReadState,
+                    evertrace_store::projections::ScopeDirectoryReadContext,
+                )>,
+                WriterActorError,
+            >,
+        >,
+    },
     ReadMetadataBatch {
         query: Box<evertrace_domain::query::MetadataBatchQuery>,
         cancelled: std::sync::Arc<std::sync::atomic::AtomicBool>,
         config_hash: [u8; 32],
+        deadline: std::time::Instant,
         reply: oneshot::Sender<
             Result<
                 evertrace_domain::query::MetadataReadOutcome<
@@ -876,11 +893,41 @@ impl WriterHandle {
         response.await.map_err(|_| WriterActorError::Stopped)?
     }
 
+    pub(crate) async fn read_scope_metadata_context(
+        &self,
+        query: &evertrace_domain::query::ScopeDirectoryQuery,
+        after: Option<&str>,
+        cancelled: std::sync::Arc<std::sync::atomic::AtomicBool>,
+        deadline: std::time::Instant,
+        config_hash: [u8; 32],
+    ) -> Result<
+        evertrace_domain::query::MetadataReadOutcome<(
+            evertrace_domain::query::ObjectReadState,
+            evertrace_store::projections::ScopeDirectoryReadContext,
+        )>,
+        WriterActorError,
+    > {
+        let (reply, response) = oneshot::channel();
+        self.sender
+            .send(WriterRequest::ReadScopeMetadata {
+                query: query.clone(),
+                after: after.map(str::to_owned),
+                cancelled,
+                deadline,
+                config_hash,
+                reply,
+            })
+            .await
+            .map_err(|_| WriterActorError::Stopped)?;
+        response.await.map_err(|_| WriterActorError::Stopped)?
+    }
+
     pub(crate) async fn read_metadata_batch(
         &self,
         query: Box<evertrace_domain::query::MetadataBatchQuery>,
         cancelled: std::sync::Arc<std::sync::atomic::AtomicBool>,
         config_hash: [u8; 32],
+        deadline: std::time::Instant,
     ) -> Result<
         evertrace_domain::query::MetadataReadOutcome<evertrace_domain::query::ObjectReadBatch>,
         WriterActorError,
@@ -891,6 +938,7 @@ impl WriterHandle {
                 query,
                 cancelled,
                 config_hash,
+                deadline,
                 reply,
             })
             .await
@@ -1711,9 +1759,11 @@ async fn run_writer(
                     };
                     let _ = reply.send(result);
                 }
-                WriterRequest::ReadMetadataBatch {
+                WriterRequest::ReadScopeMetadata {
                     query,
+                    after,
                     cancelled,
+                    deadline,
                     config_hash,
                     reply,
                 } => {
@@ -1722,7 +1772,32 @@ async fn run_writer(
                     }
                     let result = match writer.as_ref() {
                         Some(writer) => writer
-                            .read_metadata_batch(&query, &cancelled, config_hash)
+                            .read_scope_metadata_context(
+                                &query,
+                                after.as_deref(),
+                                &cancelled,
+                                deadline,
+                                config_hash,
+                            )
+                            .map_err(map_store_error),
+                        None => Err(WriterActorError::Stopped),
+                    };
+                    // Cancellation and budget failures do not terminate the single writer.
+                    let _ = reply.send(result);
+                }
+                WriterRequest::ReadMetadataBatch {
+                    query,
+                    cancelled,
+                    config_hash,
+                    deadline,
+                    reply,
+                } => {
+                    if reply.is_closed() {
+                        continue;
+                    }
+                    let result = match writer.as_ref() {
+                        Some(writer) => writer
+                            .read_metadata_batch(&query, &cancelled, config_hash, deadline)
                             .map_err(map_store_error),
                         None => Err(WriterActorError::Stopped),
                     };

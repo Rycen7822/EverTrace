@@ -2975,6 +2975,11 @@ impl RevisionPairFields {
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
 pub enum MetadataReadQuery {
+    Scopes {
+        query: ScopeDirectoryQuery,
+        after: Option<String>,
+        limit: u16,
+    },
     Revisions {
         reference: HumanRevisionRef,
         after: Option<RevisionMetadataKey>,
@@ -3004,12 +3009,23 @@ impl MetadataReadQuery {
             Self::Work { query } | Self::Review { query } => query.limit,
             Self::Memories { limit, .. }
             | Self::Jobs { limit, .. }
-            | Self::Revisions { limit, .. } => *limit,
+            | Self::Revisions { limit, .. }
+            | Self::Scopes { limit, .. } => *limit,
         }
     }
 
     fn validate(&self, batch: &MetadataBatchQuery) -> bool {
         match self {
+            Self::Scopes { query, after, .. } => {
+                query.validate().is_ok()
+                    && after.as_ref().is_none_or(|key| {
+                        !key.is_empty()
+                            && key.len() <= 512
+                            && !key.chars().any(char::is_control)
+                            && batch.expected_frontier.is_some()
+                            && batch.expected_data_identity.is_some()
+                    })
+            }
             Self::Revisions {
                 reference, after, ..
             } => {
@@ -3094,6 +3110,7 @@ pub struct MemoryMetadataPage {
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
 pub enum MetadataReadPage {
+    Scopes { page: Box<ScopeMetadataPage> },
     Revisions { page: Box<RevisionMetadataPage> },
     Memories { page: Box<MemoryMetadataPage> },
     Jobs { page: Box<ObjectReadJobs> },
@@ -3142,6 +3159,66 @@ impl RevisionMetadataPage {
     }
 }
 
+/// Scope identities and permitted input fields, not directory titles or access grants.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct ScopeMetadataRecord {
+    pub stable_key: String,
+    pub selection: MemoryScopeSelection,
+    pub path_hint: Option<String>,
+    pub branch_hint: Option<String>,
+    pub lifecycle: Option<String>,
+    pub repository_user_disabled: bool,
+    pub repository_trust_revoked: bool,
+    pub has_children: bool,
+    pub goal: Option<String>,
+    pub goal_state: HumanContentState,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct ScopeMetadataPage {
+    pub query: ScopeDirectoryQuery,
+    pub parent_available: bool,
+    pub names_complete: bool,
+    pub records: Vec<ScopeMetadataRecord>,
+    /// Exact number of matching identities under query.parent; unknown when name inputs are unreadable.
+    pub matching_count: Option<u64>,
+    pub next: Option<String>,
+}
+
+impl ScopeMetadataPage {
+    pub fn validate(&self) -> bool {
+        self.query.validate().is_ok()
+            && self.next.as_ref().is_none_or(|key| {
+                !key.is_empty() && key.len() <= 512 && !key.chars().any(char::is_control)
+            })
+            && self.records.iter().all(|row| {
+                !row.stable_key.is_empty()
+                    && row.stable_key.len() <= 512
+                    && !row.stable_key.chars().any(char::is_control)
+                    && matches!(
+                        row.selection,
+                        MemoryScopeSelection::Repository { .. }
+                            | MemoryScopeSelection::Worktree { .. }
+                            | MemoryScopeSelection::Task { .. }
+                    )
+                    && row.goal.as_ref().is_none_or(|goal| goal.len() <= 4096)
+                    && ((row.goal_state == HumanContentState::Ready) == row.goal.is_some())
+            })
+            && if self.parent_available {
+                self.matching_count
+                    .is_none_or(|count| count >= self.records.len() as u64)
+                    && (self.next.is_none() || !self.records.is_empty())
+            } else {
+                !self.names_complete
+                    && self.records.is_empty()
+                    && self.matching_count.is_none()
+                    && self.next.is_none()
+            }
+    }
+}
+
 /// Scoped domain counts and the original input-matching derivation record, not generation explanations.
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
@@ -3182,6 +3259,10 @@ impl ObjectReadBatch {
         self.state.validate()
             && (1..=METADATA_BATCH_LIMIT).contains(&self.items.len())
             && self.items.iter().all(|item| match item {
+                MetadataReadPage::Scopes { page } => {
+                    count += page.records.len();
+                    page.validate()
+                }
                 MetadataReadPage::Revisions { page } => {
                     count += page.records.len();
                     page.validate()

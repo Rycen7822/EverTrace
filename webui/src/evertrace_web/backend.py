@@ -160,6 +160,17 @@ def _read_boundary(frontier, identity):
     return frontier, identity
 
 
+def normalize_scope_query(query):
+    query = {} if query is None else query
+    if not isinstance(query, dict) or set(query) - {"parent", "name"}:
+        raise BackendError("invalid_input")
+    name, parent = query.get("name", ""), query.get("parent")
+    if (not isinstance(name, str) or len(name.encode()) > 256 or name != name.strip()
+        or any(ord(char) < 32 or 127 <= ord(char) < 160 for char in name)):
+        raise BackendError("invalid_input")
+    return {"parent":normalize_scope(parent, boundary=True) if parent is not None else None, "name":name}
+
+
 class Backend:
     def __init__(self, socket_path, config_hash, build_id):
         self.path = Path(socket_path)
@@ -366,6 +377,16 @@ class Backend:
                     "after": after,
                     "limit": item.get("limit", 32),
                 }
+            elif kind == "scopes":
+                if set(item) - {"kind", "query", "after", "limit"}:
+                    raise BackendError("invalid_input")
+                after = item.get("after")
+                if after is not None:
+                    if (not isinstance(after, str) or not 0 < len(after.encode()) <= 512
+                        or any(ord(char) < 32 or 127 <= ord(char) < 160 for char in after)
+                        or frontier is None or identity is None):
+                        raise BackendError("invalid_input")
+                value = {"kind":kind, "query":normalize_scope_query(item.get("query")), "after":after, "limit":item.get("limit", 32)}
             elif kind == "revisions":
                 if set(item) - {"kind", "reference", "after", "limit"}:
                     raise BackendError("invalid_input")
@@ -524,29 +545,6 @@ class Backend:
         return await self._request(
             {
                 "kind": "source_catalog",
-                "query": normalized,
-                "expected_frontier": expected_frontier,
-                "after": after,
-                "limit": 32,
-            }
-        )
-
-    async def scopes(self, query=None, after=None, expected_frontier=None):
-        if query is None:
-            query = {}
-        if not isinstance(query, dict) or set(query) - {"parent", "name"}:
-            raise BackendError("invalid_input")
-        name = query.get("name", "")
-        if not isinstance(name, str) or len(name.encode("utf-8")) > 256:
-            raise BackendError("invalid_input")
-        parent = query.get("parent")
-        normalized = {
-            "parent": normalize_scope(parent, boundary=True) if parent is not None else None,
-            "name": name,
-        }
-        return await self._request(
-            {
-                "kind": "scope_directory",
                 "query": normalized,
                 "expected_frontier": expected_frontier,
                 "after": after,

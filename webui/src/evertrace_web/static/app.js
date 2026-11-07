@@ -1152,8 +1152,8 @@ async function loadDirectory() {
       : !page.complete
         ? "本次目录读取未完成；可继续下一页或重新读取。"
         : !page.names_complete
-          ? "部分任务名称暂时读不到，搜索结果可能不全。"
-          : "本页按稳定身份排列；名称与限制已重新检查，目录可见不代表正文可读。";
+          ? `部分任务名称暂时读不到；${page.matching_count === null ? "匹配数量未知" : `共 ${page.matching_count} 个匹配身份`}。`
+          : `共 ${page.matching_count} 个匹配身份，按稳定身份排列；目录可见不代表正文可读。`;
   } catch {
     if (directory.controller === controller && !controller.signal.aborted) {
       $("scope-items").replaceChildren();

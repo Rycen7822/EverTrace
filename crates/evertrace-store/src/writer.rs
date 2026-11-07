@@ -1460,9 +1460,40 @@ impl JournalWriter {
         deadline: std::time::Instant,
     ) -> Result<crate::projections::ScopeDirectoryReadContext, StoreError> {
         self.validated_current_read(|state, _| {
-            state.scope_directory_context(query, after, limit, deadline)
+            state.scope_directory_context(query, after, limit, deadline, None)
         })
         .await
+    }
+
+    /// One bounded scope candidate cohort at the canonical writer binding; no presentation or diagnostics.
+    pub fn read_scope_metadata_context(
+        &self,
+        query: &evertrace_domain::query::ScopeDirectoryQuery,
+        after: Option<&str>,
+        cancelled: &std::sync::atomic::AtomicBool,
+        deadline: std::time::Instant,
+        config_hash: [u8; 32],
+    ) -> Result<
+        evertrace_domain::query::MetadataReadOutcome<(
+            evertrace_domain::query::ObjectReadState,
+            crate::projections::ScopeDirectoryReadContext,
+        )>,
+        StoreError,
+    > {
+        use evertrace_domain::query::MetadataReadOutcome as O;
+        let (before, state) = self.metadata_read_boundary(config_hash)?;
+        let context = self.admission_state.scope_directory_context(
+            query,
+            after,
+            64,
+            deadline,
+            Some(cancelled),
+        )?;
+        self.finish_metadata_read(before, cancelled)?;
+        if !context.complete && context.parent_available || std::time::Instant::now() >= deadline {
+            return Ok(O::TooLarge);
+        }
+        Ok(O::Page(Box::new((state, context))))
     }
 
     pub async fn source_archive_context(
@@ -1625,6 +1656,7 @@ impl JournalWriter {
         query: &evertrace_domain::query::MetadataBatchQuery,
         cancelled: &std::sync::atomic::AtomicBool,
         effective_config_hash: [u8; 32],
+        deadline: std::time::Instant,
     ) -> Result<
         evertrace_domain::query::MetadataReadOutcome<evertrace_domain::query::ObjectReadBatch>,
         StoreError,
@@ -1649,7 +1681,6 @@ impl JournalWriter {
         {
             return Ok(Outcome::Conflict(state.frontier));
         }
-        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
         let build = |mut times: Option<&mut crate::sqlite_state::JournalTimeReader<'_>>| {
             let mut items = Vec::with_capacity(query.items.len());
             for item in &query.items {
@@ -1660,6 +1691,8 @@ impl JournalWriter {
                     return Ok(Outcome::TooLarge);
                 }
                 let page = match item {
+                    // Source-authorized directory matching is performed by the Native async read owner.
+                    MetadataReadQuery::Scopes { .. } => return Err(StoreError::InvalidInput),
                     MetadataReadQuery::Revisions {
                         reference,
                         after,
@@ -1827,7 +1860,9 @@ impl JournalWriter {
             MetadataReadQuery::Work { query } | MetadataReadQuery::Review { query } => {
                 query.time_range.is_some()
             }
-            MetadataReadQuery::Jobs { .. } | MetadataReadQuery::Revisions { .. } => false,
+            MetadataReadQuery::Jobs { .. }
+            | MetadataReadQuery::Revisions { .. }
+            | MetadataReadQuery::Scopes { .. } => false,
         });
         let result = if needs_times {
             self.lock_sqlite()?

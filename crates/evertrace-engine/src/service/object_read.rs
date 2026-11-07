@@ -1004,6 +1004,232 @@ impl EngineService {
         Ok(result)
     }
 
+    async fn read_scopes_metadata(
+        writer: &crate::WriterHandle,
+        query: &evertrace_domain::query::ScopeDirectoryQuery,
+        after: Option<&str>,
+        limit: u16,
+        state: &evertrace_domain::query::ObjectReadState,
+        config_hash: [u8; 32],
+        cancelled: &std::sync::Arc<std::sync::atomic::AtomicBool>,
+        deadline: Instant,
+        report: &std::sync::Arc<tokio::sync::RwLock<Option<evertrace_codex::HostProbeReport>>>,
+    ) -> Result<
+        evertrace_domain::query::MetadataReadOutcome<evertrace_domain::query::ScopeMetadataPage>,
+        crate::WriterActorError,
+    > {
+        use evertrace_domain::query::{
+            HumanContentState as S, MemoryScopeSelection as Selection, MetadataReadOutcome as O,
+            ScopeMetadataPage, ScopeMetadataRecord,
+        };
+        use evertrace_store::JournalPayload as P;
+        let mut page = ScopeMetadataPage {
+            query: query.clone(),
+            parent_available: true,
+            names_complete: true,
+            records: Vec::new(),
+            matching_count: None,
+            next: None,
+        };
+        let mut scan_after = None;
+        let mut found_after = after.is_none();
+        let mut count = 0_u64;
+        let needle = query.name.to_lowercase();
+        // This normalization is only a Native full-domain name predicate, not a directory label.
+        let matches_name = |value: &str| {
+            value.to_lowercase().contains(&needle)
+                || value
+                    .split(|ch: char| ch.is_whitespace() || ch.is_control())
+                    .filter(|part| !part.is_empty())
+                    .collect::<Vec<_>>()
+                    .join(" ")
+                    .to_lowercase()
+                    .contains(&needle)
+        };
+        loop {
+            let context = writer
+                .read_scope_metadata_context(
+                    query,
+                    scan_after.as_deref(),
+                    cancelled.clone(),
+                    deadline,
+                    config_hash,
+                )
+                .await?;
+            let (current, context) = match context {
+                O::Page(context) => *context,
+                O::TooLarge => return Ok(O::TooLarge),
+                O::Conflict(frontier) => return Ok(O::Conflict(frontier)),
+            };
+            if current != *state {
+                return Ok(O::Conflict(current.frontier));
+            }
+            if !context.parent_available {
+                page.parent_available = false;
+                page.names_complete = false;
+                return Ok(O::Page(Box::new(page)));
+            }
+            for candidate in context.items {
+                if cancelled.load(std::sync::atomic::Ordering::SeqCst) {
+                    return Err(crate::WriterActorError::Store);
+                }
+                if Instant::now() >= deadline {
+                    return Ok(O::TooLarge);
+                }
+                found_after |= after == Some(candidate.row.row_id.as_str());
+                let payload: P = serde_json::from_str(
+                    candidate
+                        .row
+                        .payload_json
+                        .as_deref()
+                        .ok_or(crate::WriterActorError::StoreCorrupt)?,
+                )
+                .map_err(|_| crate::WriterActorError::StoreCorrupt)?;
+                let mut record = ScopeMetadataRecord {
+                    stable_key: candidate.row.row_id.clone(),
+                    selection: Selection::All,
+                    path_hint: None,
+                    branch_hint: candidate.branch_ref,
+                    lifecycle: None,
+                    repository_user_disabled: false,
+                    repository_trust_revoked: false,
+                    has_children: candidate.has_children,
+                    goal: None,
+                    goal_state: S::Unsupported,
+                };
+                let repository = match &payload {
+                    P::RepositoryInstanceRecorded(repo) => Some(repo.as_ref()),
+                    _ => candidate.repository.as_ref(),
+                };
+                if let Some(repo) = repository {
+                    record.repository_user_disabled = repo.user_disabled;
+                    record.repository_trust_revoked = repo
+                        .capability_state
+                        .as_ref()
+                        .is_some_and(|v| v.trust_revoked);
+                }
+                let id = match payload {
+                    P::RepositoryInstanceRecorded(repo) => {
+                        record.selection = Selection::Repository {
+                            repository_id: repo.repository_id,
+                        };
+                        record.path_hint = Some(repo.current_path);
+                        repo.repository_id.to_string()
+                    }
+                    P::WorktreeInstanceRecorded(tree) => {
+                        record.selection = Selection::Worktree {
+                            worktree_id: tree.worktree_instance_id,
+                        };
+                        record.path_hint = tree.current_path;
+                        record.lifecycle = Some(
+                            match tree.lifecycle {
+                                evertrace_domain::repository::WorktreeLifecycle::Active => "active",
+                                evertrace_domain::repository::WorktreeLifecycle::Missing => {
+                                    "missing"
+                                }
+                                evertrace_domain::repository::WorktreeLifecycle::Removed => {
+                                    "removed"
+                                }
+                                evertrace_domain::repository::WorktreeLifecycle::Pruned => "pruned",
+                                evertrace_domain::repository::WorktreeLifecycle::Archived => {
+                                    "archived"
+                                }
+                            }
+                            .into(),
+                        );
+                        tree.worktree_instance_id.to_string()
+                    }
+                    P::TaskRecorded(task) => {
+                        record.selection = Selection::Task {
+                            task_id: task.task_id,
+                        };
+                        record.lifecycle = Some(task.lifecycle.as_str().into());
+                        record.goal_state = S::Unavailable;
+                        if candidate.sources_complete {
+                            // Consume this bounded cohort instead of cloning its metadata/payload buffers.
+                            let mut all = std::collections::BTreeMap::new();
+                            let mut selected = std::collections::BTreeSet::new();
+                            selected.insert(candidate.row.row_id.clone());
+                            all.insert(candidate.row.row_id.clone(), candidate.row);
+                            for row in candidate.source_rows {
+                                selected.insert(row.row_id.clone());
+                                all.insert(row.row_id.clone(), row);
+                            }
+                            for row in candidate.source_scope_rows {
+                                all.insert(row.row_id.clone(), row);
+                            }
+                            let all = all.into_values().collect::<Vec<_>>();
+                            let selected = all
+                                .iter()
+                                .filter(|row| selected.contains(&row.row_id))
+                                .collect::<Vec<_>>();
+                            let bytes = selected
+                                .iter()
+                                .map(|row| row.payload_json.as_ref().map_or(0, |value| value.len()))
+                                .sum::<usize>();
+                            if selected.len() <= 4096 && bytes <= 64 * 1024 * 1024 {
+                                let host = report.read().await.clone();
+                                let access = if candidate.source_suppressed {
+                                    Err(ErrorCode::Untrusted)
+                                } else {
+                                    check_source_access(
+                                        writer,
+                                        host.as_ref(),
+                                        &all,
+                                        &selected,
+                                        deadline,
+                                    )
+                                    .await
+                                };
+                                record.goal_state = match access {
+                                    Ok(()) => {
+                                        record.goal = Some(task.canonical_goal);
+                                        S::Ready
+                                    }
+                                    Err(ErrorCode::Untrusted) => S::AccessDenied,
+                                    Err(_) => S::Unavailable,
+                                };
+                            }
+                        }
+                        page.names_complete &= record.goal_state == S::Ready;
+                        task.task_id.to_string()
+                    }
+                    _ => return Err(crate::WriterActorError::StoreCorrupt),
+                };
+                let matches = needle.is_empty()
+                    || matches_name(&id)
+                    || record.path_hint.as_ref().is_some_and(|v| matches_name(v))
+                    || record.branch_hint.as_ref().is_some_and(|v| matches_name(v))
+                    || record.goal.as_ref().is_some_and(|v| matches_name(v));
+                if !matches {
+                    continue;
+                }
+                count = count
+                    .checked_add(1)
+                    .ok_or(crate::WriterActorError::StoreCorrupt)?;
+                if after.is_none_or(|key| record.stable_key.as_str() > key)
+                    && page.records.len() <= usize::from(limit)
+                {
+                    page.records.push(record);
+                }
+            }
+            scan_after = context.next_cursor;
+            if scan_after.is_none() {
+                break;
+            }
+        }
+        if !found_after {
+            return Err(crate::WriterActorError::InvalidInput);
+        }
+        if page.records.len() > usize::from(limit) {
+            page.records.truncate(usize::from(limit));
+            page.next = page.records.last().map(|row| row.stable_key.clone());
+        }
+        // Unknown protected names must not become an exact zero or a keyword-presence oracle.
+        page.matching_count = (needle.is_empty() || page.names_complete).then_some(count);
+        Ok(O::Page(Box::new(page)))
+    }
+
     pub async fn read_metadata_batch(
         writer: crate::WriterHandle,
         query: Box<evertrace_domain::query::MetadataBatchQuery>,
@@ -1015,13 +1241,140 @@ impl EngineService {
         crate::WriterActorError,
     > {
         use evertrace_domain::query::{
+            MetadataBatchQuery, MetadataReadOutcome as O, MetadataReadPage as P,
+            MetadataReadQuery as Q, ObjectReadBatch,
+        };
+        if !query.validate() {
+            return Err(crate::WriterActorError::InvalidInput);
+        }
+        let deadline = Instant::now() + std::time::Duration::from_secs(2);
+        let (cancelled, _cancel_on_drop) = evertrace_store::StoreReadHandle::cancellation_scope();
+        let read = async {
+            if !query
+                .items
+                .iter()
+                .any(|item| matches!(item, Q::Scopes { .. }))
+            {
+                return Self::read_stored_metadata_batch(
+                    writer,
+                    query,
+                    effective_config_hash,
+                    llm,
+                    report,
+                    cancelled.clone(),
+                    deadline,
+                )
+                .await;
+            }
+            let state = Self::read_state(writer.read_handle(), effective_config_hash)
+                .await
+                .map_err(|_| crate::WriterActorError::Store)?;
+            if query.expected_frontier.is_some_and(|v| v != state.frontier)
+                || query
+                    .expected_data_identity
+                    .is_some_and(|v| v != state.data_identity)
+            {
+                return Ok(O::Conflict(state.frontier));
+            }
+            let stored = query
+                .items
+                .iter()
+                .filter(|item| !matches!(item, Q::Scopes { .. }))
+                .cloned()
+                .collect::<Vec<_>>();
+            let mut stored = if stored.is_empty() {
+                Vec::new()
+            } else {
+                match Self::read_stored_metadata_batch(
+                    writer.clone(),
+                    Box::new(MetadataBatchQuery {
+                        expected_frontier: Some(state.frontier),
+                        expected_data_identity: Some(state.data_identity),
+                        items: stored,
+                    }),
+                    effective_config_hash,
+                    llm,
+                    report.clone(),
+                    cancelled.clone(),
+                    deadline,
+                )
+                .await?
+                {
+                    O::Page(batch) if batch.state == state => batch.items,
+                    O::Page(batch) => return Ok(O::Conflict(batch.state.frontier)),
+                    O::TooLarge => return Ok(O::TooLarge),
+                    O::Conflict(frontier) => return Ok(O::Conflict(frontier)),
+                }
+            }
+            .into_iter();
+            let mut items = Vec::with_capacity(query.items.len());
+            for item in &query.items {
+                items.push(
+                    if let Q::Scopes {
+                        query,
+                        after,
+                        limit,
+                    } = item
+                    {
+                        match Self::read_scopes_metadata(
+                            &writer,
+                            query,
+                            after.as_deref(),
+                            *limit,
+                            &state,
+                            effective_config_hash,
+                            &cancelled,
+                            deadline,
+                            &report,
+                        )
+                        .await?
+                        {
+                            O::Page(page) => P::Scopes { page },
+                            O::TooLarge => return Ok(O::TooLarge),
+                            O::Conflict(frontier) => return Ok(O::Conflict(frontier)),
+                        }
+                    } else {
+                        stored.next().ok_or(crate::WriterActorError::StoreCorrupt)?
+                    },
+                );
+            }
+            let current = Self::read_state(writer.read_handle(), effective_config_hash)
+                .await
+                .map_err(|_| crate::WriterActorError::Store)?;
+            if current != state {
+                return Ok(O::Conflict(current.frontier));
+            }
+            let batch = ObjectReadBatch { state, items };
+            Ok(if batch.validate() {
+                O::Page(Box::new(batch))
+            } else {
+                O::TooLarge
+            })
+        };
+        match tokio::time::timeout_at(tokio::time::Instant::from_std(deadline), read).await {
+            Ok(result) => result,
+            Err(_) => Ok(O::TooLarge),
+        }
+    }
+
+    async fn read_stored_metadata_batch(
+        writer: crate::WriterHandle,
+        query: Box<evertrace_domain::query::MetadataBatchQuery>,
+        effective_config_hash: [u8; 32],
+        llm: &evertrace_domain::config::LlmConfig,
+        report: std::sync::Arc<tokio::sync::RwLock<Option<evertrace_codex::HostProbeReport>>>,
+        cancelled: std::sync::Arc<std::sync::atomic::AtomicBool>,
+        deadline: Instant,
+    ) -> Result<
+        evertrace_domain::query::MetadataReadOutcome<evertrace_domain::query::ObjectReadBatch>,
+        crate::WriterActorError,
+    > {
+        use evertrace_domain::query::{
             ExactFieldsQuery, ExactReadQuery, HumanContentState as S, MetadataReadOutcome as O,
             MetadataReadPage as P,
         };
-        let deadline = Instant::now() + std::time::Duration::from_secs(2);
-        let (cancelled, _cancel_on_drop) = evertrace_store::StoreReadHandle::cancellation_scope();
         let mut outcome = writer
-            .read_metadata_batch(query, cancelled.clone(), effective_config_hash)
+            .read_metadata_batch(query, cancelled.clone(), effective_config_hash, deadline)
             .await?;
         if let evertrace_domain::query::MetadataReadOutcome::Page(batch) = &mut outcome {
             for item in &mut batch.items {
