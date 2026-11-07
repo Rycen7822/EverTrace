@@ -1,6 +1,6 @@
 //! Bounded kernel data reads. No presentation, diagnostics or background work.
 use super::EngineService;
-use evertrace_domain::error::ErrorCode;
+use evertrace_domain::{error::ErrorCode, query::HumanContentState};
 use evertrace_store::ObjectRow;
 use std::time::Instant;
 
@@ -434,25 +434,29 @@ fn semantic_record<T: serde::Serialize>(
     )))
 }
 
-/// Original metadata and a bounded protected-source binding; never a generic CAS reader.
+/// Only the selected revision supplies a CAS coordinate; external references are never opened.
 fn artifact_record(
     value: &evertrace_domain::work::WorkArtifact,
     rows: &[ObjectRow],
     query: &evertrace_domain::query::ExactRecordQuery,
+    cas_dir: &std::path::Path,
     check: &dyn Fn() -> Result<(), ErrorCode>,
-) -> Result<Option<RecordData>, ErrorCode> {
+) -> Result<(HumanContentState, Option<RecordData>), ErrorCode> {
+    use evertrace_capture::{CasError, CasStore};
+    use evertrace_domain::query::{
+        ExactRecordField as Field, ExactRecordInfo as Info, HumanContentState as State,
+    };
     use evertrace_domain::work::ArtifactPayloadStatus as Status;
     use evertrace_store::JournalPayload as P;
     value.validate().map_err(|_| ErrorCode::StoreCorrupt)?;
-    let Some((_, window)) = semantic_record(value, None, query, check)? else {
-        return Ok(None);
-    };
-    let mut source = None;
-    if matches!(
-        value.revision.payload_status,
-        Status::Available | Status::Degraded
-    ) && let Some(blob) = value.revision.content_blob_ref
-    {
+    let blob = value.revision.content_blob_ref.filter(|_| {
+        matches!(
+            value.revision.payload_status,
+            Status::Available | Status::Degraded
+        )
+    });
+    let mut source_pair = None;
+    if let Some(blob) = blob {
         let expected = blob.to_string();
         for id in &value.revision.source_observation_refs {
             check()?;
@@ -460,7 +464,7 @@ fn artifact_record(
                 row.object_kind.as_deref() == Some("source_observation")
                     && row.object_id.as_deref() == Some(id.to_string().as_str())
             }) else {
-                continue;
+                return Ok((State::Unavailable, None));
             };
             let P::SourceObservationRecorded(observation) =
                 serde_json::from_str(row.payload_json.as_deref().ok_or(ErrorCode::StoreCorrupt)?)
@@ -473,7 +477,7 @@ fn artifact_record(
                     && row.object_id.as_deref()
                         == Some(observation.source_receipt_ref.to_string().as_str())
             }) else {
-                continue;
+                return Ok((State::Unavailable, None));
             };
             let P::SourceReceiptRecorded(receipt) =
                 serde_json::from_str(row.payload_json.as_deref().ok_or(ErrorCode::StoreCorrupt)?)
@@ -481,19 +485,88 @@ fn artifact_record(
             else {
                 return Err(ErrorCode::StoreCorrupt);
             };
-            if expected.strip_prefix("cas:") == Some(receipt.cas_ref.as_str())
-                && evertrace_capture::cas::SourceArchiveVerifier::new(&receipt, &observation)
-                    .is_ok()
-            {
-                source = Some(Box::new(source_identity(&receipt, &observation)));
-                break;
+            if expected.strip_prefix("cas:") == Some(receipt.cas_ref.as_str()) {
+                // A broken matching source proof must not fall back to a less restrictive blob read.
+                evertrace_capture::cas::SourceArchiveVerifier::new(&receipt, &observation)
+                    .map_err(|_| ErrorCode::StoreCorrupt)?;
+                if source_pair.is_none() {
+                    source_pair = Some((receipt, observation));
+                }
             }
         }
     }
-    Ok(Some((
-        evertrace_domain::query::ExactRecordInfo::Artifact { source },
-        window,
-    )))
+    let info = Info::Artifact {
+        source: source_pair
+            .as_ref()
+            .map(|(receipt, observation)| Box::new(source_identity(receipt, observation))),
+    };
+    if query.field == Some(Field::Text) {
+        let Some(blob) = blob else {
+            return Ok((State::Unsupported, None));
+        };
+        let Some(range) = &query.range else {
+            return Ok((State::Unsupported, None));
+        };
+        let media = value
+            .revision
+            .media_type
+            .split(';')
+            .next()
+            .unwrap_or_default()
+            .trim()
+            .to_ascii_lowercase();
+        if !(media.starts_with("text/")
+            || matches!(media.as_str(), "application/json" | "application/x-ndjson"))
+        {
+            return Ok((State::Unsupported, None));
+        }
+        let Ok(cas) = CasStore::open_existing(cas_dir.to_path_buf()) else {
+            return Ok((State::Unavailable, None));
+        };
+        let mut checkpoint = || check().map_err(|_| CasError::ReadCancelled);
+        let bytes = range.offset..range.offset + u64::from(range.length) + 1;
+        let read = if let Some((receipt, observation)) = &source_pair {
+            if matches!(
+                receipt.protected_presentation,
+                Some(evertrace_domain::evidence::ProtectedPresentation::Unavailable { .. })
+            ) {
+                return Ok((State::Unsupported, None));
+            }
+            cas.read_source_text_window_checked(receipt, observation, bytes, &mut checkpoint)
+        } else {
+            let digest = evertrace_domain::evidence::hex(&blob.as_digest())
+                .parse()
+                .map_err(|_| ErrorCode::StoreCorrupt)?;
+            cas.read_text_window_checked(&digest, bytes, &mut checkpoint)
+        };
+        return match read {
+            Ok((window, true)) => Ok((
+                State::Ready,
+                Some((
+                    info,
+                    Some(utf8_window(
+                        window.bytes,
+                        range.offset,
+                        range.length,
+                        window.total_bytes,
+                    )?),
+                )),
+            )),
+            Ok((_, false)) => Ok((State::Unsupported, None)),
+            Err(CasError::ReadBudgetExceeded) => Ok((State::TooLarge, None)),
+            Err(CasError::ReadCancelled) => Err(ErrorCode::ResourceExhausted),
+            Err(_) => Ok((State::Unavailable, None)),
+        };
+    }
+    let data = semantic_record(value, None, query, check)?.map(|(_, window)| (info, window));
+    Ok((
+        if data.is_some() {
+            State::Ready
+        } else {
+            State::Unsupported
+        },
+        data,
+    ))
 }
 
 fn record_data(
@@ -747,6 +820,7 @@ impl EngineService {
         query: Box<evertrace_domain::query::ExactRecordQuery>,
         effective_config_hash: [u8; 32],
         report: std::sync::Arc<tokio::sync::RwLock<Option<evertrace_codex::HostProbeReport>>>,
+        cas_dir: std::path::PathBuf,
     ) -> Result<
         evertrace_domain::query::MetadataReadOutcome<evertrace_domain::query::ExactRecordWindow>,
         ErrorCode,
@@ -812,12 +886,12 @@ impl EngineService {
             };
             return Ok(Outcome::Page(Box::new(result)));
         }
-        let data = if matches!(
+        let (read_state, data) = if matches!(
             root.object_kind.as_deref(),
             Some("source_receipt" | "source_observation")
         ) {
             if query.field.is_some() {
-                None
+                (State::Unsupported, None)
             } else {
                 let (receipt, observation) = source_records(&before)?;
                 let record = evertrace_domain::source::SourceRecordMetadata::from_records(
@@ -825,15 +899,18 @@ impl EngineService {
                     &observation,
                 )
                 .ok_or(ErrorCode::StoreCorrupt)?;
-                Some((
-                    evertrace_domain::query::ExactRecordInfo::Source {
-                        record: Box::new(record),
-                        source: Box::new(source_identity(&receipt, &observation)),
-                        source_kind: receipt.source_kind,
-                        source_session_ref: receipt.source_session_ref,
-                    },
-                    None,
-                ))
+                (
+                    State::Ready,
+                    Some((
+                        evertrace_domain::query::ExactRecordInfo::Source {
+                            record: Box::new(record),
+                            source: Box::new(source_identity(&receipt, &observation)),
+                            source_kind: receipt.source_kind,
+                            source_session_ref: receipt.source_session_ref,
+                        },
+                        None,
+                    )),
+                )
             }
         } else {
             let payload = root.payload_json.clone().ok_or(ErrorCode::StoreCorrupt)?;
@@ -871,9 +948,23 @@ impl EngineService {
                             if let evertrace_store::JournalPayload::WorkArtifactRecorded(value) =
                                 payload
                             {
-                                artifact_record(&value, &source_rows, &selected_query, &check)?
+                                artifact_record(
+                                    &value,
+                                    &source_rows,
+                                    &selected_query,
+                                    &cas_dir,
+                                    &check,
+                                )?
                             } else {
-                                record_data(payload, &selected_query, &check)?
+                                let data = record_data(payload, &selected_query, &check)?;
+                                (
+                                    if data.is_some() {
+                                        State::Ready
+                                    } else {
+                                        State::Unsupported
+                                    },
+                                    data,
+                                )
                             };
                         check()?;
                         Ok(data)
@@ -909,12 +1000,12 @@ impl EngineService {
             || before.rows != current.rows
         {
             return Ok(Outcome::Conflict(current.state.frontier));
-        } else if let Some((info, window)) = data {
-            result.content_state = State::Ready;
-            result.info = Some(info);
-            result.window = window;
         } else {
-            result.content_state = State::Unsupported;
+            result.content_state = read_state;
+            if let Some((info, window)) = data {
+                result.info = Some(info);
+                result.window = window;
+            }
         }
         if !result.validate() {
             return Err(ErrorCode::ResourceExhausted);

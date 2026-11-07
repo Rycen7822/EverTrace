@@ -28,8 +28,8 @@ const CAS_MAGIC: &[u8; 8] = b"ETCAS001";
 const FORMAT_VERSION: u16 = 1;
 const COMPRESSION_VERSION: u16 = 1;
 const HEADER_LENGTH: usize = 64;
-pub const SOURCE_ARCHIVE_MAX_ENCODED_BYTES: u64 = 64 * 1024 * 1024;
-pub const SOURCE_ARCHIVE_MAX_DECODED_BYTES: u64 = 128 * 1024 * 1024;
+pub const PROTECTED_CONTENT_MAX_ENCODED_BYTES: u64 = 64 * 1024 * 1024;
+pub const PROTECTED_CONTENT_MAX_DECODED_BYTES: u64 = 128 * 1024 * 1024;
 const CREATE_ATTEMPTS: u8 = 16;
 
 #[derive(Clone, Copy, Eq, Hash, Ord, PartialEq, PartialOrd)]
@@ -576,6 +576,29 @@ impl CasStore {
         })
     }
 
+    /// Whole-envelope integrity and text classification precede disclosure of a bounded window.
+    pub fn read_text_window_checked(
+        &self,
+        digest: &CasDigest,
+        range: Range<u64>,
+        check: &mut dyn FnMut() -> Result<(), CasError>,
+    ) -> Result<(CasReadWindow, bool), CasError> {
+        let mut utf8 = Utf8Check::default();
+        let window = self.read_bounded_window_checked(
+            digest,
+            PROTECTED_CONTENT_MAX_ENCODED_BYTES,
+            PROTECTED_CONTENT_MAX_DECODED_BYTES,
+            range,
+            check,
+            &mut |bytes| {
+                utf8.update(bytes);
+                Ok(())
+            },
+        )?;
+        check()?;
+        Ok((window, utf8.valid && utf8.pending_len == 0))
+    }
+
     /// Exact protected source text. Complete archive and text classification are
     /// verified before returning any selected bytes; no locator comes from a read client.
     pub fn read_source_text_window_checked(
@@ -590,8 +613,8 @@ impl CasStore {
         let mut utf8 = Utf8Check::default();
         let window = self.read_bounded_window_checked(
             &digest,
-            SOURCE_ARCHIVE_MAX_ENCODED_BYTES,
-            SOURCE_ARCHIVE_MAX_DECODED_BYTES,
+            PROTECTED_CONTENT_MAX_ENCODED_BYTES,
+            PROTECTED_CONTENT_MAX_DECODED_BYTES,
             range,
             check,
             &mut |bytes| {

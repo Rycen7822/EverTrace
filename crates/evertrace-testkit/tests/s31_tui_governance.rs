@@ -2171,6 +2171,7 @@ async fn plain_accept_uses_one_real_command_for_atom_procedure_and_core_inner() 
             }),
             CONFIG,
             std::sync::Arc::new(tokio::sync::RwLock::new(None)),
+            root.path().join("cas"),
         )
         .await
         .unwrap()
@@ -5470,6 +5471,7 @@ async fn plain_accept_uses_one_real_command_for_atom_procedure_and_core_inner() 
             }),
             CONFIG,
             report.clone(),
+            root.path().join("cas"),
         )
         .await
         .unwrap()
@@ -5540,6 +5542,7 @@ async fn plain_accept_uses_one_real_command_for_atom_procedure_and_core_inner() 
                 }),
                 CONFIG,
                 report.clone(),
+                root.path().join("cas"),
             )
             .await
             .unwrap()
@@ -5654,9 +5657,11 @@ async fn protected_archive_export(
         ExactRecordQuery, ExactRecordRef, ExactSourceTextQuery, ExactUtf8Range,
         HumanContentState as ReadState, HumanRevisionRef, MetadataReadOutcome, SourceTextField,
     };
+    let record_cas = import_runtime.cas_dir.clone();
     let read_record = |stable_key: String, revision_ref: String| {
         let writer = import_handle.clone();
         let report = report.clone();
+        let cas_dir = record_cas.clone();
         async move {
             let MetadataReadOutcome::Page(page) =
                 evertrace_engine::EngineService::read_exact_record(
@@ -5673,6 +5678,7 @@ async fn protected_archive_export(
                     }),
                     CONFIG,
                     report,
+                    cas_dir,
                 )
                 .await
                 .unwrap()

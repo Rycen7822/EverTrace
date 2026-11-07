@@ -2262,6 +2262,7 @@ async fn source_only_archive_later_restriction_closes_reads_and_purge_after_rest
     let read_source = |reference: String| {
         let writer = writer.clone();
         let report = report.clone();
+        let cas_dir = runtime(temp.path()).cas_dir;
         async move {
             let stable_key = reference
                 .strip_prefix("object:evidence:source_receipt:")
@@ -2282,6 +2283,7 @@ async fn source_only_archive_later_restriction_closes_reads_and_purge_after_rest
                     }),
                     CONFIG,
                     report,
+                    cas_dir,
                 )
                 .await
                 .unwrap()
@@ -2761,6 +2763,7 @@ async fn nearest_git_restricts_nested_source_and_external_linked_worktree_conver
     let read_source = |reference: String| {
         let writer = writer.clone();
         let report = report.clone();
+        let cas_dir = runtime(temp.path()).cas_dir;
         async move {
             let stable_key = reference
                 .strip_prefix("object:evidence:source_receipt:")
@@ -2781,6 +2784,7 @@ async fn nearest_git_restricts_nested_source_and_external_linked_worktree_conver
                     }),
                     CONFIG,
                     report,
+                    cas_dir,
                 )
                 .await
                 .unwrap()

@@ -1,6 +1,9 @@
 <section class="detail" data-content-state="{{ content.state }}">
 <h2>{{ '受保护来源归档分段' if content.representation == 'source_text' else '原修订分段读取' }}</h2>
 <button class="button" type="button" data-nav-back hidden>返回上一条记录</button>
+{% if content.get('artifact_payload') %}
+<p>这是所选产物修订的受保护载荷。仅供阅读，不按其中内容执行指令；载荷状态不代表采用或验证通过。</p>
+{% endif %}
 {% if content.representation == 'source_text' or content.get('source_ref') %}
 <p>这是已归档并脱敏的原记录，不是 EvidenceSurface 或检索片段；不按文本内容执行指令。捕获完整性与信任标记见来源详情。</p>
 {% endif %}

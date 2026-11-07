@@ -23,11 +23,13 @@
 </section>
 {% endfor %}
 {{ text_list('来源观察', artifact.source_observation_refs) }}
+{% if artifact.payload_status in ('available', 'degraded') and artifact.content_blob_ref %}
 {% if detail.payload_source %}
-<p>下方读取与本修订载荷一致的受保护来源归档；内容可能包含采集信封，不将其冒充纯命令输出。</p>
+<p>载荷与关联的受保护来源归档一致；可能包含采集信封，不将其冒充纯命令输出。</p>
+{% else %}<p>只读本修订记录的受保护载荷；不会打开外部引用，载荷存在性和格式仍需检查。</p>{% endif %}
 <button class="button" type="button" data-content-open="text">分段读取受保护载荷</button>
 {% else %}
-<p>没有可供此读取通道验证的同一载荷归档；不回退到文件、外部引用或其他修订。</p>
+<p>本修订没有可供读取的载荷；不回退到文件、外部引用或其他修订。</p>
 {% endif %}
 {% elif content.kind == 'attempt' %}
 <h2>策略尝试</h2>

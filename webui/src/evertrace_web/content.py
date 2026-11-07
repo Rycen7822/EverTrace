@@ -248,21 +248,7 @@ async def read_record_content(backend, reference, frontier, revision, representa
     identity, selection, info = meta["state"]["data_identity"], meta["selection"], meta["info"]
     start = max(0, offset - _LIMIT) if backwards else offset
     end = offset if backwards else offset + _LIMIT
-    if representation == "text" and info["kind"] == "artifact":
-        source = info["source"]
-        if source is None:
-            return _unavailable({**meta, "content_state": "unsupported"}, reference, revision, representation)
-        source_ref = source["observation_ref"]
-        source_cursor = _cursor(source_ref, source_ref, identity, source, offset, backwards)
-        reply = await read_source_content(backend, source_ref, frontier, source_ref, source_cursor)
-        if reply["kind"] == "conflict":
-            return reply
-        content = reply["content"]
-        if content["state"] != "ready":
-            return _unavailable({**meta, "content_state": content["state"]}, reference, revision, representation)
-        text, total = content["text"], content["total_bytes"]
-        start, end = content["range_start"], content["range_end"]
-    elif representation == "text" and info["kind"] == "work":
+    if representation == "text" and info["kind"] == "work":
         parts = _work_parts(info)
         total, position, pieces = sum(part[2] for part in parts), 0, []
         if offset > total:
@@ -296,7 +282,7 @@ async def read_record_content(backend, reference, frontier, revision, representa
         end = start + len(text.encode())
     else:
         field = {"kind": "json" if representation == "semantic_json" else "text"}
-        if representation == "text" and info.get("text_bytes") is None:
+        if representation == "text" and info["kind"] != "artifact" and info.get("text_bytes") is None:
             return _unavailable({**meta, "content_state": "unsupported"}, reference, revision, representation)
         reply = await backend.read_record_window(reference, revision, field,
             {"offset": start, "length": max(4, end - start)}, identity, selection)
@@ -326,7 +312,9 @@ async def read_record_content(backend, reference, frontier, revision, representa
         return {"kind": "conflict"}
     content = _unavailable(current, reference, revision, representation)["content"]
     if representation == "text" and info["kind"] == "artifact":
-        content["source_ref"] = info["source"]["observation_ref"]
+        content["artifact_payload"] = True
+        if info["source"] is not None:
+            content["source_ref"] = info["source"]["observation_ref"]
     content.update({"text": text, "total_bytes": total, "range_start": start, "range_end": end,
         "previous_cursor": _record_cursor(reference, revision, representation, identity, selection, start, True) if start else None,
         "next_cursor": _record_cursor(reference, revision, representation, identity, selection, end, False) if end < total else None})

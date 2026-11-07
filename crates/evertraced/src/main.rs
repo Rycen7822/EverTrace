@@ -861,7 +861,7 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
                                 },
                                 ExactReadQuery::Record(record) => match EngineService::read_exact_record(
                                     writer.clone(), Box::new(record.clone()), config_snapshot.hash(),
-                                    Arc::clone(&session_catalog_report),
+                                    Arc::clone(&session_catalog_report), runtime_snapshot.cas_dir.clone(),
                                 ).await? {
                                     MetadataReadOutcome::Page(page) => HumanGovernanceResponse::RecordWindow { page },
                                     MetadataReadOutcome::Conflict(current_frontier) => HumanGovernanceResponse::Conflict {
