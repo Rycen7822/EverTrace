@@ -8,7 +8,6 @@ pub use crate::semantic::human_acceptance::{
 mod compiled;
 mod diagnostics;
 mod export;
-mod history;
 pub use compiled::{HumanCompiledEntry, HumanCompiledPage};
 mod presentation;
 mod reading;
@@ -107,7 +106,6 @@ pub enum HumanRelationKind {
     ProposalEvidence,
     SupportDependencies,
     ObjectSources,
-    ObjectRevisions,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -1441,19 +1439,9 @@ impl HumanGovernanceService {
         self.readable_indexed_row(&snapshot, source, &index, deadline)
             .await
             .map_err(|_| HumanGovernanceError::InvalidInput)?;
-        let semantic_view = (request.relation != HumanRelationKind::ObjectRevisions)
-            .then(|| SemanticCurrentView::from_snapshot(&snapshot))
-            .transpose()
+        let semantic_view = SemanticCurrentView::from_snapshot(&snapshot)
             .map_err(|_| HumanGovernanceError::Store)?;
         let refs = match request.relation {
-            HumanRelationKind::ObjectRevisions => {
-                if source.current_revision_id.as_deref()
-                    != Some(request.expected_source_revision_ref)
-                {
-                    return Ok(Err((snapshot.frontier, source.current_revision_id.clone())));
-                }
-                return Ok(Ok(history::page(&snapshot, source, request)?));
-            }
             HumanRelationKind::ObjectSources => {
                 if source.current_revision_id.as_deref()
                     != Some(request.expected_source_revision_ref)
@@ -1494,8 +1482,6 @@ impl HumanGovernanceService {
                     .and_then(|value| value.parse::<RevisionProposalId>().ok())
                     .ok_or(HumanGovernanceError::InvalidInput)?;
                 let current = semantic_view
-                    .as_ref()
-                    .ok_or(HumanGovernanceError::Store)?
                     .proposals
                     .get(&proposal_id)
                     .ok_or(HumanGovernanceError::InvalidInput)?;
@@ -1645,7 +1631,7 @@ impl HumanGovernanceService {
                     summary(
                         &snapshot,
                         row,
-                        semantic_view.as_ref(),
+                        Some(&semantic_view),
                         usage_view.as_ref(),
                         None,
                         HumanSurface::Explorer,

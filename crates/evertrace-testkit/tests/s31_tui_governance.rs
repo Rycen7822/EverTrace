@@ -3908,20 +3908,42 @@ async fn plain_accept_uses_one_real_command_for_atom_procedure_and_core_inner() 
         matches!(&historical.items[0].semantic_detail.as_ref().unwrap().content,
         Some(evertrace_engine::HumanSemanticContent::Atom(atom)) if **atom == first_atom)
     );
-    let revisions = service
-        .related(HumanRelatedRequest {
-            relation: evertrace_engine::HumanRelationKind::ObjectRevisions,
-            source_stable_key: &historical.items[0].stable_key,
-            expected_source_revision_ref: &first_atom.revision_id.to_string(),
-            expected_frontier: historical.frontier,
-            after: None,
-            limit: 64,
-        })
-        .await
-        .unwrap()
-        .unwrap();
-    assert!(revisions.items.len() >= 2);
-    assert!(revisions.items.iter().all(|item| item.object_ref.as_deref() == Some(first_atom.atom_id.to_string().as_str())));
+    let revisions = evertrace_engine::EngineService::read_metadata_batch(
+        handle.clone(),
+        Box::new(evertrace_domain::query::MetadataBatchQuery {
+            expected_frontier: Some(historical.frontier),
+            expected_data_identity: None,
+            items: vec![evertrace_domain::query::MetadataReadQuery::Revisions {
+                reference: evertrace_domain::query::HumanRevisionRef {
+                    stable_key: historical.items[0].stable_key.clone(),
+                    revision_ref: first_atom.revision_id.to_string(),
+                },
+                after: None,
+                limit: 64,
+            }],
+        }),
+        CONFIG,
+        &Default::default(),
+        report.clone(),
+    )
+    .await
+    .unwrap();
+    let evertrace_domain::query::MetadataReadOutcome::Page(revisions) = revisions else {
+        panic!("same-watermark immutable history must be readable");
+    };
+    let evertrace_domain::query::MetadataReadPage::Revisions { page } = &revisions.items[0] else {
+        panic!("metadata query must retain its kind");
+    };
+    assert_eq!(
+        page.content_state,
+        evertrace_domain::query::HumanContentState::Ready
+    );
+    assert!(page.records.len() >= 2);
+    assert!(
+        page.records
+            .iter()
+            .all(|row| row["object_id"] == first_atom.atom_id.to_string())
+    );
     assert_memories_match_explorer(&service).await;
     assert_inbox_matches_snapshot(&service, &handle.project().await.unwrap()).await;
 

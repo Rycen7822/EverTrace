@@ -725,7 +725,6 @@ class Backend:
                     "snapshot",
                     "memory_page",
                     "compiled_projections",
-                    "revision_page",
                     "scope_directory",
                     "source_catalog",
                     "source_archive",

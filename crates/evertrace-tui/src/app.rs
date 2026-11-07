@@ -495,7 +495,6 @@ impl App {
                         | HumanGovernanceResponse::State { .. }
                         | HumanGovernanceResponse::Action { .. }
                         | HumanGovernanceResponse::Search { .. }
-                        | HumanGovernanceResponse::RevisionPage { .. }
                         | HumanGovernanceResponse::MemoryPage { .. }
                         | HumanGovernanceResponse::CompiledProjections { .. }
                         | HumanGovernanceResponse::ScopeDirectory { .. }
@@ -538,7 +537,6 @@ impl App {
                     | HumanGovernanceResponse::State { .. }
                     | HumanGovernanceResponse::Snapshot { .. }
                     | HumanGovernanceResponse::Search { .. }
-                    | HumanGovernanceResponse::RevisionPage { .. }
                     | HumanGovernanceResponse::MemoryPage { .. }
                     | HumanGovernanceResponse::CompiledProjections { .. }
                     | HumanGovernanceResponse::ScopeDirectory { .. }
@@ -784,7 +782,6 @@ impl App {
                 | UiCommand::OpenResult
                 | UiCommand::OpenResultAt(_)
                 | UiCommand::CancelModal
-                | UiCommand::DetailView(crate::state::DetailView::History)
         ) {
             self.state.ui.read_generation = self.state.ui.read_generation.wrapping_add(1).max(1);
             self.state.ui.reading = false;

@@ -1094,7 +1094,6 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
                                                 EngineHumanRelationKind::SupportDependencies
                                             }
                                             HumanRelationKind::ObjectSources => EngineHumanRelationKind::ObjectSources,
-                                            HumanRelationKind::ObjectRevisions => EngineHumanRelationKind::ObjectRevisions,
                                         },
                                         source_stable_key: &source_stable_key,
                                         expected_source_revision_ref: &expected_source_revision_ref,
@@ -1105,16 +1104,6 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
                                     .await
                                     .map_err(map_human_error)?
                                 {
-                                    Ok(page) if relation == HumanRelationKind::ObjectRevisions => {
-                                        let HumanGovernanceResponse::Snapshot {
-                                            diagnostics, frontier, status, degraded_reasons, items, next_cursor,
-                                        } = map_human_page(page) else { return Err(ErrorCode::Internal); };
-                                        HumanGovernanceResponse::RevisionPage {
-                                            diagnostics, frontier, status, degraded_reasons, items, next_cursor,
-                                            source_key: source_stable_key,
-                                            source_revision: expected_source_revision_ref,
-                                        }
-                                    }
                                     Ok(page) => map_human_page(page),
                                     Err((current_frontier, current_revision_ref)) => {
                                         HumanGovernanceResponse::Conflict {

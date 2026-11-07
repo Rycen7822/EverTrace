@@ -154,7 +154,6 @@ pub enum DetailView {
     #[default]
     Content,
     Sources,
-    History,
     Technical,
 }
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]

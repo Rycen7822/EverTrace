@@ -168,18 +168,6 @@ impl App {
                     .is_none()
                     .then_some("No readable source relation"),
             );
-            add(
-                DetailView(crate::state::DetailView::History),
-                "Revision history",
-                (!s.detail.as_ref().is_some_and(|i| {
-                    i.revision_ref.is_some()
-                        && matches!(
-                            i.object_kind.as_str(),
-                            "atom_revision" | "procedure_revision" | "core_membership"
-                        )
-                }))
-                .then_some("Revision history is not provided for this type"),
-            );
             if s.route == crate::Route::Explorer {
                 add(
                     ToggleExportSelection,
@@ -746,36 +734,8 @@ impl App {
                 if view == DetailView::Sources {
                     return Some(self.dispatch(UiCommand::OpenRelated));
                 }
-                if view == DetailView::History && self.state.detail.is_some() {
-                    self.save_navigation(false);
-                }
                 self.state.ui.detail_view = view;
                 self.state.detail_scroll = 0;
-                if matches!(view, DetailView::Sources | DetailView::History)
-                    && self.state.detail.is_some()
-                {
-                    self.state.ui.related_loaded = false;
-                    self.state.ui.page_cursor = None;
-                    let relation = if view == DetailView::History {
-                        evertrace_protocol::dto::HumanRelationKind::ObjectRevisions
-                    } else {
-                        evertrace_protocol::dto::HumanRelationKind::ObjectSources
-                    };
-                    let item = self.state.detail.as_ref()?;
-                    let Some(revision) = item.revision_ref.clone() else {
-                        return Some(UiCommand::None);
-                    };
-                    let Some(frontier) = action_frontier(&self.state) else {
-                        return Some(UiCommand::None);
-                    };
-                    self.state.related_context = Some(crate::state::RelatedContext {
-                        relation,
-                        source_stable_key: item.stable_key.clone(),
-                        expected_source_revision_ref: revision,
-                        expected_frontier: frontier,
-                    });
-                    return Some(UiCommand::OpenRelated);
-                }
             }
             UiCommand::CancelModal if !self.modal_open() => {
                 if self.state.ui.diagnostic_detail {
@@ -1094,7 +1054,6 @@ impl App {
                 UiCommand::CancelModal,
                 UiCommand::DetailView(DetailView::Content),
                 UiCommand::DetailView(DetailView::Sources),
-                UiCommand::DetailView(DetailView::History),
                 UiCommand::DetailView(DetailView::Technical),
             ]
         } else if self.state.route == crate::Route::System {
@@ -1356,7 +1315,6 @@ impl App {
                     .label(match v {
                         DetailView::Content => "Content",
                         DetailView::Sources => "Sources",
-                        DetailView::History => "History",
                         DetailView::Technical => "Technical",
                     })
                     .into(),
@@ -1468,7 +1426,6 @@ impl App {
                         .label(match s.ui.detail_view {
                             DetailView::Content => "Content",
                             DetailView::Sources => "Sources",
-                            DetailView::History => "Revision history",
                             DetailView::Technical => "Technical fields",
                         })
                         .to_string()
@@ -2045,19 +2002,19 @@ mod tests {
         for language in [crate::Language::English, crate::Language::Chinese] {
             app.dispatch(UiCommand::Language(language));
             assert!(views::detail_text(&app.state).contains(&revision.to_string()));
-            for query in ["Revision history", "修订历史"] {
+            for query in ["Sources", "来源"] {
                 app.state.ui.query = query.into();
                 assert!(
                     app.palette()
                         .iter()
-                        .any(|s| s.command == UiCommand::DetailView(DetailView::History))
+                        .any(|s| s.command == UiCommand::DetailView(DetailView::Sources))
                 );
             }
             draw(&app, 80, 24);
             assert!(!app.state.write_queued);
         }
         app.state.ui.query.clear();
-        app.dispatch(UiCommand::DetailView(DetailView::History));
+        app.dispatch(UiCommand::DetailView(DetailView::Sources));
         assert_eq!(
             app.state
                 .related_context
@@ -2069,7 +2026,7 @@ mod tests {
         app.handle(AppEvent::HumanRead {
             surface: HumanSurface::Explorer,
             locator: HumanReadLocator::Related {
-                relation: evertrace_protocol::dto::HumanRelationKind::ObjectRevisions,
+                relation: evertrace_protocol::dto::HumanRelationKind::ObjectSources,
                 source_stable_key: item.stable_key.clone(),
                 expected_source_revision_ref: revision.to_string(),
                 expected_frontier: 9,
@@ -2080,7 +2037,7 @@ mod tests {
                 status: HumanSnapshotStatus::Ready,
                 degraded_reasons: vec![],
                 items: vec![item.clone()],
-                next_cursor: Some("history-next".into()),
+                next_cursor: Some("sources-next".into()),
             },
         });
         assert_eq!(

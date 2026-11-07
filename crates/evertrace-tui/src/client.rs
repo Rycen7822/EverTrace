@@ -527,17 +527,6 @@ pub(crate) async fn run(
                                     let _ = events.send(AppEvent::HumanRead { surface, locator, response }).await;
                                     true
                                 }
-                                (PendingKind::HumanRead(surface, locator @ HumanReadLocator::Related { .. }), Response::HumanGovernance(response @ HumanGovernanceResponse::RevisionPage { .. })) if response.validate() => {
-                                    if let HumanGovernanceResponse::RevisionPage {diagnostics, frontier, status, degraded_reasons, mut items, next_cursor, ..} = response {
-                                        // The existing TUI is a loaded-page locator-key view.
-                                        // Adapt this validated page only; retain the native
-                                        // opaque continuation and its source/frontier binding.
-                                        items.sort_by(|left, right| left.stable_key.cmp(&right.stable_key));
-                                        let response = HumanGovernanceResponse::Snapshot {diagnostics, frontier, status, degraded_reasons, items, next_cursor};
-                                        let _ = events.send(AppEvent::HumanRead { surface, locator, response }).await;
-                                        true
-                                    } else { false }
-                                }
                                 (PendingKind::Export, Response::HumanGovernance(response @ HumanGovernanceResponse::Export { .. })) if response.validate() => {
                                     let _ = events.send(AppEvent::HumanAction(response)).await;
                                     true
