@@ -1,4 +1,4 @@
-//! Read-only human source catalogue contracts; no storage or permission resolver.
+//! Canonical source/import metadata and bounded archive reads; no presentation or permission resolver.
 use crate::{
     evidence::SourceRevision,
     ids::{JobId, RepositoryId, WorktreeId},
@@ -148,6 +148,33 @@ impl SourceCatalogEntry {
                 .is_none_or(|start| self.observed_end.is_some_and(|end| start >= end))
             && self.job_id.is_some() == self.job_state.is_some()
             && self.job_state.as_ref().is_none_or(|v| text(v, 64))
+    }
+}
+
+/// Bounded current catalogue facts, not host discovery, session aggregation or import completeness.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct SourceMetadataPage {
+    pub query: SourceCatalogQuery,
+    pub records: Vec<SourceCatalogEntry>,
+    /// Exact matching source-instance count in the visible, committed Native catalogue namespace.
+    pub matching_count: u64,
+    pub next: Option<String>,
+}
+
+impl SourceMetadataPage {
+    pub fn validate(&self) -> bool {
+        self.query.validate().is_ok()
+            && self.matching_count >= self.records.len() as u64
+            && self.records.iter().all(SourceCatalogEntry::validate)
+            && self
+                .records
+                .windows(2)
+                .all(|pair| pair[0].key < pair[1].key)
+            && self
+                .next
+                .as_ref()
+                .is_none_or(|key| self.records.last().is_some_and(|row| &row.key == key))
     }
 }
 

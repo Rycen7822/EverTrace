@@ -2975,6 +2975,11 @@ impl RevisionPairFields {
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
 pub enum MetadataReadQuery {
+    Sources {
+        query: crate::source::SourceCatalogQuery,
+        after: Option<String>,
+        limit: u16,
+    },
     Scopes {
         query: ScopeDirectoryQuery,
         after: Option<String>,
@@ -3010,12 +3015,23 @@ impl MetadataReadQuery {
             Self::Memories { limit, .. }
             | Self::Jobs { limit, .. }
             | Self::Revisions { limit, .. }
-            | Self::Scopes { limit, .. } => *limit,
+            | Self::Scopes { limit, .. }
+            | Self::Sources { limit, .. } => *limit,
         }
     }
 
     fn validate(&self, batch: &MetadataBatchQuery) -> bool {
         match self {
+            Self::Sources { query, after, .. } => {
+                query.validate().is_ok()
+                    && after.as_ref().is_none_or(|key| {
+                        !key.is_empty()
+                            && key.len() <= 512
+                            && !key.chars().any(char::is_control)
+                            && batch.expected_frontier.is_some()
+                            && batch.expected_data_identity.is_some()
+                    })
+            }
             Self::Scopes { query, after, .. } => {
                 query.validate().is_ok()
                     && after.as_ref().is_none_or(|key| {
@@ -3110,12 +3126,27 @@ pub struct MemoryMetadataPage {
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
 pub enum MetadataReadPage {
-    Scopes { page: Box<ScopeMetadataPage> },
-    Revisions { page: Box<RevisionMetadataPage> },
-    Memories { page: Box<MemoryMetadataPage> },
-    Jobs { page: Box<ObjectReadJobs> },
-    Work { page: Box<ScopedWorkMetadata> },
-    Review { page: Box<ScopedReviewMetadata> },
+    Sources {
+        page: Box<crate::source::SourceMetadataPage>,
+    },
+    Scopes {
+        page: Box<ScopeMetadataPage>,
+    },
+    Revisions {
+        page: Box<RevisionMetadataPage>,
+    },
+    Memories {
+        page: Box<MemoryMetadataPage>,
+    },
+    Jobs {
+        page: Box<ObjectReadJobs>,
+    },
+    Work {
+        page: Box<ScopedWorkMetadata>,
+    },
+    Review {
+        page: Box<ScopedReviewMetadata>,
+    },
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -3259,6 +3290,10 @@ impl ObjectReadBatch {
         self.state.validate()
             && (1..=METADATA_BATCH_LIMIT).contains(&self.items.len())
             && self.items.iter().all(|item| match item {
+                MetadataReadPage::Sources { page } => {
+                    count += page.records.len();
+                    page.validate()
+                }
                 MetadataReadPage::Scopes { page } => {
                     count += page.records.len();
                     page.validate()

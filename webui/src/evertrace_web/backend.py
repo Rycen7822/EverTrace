@@ -171,6 +171,21 @@ def normalize_scope_query(query):
     return {"parent":normalize_scope(parent, boundary=True) if parent is not None else None, "name":name}
 
 
+def normalize_source_query(query):
+    query = {} if query is None else query
+    if not isinstance(query, dict) or set(query) - {"session_id", "source_instance_id", "unassigned_only"}:
+        raise BackendError("invalid_input")
+    session, source = query.get("session_id"), query.get("source_instance_id")
+    for value, limit in ((session, 512), (source, 1024)):
+        if value is not None and (not isinstance(value, str) or not 0 < len(value.encode()) <= limit
+            or any(ord(char) < 32 or 127 <= ord(char) < 160 for char in value)):
+            raise BackendError("invalid_input")
+    unassigned = query.get("unassigned_only", False)
+    if type(unassigned) is not bool:
+        raise BackendError("invalid_input")
+    return {"session_id":session, "source_instance_id":source, "unassigned_only":unassigned}
+
+
 class Backend:
     def __init__(self, socket_path, config_hash, build_id):
         self.path = Path(socket_path)
@@ -377,6 +392,16 @@ class Backend:
                     "after": after,
                     "limit": item.get("limit", 32),
                 }
+            elif kind == "sources":
+                if set(item) - {"kind", "query", "after", "limit"}:
+                    raise BackendError("invalid_input")
+                after = item.get("after")
+                if after is not None:
+                    if (not isinstance(after, str) or not 0 < len(after.encode()) <= 512
+                        or any(ord(char) < 32 or 127 <= ord(char) < 160 for char in after)
+                        or frontier is None or identity is None):
+                        raise BackendError("invalid_input")
+                value = {"kind":kind, "query":normalize_source_query(item.get("query")), "after":after, "limit":item.get("limit", 32)}
             elif kind == "scopes":
                 if set(item) - {"kind", "query", "after", "limit"}:
                     raise BackendError("invalid_input")
@@ -509,42 +534,6 @@ class Backend:
         return await self._request(
             {
                 "kind": "source_archive",
-                "query": normalized,
-                "expected_frontier": expected_frontier,
-                "after": after,
-                "limit": 32,
-            }
-        )
-
-    async def source_catalog(self, query=None, after=None, expected_frontier=None):
-        if query is None:
-            query = {}
-        if not isinstance(query, dict) or set(query) - {
-            "session_id",
-            "source_instance_id",
-            "unassigned_only",
-        }:
-            raise BackendError("invalid_input")
-        session, source = query.get("session_id"), query.get("source_instance_id")
-        for value, maximum in ((session, 512), (source, 1024)):
-            if value is not None and (
-                not isinstance(value, str)
-                or not value
-                or len(value.encode("utf-8")) > maximum
-                or any(ord(ch) < 32 for ch in value)
-            ):
-                raise BackendError("invalid_input")
-        unassigned = query.get("unassigned_only", False)
-        if type(unassigned) is not bool:
-            raise BackendError("invalid_input")
-        normalized = {
-            "session_id": session,
-            "source_instance_id": source,
-            "unassigned_only": unassigned,
-        }
-        return await self._request(
-            {
-                "kind": "source_catalog",
                 "query": normalized,
                 "expected_frontier": expected_frontier,
                 "after": after,

@@ -1676,6 +1676,23 @@ impl JournalWriter {
                 let page = match item {
                     // Source-authorized directory matching is performed by the Native async read owner.
                     MetadataReadQuery::Scopes { .. } => return Err(StoreError::InvalidInput),
+                    MetadataReadQuery::Sources {
+                        query,
+                        after,
+                        limit,
+                    } => {
+                        match self.admission_state.source_metadata(
+                            query,
+                            after.as_deref(),
+                            *limit,
+                            cancelled,
+                            deadline,
+                        )? {
+                            Outcome::Page(page) => MetadataReadPage::Sources { page },
+                            Outcome::TooLarge => return Ok(Outcome::TooLarge),
+                            Outcome::Conflict(frontier) => return Ok(Outcome::Conflict(frontier)),
+                        }
+                    }
                     MetadataReadQuery::Revisions {
                         reference,
                         after,
@@ -1845,7 +1862,8 @@ impl JournalWriter {
             }
             MetadataReadQuery::Jobs { .. }
             | MetadataReadQuery::Revisions { .. }
-            | MetadataReadQuery::Scopes { .. } => false,
+            | MetadataReadQuery::Scopes { .. }
+            | MetadataReadQuery::Sources { .. } => false,
         });
         let result = if needs_times {
             self.lock_sqlite()?

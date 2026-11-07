@@ -632,7 +632,7 @@ async function readCatalogue(controller) {
   else fragmentInto($("detail-body"), page.detail_html);
   $("memory-items").scrollTop = listScroll;
   $("detail-body").scrollTop = detailScroll;
-  $("page-count").textContent = "本页 " + page.count + " 个已登记来源";
+  $("page-count").textContent = `本页 ${page.count} / 匹配 ${page.matching_count} 个已登记来源`;
   const conditions = [];
   if (page.query.session_id) conditions.push("Session：" + page.query.session_id);
   if (page.query.source_instance_id) conditions.push("来源：" + page.query.source_instance_id);

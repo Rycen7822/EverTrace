@@ -18,7 +18,7 @@ from .backend import Backend, BackendError, _decode
 from .jobs import read_jobs
 from .comparison import read_comparison
 from .content import DETAIL_KINDS, read_record_content, read_record_detail, read_source_content
-from .sources import read_revisions
+from .sources import read_revisions, read_source_catalog
 from .scopes import read_scopes
 from .memories import read_memories, read_overview
 
@@ -413,13 +413,13 @@ class App:
                         "state": page["state"],
                     }
             elif payload.get("kind") == "source_catalog" and not (
-                set(payload) - {"kind", "query", "after", "expected_frontier"}
+                set(payload) - {"kind", "query", "after", "expected_frontier", "limit"}
             ):
                 frontier = parse_frontier(payload.get("expected_frontier"), optional=True)
                 after = payload.get("after")
                 if not valid_ref(after, optional=True):
                     return JSONResponse({"error": "invalid_read"}, 400)
-                result = await self.backend.source_catalog(payload.get("query"), after, frontier)
+                result = await read_source_catalog(self.backend, payload.get("query"), after, frontier, payload.get("limit", 32))
                 if result["kind"] == "conflict":
                     data = {"conflict": True}
                 else:
@@ -432,7 +432,7 @@ class App:
                     )
                     data = {
                         "html": self.templates.get_template("source_catalog.html").render(
-                            items=page["entries"]
+                            groups=page["groups"]
                         ),
                         "detail_html": self.templates.get_template(
                             "source_catalog_detail.html"
@@ -441,6 +441,8 @@ class App:
                         "frontier": str(page["frontier"]),
                         "next_cursor": page["next_cursor"],
                         "count": len(page["entries"]),
+                        "matching_count": str(page["matching_count"]),
+                        "count_basis": page["count_basis"],
                     }
             elif payload.get("kind") == "scopes" and not (
                 set(payload) - {"kind", "query", "after", "expected_frontier", "limit"}

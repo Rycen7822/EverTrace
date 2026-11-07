@@ -8,30 +8,30 @@
 <dt>来源修订</dt><dd>{{ item.source_revision }}</dd>
 <dt>目录修订</dt><dd>{{ item.catalog_revision }}</dd>
 <dt>元数据状态</dt><dd>{{ item.metadata_state }}</dd>
-<dt>导入状态（原记录）</dt><dd>{{ item.body_state }}</dd>
+<dt>导入状态（原记录）</dt><dd>{{ item.body_label }} · {{ item.body_state }}</dd>
 <dt>显式读取意图</dt><dd>{{ item.access_decision if item.access_decision is not none else '尚无批准记录' }}</dd>
 <dt>历史归属</dt><dd>{{ item.workspace_resolution_kind }}</dd>
 <dt>已证明仓库</dt><dd>{{ item.resolved_repository_id if item.resolved_repository_id is not none else '未确定' }}</dd>
 <dt>已证明工作树</dt><dd>{{ item.resolved_worktree_id if item.resolved_worktree_id is not none else '未确定' }}</dd>
 <dt>目录提示（不是归属）</dt><dd>{{ item.workspace_hint if item.workspace_hint is not none else '未记录' }}</dd>
-<dt>读取限制</dt><dd>{% if item.repository_read_restrictions is none %}尚未核定{% elif item.repository_read_restrictions %}{{ item.repository_read_restrictions|join('、') }}{% else %}已记录限制集合为空；仍须复验当前来源及信任{% endif %}</dd>
+<dt>读取限制</dt><dd>
+{% if item.repository_read_restrictions is none %}尚未核定
+{% elif item.repository_read_restrictions %}{{ item.repository_read_restrictions|join('、') }}
+{% else %}已记录限制集合为空；仍须复验当前来源及信任{% endif %}
+</dd>
 <dt>已登记文件长度</dt><dd>{{ item.file_size }} 字节；不是已归档长度</dd>
 <dt>当前来源修订的归档进度</dt><dd>
-{% if item.observed_end is not none %}
-观察边界 {{ item.observed_end }}；
-{% if item.record_start is not none %}后续完整记录起点 {{ item.record_start }}{% else %}完整记录边界尚未确定{% endif %}；
-边界{{ '已关闭' if item.origin_closed else '未关闭' }}。
-{% if item.archived_through is not none %}后续水位 {{ item.archived_through }}；较早前缀水位 {{ item.earlier_through if item.earlier_through is not none else '未记录' }}{% else %}尚无该修订的已提交水位{% endif %}
-{% elif item.archived_through is not none %}已确认前缀水位 {{ item.archived_through }}{% else %}尚无该修订的已提交水位{% endif %}
+{{ item.progress_label }}
 </dd>
 <dt>当前导入 job</dt><dd>{% if item.job_id is not none %}{{ item.job_id }} · {{ item.job_state }}{% else %}没有当前导入 job{% endif %}</dd>
-<dt>目录记录的开始时间</dt><dd>{{ item.started_at_us if item.started_at_us is not none else '未记录' }}{% if item.started_at_us is not none %} µs（UTC Unix）{% endif %}</dd>
-<dt>目录记录的结束时间</dt><dd>{{ item.ended_at_us if item.ended_at_us is not none else '未记录' }}{% if item.ended_at_us is not none %} µs（UTC Unix）{% endif %}</dd>
+<dt>目录记录的开始时间</dt><dd>{{ item.started_label }}</dd>
+<dt>目录记录的结束时间</dt><dd>{{ item.ended_label }}</dd>
 <dt>来源格式</dt><dd>{{ item.source_format }}</dd>
 </dl>
 <p>批准不覆盖仓库信任、禁用或撤销限制。前瞻区间已处理不代表较早记录已获许可，也不代表整份来源已导入。</p>
 <button class="button" type="button" data-archive-revisions="{{ item.source_instance_id }}">已保留的归档修订</button>
-<button class="button" type="button" data-archive-revision="{{ item.source_revision }}" data-archive-source="{{ item.source_instance_id }}">查看此来源修订的记录</button>
+<button class="button" type="button" data-archive-revision="{{ item.source_revision }}"
+  data-archive-source="{{ item.source_instance_id }}">查看此来源修订的记录</button>
 <p class="muted">目录状态不是记录读取权限。这里不提供批准、导入或其它管理动作。</p>
 </div>
 {% else %}<div class="empty"><h3>选择一个已登记来源</h3><p>同一 Session 下的多个来源分别保留状态；不按路径合并，也不充当工作任务。</p></div>{% endif %}
