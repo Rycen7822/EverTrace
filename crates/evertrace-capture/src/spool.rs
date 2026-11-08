@@ -251,6 +251,23 @@ impl SealedSegment {
     pub const fn length(&self) -> u64 {
         self.length
     }
+
+    fn validate_identity(&self) -> Result<(), SpoolError> {
+        let path_metadata = fs::symlink_metadata(&self.path).map_err(map_io)?;
+        validate_owned_file_metadata(&path_metadata)?;
+        let opened = self.file.metadata().map_err(map_io)?;
+        if path_metadata.dev() != self.device
+            || path_metadata.ino() != self.inode
+            || opened.dev() != self.device
+            || opened.ino() != self.inode
+            || opened.len() != self.length
+            || segment_identity(&path_metadata) != self.identity
+            || segment_identity(&opened) != self.identity
+        {
+            return Err(SpoolError::IdentityChanged);
+        }
+        Ok(())
+    }
 }
 
 #[derive(Debug)]
@@ -1000,23 +1017,22 @@ impl DurableSpool {
         let directory_lock = File::open(&self.main_dir).map_err(map_io)?;
         FileExt::try_lock_exclusive(&directory_lock).map_err(map_busy)?;
         let _directory_unlock = DirectoryUnlock(&directory_lock);
-        let path_metadata = fs::symlink_metadata(&segment.path).map_err(map_io)?;
-        validate_owned_file_metadata(&path_metadata)?;
-        let opened = segment.file.metadata().map_err(map_io)?;
-        if path_metadata.dev() != segment.device
-            || path_metadata.ino() != segment.inode
-            || opened.dev() != segment.device
-            || opened.ino() != segment.inode
-            || opened.len() != segment.length
-            || segment_identity(&path_metadata) != segment.identity
-            || segment_identity(&opened) != segment.identity
-        {
-            return Err(SpoolError::IdentityChanged);
-        }
+        segment.validate_identity()?;
         fs::remove_file(&segment.path).map_err(map_io)?;
         File::open(&self.main_dir)
             .and_then(|directory| directory.sync_all())
             .map_err(map_io)
+    }
+
+    /// Preserve the whole claimed carrier when a complete frame fails semantic verification.
+    /// This is not an acknowledgement; the existing quarantine/gap consumer owns recovery.
+    pub fn quarantine_segment(&self, segment: SealedSegment) -> Result<(), SpoolError> {
+        let directory = File::open(&self.main_dir).map_err(map_io)?;
+        FileExt::try_lock_exclusive(&directory).map_err(map_busy)?;
+        let _directory_unlock = DirectoryUnlock(&directory);
+        segment.validate_identity()?;
+        self.quarantine(&segment.path)?;
+        Ok(())
     }
 
     pub fn recover(&mut self) -> Result<RecoveryReport, SpoolError> {

@@ -158,9 +158,17 @@ impl EvidenceIngestor {
             };
         }
         let next = segments[0].continuation().map_err(map_spool)?;
-        let result = self
+        let result = match self
             .drain_segments(&spool, segments, None, true, Some(shutdown))
-            .await?;
+            .await
+        {
+            Err(IngestError::Recovering) => {
+                // Semantic quarantine also invalidates a continuation into this carrier.
+                *cursor = None;
+                return Err(IngestError::Recovering);
+            }
+            result => result?,
+        };
         if *shutdown.borrow() {
             return Ok(result);
         }
@@ -481,6 +489,7 @@ impl EvidenceIngestor {
                 purged.extend(context.purged);
             }
             let mut committed = 0_usize;
+            let mut invalid = false;
             let mut terminal = Vec::new();
             let mut shared_maintenance = None;
             let mut replay_batch = BTreeMap::new();
@@ -516,7 +525,14 @@ impl EvidenceIngestor {
                 if selected.is_some_and(|ids| !ids.contains(&frame.record.source_observation_id)) {
                     continue;
                 }
-                let body = canonical_body(&frame.record)?;
+                let body = match canonical_body(&frame.record) {
+                    Ok(body) => body,
+                    Err(IngestError::InvalidRecord | IngestError::IdentityMismatch) if bounded => {
+                        invalid = true;
+                        break;
+                    }
+                    Err(error) => return Err(error),
+                };
                 if capture_is_purged(&body, &purged) {
                     terminal.push(body);
                     continue;
@@ -529,12 +545,19 @@ impl EvidenceIngestor {
                     let fence = MaintenanceFence::open(data_dir).map_err(|_| IngestError::Cas)?;
                     shared_maintenance = Some(fence.shared().map_err(|_| IngestError::Cas)?);
                 }
-                let mut verified = verify_capture_frame_presented(
+                let mut verified = match verify_capture_frame_presented(
                     frame,
                     &cas,
                     &mut remaining,
                     config.as_ref().map(|config| &config.config().capture),
-                )?;
+                ) {
+                    Ok(verified) => verified,
+                    Err(IngestError::InvalidRecord | IngestError::IdentityMismatch) if bounded => {
+                        invalid = true;
+                        break;
+                    }
+                    Err(error) => return Err(error),
+                };
                 let surface_count = usize::from(verified.surface.is_some());
                 let recorded_at_us = verified.body.recorded_at_us;
                 let (digest, watermark) =
@@ -768,6 +791,11 @@ impl EvidenceIngestor {
                         .await
                         .map_err(map_writer_error)?,
                 );
+            }
+            if invalid {
+                // No record is acknowledged or rewritten. Previously committed prefix commands stay canonical.
+                spool.quarantine_segment(segment).map_err(map_spool)?;
+                return Err(IngestError::Recovering);
             }
             let consumed = committed
                 .checked_add(terminal.len())
