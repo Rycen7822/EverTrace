@@ -583,6 +583,8 @@ impl SqliteState {
                 // The admitted payload owns revision identity, not the empty logical journal envelope columns.
                 let events = if evertrace_domain::query::parse_worktree_revision(revision).is_some() {
                     ["worktree_instance_recorded_v1"; 2]
+                } else if evertrace_domain::query::parse_transition_revision(revision).is_some() {
+                    ["worktree_transition_recorded_v1"; 2]
                 } else {
                     ["task_recorded_v1", "workstream_recorded_v1"]
                 };
@@ -593,6 +595,9 @@ impl SqliteState {
                        CASE WHEN event_type='worktree_instance_recorded_v1' THEN \
                          json_extract(payload_json,'$.value.worktree_instance_id') || '@' || \
                          json_extract(payload_json,'$.value.worktree_revision') \
+                       WHEN event_type='worktree_transition_recorded_v1' THEN \
+                         json_extract(payload_json,'$.value.worktree_transition_id') || '@' || \
+                         json_extract(payload_json,'$.value.transition_revision') \
                        ELSE json_extract(payload_json,'$.value.revision_id') END = ?1 \
                      END ORDER BY seq LIMIT ?4"
                 ).map_err(|_| StoreError::StoreCorrupt)?;

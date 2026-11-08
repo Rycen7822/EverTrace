@@ -102,6 +102,7 @@ DETAIL_KINDS = {"atom_revision": "atom", "procedure_revision": "procedure", "cor
                 "attempt": "attempt", "operation_burst": "operation_burst", "operation": "operation",
                 "host_occurrence": "host_occurrence", "scope_effect": "scope_effect",
                 "worktree": "worktree", "worktree_snapshot": "worktree_snapshot",
+                "work_binding": "work_binding", "worktree_transition": "worktree_transition", "integration_event": "integration_event",
                 "recovery_capture_request": "recovery_capture_request", "recovery_bundle": "recovery_bundle",
                 "recovery_application_revision": "recovery_application",
                 "work_artifact": "work_artifact", "experiment_run": "experiment_run", "result_evidence": "result_evidence",
@@ -111,6 +112,7 @@ DETAIL_KINDS = {"atom_revision": "atom", "procedure_revision": "procedure", "cor
                 "global_support_validation": "support_validation"}
 NATIVE_DETAIL_KINDS = {"task", "workstream", "work_episode", "attempt", "operation_burst", "operation",
                      "host_occurrence", "scope_effect", "worktree", "worktree_snapshot",
+                     "work_binding", "worktree_transition", "integration_event",
                      "recovery_capture_request", "recovery_bundle", "recovery_application_revision",
                      "work_artifact", "experiment_run", "result_evidence", "recall_need",
                      "procedure_usage_revision", "procedure_negative_evidence", "procedure_negative_review", "procedure_context_effect",

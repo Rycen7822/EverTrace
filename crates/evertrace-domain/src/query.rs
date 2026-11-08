@@ -383,6 +383,10 @@ pub fn parse_worktree_revision(value: &str) -> Option<(WorktreeId, u32)> {
     parse_numbered_revision(value)
 }
 
+pub fn parse_transition_revision(value: &str) -> Option<(crate::ids::WorktreeTransitionId, u32)> {
+    parse_numbered_revision(value)
+}
+
 pub fn valid_object_reference(value: &str) -> bool {
     value.parse::<AnyPublicId>().is_ok()
         || value.parse::<RevisionId>().is_ok()
@@ -2775,6 +2779,11 @@ impl ExactRecordQuery {
                     || parse_operation_revision(revision).is_some()
                     || parse_host_occurrence_revision(revision).is_some()
                     || parse_worktree_revision(revision).is_some()
+                    || parse_transition_revision(revision).is_some()
+                    || revision
+                        .parse::<crate::ids::WorkBindingRevisionId>()
+                        .is_ok()
+                    || revision.parse::<crate::ids::IntegrationEventId>().is_ok()
                     || revision.parse::<crate::ids::WorktreeSnapshotId>().is_ok()
                     || revision.parse::<crate::ids::RecoveryBundleId>().is_ok()
                     || revision.parse::<crate::ids::ScopeEffectId>().is_ok()
@@ -2800,6 +2809,9 @@ impl ExactRecordQuery {
                     || key.parse::<crate::ids::RecoveryCaptureRequestId>().is_ok()
                     || key.parse::<crate::ids::RecoveryBundleId>().is_ok()
                     || key.parse::<crate::ids::RecoveryApplicationId>().is_ok()
+                    || key.parse::<crate::ids::WorkBindingRevisionId>().is_ok()
+                    || key.parse::<crate::ids::WorktreeTransitionId>().is_ok()
+                    || key.parse::<crate::ids::IntegrationEventId>().is_ok()
                     || key.parse::<crate::ids::WorkArtifactId>().is_ok()
                     || key.parse::<crate::ids::ExperimentRunId>().is_ok()
                     || key.parse::<crate::ids::ResultEvidenceId>().is_ok()
@@ -3211,6 +3223,7 @@ impl MetadataReadQuery {
                             || parse_operation_revision(revision).is_some()
                             || parse_host_occurrence_revision(revision).is_some()
                             || parse_worktree_revision(revision).is_some()
+                            || parse_transition_revision(revision).is_some()
                     })
                     && (1..=32).contains(limit)
                     && after.as_ref().is_none_or(|key| {

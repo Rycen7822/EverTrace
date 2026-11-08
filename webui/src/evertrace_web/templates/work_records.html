@@ -91,7 +91,7 @@
 <p>类型：{{ value.operation_kind }} · 操作版本：{{ value.operation_revision }}</p>
 <p>物理配对状态：{{ value.pairing_state }}</p>
 <p>HostOccurrence：{{ value.host_occurrence_id }} · 执行通道：{{ value.execution_lane_id or '未记录' }}</p>
-{% if value.source_local_pairing %}
+{% if value.get('source_local_pairing') %}
 <section class="semantic-section"><h3>来源内配对</h3>
   <p>状态：{{ value.source_local_pairing.state }} · 来源请求 ID：{{ value.source_local_pairing.request_id }}</p>
   <p>来源线程：{{ value.source_local_pairing.namespace.thread }} · rollout：{{ value.source_local_pairing.namespace.rollout }}</p>

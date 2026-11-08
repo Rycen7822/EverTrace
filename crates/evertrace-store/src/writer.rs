@@ -1533,6 +1533,8 @@ impl JournalWriter {
                     .parse::<evertrace_domain::revision::RevisionId>()
                     .is_ok()
                     || evertrace_domain::query::parse_worktree_revision(query.lookup_ref())
+                        .is_some()
+                    || evertrace_domain::query::parse_transition_revision(query.lookup_ref())
                         .is_some())
             {
                 self.stored_fields_at_state(&query, state, cancelled, deadline, &mut budget)?
@@ -1550,7 +1552,7 @@ impl JournalWriter {
                 .filter(|row| {
                     matches!(
                         row.object_kind.as_deref(),
-                        Some("task" | "workstream" | "worktree")
+                        Some("task" | "workstream" | "worktree" | "worktree_transition")
                     )
                 })
                 .and_then(|row| row.payload_json.as_deref())
@@ -1567,6 +1569,9 @@ impl JournalWriter {
                     JournalPayload::WorktreeInstanceRecorded(value) => value
                         .predecessor_revision
                         .map(|revision| format!("{}@{revision}", value.worktree_instance_id)),
+                    JournalPayload::WorktreeTransitionRecorded(value) => value
+                        .predecessor_revision
+                        .map(|revision| format!("{}@{revision}", value.worktree_transition_id)),
                     _ => None,
                 },
                 None => None,
@@ -1805,6 +1810,7 @@ impl JournalWriter {
             .parse::<evertrace_domain::revision::RevisionId>()
             .is_err()
             && evertrace_domain::query::parse_worktree_revision(reference).is_none()
+            && evertrace_domain::query::parse_transition_revision(reference).is_none()
         {
             return Ok(O::Page(Box::new(None)));
         }
@@ -1837,6 +1843,12 @@ impl JournalWriter {
                     JournalPayload::WorkstreamRecorded(value) => value.revision_id.to_string(),
                     JournalPayload::WorktreeInstanceRecorded(value) => {
                         format!("{}@{}", value.worktree_instance_id, value.worktree_revision)
+                    }
+                    JournalPayload::WorktreeTransitionRecorded(value) => {
+                        format!(
+                            "{}@{}",
+                            value.worktree_transition_id, value.transition_revision
+                        )
                     }
                     _ => return Err(StoreError::StoreCorrupt),
                 };

@@ -135,6 +135,16 @@ pub fn source_references_for(row: &ObjectRow, payload: &JournalPayload) -> BTree
                 refs.extend(member.attempt_revision_id.map(|id| id.to_string()));
             }
         }
+        JournalPayload::WorkBindingRecorded(value) => {
+            refs.extend(value.predecessor_revision_id.map(|id| id.to_string()));
+        }
+        JournalPayload::WorktreeTransitionRecorded(value) => {
+            refs.extend(
+                value
+                    .predecessor_revision
+                    .map(|revision| format!("{}@{revision}", value.worktree_transition_id)),
+            );
+        }
         JournalPayload::AttemptRecorded(value) => {
             refs.insert(value.workstream_id.to_string());
             refs.extend(value.episode_id.map(|id| id.to_string()));
@@ -237,6 +247,9 @@ impl JournalAdmissionState {
                     | "scope_effect"
                     | "worktree"
                     | "worktree_snapshot"
+                    | "worktree_transition"
+                    | "integration_event"
+                    | "work_binding"
                     | "recovery_capture_request"
                     | "recovery_bundle"
                     | "recovery_application_revision"
@@ -312,6 +325,60 @@ impl JournalAdmissionState {
                 .current_validation(contract.support_contract_revision_id)
         {
             refs.insert(validation.validation_revision_id.to_string());
+        }
+        if let Some(JournalPayload::OperationDerived(operation)) = payload.as_ref() {
+            // All recorded binding revisions, not a heuristic current owner or extra physical execution.
+            for (binding, _) in self.work_bindings.values() {
+                if cancelled.load(std::sync::atomic::Ordering::Relaxed) {
+                    return Err(StoreError::Io);
+                }
+                if std::time::Instant::now() >= deadline {
+                    return Ok(O::TooLarge);
+                }
+                if binding.operation_id == operation.operation_id {
+                    refs.insert(binding.work_binding_revision_id.to_string());
+                    if refs.len() > READ_DEPENDENCY_LIMIT {
+                        return Ok(O::TooLarge);
+                    }
+                }
+            }
+        }
+        if let Some(JournalPayload::WorktreeInstanceRecorded(tree)) = payload.as_ref() {
+            for (transition, _) in self.worktree_transitions.values() {
+                if cancelled.load(std::sync::atomic::Ordering::Relaxed) {
+                    return Err(StoreError::Io);
+                }
+                if std::time::Instant::now() >= deadline {
+                    return Ok(O::TooLarge);
+                }
+                if transition.from_worktree_instance_id == tree.worktree_instance_id
+                    || transition.to_worktree_instance_id == tree.worktree_instance_id
+                {
+                    refs.insert(format!(
+                        "{}@{}",
+                        transition.worktree_transition_id, transition.transition_revision
+                    ));
+                    if refs.len() > READ_DEPENDENCY_LIMIT {
+                        return Ok(O::TooLarge);
+                    }
+                }
+            }
+            for (integration, _) in self.integration_events.values() {
+                if cancelled.load(std::sync::atomic::Ordering::Relaxed) {
+                    return Err(StoreError::Io);
+                }
+                if std::time::Instant::now() >= deadline {
+                    return Ok(O::TooLarge);
+                }
+                if integration.source_worktree_instance_id == tree.worktree_instance_id
+                    || integration.destination_worktree_instance_id == tree.worktree_instance_id
+                {
+                    refs.insert(integration.integration_event_id.to_string());
+                    if refs.len() > READ_DEPENDENCY_LIMIT {
+                        return Ok(O::TooLarge);
+                    }
+                }
+            }
         }
         // Current child revisions by canonical ownership/pinned input, not a reconstruction of a past subtree.
         let children: Box<dyn Iterator<Item = (bool, RevisionId)> + '_> = match payload.as_ref() {

@@ -3597,6 +3597,29 @@ pub fn read_dependencies_for(row: &ObjectRow, payload: &JournalPayload) -> BTree
         JournalPayload::WorkBindingRecorded(value) => {
             refs.insert(value.operation_id.to_string());
             refs.extend(value.evidence_refs.iter().cloned());
+            refs.extend(value.scope_effect_refs.iter().map(ToString::to_string));
+            let primary = &value.primary_binding;
+            refs.extend(primary.task_id.map(|id| id.to_string()));
+            refs.extend(primary.workstream_id.map(|id| id.to_string()));
+            refs.extend(primary.episode_id.map(|id| id.to_string()));
+            refs.extend(primary.attempt_id.map(|id| id.to_string()));
+            refs.extend(primary.experiment_run_id.map(|id| id.to_string()));
+            refs.extend(primary.competing_group_id.map(|id| id.to_string()));
+            use evertrace_domain::work::SecondaryBindingTarget as Target;
+            refs.extend(
+                value
+                    .secondary_bindings
+                    .iter()
+                    .map(|binding| match binding.target_ref {
+                        Target::Task(id) => id.to_string(),
+                        Target::Workstream(id) => id.to_string(),
+                        Target::Episode(id) => id.to_string(),
+                        Target::Attempt(id) => id.to_string(),
+                        Target::ExperimentRun(id) => id.to_string(),
+                        Target::CompetingGroup(id) => id.to_string(),
+                        Target::Artifact(id) => id.to_string(),
+                    }),
+            );
         }
         JournalPayload::OperationBurstRecorded(value) => {
             refs.extend(value.primary_binding.task_id.map(|id| id.to_string()));
@@ -6150,9 +6173,20 @@ impl JournalAdmissionState {
             ObjectFamily::Work,
             "worktree_snapshot"
         );
-        if let Ok(id) = reference.parse::<WorktreeTransitionId>()
-            && let Some((value, seq)) = self.worktree_transitions.get(&id)
-        {
+        let transition = evertrace_domain::query::parse_transition_revision(reference)
+            .and_then(|(id, revision)| {
+                self.worktree_transitions
+                    .get(&id)
+                    .filter(|(value, _)| value.transition_revision == revision)
+            })
+            .or_else(|| {
+                reference
+                    .parse::<WorktreeTransitionId>()
+                    .ok()
+                    .and_then(|id| self.worktree_transitions.get(&id))
+            });
+        if let Some((value, seq)) = transition {
+            let id = value.worktree_transition_id;
             rows.push(physical_object_row(
                 ObjectFamily::Work,
                 "worktree_transition",
@@ -6428,6 +6462,10 @@ impl JournalAdmissionState {
                 self.work_artifacts
                     .get(&id)
                     .map(|(value, _)| value.revision.revision_id.to_string())
+            } else if let Ok(id) = reference.parse::<WorktreeTransitionId>() {
+                self.worktree_transitions
+                    .get(&id)
+                    .map(|(value, _)| format!("{id}@{}", value.transition_revision))
             } else if let Ok(id) = reference.parse::<RecoveryApplicationId>() {
                 self.recovery_applications
                     .get(&id)
@@ -6724,6 +6762,9 @@ impl JournalAdmissionState {
                                 | "scope_effect"
                                 | "worktree"
                                 | "worktree_snapshot"
+                                | "worktree_transition"
+                                | "integration_event"
+                                | "work_binding"
                                 | "recovery_capture_request"
                                 | "recovery_bundle"
                                 | "recovery_application_revision"
@@ -7049,6 +7090,11 @@ impl JournalAdmissionState {
                 "worktree",
                 v.worktree_instance_id.to_string(),
                 format!("{}@{}", v.worktree_instance_id, v.worktree_revision),
+            ),
+            JournalPayload::WorktreeTransitionRecorded(v) => (
+                "worktree_transition",
+                v.worktree_transition_id.to_string(),
+                format!("{}@{}", v.worktree_transition_id, v.transition_revision),
             ),
             JournalPayload::WorktreeSnapshotRecorded(v) => (
                 "worktree_snapshot",

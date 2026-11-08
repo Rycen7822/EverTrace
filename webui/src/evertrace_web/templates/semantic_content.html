@@ -201,6 +201,8 @@
   {% include 'work_records.html' %}
 {% elif content.kind in ('experiment_run', 'result_evidence') %}
   {% include 'research_records.html' %}
+{% elif content.kind in ('work_binding', 'worktree_transition', 'integration_event') %}
+  {% include 'work_lineage.html' %}
 {% elif content.kind == 'recovery_application' %}
   {% include 'recovery_application.html' %}
 {% elif content.kind in ('recovery_capture_request', 'recovery_bundle') %}

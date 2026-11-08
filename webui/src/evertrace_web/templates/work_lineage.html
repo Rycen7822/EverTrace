@@ -1,0 +1,65 @@
+{% macro refs(title, entries) %}
+<h3>{{ title }} · {{ entries|length }}</h3>
+{% if entries %}<ul>{% for entry in entries %}<li class="memory-prose">{{ entry }}</li>{% endfor %}</ul>
+{% else %}<p class="muted">空列表。</p>{% endif %}
+{% endmacro %}
+{% if content.kind == 'work_binding' %}
+<h2>工作归属 · 所选修订</h2>
+<p class="reading-note">语义归属不改变物理执行身份。非 resolved 记录不能充当确定归属，也不证明采用、验证或成功。</p>
+<dl>
+  <dt>归属修订</dt><dd>{{ value.work_binding_revision_id }}</dd>
+  <dt>Operation</dt><dd>{{ value.operation_id }}</dd>
+  <dt>原归属状态</dt><dd data-binding-state>{{ value.assignment_status }}</dd>
+  <dt>修订代 / resolver 版本</dt><dd>{{ value.revision_generation }} / {{ value.resolver_version }}</dd>
+  <dt>前序归属修订</dt><dd>{{ value.predecessor_revision_id or '初始修订' }}</dd>
+</dl>
+<h3>记录的主要归属</h3>
+<dl>{% for field, ref in value.primary_binding.items() %}<dt>{{ field }}</dt><dd>{{ ref or '未记录' }}</dd>{% endfor %}</dl>
+<h3>次要关系 · {{ value.secondary_bindings|length }}</h3>
+{% for binding in value.secondary_bindings %}
+<p>{{ binding.role }} → {{ binding.target_ref.kind }}：{{ binding.target_ref.id }}</p>
+{% else %}<p class="muted">空列表；不补主要归属。</p>{% endfor %}
+{{ refs('所选归属的作用', value.scope_effect_refs) }}
+{{ refs('所选归属的证据', value.evidence_refs) }}
+{% if value.predecessor_revision_id %}
+<button class="button" type="button" data-link-key="{{ value.predecessor_revision_id }}"
+  data-revision="{{ value.predecessor_revision_id }}" data-kind="work_binding">读取前序归属修订</button>
+{% endif %}
+<p class="reading-note">这里只显示此修订，不把 revision generation 或证据数量当成当前 resolved 资格。当前工作上下文仍由原生 owner 判定。</p>
+{% elif content.kind == 'worktree_transition' %}
+<h2>工作树状态谱系 · 所选修订</h2>
+<dl>
+  <dt>Transition</dt><dd>{{ value.worktree_transition_id }}</dd>
+  <dt>修订 / 前序编号</dt><dd>{{ value.transition_revision }} / {{ value.predecessor_revision or '初始修订' }}</dd>
+  <dt>事件类型</dt><dd>{{ value.kind }}</dd>
+  <dt>原谱系判断</dt><dd data-lineage-assessment>{{ value.lineage_assessment }}</dd>
+  <dt>来源水位</dt><dd>{{ value.source_watermark }}（不是墙钟时间）</dd>
+  <dt>源工作树 / 快照</dt><dd>{{ value.from_worktree_instance_id }} / {{ value.from_snapshot_id or '未记录' }}</dd>
+  <dt>目标工作树 / 快照</dt><dd>{{ value.to_worktree_instance_id }} / {{ value.to_snapshot_id or '未记录' }}</dd>
+  <dt>纠正原因</dt><dd class="memory-prose">{{ value.correction_reason or '无' }}</dd>
+</dl>
+{{ refs('原判断证据', value.evidence_refs) }}
+{% if value.predecessor_revision %}
+{% set previous = value.worktree_transition_id ~ '@' ~ value.predecessor_revision %}
+<button class="button" type="button" data-link-key="{{ previous }}" data-revision="{{ previous }}"
+  data-kind="worktree_transition">读取前序谱系判断</button>
+{% endif %}
+<p class="reading-note">旧 unknown、partial 或 contradicted 判断保持原值；后续纠正不覆盖它。路径、分支或相同命令不构成实例或兼容性证明。</p>
+{% elif content.kind == 'integration_event' %}
+<h2>集成记录</h2>
+<dl>
+  <dt>IntegrationEvent</dt><dd>{{ value.integration_event_id }}</dd>
+  <dt>仓库</dt><dd>{{ value.repository_instance_id }}</dd>
+  <dt>集成类型</dt><dd>{{ value.kind }}</dd>
+  <dt>原集成判断</dt><dd data-lineage-assessment>{{ value.assessment }}</dd>
+  <dt>是否记录冲突解决</dt><dd>{{ '是' if value.conflict_resolution_detected else '否' }}</dd>
+  <dt>源工作树 / 快照</dt><dd>{{ value.source_worktree_instance_id }} / {{ value.source_snapshot_id }}</dd>
+  <dt>目标工作树 / 快照</dt><dd>{{ value.destination_worktree_instance_id }} / {{ value.destination_snapshot_id }}</dd>
+</dl>
+{{ refs('Commit 引用', value.commit_refs) }}
+{{ refs('Patch 等价性引用', value.patch_equivalence_refs) }}
+{{ refs('已集成 Attempt 引用', value.integrated_attempt_ids) }}
+{{ refs('重新验证的锚点', value.revalidated_anchor_refs) }}
+{{ refs('原集成证据', value.evidence_refs) }}
+<p class="reading-note">集成和工作树终止是不同事件。这里不重算 ancestry、patch 等价性或 verifier，也不把 branch 合并当作来源工作树已删除。</p>
+{% endif %}

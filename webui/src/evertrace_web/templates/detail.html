@@ -9,7 +9,8 @@
 {% set source_context = item.get('source_context') %}
 {% set research = item.object_kind in ('experiment_run', 'result_evidence') %}
 {% set typed_fact = item.object_kind in (
-  'procedure_context_effect', 'global_support_contract', 'global_support_validation', 'recovery_application_revision'
+  'procedure_context_effect', 'global_support_contract', 'global_support_validation', 'recovery_application_revision',
+  'work_binding', 'worktree_transition', 'integration_event'
 ) %}
 <div class="detail-title">
   {% if not research and not typed_fact %}<div class="badges">
@@ -94,7 +95,8 @@
   'atom_revision', 'procedure_revision', 'core_membership', 'revision_proposal_revision',
   'semantic_digest', 'source_receipt', 'source_observation', 'work_episode',
   'attempt', 'operation_burst', 'operation', 'task', 'workstream', 'host_occurrence', 'scope_effect',
-  'worktree', 'worktree_snapshot', 'recovery_capture_request', 'recovery_bundle', 'recovery_application_revision', 'work_artifact',
+  'worktree', 'worktree_snapshot', 'work_binding', 'worktree_transition', 'integration_event',
+  'recovery_capture_request', 'recovery_bundle', 'recovery_application_revision', 'work_artifact',
   'experiment_run', 'result_evidence', 'procedure_usage_revision', 'procedure_negative_evidence',
   'procedure_negative_review', 'procedure_context_effect', 'global_support_contract', 'global_support_validation'
 ) %}<button class="button" type="button" data-sources-open>查看来源与直接关联</button>{% endif %}
