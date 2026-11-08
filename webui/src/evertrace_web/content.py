@@ -104,10 +104,12 @@ DETAIL_KINDS = {"atom_revision": "atom", "procedure_revision": "procedure", "cor
                 "worktree": "worktree", "worktree_snapshot": "worktree_snapshot",
                 "recovery_capture_request": "recovery_capture_request", "recovery_bundle": "recovery_bundle",
                 "work_artifact": "work_artifact", "experiment_run": "experiment_run", "result_evidence": "result_evidence",
-                "recall_need": "recall_need"}
+                "recall_need": "recall_need", "procedure_usage_revision": "procedure_usage",
+                "procedure_negative_evidence": "procedure_negative", "procedure_negative_review": "procedure_negative_review"}
 WORK_DETAIL_KINDS = {"task", "workstream", "work_episode", "attempt", "operation_burst", "operation",
                      "host_occurrence", "scope_effect", "worktree", "worktree_snapshot",
-                     "recovery_capture_request", "recovery_bundle", "work_artifact", "experiment_run", "result_evidence", "recall_need"}
+                     "recovery_capture_request", "recovery_bundle", "work_artifact", "experiment_run", "result_evidence", "recall_need",
+                     "procedure_usage_revision", "procedure_negative_evidence", "procedure_negative_review"}
 
 
 async def read_record_detail(backend, reference, frontier, revision, object_kind, *, data_identity=None):

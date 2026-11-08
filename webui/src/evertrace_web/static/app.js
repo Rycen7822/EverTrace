@@ -718,15 +718,15 @@ async function readWork(controller) {
     state.selected = { key: state.query.selection.task_id, kind: "task", revision: null, object: null, path: [] };
   }
   $("memory-items").textContent = usage
-    ? "读取精确 Need 的当前账本。这里不是请求清单，也不调用 @due；usage 和负面证据读取尚未接入。"
+    ? "读取精确 Recall 快照、usage、负面事实或复核事件。这里不是请求清单，不调用 @due，不推进使用阶段。"
     : research
     ? "读取已知 Run、ResultEvidence 或研究 Atom；从结果可回到其对应 Run 的精确条件。"
     : "按精确工作记录读取。Task 的工作线、Workstream 的片段可从详情中的关联逐项展开。";
-  $("page-count").textContent = usage ? "当前 Recall 快照 · 非请求总数"
+  $("page-count").textContent = usage ? "精确使用证据 · 非请求总数"
     : research ? "精确研究记录 · 非全局实验清单" : "精确工作 · 非任务总数";
   if (state.selected) await readSelection(state.selected, controller, scroll);
   else $("detail-body").textContent = usage
-    ? "输入已知 Need ID。未选或不可用不表示没有召回义务，不填入示例状态。"
+    ? "输入已知记录 ID。未选或不可用不表示没有召回义务或负面证据，不填入示例状态。"
     : research
     ? "输入已知研究记录 ID。未选记录不显示为空实验清单，也不填入示例结果。"
     : "请从范围目录选择 Task，或输入已知工作 ID。没有把未选择工作显示成空列表。";
@@ -1020,16 +1020,17 @@ function route(name) {
   $("source-filter").hidden = name !== "sources";
   $("source-record-lookup").hidden = name !== "sources";
   $("work-record-lookup").hidden = !["work", "research", "usage"].includes(name);
-  $("work-record-label").textContent = name === "usage" ? "Need ID（当前快照）"
+  $("work-record-label").textContent = name === "usage" ? "记录 ID（精确）"
     : name === "research" ? "研究记录 ID" : "工作记录 ID";
   $("work-record-id").setAttribute("aria-label", $("work-record-label").textContent);
-  $("work-record-submit").textContent = name === "usage" ? "读取账本快照" : "读取工作记录";
+  $("work-record-submit").textContent = name === "usage" ? "读取使用证据" : "读取工作记录";
   for (const option of $("work-record-kind").options) {
-    option.hidden = name === "usage" && option.value !== "recall_need";
+    option.hidden = name === "usage" && !["recall_need", "procedure_usage_revision",
+      "procedure_negative_evidence", "procedure_negative_review"].includes(option.value);
     option.disabled = option.hidden;
   }
   $("work-record-help").textContent = name === "usage"
-    ? "目前读取 RecallNeed。修订留空读当前；填入的修订只固定计划身份，不选择历史快照。"
+    ? "usage 可选原修订；负面事实填证据 ID，复核填事件 ID。Need 修订仅固定计划身份，不选历史快照。"
     : name === "research"
     ? "选择 Run、ResultEvidence 或 Atom，输入精确 ID；修订留空只绑定原生当前版本。"
     : "也可从范围目录选择 Task。这里只读所选工作及有界关联，不把全局范围当空任务列表。";

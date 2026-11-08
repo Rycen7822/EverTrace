@@ -2631,6 +2631,10 @@ impl ExactFieldsQuery {
         self.revision_ref.parse::<RevisionId>().is_ok()
             || self
                 .revision_ref
+                .parse::<crate::ids::ProcedureNegativeEvidenceId>()
+                .is_ok()
+            || self
+                .revision_ref
                 .parse::<crate::ids::SemanticDigestId>()
                 .is_ok()
     }
@@ -2784,6 +2788,10 @@ impl ExactRecordQuery {
                     || key.parse::<crate::ids::ExperimentRunId>().is_ok()
                     || key.parse::<crate::ids::ResultEvidenceId>().is_ok()
                     || key.parse::<crate::ids::RecallNeedId>().is_ok()
+                    || key.parse::<crate::ids::ProcedureUsageId>().is_ok()
+                    || key
+                        .parse::<crate::ids::ProcedureNegativeEvidenceId>()
+                        .is_ok()
                     || key.parse::<crate::ids::ScopeEffectId>().is_ok()
                     || key.parse::<crate::ids::SourceObservationId>().is_ok()
                     || key.parse::<crate::ids::SourceReceiptId>().is_ok()

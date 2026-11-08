@@ -597,6 +597,9 @@ fn record_data(
         P::CaptureReceiptRecorded(value) => semantic_record(&value, None, query, check),
         P::ExperimentRunRecorded(value) => semantic_record(&value, None, query, check),
         P::ResultEvidenceRecorded(value) => semantic_record(&value, None, query, check),
+        P::ProcedureUsageRecorded(value) => semantic_record(&value, None, query, check),
+        P::ProcedureNegativeEvidenceRecorded(value) => semantic_record(&value, None, query, check),
+        P::ProcedureNegativeReviewRecorded(value) => semantic_record(&value, None, query, check),
         P::RecallLedgerRecorded(event) => match *event {
             evertrace_domain::recall::RecallLedgerEvent::NeedRecorded { need } => {
                 Ok(semantic_record(&need, None, query, check)?

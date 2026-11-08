@@ -3607,6 +3607,51 @@ pub fn read_dependencies_for(row: &ObjectRow, payload: &JournalPayload) -> BTree
             refs.extend(value.terminal_evidence_refs.iter().map(ToString::to_string));
             refs.extend(value.work_artifact_refs.iter().map(ToString::to_string));
         }
+        JournalPayload::ProcedureUsageRecorded(value) => {
+            refs.insert(value.procedure_revision_id.to_string());
+            refs.insert(value.exposure_episode_revision_id.to_string());
+            refs.insert(value.task_id.to_string());
+            refs.insert(value.workstream_id.to_string());
+            refs.extend(value.attempt_ids.iter().map(ToString::to_string));
+            refs.extend(
+                value
+                    .action_episode_revision_ids
+                    .iter()
+                    .map(ToString::to_string),
+            );
+            refs.extend(
+                value
+                    .verification_episode_revision_ids
+                    .iter()
+                    .map(ToString::to_string),
+            );
+            refs.extend(value.action_operation_refs.iter().map(ToString::to_string));
+            refs.extend(
+                value
+                    .verification_operation_refs
+                    .iter()
+                    .map(ToString::to_string),
+            );
+            refs.extend(
+                value
+                    .work_binding_revision_refs
+                    .iter()
+                    .map(ToString::to_string),
+            );
+            refs.extend(value.scope_effect_refs.iter().map(ToString::to_string));
+            refs.extend(value.evidence_refs.iter().cloned());
+        }
+        JournalPayload::ProcedureNegativeEvidenceRecorded(value) => {
+            refs.insert(value.procedure_revision_id.to_string());
+            refs.insert(value.procedure_usage_id.to_string());
+            refs.insert(value.task_id.to_string());
+            refs.extend(value.evidence_refs.iter().cloned());
+        }
+        JournalPayload::ProcedureNegativeReviewRecorded(value) => {
+            refs.insert(value.negative_evidence_id.to_string());
+            refs.extend(value.successor_usage_revision_id.map(|id| id.to_string()));
+            refs.extend(value.evidence_refs.iter().cloned());
+        }
         JournalPayload::RecallLedgerRecorded(event) => {
             if let evertrace_domain::recall::RecallLedgerEvent::NeedRecorded { need } =
                 event.as_ref()
@@ -5955,7 +6000,29 @@ impl JournalAdmissionState {
                 *seq,
             )?);
         }
+        if let Ok(id) = reference.parse::<evertrace_domain::ids::ProcedureUsageId>()
+            && let Some(value) = self.procedure.usage(id)
+            && let Some(row) = self
+                .procedure
+                .usage_row(value.usage_revision_id, PROJECTION_GENERATION)?
+        {
+            rows.push(row);
+        }
+        if let Ok(id) = reference.parse::<evertrace_domain::ids::ProcedureNegativeEvidenceId>()
+            && let Some(row) = self.procedure.negative_row(id, PROJECTION_GENERATION)?
+        {
+            rows.push(row);
+        }
         if let Ok(revision) = reference.parse::<RevisionId>() {
+            if let Some(row) = self.procedure.usage_row(revision, PROJECTION_GENERATION)? {
+                rows.push(row);
+            }
+            if let Some(row) = self
+                .procedure
+                .negative_review_row(revision, PROJECTION_GENERATION)?
+            {
+                rows.push(row);
+            }
             if let Some((value, seq)) = self.procedure.revision_entry(revision) {
                 rows.push(
                     self.memory_candidate_row(
@@ -6252,6 +6319,10 @@ impl JournalAdmissionState {
                 self.procedure
                     .current_revision(id)
                     .map(|value| value.revision_id.to_string())
+            } else if let Ok(id) = reference.parse::<evertrace_domain::ids::ProcedureUsageId>() {
+                self.procedure
+                    .usage(id)
+                    .map(|value| value.usage_revision_id.to_string())
             } else if let Ok(id) = reference.parse::<evertrace_domain::ids::CoreMembershipId>() {
                 self.scenario_core
                     .current_membership(id)
@@ -6573,6 +6644,9 @@ impl JournalAdmissionState {
                             "atom_revision"
                                 | "core_membership"
                                 | "procedure_revision"
+                                | "procedure_usage_revision"
+                                | "procedure_negative_evidence"
+                                | "procedure_negative_review"
                                 | "revision_proposal_revision"
                                 | "semantic_digest"
                                 | "task"
@@ -7456,7 +7530,8 @@ impl JournalAdmissionState {
                 .validation_row(v.validation_revision_id, PROJECTION_GENERATION),
             InboxCandidate::Negative(v) => self
                 .procedure
-                .negative_review_row(v.review_event_id, PROJECTION_GENERATION),
+                .negative_review_row(v.review_event_id, PROJECTION_GENERATION)?
+                .ok_or(StoreError::StoreCorrupt),
             InboxCandidate::Publication(v) => self
                 .procedure
                 .publication_row(v.state_event_id, PROJECTION_GENERATION),

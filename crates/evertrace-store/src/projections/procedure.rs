@@ -105,17 +105,16 @@ impl ProcedureState {
         &self,
         review_id: RevisionId,
         generation: u64,
-    ) -> Result<ObjectRow, StoreError> {
-        let (review, seq) = self
-            .negative_reviews
-            .get(&review_id)
-            .ok_or(StoreError::StoreCorrupt)?;
+    ) -> Result<Option<ObjectRow>, StoreError> {
+        let Some((review, seq)) = self.negative_reviews.get(&review_id) else {
+            return Ok(None);
+        };
         let negative = self
             .negative_evidence
             .get(&review.negative_evidence_id)
             .ok_or(StoreError::StoreCorrupt)?;
         let payload = JournalPayload::ProcedureNegativeReviewRecorded(Box::new(review.clone()));
-        Ok(ObjectRow {
+        Ok(Some(ObjectRow {
             row_id: format!("object:procedure_negative_review:{review_id}"),
             row_kind: ObjectRowKind::Data,
             row_class: Some(ObjectRowClass::Object),
@@ -155,7 +154,7 @@ impl ProcedureState {
             payload_json: Some(payload.canonical_json()?.into()),
             source_event_seq: *seq,
             projection_generation: generation,
-        })
+        }))
     }
 
     pub(super) fn forget(
@@ -282,6 +281,32 @@ impl ProcedureState {
             }
         }
         Ok(())
+    }
+
+    pub(super) fn usage_row(
+        &self,
+        revision: RevisionId,
+        generation: u64,
+    ) -> Result<Option<ObjectRow>, StoreError> {
+        self.usage_revisions
+            .get(&revision)
+            .map(|(value, seq)| procedure_usage_row(revision, value, *seq, generation))
+            .transpose()
+    }
+
+    pub(super) fn negative_row(
+        &self,
+        id: ProcedureNegativeEvidenceId,
+        generation: u64,
+    ) -> Result<Option<ObjectRow>, StoreError> {
+        let status = self
+            .current_negative_reviews
+            .get(&id)
+            .map(|(review, _)| review.status);
+        self.negative_evidence
+            .get(&id)
+            .map(|(value, seq)| procedure_negative_row(id, value, status, *seq, generation))
+            .transpose()
     }
 
     pub(super) fn usage(&self, id: ProcedureUsageId) -> Option<&ProcedureUsageRevision> {
@@ -1605,80 +1630,109 @@ impl ProcedureState {
             rows.push(self.publication_row(*event_id, generation)?);
         }
         for (revision_id, (usage, seq)) in &self.usage_revisions {
-            let payload = JournalPayload::ProcedureUsageRecorded(Box::new(usage.clone()));
-            rows.push(ObjectRow {
-                row_id: format!("object:procedure_usage:{revision_id}"),
-                row_kind: ObjectRowKind::Data,
-                row_class: Some(ObjectRowClass::Object),
-                object_family: Some(ObjectFamily::Procedure),
-                object_kind: Some("procedure_usage_revision".into()),
-                object_id: Some(usage.procedure_usage_id.to_string()),
-                current_revision_id: Some(revision_id.to_string()),
-                lifecycle: Some("active".into()),
-                epistemic: None,
-                authority: None,
-                publication_state: None,
-                support_state: None,
-                project_id: None,
-                repository_id: usage.local_context.repository_id.map(|id| id.to_string()),
-                worktree_id: usage.local_context.worktree_id.map(|id| id.to_string()),
-                task_id: Some(usage.task_id.to_string()),
-                workstream_id: Some(usage.workstream_id.to_string()),
-                session_id: None,
-                payload_json: Some(payload.canonical_json()?.into()),
-                source_event_seq: *seq,
-                projection_generation: generation,
-            });
+            rows.push(procedure_usage_row(*revision_id, usage, *seq, generation)?);
         }
         for (negative_id, (negative, seq)) in &self.negative_evidence {
-            let payload =
-                JournalPayload::ProcedureNegativeEvidenceRecorded(Box::new(negative.clone()));
-            rows.push(ObjectRow {
-                row_id: format!("object:procedure_negative:{negative_id}"),
-                row_kind: ObjectRowKind::Data,
-                row_class: Some(ObjectRowClass::Object),
-                object_family: Some(ObjectFamily::Procedure),
-                object_kind: Some("procedure_negative_evidence".into()),
-                object_id: Some(negative_id.to_string()),
-                current_revision_id: Some(negative_id.to_string()),
-                lifecycle: self
-                    .current_negative_reviews
-                    .get(negative_id)
-                    .map(|(review, _)| match review.status {
-                        ProcedureNegativeReviewStatus::Pending => "pending",
-                        ProcedureNegativeReviewStatus::Upheld => "upheld",
-                        ProcedureNegativeReviewStatus::Dismissed => "dismissed",
-                        ProcedureNegativeReviewStatus::Superseded => "superseded",
-                    })
-                    .map(str::to_owned),
-                epistemic: None,
-                authority: None,
-                publication_state: None,
-                support_state: None,
-                project_id: None,
-                repository_id: negative
-                    .local_context
-                    .as_ref()
-                    .and_then(|value| value.repository_id)
-                    .map(|id| id.to_string()),
-                worktree_id: negative
-                    .local_context
-                    .as_ref()
-                    .and_then(|value| value.worktree_id)
-                    .map(|id| id.to_string()),
-                task_id: Some(negative.task_id.to_string()),
-                workstream_id: None,
-                session_id: Some(negative.session_id.clone()),
-                payload_json: Some(payload.canonical_json()?.into()),
-                source_event_seq: *seq,
-                projection_generation: generation,
-            });
+            let status = self
+                .current_negative_reviews
+                .get(negative_id)
+                .map(|(review, _)| review.status);
+            rows.push(procedure_negative_row(
+                *negative_id,
+                negative,
+                status,
+                *seq,
+                generation,
+            )?);
         }
         for review_id in self.negative_reviews.keys() {
-            rows.push(self.negative_review_row(*review_id, generation)?);
+            rows.push(
+                self.negative_review_row(*review_id, generation)?
+                    .ok_or(StoreError::StoreCorrupt)?,
+            );
         }
         Ok(rows)
     }
+}
+
+fn procedure_usage_row(
+    revision_id: RevisionId,
+    usage: &ProcedureUsageRevision,
+    seq: u64,
+    generation: u64,
+) -> Result<ObjectRow, StoreError> {
+    let payload = JournalPayload::ProcedureUsageRecorded(Box::new(usage.clone()));
+    Ok(ObjectRow {
+        row_id: format!("object:procedure_usage:{revision_id}"),
+        row_kind: ObjectRowKind::Data,
+        row_class: Some(ObjectRowClass::Object),
+        object_family: Some(ObjectFamily::Procedure),
+        object_kind: Some("procedure_usage_revision".into()),
+        object_id: Some(usage.procedure_usage_id.to_string()),
+        current_revision_id: Some(revision_id.to_string()),
+        lifecycle: Some("active".into()),
+        epistemic: None,
+        authority: None,
+        publication_state: None,
+        support_state: None,
+        project_id: None,
+        repository_id: usage.local_context.repository_id.map(|id| id.to_string()),
+        worktree_id: usage.local_context.worktree_id.map(|id| id.to_string()),
+        task_id: Some(usage.task_id.to_string()),
+        workstream_id: Some(usage.workstream_id.to_string()),
+        session_id: None,
+        payload_json: Some(payload.canonical_json()?.into()),
+        source_event_seq: seq,
+        projection_generation: generation,
+    })
+}
+
+fn procedure_negative_row(
+    negative_id: ProcedureNegativeEvidenceId,
+    negative: &ProcedureNegativeEvidence,
+    status: Option<ProcedureNegativeReviewStatus>,
+    seq: u64,
+    generation: u64,
+) -> Result<ObjectRow, StoreError> {
+    let payload = JournalPayload::ProcedureNegativeEvidenceRecorded(Box::new(negative.clone()));
+    Ok(ObjectRow {
+        row_id: format!("object:procedure_negative:{negative_id}"),
+        row_kind: ObjectRowKind::Data,
+        row_class: Some(ObjectRowClass::Object),
+        object_family: Some(ObjectFamily::Procedure),
+        object_kind: Some("procedure_negative_evidence".into()),
+        object_id: Some(negative_id.to_string()),
+        current_revision_id: Some(negative_id.to_string()),
+        lifecycle: status
+            .map(|status| match status {
+                ProcedureNegativeReviewStatus::Pending => "pending",
+                ProcedureNegativeReviewStatus::Upheld => "upheld",
+                ProcedureNegativeReviewStatus::Dismissed => "dismissed",
+                ProcedureNegativeReviewStatus::Superseded => "superseded",
+            })
+            .map(str::to_owned),
+        epistemic: None,
+        authority: None,
+        publication_state: None,
+        support_state: None,
+        project_id: None,
+        repository_id: negative
+            .local_context
+            .as_ref()
+            .and_then(|value| value.repository_id)
+            .map(|id| id.to_string()),
+        worktree_id: negative
+            .local_context
+            .as_ref()
+            .and_then(|value| value.worktree_id)
+            .map(|id| id.to_string()),
+        task_id: Some(negative.task_id.to_string()),
+        workstream_id: None,
+        session_id: Some(negative.session_id.clone()),
+        payload_json: Some(payload.canonical_json()?.into()),
+        source_event_seq: seq,
+        projection_generation: generation,
+    })
 }
 
 fn validate_publication_event(

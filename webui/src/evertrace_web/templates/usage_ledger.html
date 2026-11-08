@@ -1,0 +1,68 @@
+{% if content.kind == 'procedure_usage' %}
+<h2>ProcedureUsage · 所选修订</h2>
+<dl>
+  <dt>Usage / 修订</dt><dd>{{ value.procedure_usage_id }} / {{ value.usage_revision_id }}</dd>
+  <dt>前驱</dt><dd>{{ value.predecessor_revision_id or '无' }} · generation {{ value.revision_generation }}</dd>
+  <dt>原记录阶段</dt><dd data-usage-stage>{{ value.stage }}</dd>
+  <dt>原 route decision</dt><dd>{{ value.route_decision }}</dd>
+  <dt>原 eligible</dt><dd>{{ value.eligible }} · correlation {{ value.correlation_state }}</dd>
+  <dt>原 action_aligned</dt><dd>{{ value.action_aligned }}</dd>
+  <dt>原 verifier_aligned</dt><dd>{{ value.verifier_aligned }}</dd>
+  <dt>原 outcome_supported</dt><dd>{{ value.outcome_supported }}</dd>
+  <dt>曾使用的 Procedure 修订</dt><dd>{{ value.procedure_revision_id }}</dd>
+  <dt>原边界</dt><dd class="memory-prose">{{ value.decision_boundary_ref }}</dd>
+  <dt>Task / Workstream</dt><dd>{{ value.task_id }} / {{ value.workstream_id }}</dd>
+  <dt>原 exposure Episode</dt><dd>{{ value.exposure_episode_revision_id }}</dd>
+  <dt>原来源水位 / 时间</dt><dd>{{ value.source_watermark }} / {{ value.created_at_us }}</dd>
+</dl>
+<p>Routed 不是已返回；Returned 不是已执行，动作对齐也不是效果成功。本页没有重新路由或推进阶段。</p>
+{{ text_list('Attempt', value.attempt_ids) }}
+{{ text_list('动作 Episode', value.action_episode_revision_ids) }}
+{{ text_list('验证 Episode', value.verification_episode_revision_ids) }}
+{{ text_list('动作 Operation', value.action_operation_refs) }}
+{{ text_list('验证 Operation', value.verification_operation_refs) }}
+{{ text_list('WorkBinding', value.work_binding_revision_refs) }}
+{{ text_list('ScopeEffect', value.scope_effect_refs) }}
+{% elif content.kind == 'procedure_negative' %}
+<h2>负面证据 · 原事实</h2>
+<dl>
+  <dt>证据 ID</dt><dd>{{ value.negative_evidence_id }}</dd>
+  <dt>Procedure / Usage</dt><dd>{{ value.procedure_revision_id }} / {{ value.procedure_usage_id }}</dd>
+  <dt>原 observed effect</dt><dd class="memory-prose" data-negative-fact>{{ value.observed_effect }}</dd>
+  <dt>原 expected effect</dt><dd class="memory-prose">{{ value.expected_effect }}</dd>
+  <dt>原 level / 归因依据</dt><dd>{{ value.level }} / {{ value.attribution_basis }}</dd>
+  <dt>原决策来源 / Session</dt><dd>{{ value.decision_source }} / {{ value.session_id }}</dd>
+  <dt>当前复核状态（另读，不改原事实）</dt><dd data-negative-review>{{ content.get('current_review') or '未提供' }}</dd>
+  <dt>Task / 原时间</dt><dd>{{ value.task_id }} / {{ value.created_at_us }}</dd>
+</dl>
+<p>Ineffective、SuspectedHarm、ConfirmedHarm 不等价；pending 也不是确认有害。本页不作复核决策。</p>
+{{ text_list('原 confounders', value.confounders) }}
+{% else %}
+<h2>负面复核 · 所选事件</h2>
+<dl>
+  <dt>事件 / 负面证据</dt><dd>{{ value.review_event_id }} / {{ value.negative_evidence_id }}</dd>
+  <dt>原状态 / 原因</dt><dd data-negative-review-event>{{ value.status }} / {{ value.reason }}</dd>
+  <dt>前驱 / generation</dt><dd>{{ value.predecessor_review_event_id or '无' }} / {{ value.review_generation }}</dd>
+  <dt>原时间</dt><dd>{{ value.created_at_us }}</dd>
+  <dt>原后继 usage</dt><dd>{{ value.successor_usage_revision_id or '无' }}</dd>
+</dl>
+<p>这里只读所选复核事件，不把它冒成最新事件，也不发起采纳、驳回、恢复或确认有害。</p>
+{% endif %}
+{{ text_list('原证据引用', value.evidence_refs) }}
+<details><summary>原 context</summary>
+<pre>{{ value.local_context|pretty if content.kind != 'procedure_negative_review' else '由负面事实关联读取' }}</pre></details>
+{% set now = content.get('procedure_now') %}
+{% if now %}
+<section class="semantic-section" data-procedure-now>
+  <h3>Procedure 当前元数据 · 与历史事实分开</h3>
+  <p>读取状态：{{ now.state }}；记录中的修订：{{ now.recorded_revision or '未取得' }}。</p>
+  {% if now.get('metadata') %}
+  <p>当前修订：{{ now.metadata.current_revision_id or '未取得' }}；
+    publication：{{ now.metadata.publication_state or '未提供' }}；
+    support：<strong data-current-support>{{ now.metadata.support_state or '未提供' }}</strong>。</p>
+  {% endif %}
+  <p>这些是本次 Native 读取的元数据，不是历史路由判定；不能把旧正结果转移给新修订或跳过 support pending。</p>
+</section>
+{% endif %}
+<p data-usage-trace="not_recorded">历史请求轨迹：本读源 not_recorded。保留原边界和证据引用，不从调用次数或备注推测 agent 看过什么。</p>
+<p>当前 context-effect 投影未接入本页；不按 usage 数量或原始成功比例推断效果、APPLY 资格或自动提升。</p>
