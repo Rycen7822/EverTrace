@@ -2267,9 +2267,17 @@ impl CurrentFacts {
     }
 
     pub fn source_observations(&self) -> impl Iterator<Item = (&Arc<SourceObservation>, u64)> + '_ {
+        self.source_observations_after(None)
+    }
+
+    pub fn source_observations_after(
+        &self,
+        after: Option<SourceObservationId>,
+    ) -> impl Iterator<Item = (&Arc<SourceObservation>, u64)> + '_ {
+        use std::ops::Bound::{Excluded, Unbounded};
         self.source_observations
-            .values()
-            .map(|(value, seq)| (value, *seq))
+            .range((after.map_or(Unbounded, Excluded), Unbounded))
+            .map(|(_, (value, seq))| (value, *seq))
     }
 
     pub fn evidence_surfaces(&self) -> impl Iterator<Item = (&Arc<EvidenceSurface>, u64)> + '_ {

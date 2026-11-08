@@ -1,4 +1,4 @@
-use std::str::FromStr;
+use std::{collections::BTreeSet, str::FromStr};
 
 use evertrace_capture::{CasDigest, CasStore};
 use evertrace_domain::{
@@ -55,6 +55,297 @@ pub struct AutoresearchCommandContext {
     pub occurred_at_us: i64,
     pub effective_config_hash: [u8; 32],
     pub algorithm_revision: &'static str,
+}
+
+/// Ephemeral fair progress; canonical Run/Result own replay and recovery.
+#[derive(Debug, Default)]
+pub(crate) struct ControlledSourceScan {
+    after: Option<SourceObservationId>,
+    completed: u64,
+    round: u64,
+    checked_frontier: u64,
+    context: Option<([u8; 32], Option<String>)>,
+}
+
+impl ControlledSourceScan {
+    pub(crate) fn observe_context(&mut self, config: [u8; 32], policy_receipt: Option<&str>) {
+        if self
+            .context
+            .as_ref()
+            .is_none_or(|(previous_config, previous_policy)| {
+                *previous_config != config || previous_policy.as_deref() != policy_receipt
+            })
+        {
+            self.retry();
+            self.context = Some((config, policy_receipt.map(str::to_owned)));
+        }
+    }
+
+    pub(crate) fn resume_after(&mut self, observation: SourceObservationId) {
+        self.after = Some(observation);
+    }
+
+    pub(crate) fn retry(&mut self) {
+        self.after = None;
+        self.completed = 0;
+        self.checked_frontier = 0;
+    }
+
+    pub(crate) fn defer(&mut self) {
+        self.round = 0;
+        self.completed = 0;
+        self.checked_frontier = 0;
+    }
+
+    pub(crate) fn page(
+        &mut self,
+        current: &evertrace_store::CurrentFacts,
+    ) -> (Vec<SourceObservationId>, bool) {
+        if self.after.is_none() {
+            if self.checked_frontier == current.frontier() {
+                return (Vec::new(), false);
+            }
+            self.checked_frontier = current.frontier();
+            let watermark = current
+                .other_data_rows()
+                .map(|row| row.source_event_seq)
+                .chain(current.source_observations().map(|(_, seq)| seq))
+                .max()
+                .unwrap_or(0);
+            if self.completed == watermark {
+                return (Vec::new(), false);
+            }
+            self.round = watermark;
+        }
+        let mut candidates = Vec::new();
+        let mut inspected = 0;
+        for (observation, _) in current.source_observations_after(self.after) {
+            if inspected == 64 {
+                return (candidates, true);
+            }
+            inspected += 1;
+            self.after = Some(observation.source_observation_id);
+            if let Some(envelope) = source_envelope(current, observation.source_observation_id)
+                && !source_resolved(current, observation, &envelope)
+            {
+                candidates.push(observation.source_observation_id);
+                if candidates.len() == 4 {
+                    return (candidates, true);
+                }
+            }
+        }
+        self.after = None;
+        self.completed = self.round;
+        (candidates, false)
+    }
+}
+
+// Replaying an already admitted source must not reopen a repository or mutate current trust.
+fn source_resolved(
+    current: &evertrace_store::CurrentFacts,
+    observation: &SourceObservation,
+    envelope: &ControlledRunSourceEnvelope,
+) -> bool {
+    current.other_data_rows().any(|row| {
+        if row.object_kind.as_deref() != Some("experiment_run") {
+            return false;
+        }
+        let Some(JournalPayload::ExperimentRunRecorded(run)) = row
+            .payload_json
+            .as_deref()
+            .and_then(|json| serde_json::from_str::<JournalPayload>(json).ok())
+        else {
+            return false;
+        };
+        match envelope {
+            ControlledRunSourceEnvelope::Launch { .. } => run
+                .source_receipt_refs
+                .contains(&observation.source_receipt_ref),
+            ControlledRunSourceEnvelope::Terminal { run_id, .. } => {
+                run.run_id == *run_id && !run.is_controlled_declaration()
+            }
+        }
+    })
+}
+
+fn source_envelope(
+    current: &evertrace_store::CurrentFacts,
+    id: SourceObservationId,
+) -> Option<ControlledRunSourceEnvelope> {
+    use evertrace_domain::evidence::{ContentTrust, SourceRole};
+    let (observation, _) = current.source_observation(id)?;
+    if observation.content_trust != ContentTrust::Observed
+        || !matches!(observation.source_role, SourceRole::Host | SourceRole::Tool)
+    {
+        return None;
+    }
+    let (surface, _) = current.evidence_surface(id)?;
+    // Candidate decoding only: witness() must still verify original CAS/native receipts and eligibility.
+    if !(surface.protected_text.starts_with("kind = \"launch\"\n")
+        || surface.protected_text.starts_with("kind = \"terminal\"\n"))
+    {
+        return None;
+    }
+    ControlledRunSourceEnvelope::decode_canonical(surface.protected_text.as_bytes()).ok()
+}
+
+/// Select the closed current input closure, never a second Work graph or the complete source snapshot.
+pub(crate) fn controlled_source_snapshot(
+    current: &evertrace_store::CurrentFacts,
+    id: SourceObservationId,
+) -> Result<Option<ProjectionSnapshot>, AutoresearchError> {
+    let Some(envelope) = source_envelope(current, id) else {
+        return Ok(None);
+    };
+    let mut refs = BTreeSet::from([id.to_string()]);
+    match envelope {
+        ControlledRunSourceEnvelope::Launch {
+            attempt_id,
+            procedure_revision_id,
+            code_snapshot_id,
+            binding,
+            ..
+        } => {
+            refs.insert(attempt_id.to_string());
+            refs.insert(procedure_revision_id.to_string());
+            refs.insert(code_snapshot_id.to_string());
+            refs.extend(
+                binding
+                    .procedure_exposure_revision_id
+                    .map(|id| id.to_string()),
+            );
+        }
+        ControlledRunSourceEnvelope::Terminal {
+            run_id,
+            artifact_refs,
+            ..
+        } => {
+            refs.insert(run_id.to_string());
+            refs.extend(artifact_refs.into_iter().map(|id| id.to_string()));
+        }
+    }
+    let mut selected = BTreeSet::new();
+    let mut rows = Vec::new();
+    let mut bytes = 0_usize;
+    let deadline = std::time::Instant::now() + std::time::Duration::from_millis(40);
+    loop {
+        let before = selected.len();
+        for reference in refs.clone() {
+            if let Ok(observation) = reference.parse::<SourceObservationId>()
+                && let Some((value, _)) = current.source_observation(observation)
+            {
+                refs.insert(value.source_receipt_ref.to_string());
+                for kind in ["source_observation", "evidence_surface"] {
+                    if let Some(row) = current.selected_source_row(kind, &reference)?
+                        && selected.insert(row.row_id.clone())
+                    {
+                        bytes = bytes
+                            .saturating_add(row.payload_json.as_ref().map_or(0, |json| json.len()));
+                        rows.push(row);
+                    }
+                }
+            }
+            if reference.parse::<SourceReceiptId>().is_ok()
+                && let Some(row) = current.selected_source_row("source_receipt", &reference)?
+                && selected.insert(row.row_id.clone())
+            {
+                bytes =
+                    bytes.saturating_add(row.payload_json.as_ref().map_or(0, |json| json.len()));
+                rows.push(row);
+            }
+        }
+        for row in current.other_data_rows() {
+            if std::time::Instant::now() >= deadline {
+                return Err(AutoresearchError::SelectionDeferred);
+            }
+            if rows.len() > 256 || bytes > 2 * 1024 * 1024 {
+                return Err(AutoresearchError::EvidenceIncomplete);
+            }
+            if selected.contains(&row.row_id) {
+                continue;
+            }
+            let direct = row.object_id.as_ref().is_some_and(|key| refs.contains(key))
+                || row
+                    .current_revision_id
+                    .as_ref()
+                    .is_some_and(|key| refs.contains(key));
+            if !direct
+                && !matches!(
+                    row.object_kind.as_deref(),
+                    Some(
+                        "operation"
+                            | "work_binding"
+                            | "result_evidence"
+                            | "procedure_usage_revision"
+                    )
+                )
+            {
+                continue;
+            }
+            let Some(json) = &row.payload_json else {
+                continue;
+            };
+            let payload: JournalPayload = serde_json::from_str(json)
+                .map_err(|_| AutoresearchError::Store(evertrace_store::StoreError::StoreCorrupt))?;
+            let inverse = match &payload {
+                JournalPayload::OperationDerived(operation) => operation
+                    .input_source_observation_refs
+                    .iter()
+                    .chain(&operation.result_source_observation_refs)
+                    .any(|source| refs.contains(&source.to_string())),
+                JournalPayload::WorkBindingRecorded(binding) => {
+                    refs.contains(&binding.operation_id.to_string())
+                }
+                JournalPayload::ResultEvidenceRecorded(result) => {
+                    refs.contains(&result.experiment_run_id.to_string())
+                }
+                JournalPayload::ProcedureUsageRecorded(usage) => {
+                    refs.contains(&usage.procedure_revision_id.to_string())
+                        && usage
+                            .attempt_ids
+                            .iter()
+                            .any(|attempt| refs.contains(&attempt.to_string()))
+                }
+                _ => false,
+            };
+            if !direct && !inverse {
+                continue;
+            }
+            refs.extend(evertrace_store::projections::read_dependencies_for(
+                row, &payload,
+            ));
+            refs.extend(row.object_id.iter().cloned());
+            refs.extend(row.current_revision_id.iter().cloned());
+            match &payload {
+                JournalPayload::WorkBindingRecorded(binding) => {
+                    refs.extend(binding.predecessor_revision_id.map(|key| key.to_string()));
+                }
+                JournalPayload::AttemptRecorded(attempt) => {
+                    refs.extend(
+                        attempt
+                            .strategy_contract
+                            .search_policy_ref
+                            .as_deref()
+                            .and_then(|value| value.parse::<RevisionId>().ok())
+                            .map(|id| id.to_string()),
+                    );
+                }
+                _ => {}
+            }
+            bytes = bytes.saturating_add(json.len());
+            selected.insert(row.row_id.clone());
+            rows.push(row.clone());
+        }
+        if rows.len() > 256 || bytes > 2 * 1024 * 1024 {
+            return Err(AutoresearchError::EvidenceIncomplete);
+        }
+        if selected.len() == before {
+            return Ok(Some(ProjectionSnapshot {
+                frontier: current.frontier(),
+                rows,
+            }));
+        }
+    }
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -182,6 +473,40 @@ pub struct ControlledRunResolver {
 impl ControlledRunResolver {
     pub const fn new(cas: CasStore) -> Self {
         Self { cas }
+    }
+
+    /// Source identity is the only dispatch input; write-protected fields still come from the original witness/resolver.
+    pub(crate) fn resolve_source(
+        &self,
+        snapshot: &ProjectionSnapshot,
+        source: SourceObservationId,
+        context: &AutoresearchCommandContext,
+    ) -> Result<ControlledRunCommand, AutoresearchError> {
+        let facts = ControlledFacts::from_snapshot(snapshot)?;
+        let Some(surface) = facts.surfaces.get(&source) else {
+            return Ok(ControlledRunCommand::NoDelta);
+        };
+        let envelope =
+            ControlledRunSourceEnvelope::decode_canonical(surface.protected_text.as_bytes())
+                .map_err(|_| AutoresearchError::UntrustedRunEvidence)?;
+        match envelope {
+            ControlledRunSourceEnvelope::Launch {
+                attempt_id,
+                procedure_revision_id,
+                ..
+            } => self.declare(
+                snapshot,
+                ControlledRunRequest {
+                    attempt_id,
+                    procedure_revision_id,
+                    source_observation_id: source,
+                },
+                context.clone(),
+            ),
+            ControlledRunSourceEnvelope::Terminal { run_id, .. } => {
+                self.complete(snapshot, run_id, source, context.clone())
+            }
+        }
     }
 
     pub fn declare(
@@ -1646,6 +1971,8 @@ pub enum AutoresearchError {
     ImmutableConflict,
     #[error("required evidence is incomplete")]
     EvidenceIncomplete,
+    #[error("controlled source selection deferred by read budget")]
+    SelectionDeferred,
     #[error("no trusted scheduler or process evidence source is available")]
     UntrustedRunEvidence,
     #[error("result contracts are incompatible")]

@@ -1017,7 +1017,10 @@ where
             .arg("--launcher-root").arg(&root).env_clear().stdin(Stdio::piped())
             .stdout(Stdio::null()).stderr(Stdio::null()).process_group(0).spawn().map_err(|_| RestoreError::Io)?));
         let hook_result = async {
-        hook.0.as_mut().ok_or_else(invalid)?.stdin.take().ok_or_else(invalid)?.write_all(&serde_json::to_vec(&native).map_err(|_| invalid())?).map_err(|_| RestoreError::Io)?;
+        let input = serde_json::to_vec(&native).map_err(|_| invalid())?;
+        hook.0.as_mut().ok_or_else(invalid)?
+            .stdin.take().ok_or_else(invalid)?
+            .write_all(&input).map_err(|_| RestoreError::Io)?;
         loop {
             if let Some(status) = crate::recovery::finish_owned_child(&mut hook.0, false).map_err(|_| uncertain())? {
                 if !status.success() { return Err(invalid()); }
@@ -1037,8 +1040,12 @@ where
             });
             let normalized = payloads.iter().any(|payload| matches!(payload, JournalPayload::HostOccurrenceNormalized(_)));
             if let Some(receipt) = receipt && normalized
-                && payloads.iter().any(|payload| matches!(payload, JournalPayload::SourceIngestWatermark(value) if value.source_instance_id == receipt.source_instance_id)) {
-                if payloads.iter().any(|payload| matches!(payload, JournalPayload::ExecutionLaneRecorded(_) | JournalPayload::CaptureReceiptRecorded(_))) { return Err(invalid()); }
+                && payloads.iter().any(|payload| matches!(payload,
+                    JournalPayload::SourceIngestWatermark(value) if value.source_instance_id == receipt.source_instance_id)) {
+                if payloads.iter().any(|payload| matches!(payload,
+                    JournalPayload::ExecutionLaneRecorded(_) | JournalPayload::CaptureReceiptRecorded(_))) {
+                    return Err(invalid());
+                }
                 let cas = evertrace_capture::CasStore::open_existing(runtime.cas_dir.clone()).map_err(|_| invalid())?;
                 let digest = evertrace_capture::CasStore::parse_digest(&receipt.cas_ref).map_err(|_| invalid())?;
                 let (payload, _) = cas.read_bounded(&digest, 64 * 1024, 64 * 1024).map_err(|_| invalid())?;
@@ -1050,7 +1057,9 @@ where
             tokio::time::sleep(Duration::from_millis(50)).await;
         }
         if let Some(request) = live_host {
-            let result = tokio::time::timeout(Duration::from_secs(35), canary(root.join("runtime/evertraced-v1.sock"), request)).await.map_err(|_| invalid())?.ok_or_else(invalid)?;
+            let result = tokio::time::timeout(
+                Duration::from_secs(35), canary(root.join("runtime/evertraced-v1.sock"), request),
+            ).await.map_err(|_| invalid())?.ok_or_else(invalid)?;
             if result.scope != (crate::HostCanaryScope::Candidate { check_id: check_id.clone(), generation }) { return Err(invalid()); }
             if result.status == crate::HostCanaryStatus::Observed && !result.installed_path_observed() { return Err(invalid()); }
             Ok(Some(result))
@@ -1694,6 +1703,7 @@ pub struct BackgroundScheduler {
     synthesis: SynthesisPlanner,
     dreaming: DreamingConfig,
     capture_cursor: Arc<tokio::sync::Mutex<CaptureScan>>,
+    controlled_cursor: Arc<tokio::sync::Mutex<crate::autoresearch::ControlledSourceScan>>,
     artifact_scan: Arc<tokio::sync::Mutex<(tokio::time::Instant, u64, bool)>>,
     dispatch: Option<Arc<RwLock<()>>>,
     repository_purge_plans: Arc<std::sync::Mutex<BTreeMap<JobId, Vec<String>>>>,
@@ -1725,6 +1735,7 @@ impl BackgroundScheduler {
             synthesis,
             dreaming,
             capture_cursor: Arc::new(tokio::sync::Mutex::new(CaptureScan::default())),
+            controlled_cursor: Arc::default(),
             artifact_scan: Arc::new(tokio::sync::Mutex::new((
                 tokio::time::Instant::now(),
                 0,
@@ -1803,6 +1814,159 @@ impl BackgroundScheduler {
         operation.run_once_inner().await
     }
 
+    async fn resolve_controlled_sources(
+        &self,
+        current: &CurrentFacts,
+    ) -> Result<BackgroundProgress, BackgroundSchedulerError> {
+        use crate::autoresearch::{
+            AutoresearchCommandContext, AutoresearchError, ControlledRunCommand,
+            ControlledRunResolver, controlled_source_snapshot,
+        };
+        let report_guard = self.report.read().await;
+        let (sources, more) = {
+            let mut cursor = self.controlled_cursor.lock().await;
+            cursor.observe_context(
+                self.runtime.effective_config_hash,
+                report_guard
+                    .as_ref()
+                    .map(|report| report.project_policy().protected_digest()),
+            );
+            cursor.page(current)
+        };
+        let mut outcome = BackgroundProgress {
+            completed: 0,
+            retryable: more,
+        };
+        if sources.is_empty() {
+            return Ok(outcome);
+        }
+        let report = report_guard.clone();
+        drop(report_guard);
+        let cas = evertrace_capture::CasStore::open_existing(self.runtime.cas_dir.clone())
+            .map_err(|_| BackgroundSchedulerError::Store)?;
+        let resolver = ControlledRunResolver::new(cas);
+        for source in sources {
+            let snapshot = match controlled_source_snapshot(current, source) {
+                Ok(Some(snapshot)) => snapshot,
+                Ok(None) | Err(AutoresearchError::EvidenceIncomplete) => continue,
+                Err(AutoresearchError::SelectionDeferred) => {
+                    self.controlled_cursor.lock().await.defer();
+                    outcome.retryable = true;
+                    continue;
+                }
+                Err(_) => return Err(BackgroundSchedulerError::Store),
+            };
+            let refs = snapshot
+                .rows
+                .iter()
+                .filter(|row| row.object_kind.as_deref() == Some("source_observation"))
+                .filter_map(|row| row.object_id.as_ref()?.parse::<SourceObservationId>().ok())
+                .map(|id| id.to_string())
+                .chain(std::iter::once(source.to_string()))
+                .collect::<BTreeSet<_>>()
+                .into_iter()
+                .collect::<Vec<_>>();
+            if refs.len() > 64 {
+                continue;
+            }
+            let mut repositories = BTreeSet::new();
+            for row in &snapshot.rows {
+                if let Some(id) = &row.repository_id {
+                    repositories.insert(id.parse().map_err(|_| BackgroundSchedulerError::Store)?);
+                }
+                if row.object_kind.as_deref() == Some("repository") {
+                    let id = row
+                        .object_id
+                        .as_ref()
+                        .ok_or(BackgroundSchedulerError::Store)?;
+                    repositories.insert(id.parse().map_err(|_| BackgroundSchedulerError::Store)?);
+                }
+            }
+            if !crate::repository::blocked_repositories(
+                &self.writer,
+                repositories.clone(),
+                report.as_ref(),
+                self.runtime.effective_config_hash,
+            )
+            .await
+            .map_err(|_| BackgroundSchedulerError::Store)?
+            .is_empty()
+            {
+                continue;
+            }
+            let denied = crate::session_import::blocked_source_observations(
+                &self.writer,
+                report.as_ref(),
+                current,
+                &refs,
+                self.runtime.effective_config_hash,
+            )
+            .await
+            .map_err(|_| BackgroundSchedulerError::Store)?;
+            if !denied.is_empty() {
+                continue;
+            }
+            let context = AutoresearchCommandContext {
+                command_id: CommandId::new_v7(),
+                occurred_at_us: now_us()?,
+                effective_config_hash: self.runtime.effective_config_hash,
+                algorithm_revision: "controlled_run_resolver_v1",
+            };
+            let command = match resolver.resolve_source(&snapshot, source, &context) {
+                Ok(ControlledRunCommand::NoDelta) => continue,
+                Ok(ControlledRunCommand::Declaration { command, .. })
+                | Ok(ControlledRunCommand::Terminal { command, .. }) => command,
+                Err(AutoresearchError::Store(_)) => return Err(BackgroundSchedulerError::Store),
+                // Absent/contradictory/untrusted evidence is not a write or a fabricated terminal result.
+                Err(_) => continue,
+            };
+            if !crate::session_import::blocked_source_observations(
+                &self.writer,
+                report.as_ref(),
+                current,
+                &refs,
+                self.runtime.effective_config_hash,
+            )
+            .await
+            .map_err(|_| BackgroundSchedulerError::Store)?
+            .is_empty()
+            {
+                continue;
+            }
+            if !crate::repository::blocked_repositories(
+                &self.writer,
+                repositories,
+                report.as_ref(),
+                self.runtime.effective_config_hash,
+            )
+            .await
+            .map_err(|_| BackgroundSchedulerError::Store)?
+            .is_empty()
+            {
+                continue;
+            }
+            match self
+                .writer
+                .commit_if_frontier(command, now_us()?, current.frontier())
+                .await
+            {
+                Ok(_) => {
+                    outcome.completed = 1;
+                    outcome.retryable = true;
+                    self.controlled_cursor.lock().await.resume_after(source);
+                    return Ok(outcome);
+                }
+                Err(WriterActorError::StaleFrontier { .. }) => {
+                    self.controlled_cursor.lock().await.retry();
+                    outcome.retryable = true;
+                    return Ok(outcome);
+                }
+                Err(_) => return Err(BackgroundSchedulerError::Writer),
+            }
+        }
+        Ok(outcome)
+    }
+
     async fn run_once_inner(&self) -> Result<RunOnceOutcome, BackgroundSchedulerError> {
         let (capture_state, ordinary_pending) = self
             .runtime
@@ -1879,6 +2043,18 @@ impl BackgroundScheduler {
                 Err(crate::jobs::InventoryWorkerError::Store) => {
                     return Err(BackgroundSchedulerError::Store);
                 }
+            }
+        }
+        if optional_allowed {
+            let controlled = self.resolve_controlled_sources(&snapshot).await?;
+            retryable |= controlled.retryable;
+            completed += controlled.completed;
+            if controlled.completed != 0 {
+                snapshot = self
+                    .writer
+                    .project_current(true)
+                    .await
+                    .map_err(map_writer)?;
             }
         }
         let recovery_now_us = now_us()?;
