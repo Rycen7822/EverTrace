@@ -1,0 +1,65 @@
+{% macro support_refs(label, refs) %}
+<h3>{{ label }}</h3>
+{% if refs %}<ul>{% for ref in refs %}<li>{{ ref }}</li>{% endfor %}</ul>
+{% else %}<p class="muted">空列表（0 项）。</p>{% endif %}
+{% endmacro %}
+{% set value = content.value %}
+{% if content.kind == 'support_contract' %}
+<h2>全局支持 · 原合同</h2>
+<p>这是接受时记录的不可变支持快照，不是现在重新评估的结果。support refs 是依赖，不是删除所有权。</p>
+<dl>
+  <dt>合同修订</dt><dd>{{ value.support_contract_revision_id }}</dd>
+  <dt>原后继修订 / membership</dt><dd>{{ value.successor_revision_or_membership_ref }}</dd>
+  <dt>原 promotion proposal</dt><dd>{{ value.promotion_proposal_revision_id }}</dd>
+  <dt>阈值 / 授权要求</dt>
+  <dd>{{ value.support_threshold_snapshot.minimum_surviving_support }} / {{ value.support_threshold_snapshot.require_authorization }}</dd>
+  <dt>原 validator revision / 时间</dt><dd>{{ value.promotion_validator_revision }} / {{ value.created_at_us }}</dd>
+</dl>
+{{ support_refs('原支持修订', value.support_revision_refs) }}
+{{ support_refs('原授权修订', value.authorization_revision_refs) }}
+{% else %}
+<h2>全局支持 · 所选校验事件</h2>
+<p>这是 append-only 原事件。原状态和 dependency generation 不能代替当下支持状态，也不按时间挑选“最新”。</p>
+<dl>
+  <dt>事件修订</dt><dd>{{ value.validation_revision_id }}</dd>
+  <dt>支持合同 / 原后继引用</dt><dd>{{ value.support_contract_ref }} / {{ value.successor_ref }}</dd>
+  <dt>原状态</dt><dd data-support-selected-state>{{ value.state }}</dd>
+  <dt>原 dependency generation</dt><dd data-support-selected-generation>{{ value.dependency_generation }}</dd>
+  <dt>原 provenance degraded</dt><dd>{{ value.provenance_degraded }}</dd>
+  <dt>原 validator revision / 时间</dt><dd>{{ value.validator_revision }} / {{ value.created_at_us }}</dd>
+</dl>
+{{ support_refs('事件记录的 surviving support', value.surviving_support_refs) }}
+{{ support_refs('事件记录的 invalid / missing refs', value.invalid_or_missing_refs) }}
+{{ support_refs('原触发引用', value.trigger_refs) }}
+<button class="button" type="button" data-link-key="{{ value.support_contract_ref }}"
+  data-revision="{{ value.support_contract_ref }}" data-object="{{ value.support_contract_ref }}"
+  data-kind="global_support_contract">读取原支持合同</button>
+{% if value.state == 'revalidation_pending' %}
+<p>pending 尚未完成复核。事件中保留的 surviving 列表不保证当前仍可读，也不证明可以提升或普通路由。</p>
+{% endif %}
+{% endif %}
+{% set current = content.contract_now %}
+<section data-current-contract>
+  <h3>此合同的当前校验 · Native current map</h3>
+  {% if current.state == 'ready' %}
+  <p>原生选择的事件：{{ current.value.validation_revision_id }}；generation {{ current.value.dependency_generation }}；
+    状态：<strong data-support-current>{{ current.value.state }}</strong>；
+    provenance degraded：{{ current.value.provenance_degraded }}。</p>
+  {{ support_refs('当前事件记录的 surviving support', current.value.surviving_support_refs) }}
+  {{ support_refs('当前事件记录的 invalid / missing refs', current.value.invalid_or_missing_refs) }}
+  {% else %}<p>读取状态：{{ current.state }}。没有用所选旧事件、空列表或计数代替当前校验。</p>{% endif %}
+</section>
+{% set now = content.asset_now %}
+<section data-current-supported-asset>
+  <h3>资产当前元数据 · 与合同和历史事件分开</h3>
+  <p>读取状态：{{ now.state }}；原记录引用：{{ now.recorded_revision }}。</p>
+  {% if now.state == 'ready' %}
+  <p>当前修订：{{ now.metadata.current_revision_id }}；lifecycle：{{ now.metadata.lifecycle or '未提供' }}；
+    publication：{{ now.metadata.publication_state or '未提供' }}；
+    support：<strong data-support-asset-state>{{ now.metadata.support_state or '未提供' }}</strong>。</p>
+  <button class="button" type="button" data-link-key="{{ now.metadata.row_id }}"
+    data-revision="{{ now.metadata.current_revision_id }}" data-object="{{ now.metadata.object_id }}"
+    data-kind="{{ now.metadata.object_kind }}">读取当前资产</button>
+  {% endif %}
+</section>
+<p>valid 可以伴随 provenance degraded；它不等于被删来源仍在。pending、insufficient、invalidated 不等价，本页不代替原生复核或接受命令。</p>

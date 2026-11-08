@@ -243,6 +243,8 @@ impl JournalAdmissionState {
                     | "procedure_negative_evidence"
                     | "procedure_negative_review"
                     | "procedure_context_effect"
+                    | "global_support_contract"
+                    | "global_support_validation"
                     | "task"
                     | "workstream"
             )
@@ -276,6 +278,37 @@ impl JournalAdmissionState {
                 .filter(|row| row.object_kind.as_deref() == Some("procedure_context_effect"))
                 .map(|row| row.row_id.clone()),
         );
+        let contracts: Box<dyn Iterator<Item = RevisionId> + '_> = match payload.as_ref() {
+            Some(JournalPayload::AtomRecorded(atom)) => Box::new(
+                self.scenario_core
+                    .atom_support_contract_refs(atom.revision_id)
+                    .into_iter(),
+            ),
+            Some(JournalPayload::ProcedureRevisionRecorded(procedure)) => Box::new(
+                self.scenario_core
+                    .successor_support_contract_refs(procedure.revision_id),
+            ),
+            _ => Box::new(std::iter::empty()),
+        };
+        for contract in contracts {
+            if cancelled.load(std::sync::atomic::Ordering::Relaxed) {
+                return Err(StoreError::Io);
+            }
+            if std::time::Instant::now() >= deadline {
+                return Ok(O::TooLarge);
+            }
+            refs.insert(contract.to_string());
+            if refs.len() > READ_DEPENDENCY_LIMIT {
+                return Ok(O::TooLarge);
+            }
+        }
+        if let Some(JournalPayload::GlobalSupportContractRecorded(contract)) = payload.as_ref()
+            && let Some(validation) = self
+                .scenario_core
+                .current_validation(contract.support_contract_revision_id)
+        {
+            refs.insert(validation.validation_revision_id.to_string());
+        }
         // Current child revisions by canonical ownership/pinned input, not a reconstruction of a past subtree.
         let children: Box<dyn Iterator<Item = (bool, RevisionId)> + '_> = match payload.as_ref() {
             Some(JournalPayload::TaskRecorded(task)) => Box::new(
@@ -344,10 +377,18 @@ impl JournalAdmissionState {
             }
         }
         refs.remove(&root.row_id);
-        if let Some(value) = &root.object_id {
+        // These immutable events share their stream's parent ID; it is a true parent link, not a self alias.
+        if !matches!(
+            root.object_kind.as_deref(),
+            Some("global_support_validation" | "procedure_negative_review")
+        ) && let Some(value) = &root.object_id
+        {
             refs.remove(value);
         }
-        if let Some(value) = &root.current_revision_id {
+        // A context projection's revision column is its Procedure input, not its own immutable revision.
+        if root.object_kind.as_deref() != Some("procedure_context_effect")
+            && let Some(value) = &root.current_revision_id
+        {
             refs.remove(value);
         }
         if refs.len() > READ_DEPENDENCY_LIMIT {

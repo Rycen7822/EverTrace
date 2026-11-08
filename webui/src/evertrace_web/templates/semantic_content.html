@@ -12,6 +12,8 @@
 <div class="semantic-content" data-semantic-kind="{{ content.kind }}">
 {% if content.kind == 'recall_need' %}
   {% include 'recall_ledger.html' %}
+{% elif content.kind in ('support_contract', 'support_validation') %}
+{% include 'global_support.html' %}
 {% elif content.kind in ('procedure_usage', 'procedure_negative', 'procedure_negative_review', 'procedure_effect') %}
   {% include 'usage_ledger.html' %}
 {% elif content.kind == 'atom' %}

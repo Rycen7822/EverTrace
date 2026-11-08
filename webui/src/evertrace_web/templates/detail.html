@@ -8,9 +8,9 @@
 {% from 'source_time.html' import source_time %}
 {% set source_context = item.get('source_context') %}
 {% set research = item.object_kind in ('experiment_run', 'result_evidence') %}
-{% set projection = item.object_kind == 'procedure_context_effect' %}
+{% set typed_fact = item.object_kind in ('procedure_context_effect', 'global_support_contract', 'global_support_validation') %}
 <div class="detail-title">
-  {% if not research and not projection %}<div class="badges">
+  {% if not research and not typed_fact %}<div class="badges">
     {% for label, field in [
       ('真值', 'epistemic'), ('权威', 'authority'), ('生命周期', 'lifecycle'),
       ('发布', 'publication_state'), ('支持', 'support_state')
@@ -94,7 +94,7 @@
   'attempt', 'operation_burst', 'operation', 'task', 'workstream', 'host_occurrence', 'scope_effect',
   'worktree', 'worktree_snapshot', 'recovery_capture_request', 'recovery_bundle', 'work_artifact',
   'experiment_run', 'result_evidence', 'procedure_usage_revision', 'procedure_negative_evidence',
-  'procedure_negative_review', 'procedure_context_effect'
+  'procedure_negative_review', 'procedure_context_effect', 'global_support_contract', 'global_support_validation'
 ) %}<button class="button" type="button" data-sources-open>查看来源与直接关联</button>{% endif %}
 {% if item.object_kind in ('atom_revision', 'procedure_revision', 'core_membership', 'revision_proposal_revision', 'semantic_digest') %}
 <button class="button" type="button" data-compare-base>设为比较左侧</button>

@@ -3537,6 +3537,8 @@ pub fn read_dependencies_for(row: &ObjectRow, payload: &JournalPayload) -> BTree
             );
         }
         JournalPayload::GlobalSupportContractRecorded(value) => {
+            refs.insert(value.successor_revision_or_membership_ref.clone());
+            refs.insert(value.promotion_proposal_revision_id.to_string());
             refs.extend(value.support_revision_refs.iter().map(ToString::to_string));
             refs.extend(
                 value
@@ -3544,6 +3546,11 @@ pub fn read_dependencies_for(row: &ObjectRow, payload: &JournalPayload) -> BTree
                     .iter()
                     .map(ToString::to_string),
             );
+        }
+        JournalPayload::GlobalSupportValidationRecorded(value) => {
+            refs.insert(value.support_contract_ref.to_string());
+            refs.insert(value.successor_ref.clone());
+            // Invalid/missing and trigger refs explain the event, not promised readable dependencies.
         }
         JournalPayload::SemanticDigestRecorded(value) => {
             refs.extend(value.selected_direct_refs.iter().cloned());
@@ -6047,15 +6054,17 @@ impl JournalAdmissionState {
                     )?,
                 );
             }
-            if let Some((value, seq)) = self.scenario_core.contract_entry(revision) {
-                rows.push(physical_object_row(
-                    ObjectFamily::Atom,
-                    "global_support_contract",
-                    reference.into(),
-                    reference.into(),
-                    &JournalPayload::GlobalSupportContractRecorded(Box::new(value.clone())),
-                    seq,
-                )?);
+            if let Some(row) = self
+                .scenario_core
+                .contract_row(revision, PROJECTION_GENERATION)?
+            {
+                rows.push(row);
+            }
+            if self.scenario_core.validation(revision).is_some() {
+                rows.push(
+                    self.scenario_core
+                        .validation_row(revision, PROJECTION_GENERATION)?,
+                );
             }
             if let Some((value, seq)) = self.episode_revisions.get(&revision) {
                 rows.push(inbox_work_row(
@@ -6647,6 +6656,8 @@ impl JournalAdmissionState {
                                 | "procedure_usage_revision"
                                 | "procedure_negative_evidence"
                                 | "procedure_negative_review"
+                                | "global_support_contract"
+                                | "global_support_validation"
                                 | "revision_proposal_revision"
                                 | "semantic_digest"
                                 | "task"

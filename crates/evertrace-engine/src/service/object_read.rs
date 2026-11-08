@@ -583,6 +583,8 @@ fn record_data(
         P::AtomRecorded(value) => semantic_record(&value, Some(&value.value.text), query, check),
         P::ProcedureRevisionRecorded(value) => semantic_record(&value, None, query, check),
         P::CoreMembershipRecorded(value) => semantic_record(&value, None, query, check),
+        P::GlobalSupportContractRecorded(value) => semantic_record(&value, None, query, check),
+        P::GlobalSupportValidationRecorded(value) => semantic_record(&value, None, query, check),
         P::SemanticDigestRecorded(value) => semantic_record(&value, None, query, check),
         P::RevisionProposalRecorded(value) => semantic_record(&value, None, query, check),
         P::AttemptRecorded(value) => semantic_record(&value, None, query, check),

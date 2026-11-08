@@ -718,7 +718,7 @@ async function readWork(controller) {
     state.selected = { key: state.query.selection.task_id, kind: "task", revision: null, object: null, path: [] };
   }
   $("memory-items").textContent = usage
-    ? "读取 Recall 快照、usage、负面事实、复核事件或当前 effect 投影。不调用 @due，也不推进使用阶段。"
+    ? "读取 Recall、usage、负面事实、效果或支持记录。所选原事件与当前元数据分开显示，不调用 @due。"
     : research
     ? "读取已知 Run、ResultEvidence 或研究 Atom；从结果可回到其对应 Run 的精确条件。"
     : "按精确工作记录读取。Task 的工作线、Workstream 的片段可从详情中的关联逐项展开。";
@@ -1026,11 +1026,12 @@ function route(name) {
   $("work-record-submit").textContent = name === "usage" ? "读取使用证据" : "读取工作记录";
   for (const option of $("work-record-kind").options) {
     option.hidden = name === "usage" && !["recall_need", "procedure_usage_revision",
-      "procedure_negative_evidence", "procedure_negative_review", "procedure_context_effect"].includes(option.value);
+      "procedure_negative_evidence", "procedure_negative_review", "procedure_context_effect",
+      "global_support_contract", "global_support_validation"].includes(option.value);
     option.disabled = option.hidden;
   }
   $("work-record-help").textContent = name === "usage"
-    ? "usage 可选修订；复核填事件 ID，effect 填原投影键。Need 修订仅固定计划身份，不选历史快照。"
+    ? "usage 可选修订；复核/支持填原事件或合同 ID，effect 填原键。Need 修订不选择历史快照。"
     : name === "research"
     ? "选择 Run、ResultEvidence 或 Atom，输入精确 ID；修订留空只绑定原生当前版本。"
     : "也可从范围目录选择 Task。这里只读所选工作及有界关联，不把全局范围当空任务列表。";

@@ -19,8 +19,8 @@ from .jobs import read_jobs
 from .comparison import read_comparison
 from .research import read_research_comparison
 from .compiled import read_compiled
-from .usage import USAGE_DETAIL_KINDS, read_usage_detail
-from .content import DETAIL_KINDS, WORK_DETAIL_KINDS, read_record_content, read_record_detail, read_source_content
+from .usage import SUPPORT_DETAIL_KINDS, USAGE_DETAIL_KINDS, read_support_detail, read_usage_detail
+from .content import DETAIL_KINDS, NATIVE_DETAIL_KINDS, read_record_content, read_record_detail, read_source_content
 from .sources import read_revisions, read_source_catalog, read_source_archive, read_source_detail, read_source_links
 from .scopes import read_scopes
 from .memories import read_memories, read_overview
@@ -625,9 +625,13 @@ class App:
                     result = await read_source_detail(self.backend, payload["reference"], frontier,
                         payload["revision"], payload["object_kind"])
                 elif payload["object_kind"] in DETAIL_KINDS and (
-                    surface == "explorer" or payload["object_kind"] in WORK_DETAIL_KINDS
+                    surface == "explorer" or payload["object_kind"] in NATIVE_DETAIL_KINDS
                 ):
-                    reader = read_usage_detail if payload["object_kind"] in USAGE_DETAIL_KINDS else read_record_detail
+                    reader = read_record_detail
+                    if payload["object_kind"] in USAGE_DETAIL_KINDS:
+                        reader = read_usage_detail
+                    elif payload["object_kind"] in SUPPORT_DETAIL_KINDS:
+                        reader = read_support_detail
                     result = await reader(self.backend, payload["reference"], frontier,
                         payload["revision"], payload["object_kind"])
                 else:
@@ -665,7 +669,7 @@ def present_detail(templates, result, surface):
         semantic_text = content["value"]["value"]["text"]
     elif content and content["kind"] == "procedure":
         semantic_text = content["value"]["draft"]["summary"]
-    reading_record = item and (item["object_kind"] in WORK_DETAIL_KINDS
+    reading_record = item and (item["object_kind"] in NATIVE_DETAIL_KINDS
                                or item["object_kind"] in ("source_receipt", "source_observation"))
     template = "detail.html" if surface == "explorer" or reading_record else "observation_detail.html"
     selection = (

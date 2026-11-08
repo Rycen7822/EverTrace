@@ -339,16 +339,6 @@ impl ScenarioCoreState {
             .filter(move |value| value.core_membership_id == membership_id)
     }
 
-    /// Exact immutable contract facts; never materialize the reducer's complete row set for a read.
-    pub(super) fn contract_entry(
-        &self,
-        revision: RevisionId,
-    ) -> Option<(&GlobalSuccessorSupportContract, u64)> {
-        self.contracts
-            .get(&revision)
-            .map(|(value, seq)| (value, *seq))
-    }
-
     pub(super) fn membership_revision_entry(
         &self,
         id: RevisionId,
@@ -362,6 +352,17 @@ impl ScenarioCoreState {
         self.membership_revisions
             .values()
             .map(|(membership, _)| membership)
+    }
+
+    pub(super) fn contract_row(
+        &self,
+        revision_id: RevisionId,
+        generation: u64,
+    ) -> Result<Option<ObjectRow>, StoreError> {
+        self.contracts
+            .get(&revision_id)
+            .map(|(value, seq)| support_contract_row(revision_id, value, *seq, generation))
+            .transpose()
     }
 
     pub(super) fn validation(
@@ -612,17 +613,9 @@ impl ScenarioCoreState {
         revision_id: RevisionId,
         removed_contracts: &BTreeSet<RevisionId>,
     ) -> Option<&'static str> {
-        let reference = revision_id.to_string();
-        self.contracts
-            .values()
-            .filter(|(contract, _)| contract.successor_revision_or_membership_ref == reference)
-            .filter(|(contract, _)| {
-                !removed_contracts.contains(&contract.support_contract_revision_id)
-            })
-            .filter_map(|(contract, _)| {
-                self.current_validations
-                    .get(&contract.support_contract_revision_id)
-            })
+        self.successor_support_contract_refs(revision_id)
+            .filter(|contract| !removed_contracts.contains(contract))
+            .filter_map(|contract| self.current_validations.get(&contract))
             .map(|(validation, _)| support_state(validation.state))
             .max_by_key(|state| support_state_rank(state))
     }
@@ -649,10 +642,21 @@ impl ScenarioCoreState {
         states
     }
 
-    fn atom_support_validations(
+    pub(super) fn successor_support_contract_refs(
         &self,
         revision_id: RevisionId,
-    ) -> Vec<&GlobalSupportValidationEvent> {
+    ) -> impl Iterator<Item = RevisionId> + '_ {
+        let reference = revision_id.to_string();
+        self.contracts.values().filter_map(move |(contract, _)| {
+            (contract.successor_revision_or_membership_ref == reference)
+                .then_some(contract.support_contract_revision_id)
+        })
+    }
+
+    pub(super) fn atom_support_contract_refs(
+        &self,
+        revision_id: RevisionId,
+    ) -> BTreeSet<RevisionId> {
         let mut contracts = self
             .memberships
             .values()
@@ -661,11 +665,15 @@ impl ScenarioCoreState {
             })
             .map(|(membership, _)| membership.support_contract_ref)
             .collect::<BTreeSet<_>>();
-        contracts.extend(self.contracts.values().filter_map(|(contract, _)| {
-            (contract.successor_revision_or_membership_ref == revision_id.to_string())
-                .then_some(contract.support_contract_revision_id)
-        }));
+        contracts.extend(self.successor_support_contract_refs(revision_id));
         contracts
+    }
+
+    fn atom_support_validations(
+        &self,
+        revision_id: RevisionId,
+    ) -> Vec<&GlobalSupportValidationEvent> {
+        self.atom_support_contract_refs(revision_id)
             .into_iter()
             .filter_map(|contract| {
                 self.current_validations
@@ -1049,20 +1057,7 @@ impl ScenarioCoreState {
             rows.push(self.membership_row(*revision, generation)?);
         }
         for (revision, (value, seq)) in &self.contracts {
-            rows.push(object_row(
-                format!("object:atom:global_support_contract:{revision}"),
-                ObjectFamily::Atom,
-                "global_support_contract",
-                revision.to_string(),
-                revision.to_string(),
-                "immutable",
-                None,
-                None,
-                None,
-                &JournalPayload::GlobalSupportContractRecorded(Box::new(value.clone())),
-                *seq,
-                generation,
-            )?);
+            rows.push(support_contract_row(*revision, value, *seq, generation)?);
         }
         for revision in self.validations.keys() {
             rows.push(self.validation_row(*revision, generation)?);
@@ -1274,6 +1269,28 @@ fn conflicted_revisions(atoms: &BTreeMap<RevisionId, (Atom, u64)>) -> BTreeSet<R
         }
     }
     values
+}
+
+fn support_contract_row(
+    revision: RevisionId,
+    value: &GlobalSuccessorSupportContract,
+    seq: u64,
+    generation: u64,
+) -> Result<ObjectRow, StoreError> {
+    object_row(
+        format!("object:atom:global_support_contract:{revision}"),
+        ObjectFamily::Atom,
+        "global_support_contract",
+        revision.to_string(),
+        revision.to_string(),
+        "immutable",
+        None,
+        None,
+        None,
+        &JournalPayload::GlobalSupportContractRecorded(Box::new(value.clone())),
+        seq,
+        generation,
+    )
 }
 
 #[allow(clippy::too_many_arguments)]
