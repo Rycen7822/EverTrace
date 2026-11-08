@@ -12,13 +12,14 @@ pub(super) async fn check_source_access(
     rows: &[&ObjectRow],
     deadline: Instant,
 ) -> Result<(), ErrorCode> {
+    let authority = crate::repository::RepositoryReadAuthority::retained(report);
     for chunk in rows.chunks(usize::from(evertrace_domain::query::METADATA_READ_LIMIT)) {
         if Instant::now() >= deadline {
             return Err(ErrorCode::ResourceExhausted);
         }
         if !crate::session_import::source_rows_read_assessment(
             writer,
-            report,
+            &authority,
             all_rows,
             chunk,
             None,
@@ -37,7 +38,7 @@ pub(super) async fn check_source_access(
     if !crate::repository::repository_read_assessment(
         writer,
         scopes.values().flatten().copied().collect(),
-        report,
+        &authority,
         deadline,
     )
     .await
@@ -1584,12 +1585,13 @@ impl EngineService {
         let mut page = context.page;
         if page.state == S::Ready {
             let host = report.read().await.clone();
+            let authority = crate::repository::RepositoryReadAuthority::retained(host.as_ref());
             let sources = [(query.source().to_owned(), query.source().to_owned())]
                 .into_iter()
                 .collect();
             let source = crate::session_import::source_instance_read_assessment(
                 writer,
-                host.as_ref(),
+                &authority,
                 sources,
                 Some(deadline),
             )
@@ -1603,7 +1605,7 @@ impl EngineService {
             let repositories = crate::repository::repository_read_assessment(
                 writer,
                 scopes.values().flatten().copied().collect(),
-                host.as_ref(),
+                &authority,
                 deadline,
             )
             .await?;

@@ -435,7 +435,7 @@ pub(crate) fn read_report_path_trust_before(
     read_repository_trust_at(adapter_root, repository_path, deadline)
 }
 
-fn read_repository_trust_at(
+pub(super) fn read_repository_trust_at(
     adapter_root: &Path,
     repository_path: Option<&str>,
     deadline: Instant,

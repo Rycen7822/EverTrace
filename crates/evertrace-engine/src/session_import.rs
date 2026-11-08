@@ -2546,11 +2546,16 @@ pub(crate) fn source_read_allowed(
     context: &evertrace_store::SessionImportContext,
     deadline: Instant,
 ) -> bool {
-    source_read_decision(report, context, deadline).0
+    source_read_decision(
+        &crate::repository::RepositoryReadAuthority::observed(Some(report)),
+        context,
+        deadline,
+    )
+    .0
 }
 
 fn source_read_decision(
-    report: &HostProbeReport,
+    authority: &crate::repository::RepositoryReadAuthority<'_>,
     context: &evertrace_store::SessionImportContext,
     deadline: Instant,
 ) -> (bool, Vec<evertrace_domain::repository::RepositoryInstance>) {
@@ -2591,9 +2596,7 @@ fn source_read_decision(
             location.as_ref(),
             context.read_worktrees.iter(),
         );
-        let trust =
-            crate::repository::read_report_path_trust_before(report, Some(trust_path), deadline)
-                .state;
+        let trust = authority.trust(Some(trust_path), deadline).state;
         if trust == RepositoryTrustState::Untrusted
             && !context.repository_purged
             && !repository
@@ -2759,7 +2762,7 @@ pub(crate) async fn preflight_import_context(
     let context = located_context.as_ref().unwrap_or(context);
     let current = &context.current;
     let (_, revoked) = source_read_decision(
-        report,
+        &crate::repository::RepositoryReadAuthority::observed(Some(report)),
         context,
         Instant::now() + allowance.saturating_sub(preparation_time),
     );
@@ -3147,11 +3150,16 @@ pub(crate) async fn blocked_source_rows(
     if rows.len() > 64 {
         return Err(SessionImportServiceError::Unavailable);
     }
-    Ok(
-        source_rows_read_assessment(writer, report, &snapshot.rows, rows, None, None)
-            .await?
-            .0,
+    Ok(source_rows_read_assessment(
+        writer,
+        &crate::repository::RepositoryReadAuthority::observed(report),
+        &snapshot.rows,
+        rows,
+        None,
+        None,
     )
+    .await?
+    .0)
 }
 
 /// Typed background admission for a bounded source observation cohort. Search
@@ -3194,8 +3202,15 @@ pub(crate) async fn blocked_source_rows_from_rows_before(
     lookup: Option<&BTreeMap<&str, &evertrace_store::ObjectRow>>,
     deadline: Option<Instant>,
 ) -> Result<std::collections::BTreeSet<String>, SessionImportServiceError> {
-    let (blocked, revoked) =
-        source_rows_read_assessment(writer, report, all_rows, rows, lookup, deadline).await?;
+    let (blocked, revoked) = source_rows_read_assessment(
+        writer,
+        &crate::repository::RepositoryReadAuthority::observed(report),
+        all_rows,
+        rows,
+        lookup,
+        deadline,
+    )
+    .await?;
     crate::repository::record_trust_revocations(writer, revoked, config_hash)
         .await
         .map_err(map_writer)?;
@@ -3204,7 +3219,7 @@ pub(crate) async fn blocked_source_rows_from_rows_before(
 
 pub(crate) async fn source_rows_read_assessment(
     writer: &WriterHandle,
-    report: Option<&HostProbeReport>,
+    authority: &crate::repository::RepositoryReadAuthority<'_>,
     all_rows: &[evertrace_store::ObjectRow],
     rows: &[&evertrace_store::ObjectRow],
     lookup: Option<&BTreeMap<&str, &evertrace_store::ObjectRow>>,
@@ -3316,7 +3331,7 @@ pub(crate) async fn source_rows_read_assessment(
         return Err(SessionImportServiceError::Corrupt);
     }
     let (denied, revoked) =
-        source_instance_read_assessment(writer, report, sources, deadline).await?;
+        source_instance_read_assessment(writer, authority, sources, deadline).await?;
     blocked.extend(denied);
     Ok((blocked, revoked))
 }
@@ -3328,8 +3343,13 @@ pub(crate) async fn blocked_source_instances(
     config_hash: [u8; 32],
     deadline: Option<Instant>,
 ) -> Result<std::collections::BTreeSet<String>, SessionImportServiceError> {
-    let (blocked, revoked) =
-        source_instance_read_assessment(writer, report, sources, deadline).await?;
+    let (blocked, revoked) = source_instance_read_assessment(
+        writer,
+        &crate::repository::RepositoryReadAuthority::observed(report),
+        sources,
+        deadline,
+    )
+    .await?;
     crate::repository::record_trust_revocations(writer, revoked, config_hash)
         .await
         .map_err(map_writer)?;
@@ -3338,7 +3358,7 @@ pub(crate) async fn blocked_source_instances(
 
 pub(crate) async fn source_instance_read_assessment(
     writer: &WriterHandle,
-    report: Option<&HostProbeReport>,
+    authority: &crate::repository::RepositoryReadAuthority<'_>,
     sources: BTreeMap<String, String>,
     deadline: Option<Instant>,
 ) -> Result<
@@ -3373,14 +3393,13 @@ pub(crate) async fn source_instance_read_assessment(
     let permissions = contexts
         .into_iter()
         .map(|(source, context)| {
-            let allowed = context
-                .as_ref()
-                .zip(report)
-                .is_some_and(|(context, report)| {
+            let allowed = authority.available()
+                && context.as_ref().is_some_and(|context| {
                     if context.current.source_instance() != source {
                         return false;
                     }
-                    let (allowed, observations) = source_read_decision(report, context, deadline);
+                    let (allowed, observations) =
+                        source_read_decision(authority, context, deadline);
                     revoked.extend(observations);
                     allowed
                 });

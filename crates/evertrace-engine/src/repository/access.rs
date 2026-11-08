@@ -9,6 +9,71 @@ use evertrace_domain::{
 };
 use evertrace_store::{JournalCommand, JournalEventDraft, JournalPayload};
 
+/// Request-local authority for trust assessment, never a Host capability report.
+/// Retained human reads may use the daemon's native user configuration without
+/// observing a Host/session. Ingest/execution callers retain report-only gating.
+pub(crate) enum RepositoryReadAuthority<'a> {
+    Observed(&'a evertrace_codex::HostProbeReport),
+    CurrentConfig(std::path::PathBuf),
+    Unavailable,
+}
+
+impl<'a> RepositoryReadAuthority<'a> {
+    pub(crate) fn observed(report: Option<&'a evertrace_codex::HostProbeReport>) -> Self {
+        report.map_or(Self::Unavailable, Self::Observed)
+    }
+
+    pub(crate) fn retained(report: Option<&'a evertrace_codex::HostProbeReport>) -> Self {
+        if let Some(report) = report {
+            return Self::Observed(report);
+        }
+        let root = std::env::var_os("CODEX_HOME")
+            .map(std::path::PathBuf::from)
+            .or_else(|| {
+                std::env::var_os("HOME").map(|home| std::path::PathBuf::from(home).join(".codex"))
+            });
+        match root {
+            Some(root)
+                if root
+                    .to_str()
+                    .is_some_and(evertrace_codex::binding::valid_lexical_absolute_path) =>
+            {
+                Self::CurrentConfig(root)
+            }
+            _ => Self::Unavailable,
+        }
+    }
+
+    pub(crate) fn available(&self) -> bool {
+        !matches!(self, Self::Unavailable)
+    }
+
+    fn report(&self) -> Option<&evertrace_codex::HostProbeReport> {
+        match self {
+            Self::Observed(report) => Some(report),
+            _ => None,
+        }
+    }
+
+    pub(crate) fn trust(
+        &self,
+        path: Option<&str>,
+        deadline: Instant,
+    ) -> evertrace_codex::policy::RepositoryTrustResult {
+        match self {
+            Self::Observed(report) => super::read_report_path_trust_before(report, path, deadline),
+            Self::CurrentConfig(root) => {
+                super::session_catalog::read_repository_trust_at(root, path, deadline)
+            }
+            Self::Unavailable => evertrace_codex::policy::RepositoryTrustResult {
+                state: evertrace_codex::policy::RepositoryTrustState::Unknown,
+                canonical_repository_path: None,
+                evidence_refs: Vec::new(),
+            },
+        }
+    }
+}
+
 /// Inventory freshness is deliberately absent: pending asset discovery must
 /// not invalidate independently authorized source-only L0 or archived CAS.
 pub(crate) fn repository_read_gate(repository: &RepositoryInstance, purged: bool) -> bool {
@@ -208,7 +273,13 @@ pub(crate) async fn blocked_repositories_before(
     config_hash: [u8; 32],
     deadline: Instant,
 ) -> Result<BTreeSet<RepositoryId>, crate::WriterActorError> {
-    let (blocked, revoked) = repository_read_assessment(writer, ids, report, deadline).await?;
+    let (blocked, revoked) = repository_read_assessment(
+        writer,
+        ids,
+        &RepositoryReadAuthority::observed(report),
+        deadline,
+    )
+    .await?;
     record_trust_revocations(writer, revoked, config_hash).await?;
     Ok(blocked)
 }
@@ -216,14 +287,15 @@ pub(crate) async fn blocked_repositories_before(
 pub(crate) async fn repository_read_assessment(
     writer: &crate::WriterHandle,
     ids: BTreeSet<RepositoryId>,
-    report: Option<&evertrace_codex::probe::HostProbeReport>,
+    authority: &RepositoryReadAuthority<'_>,
     deadline: Instant,
 ) -> Result<(BTreeSet<RepositoryId>, Vec<RepositoryInstance>), crate::WriterActorError> {
     if ids.is_empty() {
         return Ok((BTreeSet::new(), Vec::new()));
     }
     let context = writer.repository_read_context(ids.clone()).await?;
-    let observed_location = report
+    let observed_location = authority
+        .report()
         .and_then(|report| report.inventory_host())
         .and_then(|host| {
             super::workspace_git_location(&host.cwd, deadline)
@@ -244,16 +316,14 @@ pub(crate) async fn repository_read_assessment(
             })
             .and_then(|location| location.worktree_path.to_str())
             .unwrap_or(&repository.current_path);
-        let trust = report.map(|report| {
-            super::read_report_path_trust_before(report, Some(locator), deadline).state
-        });
+        let trust = authority.trust(Some(locator), deadline).state;
         if !repository_read_gate(repository, context.purged.contains(&id))
-            || trust != Some(evertrace_codex::policy::RepositoryTrustState::Trusted)
+            || trust != evertrace_codex::policy::RepositoryTrustState::Trusted
         {
             blocked.insert(id);
         }
         if !context.purged.contains(&id)
-            && trust == Some(evertrace_codex::policy::RepositoryTrustState::Untrusted)
+            && trust == evertrace_codex::policy::RepositoryTrustState::Untrusted
             && !repository
                 .capability_state
                 .as_ref()
@@ -407,7 +477,7 @@ async fn inventory_read_assessment_gate(
     let (blocked, revoked) = repository_read_assessment(
         writer,
         [context.repository_id].into_iter().collect(),
-        Some(&report),
+        &RepositoryReadAuthority::observed(Some(&report)),
         deadline,
     )
     .await?;

@@ -791,7 +791,7 @@ impl HumanGovernanceService {
         let (repositories, _) = crate::repository::repository_read_assessment(
             &self.writer,
             ids,
-            report.as_ref(),
+            &crate::repository::RepositoryReadAuthority::observed(report.as_ref()),
             std::time::Instant::now() + crate::repository::SESSION_ROOT_PROBE_BUDGET,
         )
         .await
