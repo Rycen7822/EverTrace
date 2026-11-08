@@ -44,7 +44,11 @@ const CHILD_TIMEOUT: Duration = Duration::from_secs(2);
 // Covers the validated 120s Recovery ceiling plus bounded child setup/cleanup.
 const LAUNCHER_CHILD_TIMEOUT: Duration = Duration::from_secs(122);
 const RECOVERY_CLEANUP_RESERVE: Duration = Duration::from_millis(25);
-const RECALL_CUE_CONTEXT: &[u8] = b"{\"hookSpecificOutput\":{\"hookEventName\":\"PreToolUse\",\"additionalContext\":\"EverTrace recall is due. Call evertrace with action=search and input=@due before continuing.\"}}";
+const RECALL_CUE_CONTEXT: &[u8] = concat!(
+    "{\"hookSpecificOutput\":{\"hookEventName\":\"PreToolUse\",\"additionalContext\":",
+    "\"EverTrace recall is due. Call evertrace with action=search and input=@due before continuing.\"}}"
+)
+.as_bytes();
 
 fn main() {
     let _ = run();
@@ -60,11 +64,23 @@ fn run() -> Result<(), ()> {
     }
     let bytes = read_input()?;
     match mode.to_str() {
-        Some("--runtime-snapshot") => capture(
-            Path::new(&path),
-            CaptureHookInput::from_json(&bytes).map_err(|_| ())?,
-            started,
-        ),
+        Some("--runtime-snapshot") => {
+            let path = Path::new(&path);
+            if let Some(record) =
+                evertrace_capture::process_source::record(&bytes, path).map_err(|_| ())?
+            {
+                let snapshot = RuntimeSnapshot::load(path).map_err(|_| ())?;
+                let mut runtime = CaptureRuntime::open_for_admission(snapshot).map_err(|_| ())?;
+                runtime.capture(record).map_err(|_| ())?;
+                Ok(())
+            } else {
+                capture(
+                    path,
+                    CaptureHookInput::from_json(&bytes).map_err(|_| ())?,
+                    started,
+                )
+            }
+        }
         Some("--binding-runtime-snapshot") => binding_rewrite(Path::new(&path), &bytes),
         Some("--launcher-root") => launch(Path::new(&path), &bytes, started),
         _ => Err(()),
@@ -703,7 +719,10 @@ mod budget_proof {
         let output = std::str::from_utf8(RECALL_CUE_CONTEXT).unwrap();
         assert_eq!(
             output,
-            "{\"hookSpecificOutput\":{\"hookEventName\":\"PreToolUse\",\"additionalContext\":\"EverTrace recall is due. Call evertrace with action=search and input=@due before continuing.\"}}"
+            concat!(
+                "{\"hookSpecificOutput\":{\"hookEventName\":\"PreToolUse\",\"additionalContext\":",
+                "\"EverTrace recall is due. Call evertrace with action=search and input=@due before continuing.\"}}"
+            )
         );
         assert!(!output.contains("recall_need"));
         assert!(recall_cue_enabled(

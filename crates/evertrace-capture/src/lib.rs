@@ -8,6 +8,7 @@ pub mod cas;
 pub mod confined_read;
 pub mod frame;
 pub mod key;
+pub mod process_source;
 pub mod protect;
 pub mod runtime_snapshot;
 pub mod spool;
