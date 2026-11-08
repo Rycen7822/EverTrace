@@ -52,8 +52,8 @@ fn detector_distinguishes_exact_redacted_and_non_utf8_inputs() {
     let protected = protect(non_utf8, &key).unwrap();
     assert_eq!(protected.archive_mode(), ArchiveMode::Redacted);
     assert!(!contains(protected.protected_bytes(), b"abcdefgh"));
-    assert_eq!(protected.detector_revision(), 1);
-    assert_eq!(protected.redaction_revision(), 1);
+    assert_eq!(protected.detector_revision(), 2);
+    assert_eq!(protected.redaction_revision(), 2);
 }
 
 #[test]

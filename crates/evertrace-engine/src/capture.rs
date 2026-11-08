@@ -133,8 +133,10 @@ pub(crate) fn verify_capture_frame_presented(
     if u64::try_from(protected.len()).map_err(|_| IngestError::InvalidRecord)?
         != body.protected_length
         || CasDigest::for_protected_bytes(&protected) != cas_digest
-        || body.detector_revision != evertrace_capture::protect::DETECTOR_REVISION
-        || body.redaction_revision != evertrace_capture::protect::REDACTION_REVISION
+        || !evertrace_capture::protect::supports_revisions(
+            body.detector_revision,
+            body.redaction_revision,
+        )
         || (body.archive_mode == SourceArchiveMode::Redacted
             && protected
                 .windows(b"[REDACTED]".len())

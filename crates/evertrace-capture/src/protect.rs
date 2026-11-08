@@ -1,4 +1,4 @@
-use std::fmt;
+use std::{borrow::Cow, fmt};
 
 use evertrace_domain::canonical::{CanonicalValue, encode, hmac_sha256};
 use hmac::{Hmac, Mac};
@@ -8,9 +8,24 @@ use thiserror::Error;
 
 use crate::key::DeviceKey;
 
-pub const DETECTOR_REVISION: u32 = 1;
-pub const REDACTION_REVISION: u32 = 1;
+pub const DETECTOR_REVISION: u32 = 2;
+pub const REDACTION_REVISION: u32 = 2;
 pub const REDACTION_TOKEN: &[u8] = b"[REDACTED]";
+
+/// v1 is retained for immutable captured frames; mixed or unknown formats are not admitted.
+pub fn supports_revisions(detector: u32, redaction: u32) -> bool {
+    matches!((detector, redaction), (1, 1) | (2, 2))
+}
+
+const ASSIGNMENTS: &[(&[u8], SecretKind)] = &[
+    (b"api_key", SecretKind::ApiKey),
+    (b"apikey", SecretKind::ApiKey),
+    (b"access_token", SecretKind::Token),
+    (b"token", SecretKind::Token),
+    (b"password", SecretKind::Credential),
+    (b"credential", SecretKind::Credential),
+    (b"secret_key", SecretKind::Credential),
+];
 
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "snake_case")]
@@ -152,7 +167,13 @@ pub enum ProtectError {
 
 pub fn protect(input: &[u8], key: &DeviceKey) -> Result<ProtectedPayload, ProtectError> {
     let raw_length = u64::try_from(input.len()).map_err(|_| ProtectError::LengthOverflow)?;
-    let spans = resolve_overlaps(detect_candidates(input))
+    let candidates = resolve_overlaps(detect_candidates(input));
+    let protected_bytes = if candidates.is_empty() {
+        input.to_vec()
+    } else {
+        redact(input, &candidates)
+    };
+    let spans = candidates
         .into_iter()
         .map(|candidate| RedactionSpan {
             start: candidate.start as u64,
@@ -160,11 +181,6 @@ pub fn protect(input: &[u8], key: &DeviceKey) -> Result<ProtectedPayload, Protec
             kind: candidate.kind,
         })
         .collect::<Vec<_>>();
-    let protected_bytes = if spans.is_empty() {
-        input.to_vec()
-    } else {
-        redact(input, &spans)
-    };
     let protected_secret_digest = if spans.is_empty() {
         None
     } else {
@@ -308,24 +324,166 @@ struct Candidate {
     start: usize,
     end: usize,
     kind: SecretKind,
+    json_value: bool,
 }
 
 fn detect_candidates(input: &[u8]) -> Vec<Candidate> {
+    detect_json_candidates(input).unwrap_or_else(|| detect_text_candidates(input))
+}
+
+fn detect_text_candidates(input: &[u8]) -> Vec<Candidate> {
     let mut output = Vec::new();
     detect_pem(input, &mut output);
     detect_bearer(input, &mut output);
-    for (name, kind) in [
-        (b"api_key".as_slice(), SecretKind::ApiKey),
-        (b"apikey".as_slice(), SecretKind::ApiKey),
-        (b"access_token".as_slice(), SecretKind::Token),
-        (b"token".as_slice(), SecretKind::Token),
-        (b"password".as_slice(), SecretKind::Credential),
-        (b"credential".as_slice(), SecretKind::Credential),
-        (b"secret_key".as_slice(), SecretKind::Credential),
-    ] {
+    for &(name, kind) in ASSIGNMENTS {
         detect_assignment(input, name, kind, &mut output);
     }
     output
+}
+
+/// Validate without an object graph, then inspect one decoded string at a time.
+/// Every candidate remains a byte range in the original input, not reserialized JSON.
+fn detect_json_candidates(input: &[u8]) -> Option<Vec<Candidate>> {
+    if !matches!(
+        input
+            .iter()
+            .copied()
+            .find(|byte| !byte.is_ascii_whitespace()),
+        Some(b'{' | b'[' | b'"')
+    ) {
+        return None;
+    }
+    let mut deserializer = serde_json::Deserializer::from_slice(input);
+    serde::de::IgnoredAny::deserialize(&mut deserializer).ok()?;
+    deserializer.end().ok()?;
+    let (mut cursor, mut output) = (0, Vec::new());
+    while cursor < input.len() {
+        if input[cursor] != b'"' {
+            cursor += 1;
+            continue;
+        }
+        let end = json_string_end(input, cursor)?;
+        let raw = &input[cursor + 1..end - 1];
+        let decoded = if raw.contains(&b'\\') {
+            Cow::Owned(serde_json::from_slice::<String>(&input[cursor..end]).ok()?)
+        } else {
+            Cow::Borrowed(std::str::from_utf8(raw).ok()?)
+        };
+        let mut following = end;
+        while input.get(following).is_some_and(u8::is_ascii_whitespace) {
+            following += 1;
+        }
+        if input.get(following) == Some(&b':')
+            && let Some(kind) = json_secret_kind(&decoded)
+        {
+            let start = following + 1;
+            let start = start
+                + input[start..]
+                    .iter()
+                    .take_while(|byte| byte.is_ascii_whitespace())
+                    .count();
+            let mut value = serde_json::Deserializer::from_slice(&input[start..])
+                .into_iter::<serde::de::IgnoredAny>();
+            value.next()?.ok()?;
+            let value_end = start + value.byte_offset();
+            if json_secret_value(kind, &input[start..value_end]) {
+                output.push(Candidate {
+                    start,
+                    end: value_end,
+                    kind,
+                    json_value: true,
+                });
+                cursor = value_end;
+                continue;
+            }
+        }
+        let mut candidates = resolve_overlaps(detect_text_candidates(decoded.as_bytes()));
+        map_json_offsets(raw, &mut candidates, cursor + 1)?;
+        output.extend(candidates);
+        cursor = end;
+    }
+    Some(output)
+}
+
+fn json_secret_kind(name: &str) -> Option<SecretKind> {
+    if name.eq_ignore_ascii_case("authorization") {
+        return Some(SecretKind::AuthorizationBearer);
+    }
+    ASSIGNMENTS
+        .iter()
+        .find_map(|(key, kind)| name.as_bytes().eq_ignore_ascii_case(key).then_some(*kind))
+}
+
+fn json_secret_value(kind: SecretKind, value: &[u8]) -> bool {
+    let decoded = if value.first() == Some(&b'"') {
+        let Ok(text) = serde_json::from_slice::<String>(value) else {
+            return false;
+        };
+        Cow::Owned(text)
+    } else {
+        let Ok(text) = std::str::from_utf8(value) else {
+            return false;
+        };
+        Cow::Borrowed(text)
+    };
+    let header = decoded.trim_ascii_start();
+    decoded.len() >= 8
+        && (kind != SecretKind::AuthorizationBearer
+            || header
+                .get(..6)
+                .is_some_and(|prefix| prefix.eq_ignore_ascii_case("bearer"))
+                && header
+                    .as_bytes()
+                    .get(6)
+                    .is_some_and(u8::is_ascii_whitespace)
+                && header[6..].trim_ascii().len() >= 8)
+}
+
+fn json_string_end(input: &[u8], start: usize) -> Option<usize> {
+    let mut cursor = start + 1;
+    while let Some(byte) = input.get(cursor) {
+        match byte {
+            b'"' => return Some(cursor + 1),
+            b'\\' => cursor += 2,
+            _ => cursor += 1,
+        }
+    }
+    None
+}
+
+/// Map sorted, disjoint decoded ranges in one pass, including UTF-16 surrogate pairs.
+fn map_json_offsets(raw: &[u8], candidates: &mut [Candidate], offset: usize) -> Option<()> {
+    let (mut cursor, mut decoded) = (0, 0);
+    for candidate in candidates {
+        for boundary in [&mut candidate.start, &mut candidate.end] {
+            while decoded < *boundary {
+                let byte = *raw.get(cursor)?;
+                let (width, decoded_width) = if byte == b'\\' {
+                    if raw.get(cursor + 1) == Some(&b'u') {
+                        let digits = std::str::from_utf8(raw.get(cursor + 2..cursor + 6)?).ok()?;
+                        let unit = u16::from_str_radix(digits, 16).ok()?;
+                        if (0xd800..=0xdbff).contains(&unit) {
+                            (12, 4)
+                        } else {
+                            (6, char::from_u32(u32::from(unit))?.len_utf8())
+                        }
+                    } else {
+                        (2, 1)
+                    }
+                } else {
+                    let width = byte.leading_ones().max(1) as usize;
+                    (width, width)
+                };
+                cursor += width;
+                decoded += decoded_width;
+            }
+            if decoded != *boundary || cursor > raw.len() {
+                return None;
+            }
+            *boundary = offset + cursor;
+        }
+    }
+    Some(())
 }
 
 fn detect_assignment(input: &[u8], name: &[u8], kind: SecretKind, output: &mut Vec<Candidate>) {
@@ -339,6 +497,14 @@ fn detect_assignment(input: &[u8], name: &[u8], kind: SecretKind, output: &mut V
             continue;
         }
         let mut value = cursor;
+        if input
+            .get(value)
+            .is_some_and(|byte| matches!(byte, b'\'' | b'"'))
+            && start > 0
+            && input[start - 1] == input[value]
+        {
+            value += 1;
+        }
         while value < input.len() && matches!(input[value], b' ' | b'\t') {
             value += 1;
         }
@@ -364,13 +530,18 @@ fn detect_assignment(input: &[u8], name: &[u8], kind: SecretKind, output: &mut V
                 !matches!(input[end], b' ' | b'\t' | b'\r' | b'\n' | b',' | b';')
             }
         {
-            end += 1;
+            if quote == Some(b'"') && input[end] == b'\\' && end + 1 < input.len() {
+                end += 2;
+            } else {
+                end += 1;
+            }
         }
         if end.saturating_sub(value) >= 8 {
             output.push(Candidate {
                 start: value,
                 end,
                 kind,
+                json_value: false,
             });
         }
     }
@@ -386,6 +557,14 @@ fn detect_bearer(input: &[u8], output: &mut Vec<Candidate>) {
             continue;
         }
         let mut position = cursor;
+        if input
+            .get(position)
+            .is_some_and(|byte| matches!(byte, b'\'' | b'"'))
+            && start > 0
+            && input[start - 1] == input[position]
+        {
+            position += 1;
+        }
         while position < input.len() && matches!(input[position], b' ' | b'\t') {
             position += 1;
         }
@@ -394,6 +573,13 @@ fn detect_bearer(input: &[u8], output: &mut Vec<Candidate>) {
         }
         position += 1;
         while position < input.len() && matches!(input[position], b' ' | b'\t') {
+            position += 1;
+        }
+        let quote = input
+            .get(position)
+            .copied()
+            .filter(|byte| matches!(byte, b'\'' | b'"'));
+        if quote.is_some() {
             position += 1;
         }
         let bearer = b"bearer";
@@ -410,7 +596,10 @@ fn detect_bearer(input: &[u8], output: &mut Vec<Candidate>) {
             position += 1;
         }
         let mut end = position;
-        while end < input.len() && !input[end].is_ascii_whitespace() {
+        while end < input.len()
+            && !input[end].is_ascii_whitespace()
+            && quote.is_none_or(|quote| input[end] != quote)
+        {
             end += 1;
         }
         if end.saturating_sub(position) >= 8 {
@@ -418,6 +607,7 @@ fn detect_bearer(input: &[u8], output: &mut Vec<Candidate>) {
                 start: position,
                 end,
                 kind: SecretKind::AuthorizationBearer,
+                json_value: false,
             });
         }
     }
@@ -446,6 +636,7 @@ fn detect_pem(input: &[u8], output: &mut Vec<Candidate>) {
                 start,
                 end,
                 kind: SecretKind::PemPrivateKey,
+                json_value: false,
             });
             cursor = end;
         }
@@ -474,15 +665,19 @@ fn resolve_overlaps(mut candidates: Vec<Candidate>) -> Vec<Candidate> {
     selected
 }
 
-fn redact(input: &[u8], spans: &[RedactionSpan]) -> Vec<u8> {
+fn redact(input: &[u8], candidates: &[Candidate]) -> Vec<u8> {
     let mut output = Vec::with_capacity(input.len());
     let mut cursor = 0;
-    for span in spans {
-        let start = span.start as usize;
-        let end = span.end as usize;
-        output.extend_from_slice(&input[cursor..start]);
+    for candidate in candidates {
+        output.extend_from_slice(&input[cursor..candidate.start]);
+        if candidate.json_value {
+            output.push(b'"');
+        }
         output.extend_from_slice(REDACTION_TOKEN);
-        cursor = end;
+        if candidate.json_value {
+            output.push(b'"');
+        }
+        cursor = candidate.end;
     }
     output.extend_from_slice(&input[cursor..]);
     output
