@@ -45,6 +45,8 @@
 <p class="memory-prose">假设：{{ value.strategy_contract.hypothesis }}</p>
 <p class="memory-prose">干预：{{ value.strategy_contract.intervention }}</p>
 <p>干预族：{{ value.strategy_contract.intervention_family }}</p>
+<p>搜索策略引用：{{ value.strategy_contract.search_policy_ref or '未记录' }}</p>
+<p>目标引用：{{ value.strategy_contract.objective_ref or '未记录' }}</p>
 <p class="memory-prose">预期效果：{{ value.strategy_contract.expected_effect }}</p>
 <p>验收引用：{{ value.strategy_contract.acceptance_boundary_ref }}</p>
 {{ text_list('策略对象', value.strategy_contract.target_refs) }}
