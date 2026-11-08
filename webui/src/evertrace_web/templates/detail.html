@@ -8,14 +8,16 @@
 {% from 'source_time.html' import source_time %}
 {% set source_context = item.get('source_context') %}
 {% set research = item.object_kind in ('experiment_run', 'result_evidence') %}
+{% set projection = item.object_kind == 'procedure_context_effect' %}
 <div class="detail-title">
-  {% if not research %}<div class="badges">
+  {% if not research and not projection %}<div class="badges">
     {% for label, field in [
       ('真值', 'epistemic'), ('权威', 'authority'), ('生命周期', 'lifecycle'),
       ('发布', 'publication_state'), ('支持', 'support_state')
     ] if item[field] %}<span class="badge">{{ label }}：{{ item[field] }}</span>{% endfor %}
   </div>{% endif %}
-  <p>{{ item.object_kind }} · {{ '当前快照，计划修订' if item.object_kind == 'recall_need' else '所选修订' }}：
+  <p>{{ item.object_kind }} · {{ '当前快照，计划修订' if item.object_kind == 'recall_need' else
+    '当前效果投影，Procedure 修订' if item.object_kind == 'procedure_context_effect' else '所选修订' }}：
     {{ item.revision_ref or item.object_ref }}</p>
   {% if item.object_kind in ('task', 'workstream') %}
   <p class="reading-note">当前固定读取此修订。上方真值和生命周期来自这份记录，不表示它是该工作的最新版本。</p>
@@ -91,7 +93,8 @@
   'semantic_digest', 'source_receipt', 'source_observation', 'work_episode',
   'attempt', 'operation_burst', 'operation', 'task', 'workstream', 'host_occurrence', 'scope_effect',
   'worktree', 'worktree_snapshot', 'recovery_capture_request', 'recovery_bundle', 'work_artifact',
-  'experiment_run', 'result_evidence'
+  'experiment_run', 'result_evidence', 'procedure_usage_revision', 'procedure_negative_evidence',
+  'procedure_negative_review', 'procedure_context_effect'
 ) %}<button class="button" type="button" data-sources-open>查看来源与直接关联</button>{% endif %}
 {% if item.object_kind in ('atom_revision', 'procedure_revision', 'core_membership', 'revision_proposal_revision', 'semantic_digest') %}
 <button class="button" type="button" data-compare-base>设为比较左侧</button>

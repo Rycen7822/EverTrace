@@ -83,6 +83,28 @@ pub(super) fn restore(
     Ok(Some(value))
 }
 
+pub(super) fn read_references(value: &ProcedureContextEffectProjection) -> BTreeSet<String> {
+    let mut refs = BTreeSet::from([
+        value.procedure_revision_id.to_string(),
+        value.context.task_id.to_string(),
+    ]);
+    refs.extend(value.evidence_refs.iter().cloned());
+    match &value.context.anchor {
+        ProcedureContextAnchor::Repository {
+            worktree_id,
+            worktree_snapshot_id,
+            ..
+        } => {
+            refs.insert(worktree_id.to_string());
+            refs.insert(worktree_snapshot_id.to_string());
+        }
+        ProcedureContextAnchor::NonRepository { fixture_refs } => {
+            refs.extend(fixture_refs.iter().cloned())
+        }
+    }
+    refs
+}
+
 struct PairBasis<'a> {
     context: ProcedureEffectContext,
     usage: &'a evertrace_domain::procedure::ProcedureUsageRevision,

@@ -105,11 +105,12 @@ DETAIL_KINDS = {"atom_revision": "atom", "procedure_revision": "procedure", "cor
                 "recovery_capture_request": "recovery_capture_request", "recovery_bundle": "recovery_bundle",
                 "work_artifact": "work_artifact", "experiment_run": "experiment_run", "result_evidence": "result_evidence",
                 "recall_need": "recall_need", "procedure_usage_revision": "procedure_usage",
-                "procedure_negative_evidence": "procedure_negative", "procedure_negative_review": "procedure_negative_review"}
+                "procedure_negative_evidence": "procedure_negative", "procedure_negative_review": "procedure_negative_review",
+                "procedure_context_effect": "procedure_effect"}
 WORK_DETAIL_KINDS = {"task", "workstream", "work_episode", "attempt", "operation_burst", "operation",
                      "host_occurrence", "scope_effect", "worktree", "worktree_snapshot",
                      "recovery_capture_request", "recovery_bundle", "work_artifact", "experiment_run", "result_evidence", "recall_need",
-                     "procedure_usage_revision", "procedure_negative_evidence", "procedure_negative_review"}
+                     "procedure_usage_revision", "procedure_negative_evidence", "procedure_negative_review", "procedure_context_effect"}
 
 
 async def read_record_detail(backend, reference, frontier, revision, object_kind, *, data_identity=None):
@@ -122,7 +123,8 @@ async def read_record_detail(backend, reference, frontier, revision, object_kind
     meta = reply["page"]
     if meta["state"]["frontier"] < frontier:
         return {"kind": "conflict"}
-    if object_kind == "recall_need" and meta["content_state"] == "ready" and meta["info"] != {"kind":"current_recall"}:
+    marker = {"recall_need":"current_recall", "procedure_context_effect":"current_procedure_effect"}.get(object_kind)
+    if marker and meta["content_state"] == "ready" and meta["info"] != {"kind":marker}:
         raise BackendError("invalid_read_response")
     row = meta["metadata"]
     if row is None:
@@ -185,6 +187,8 @@ async def read_record_detail(backend, reference, frontier, revision, object_kind
         detail["content"].update({"ledger_event_seq": selection["source_event_seq"],
             "need_hash": bytes(record["recall_need_hash"]).hex(), "plan_fingerprint": bytes(record["recall_plan_fingerprint"]).hex(),
             "matched_contracts": [bytes(value).hex() for value in record["matched_contract_ids"]]})
+    if object_kind == "procedure_context_effect" and record is not None:
+        detail["content"]["context_hash"] = bytes(record["context_fingerprint_hash"]).hex()
     if object_kind == "work_artifact" and record is not None:
         detail["payload_source"] = final["info"]["source"]
     item = {**row, "stable_key": row["row_id"], "object_ref": row["object_id"], "revision_ref": revision,
@@ -322,6 +326,8 @@ async def read_record_content(backend, reference, frontier, revision, representa
     content = _unavailable(current, reference, revision, representation)["content"]
     if info["kind"] == "current_recall":
         content.update({"current_ledger": True, "ledger_event_seq": selection["source_event_seq"]})
+    if info["kind"] == "current_procedure_effect":
+        content.update({"current_effect":True, "projection_watermark":selection["source_event_seq"]})
     if representation == "text" and info["kind"] == "artifact":
         content["artifact_payload"] = True
         if info["source"] is not None:

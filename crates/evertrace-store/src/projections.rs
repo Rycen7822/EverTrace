@@ -141,7 +141,7 @@ pub(crate) fn procedure_context_effect(
     procedure_effect::restore(row)
 }
 
-const PROJECTION_GENERATION: u64 = 1;
+pub(crate) const PROJECTION_GENERATION: u64 = 1;
 // S10 fail-closed safety ceiling. Pagination/cursors belong to the later S23 owner.
 const MAX_S10_RECONCILIATION_DEPENDENCIES: usize = 64;
 
@@ -6775,21 +6775,35 @@ impl JournalAdmissionState {
             root.object_kind.as_deref(),
             Some("source_receipt" | "source_observation" | "capture_receipt")
         );
-        let payload: JournalPayload = serde_json::from_str(
-            root.payload_json
-                .as_deref()
-                .ok_or(StoreError::StoreCorrupt)?,
-        )
-        .map_err(|_| StoreError::StoreCorrupt)?;
-        let Some(mut pending) = self.stored_read_dependencies(
-            &root,
-            &payload,
-            cancelled,
-            deadline,
-            &mut context.source_suppressed,
-        )?
-        else {
-            return Ok(Outcome::TooLarge);
+        let mut effect_scope = None;
+        let mut pending = if let Some(value) = procedure_effect::restore(&root)? {
+            if let evertrace_domain::procedure::ProcedureContextAnchor::Repository {
+                repository_id,
+                worktree_id,
+                ..
+            } = &value.context.anchor
+            {
+                effect_scope = Some((*repository_id, *worktree_id));
+            }
+            procedure_effect::read_references(&value)
+        } else {
+            let payload: JournalPayload = serde_json::from_str(
+                root.payload_json
+                    .as_deref()
+                    .ok_or(StoreError::StoreCorrupt)?,
+            )
+            .map_err(|_| StoreError::StoreCorrupt)?;
+            let Some(refs) = self.stored_read_dependencies(
+                &root,
+                &payload,
+                cancelled,
+                deadline,
+                &mut context.source_suppressed,
+            )?
+            else {
+                return Ok(Outcome::TooLarge);
+            };
+            refs
         };
         let mut visited = BTreeSet::new();
         let mut rows = BTreeMap::from([(root_id.clone(), root)]);
@@ -6913,11 +6927,26 @@ impl JournalAdmissionState {
             &self.scope_purges,
             self.repository_closures.values(),
         )?;
+        // Keep the anchor's read gate even if its Worktree/Task dependencies were removed by scope purge.
+        // Apply transient scope only after canonical projection filtering/restore has finished.
+        if let Some((repository, worktree)) = effect_scope
+            && let Some(row) = context.rows.iter_mut().find(|row| row.row_id == root_id)
+        {
+            row.repository_id = Some(repository.to_string());
+            row.worktree_id = Some(worktree.to_string());
+        }
         context.selected = context
             .rows
             .iter()
             .find(|row| row.row_id == root_id)
             .cloned();
+        // Only the read selection uses the existing projection coordinate as its reference.
+        // Keep persisted/filter input rows canonical: a projection is not a new public object.
+        if let Some(row) = &mut context.selected
+            && row.object_kind.as_deref() == Some("procedure_context_effect")
+        {
+            row.object_id = Some(row.row_id.clone());
+        }
         Ok(Outcome::Page(Box::new(context)))
     }
 

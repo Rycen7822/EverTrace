@@ -1,0 +1,29 @@
+<h2>Context effect · 当前投影</h2>
+<p data-current-effect>这是可重建投影，不是不可变 usage，也不是当时的路由 trace；水位变化后旧读取选择失效。</p>
+<dl>
+  <dt>Procedure 修订</dt><dd>{{ value.procedure_revision_id }}</dd>
+  <dt>Context fingerprint</dt><dd>v{{ value.context_fingerprint_version }} · {{ content.context_hash }}</dd>
+  <dt>原 evidence class</dt><dd data-effect-class>{{ value.evidence_class }}</dd>
+  <dt>原 effect</dt><dd data-effect-value>{{ value.effect }}</dd>
+  <dt>有效 usage / paired repeats</dt><dd>{{ value.valid_usage_count }} / {{ value.valid_pair_count }}</dd>
+  <dt>原 threshold revision</dt><dd>{{ value.practical_threshold_revision }}</dd>
+  <dt>投影来源水位</dt><dd data-effect-watermark>{{ value.source_watermark }}</dd>
+</dl>
+{% if value.evidence_class == 'observational_association' %}
+<p>观测关联：自然使用只能说明相关性，不是 Procedure on/off 的因果比较。</p>
+{% else %}
+<p>受控比较：这里只显示原生已准入的比较事实，不与自然使用合并，也不从指标或文本补造 paired repeats。</p>
+{% endif %}
+<p>本页不运行效果路由；positive 不等于当前 APPLY 资格，insufficient/mixed 也不等于已证明无效。</p>
+<h3>投影所用 context · 不代表当前输入相容</h3>
+<dl>
+  <dt>Task / phase</dt><dd>{{ value.context.task_id }} / {{ value.context.phase_kind }}</dd>
+  <dt>Failure signature</dt><dd>{{ value.context.failure_signature or '未记录' }}</dd>
+  <dt>Toolchain</dt><dd>{{ value.context.toolchain }}</dd>
+  <dt>Model / harness / algorithm</dt>
+  <dd>{{ value.context.model_revision }} / {{ value.context.harness_revision }} / {{ value.context.algorithm_revision }}</dd>
+  <dt>Budget / acceptance boundary</dt><dd>{{ value.context.budget }} / {{ value.context.acceptance_boundary }}</dd>
+</dl>
+<details><summary>原 anchor 与 applicability operands</summary>
+<pre>{{ value.context.anchor|pretty }}</pre><pre>{{ value.context.operands|pretty }}</pre></details>
+<p>unknown 保持 unknown；本页不补猜环境，也不把其他 context 的旧成功转移到这里。</p>

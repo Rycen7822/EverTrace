@@ -1,4 +1,6 @@
-{% if content.kind == 'procedure_usage' %}
+{% if content.kind == 'procedure_effect' %}
+{% include 'procedure_effect.html' %}
+{% elif content.kind == 'procedure_usage' %}
 <h2>ProcedureUsage · 所选修订</h2>
 <dl>
   <dt>Usage / 修订</dt><dd>{{ value.procedure_usage_id }} / {{ value.usage_revision_id }}</dd>
@@ -49,20 +51,25 @@
 <p>这里只读所选复核事件，不把它冒成最新事件，也不发起采纳、驳回、恢复或确认有害。</p>
 {% endif %}
 {{ text_list('原证据引用', value.evidence_refs) }}
+{% if content.kind != 'procedure_effect' %}
 <details><summary>原 context</summary>
 <pre>{{ value.local_context|pretty if content.kind != 'procedure_negative_review' else '由负面事实关联读取' }}</pre></details>
+{% endif %}
 {% set now = content.get('procedure_now') %}
 {% if now %}
 <section class="semantic-section" data-procedure-now>
-  <h3>Procedure 当前元数据 · 与历史事实分开</h3>
+  <h3>Procedure 当前元数据 · 与所选记录分开</h3>
   <p>读取状态：{{ now.state }}；记录中的修订：{{ now.recorded_revision or '未取得' }}。</p>
   {% if now.get('metadata') %}
   <p>当前修订：{{ now.metadata.current_revision_id or '未取得' }}；
     publication：{{ now.metadata.publication_state or '未提供' }}；
     support：<strong data-current-support>{{ now.metadata.support_state or '未提供' }}</strong>。</p>
+  <button class="button" type="button" data-link-key="{{ now.metadata.row_id }}"
+    data-revision="{{ now.metadata.current_revision_id }}" data-object="{{ now.metadata.object_id }}"
+    data-kind="procedure_revision">读取当前 Procedure 与效果关联</button>
   {% endif %}
   <p>这些是本次 Native 读取的元数据，不是历史路由判定；不能把旧正结果转移给新修订或跳过 support pending。</p>
 </section>
 {% endif %}
 <p data-usage-trace="not_recorded">历史请求轨迹：本读源 not_recorded。保留原边界和证据引用，不从调用次数或备注推测 agent 看过什么。</p>
-<p>当前 context-effect 投影未接入本页；不按 usage 数量或原始成功比例推断效果、APPLY 资格或自动提升。</p>
+<p>context-effect 可从 Procedure 的直接关联读取。未选投影不表示没有效果记录，也不按使用次数推断效果或 APPLY 资格。</p>

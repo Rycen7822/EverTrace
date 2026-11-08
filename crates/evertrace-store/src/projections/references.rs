@@ -169,7 +169,7 @@ impl JournalAdmissionState {
         limit: u16,
         source: StoredFieldsContext,
         mut budget: ReadDependencyBudget,
-        historical: Option<&ObjectRow>,
+        retained: &[ObjectRow],
         cancelled: &std::sync::atomic::AtomicBool,
         deadline: std::time::Instant,
     ) -> Result<evertrace_domain::query::MetadataReadOutcome<ReferenceReadContext>, StoreError>
@@ -239,6 +239,10 @@ impl JournalAdmissionState {
                     | "work_artifact"
                     | "experiment_run"
                     | "result_evidence"
+                    | "procedure_usage_revision"
+                    | "procedure_negative_evidence"
+                    | "procedure_negative_review"
+                    | "procedure_context_effect"
                     | "task"
                     | "workstream"
             )
@@ -250,21 +254,36 @@ impl JournalAdmissionState {
                 targets: Vec::new(),
             })));
         }
-        let payload = serde_json::from_str::<JournalPayload>(
-            root.payload_json
-                .as_deref()
-                .ok_or(StoreError::StoreCorrupt)?,
-        )
-        .map_err(|_| StoreError::StoreCorrupt)?;
-        let mut refs = source_references_for(root, &payload);
+        let json = root
+            .payload_json
+            .as_deref()
+            .ok_or(StoreError::StoreCorrupt)?;
+        let (payload, mut refs) = if root.object_kind.as_deref() == Some("procedure_context_effect")
+        {
+            let value: evertrace_domain::procedure::ProcedureContextEffectProjection =
+                serde_json::from_str(json).map_err(|_| StoreError::StoreCorrupt)?;
+            value.validate().map_err(|_| StoreError::StoreCorrupt)?;
+            (None, procedure_effect::read_references(&value))
+        } else {
+            let value: JournalPayload =
+                serde_json::from_str(json).map_err(|_| StoreError::StoreCorrupt)?;
+            let refs = source_references_for(root, &value);
+            (Some(value), refs)
+        };
+        refs.extend(
+            retained
+                .iter()
+                .filter(|row| row.object_kind.as_deref() == Some("procedure_context_effect"))
+                .map(|row| row.row_id.clone()),
+        );
         // Current child revisions by canonical ownership/pinned input, not a reconstruction of a past subtree.
-        let children: Box<dyn Iterator<Item = (bool, RevisionId)> + '_> = match &payload {
-            JournalPayload::TaskRecorded(task) => Box::new(
+        let children: Box<dyn Iterator<Item = (bool, RevisionId)> + '_> = match payload.as_ref() {
+            Some(JournalPayload::TaskRecorded(task)) => Box::new(
                 self.workstreams
                     .values()
                     .map(|(stream, _)| (stream.task_id == task.task_id, stream.revision_id)),
             ),
-            JournalPayload::WorkstreamRecorded(stream) => {
+            Some(JournalPayload::WorkstreamRecorded(stream)) => {
                 Box::new(self.episodes.values().map(|(episode, _)| {
                     (
                         episode.workstream_id == stream.workstream_id,
@@ -272,7 +291,7 @@ impl JournalAdmissionState {
                     )
                 }))
             }
-            JournalPayload::ExperimentRunRecorded(run) => {
+            Some(JournalPayload::ExperimentRunRecorded(run)) => {
                 Box::new(self.result_evidence.values().map(|(result, _)| {
                     (
                         result.experiment_run_id == run.run_id
@@ -297,11 +316,11 @@ impl JournalAdmissionState {
                 }
             }
         }
-        let source_tuple = match &payload {
-            JournalPayload::SourceReceiptRecorded(value) => {
+        let source_tuple = match payload.as_ref() {
+            Some(JournalPayload::SourceReceiptRecorded(value)) => {
                 Some((&value.source_instance_id, &value.source_revision))
             }
-            JournalPayload::SourceObservationRecorded(value) => {
+            Some(JournalPayload::SourceObservationRecorded(value)) => {
                 Some((&value.source_instance_id, &value.source_revision))
             }
             _ => None,
@@ -346,8 +365,10 @@ impl JournalAdmissionState {
             let mut candidates =
                 self.capture_product_rows(self.stored_reference_rows(&reference)?)?;
             if candidates.is_empty()
-                && let Some(row) = historical
-                    .filter(|row| row.current_revision_id.as_deref() == Some(reference.as_str()))
+                && let Some(row) = retained.iter().find(|row| {
+                    row.row_id == reference
+                        || row.current_revision_id.as_deref() == Some(reference.as_str())
+                })
             {
                 candidates.push(row.clone());
             }
@@ -430,7 +451,7 @@ impl JournalAdmissionState {
                 .rows
                 .iter()
                 .find(matches)
-                .or_else(|| historical.filter(|row| matches(row)))
+                .or_else(|| retained.iter().find(matches))
                 .cloned();
             let selected = match selected {
                 Some(row) => Some(row),

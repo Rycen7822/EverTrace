@@ -4,7 +4,7 @@ import asyncio
 from . import BackendError
 from .content import read_record_detail
 
-USAGE_DETAIL_KINDS = {"procedure_usage_revision", "procedure_negative_evidence", "procedure_negative_review"}
+USAGE_DETAIL_KINDS = {"procedure_usage_revision", "procedure_negative_evidence", "procedure_negative_review", "procedure_context_effect"}
 
 
 def _same_page(before, after):

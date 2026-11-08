@@ -2739,12 +2739,27 @@ pub struct ExactRecordQuery {
     pub expected_selection: Option<ExactFieldIdentity>,
 }
 
-/// An omitted expected revision binds only a typed public ID to its Native canonical-current revision.
+/// Omitted revision binds a typed public ID or a canonical rebuildable-projection coordinate.
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct ExactRecordRef {
     pub stable_key: String,
     pub revision_ref: Option<String>,
+}
+
+/// Existing observational projection key, not a new public object or immutable revision.
+pub fn procedure_effect_revision(reference: &str) -> Option<RevisionId> {
+    let (revision, fingerprint) = reference
+        .strip_prefix("projection:procedure_effect:")?
+        .strip_suffix(":observational")?
+        .split_once(':')?;
+    let id = revision.parse::<RevisionId>().ok()?;
+    (id.to_string() == revision
+        && fingerprint.len() == 64
+        && fingerprint
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte)))
+    .then_some(id)
 }
 
 impl ExactRecordQuery {
@@ -2788,6 +2803,7 @@ impl ExactRecordQuery {
                     || key.parse::<crate::ids::ExperimentRunId>().is_ok()
                     || key.parse::<crate::ids::ResultEvidenceId>().is_ok()
                     || key.parse::<crate::ids::RecallNeedId>().is_ok()
+                    || procedure_effect_revision(key).is_some()
                     || key.parse::<crate::ids::ProcedureUsageId>().is_ok()
                     || key
                         .parse::<crate::ids::ProcedureNegativeEvidenceId>()
@@ -2845,6 +2861,8 @@ pub enum ExactRecordInfo {
     },
     /// Current folded ledger axes, pinned by selection.source_event_seq; not Need revision history.
     CurrentRecall,
+    /// Current mandatory projection; source_event_seq pins its source watermark, not Procedure history.
+    CurrentProcedureEffect,
     Work {
         goal_bytes: u64,
         open_loop_bytes: Vec<u64>,
@@ -2917,6 +2935,11 @@ impl ExactRecordWindow {
                             .selection
                             .as_ref()
                             .is_some_and(|selected| selected.object_kind == "recall_need"),
+                        ExactRecordInfo::CurrentProcedureEffect => {
+                            self.selection.as_ref().is_some_and(|selected| {
+                                selected.object_kind == "procedure_context_effect"
+                            })
+                        }
                         ExactRecordInfo::Artifact { source } => {
                             self.selection
                                 .as_ref()

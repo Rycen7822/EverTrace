@@ -1507,13 +1507,26 @@ impl JournalWriter {
             });
             // Raw reference selectors also admit physical revisions outside the Record/Fields wire contracts.
             // Only missing, closed Work coordinates use the historical Record path; never widen Fields.
-            let cached = self.admission_state.stored_fields_context_with_budget(
-                query.lookup_ref(),
-                state.clone(),
-                cancelled,
-                deadline,
-                &mut budget,
-            )?;
+            let cached =
+                if evertrace_domain::query::procedure_effect_revision(&reference.stable_key)
+                    .is_some()
+                {
+                    self.stored_fields_at_state(
+                        &query,
+                        state.clone(),
+                        cancelled,
+                        deadline,
+                        &mut budget,
+                    )?
+                } else {
+                    self.admission_state.stored_fields_context_with_budget(
+                        query.lookup_ref(),
+                        state.clone(),
+                        cancelled,
+                        deadline,
+                        &mut budget,
+                    )?
+                };
             let source = if matches!(&cached, O::Page(context) if context.selected.is_none())
                 && (query
                     .lookup_ref()
@@ -1567,15 +1580,39 @@ impl JournalWriter {
             } else {
                 None
             };
+            let mut retained = historical.into_iter().collect::<Vec<_>>();
+            if let Some(root) = source.selected.as_ref()
+                && root.object_kind.as_deref() == Some("procedure_revision")
+            {
+                let mut sqlite = self.lock_sqlite()?;
+                let stamp = sqlite.stamp()?;
+                if stamp.object_checkpoint != source.state.frontier
+                    || stamp.object_generation != crate::projections::PROJECTION_GENERATION
+                {
+                    return Ok(O::Conflict(source.state.frontier));
+                }
+                let revision = root
+                    .current_revision_id
+                    .as_ref()
+                    .ok_or(StoreError::StoreCorrupt)?
+                    .parse()
+                    .map_err(|_| StoreError::StoreCorrupt)?;
+                let effects = sqlite.procedure_effect_objects(revision)?;
+                if effects.len() > 64 {
+                    return Ok(O::TooLarge);
+                }
+                for row in &effects {
+                    if row.projection_generation != stamp.object_generation
+                        || row.source_event_seq > source.state.frontier
+                        || crate::projections::procedure_context_effect(row)?.is_none()
+                    {
+                        return Err(StoreError::StoreCorrupt);
+                    }
+                }
+                retained.extend(effects);
+            }
             self.admission_state.reference_metadata_context(
-                reference,
-                after,
-                limit,
-                source,
-                budget,
-                historical.as_ref(),
-                cancelled,
-                deadline,
+                reference, after, limit, source, budget, &retained, cancelled, deadline,
             )
         })()?;
         self.finish_metadata_read(before, cancelled)?;
@@ -1621,7 +1658,7 @@ impl JournalWriter {
             return Err(StoreError::InvalidInput);
         };
         self.validated_current_read(|state, _| {
-            let row = self.lock_sqlite()?.compiled_object(reference)?;
+            let row = self.lock_sqlite()?.object_row(reference)?;
             state.compiled_entries_context(query, row.as_ref(), offset, limit)
         })
         .await
@@ -1698,7 +1735,45 @@ impl JournalWriter {
         evertrace_domain::query::MetadataReadOutcome<crate::projections::StoredFieldsContext>,
         StoreError,
     > {
-        use evertrace_domain::query::MetadataReadOutcome as O;
+        use evertrace_domain::query::{
+            ExactReadQuery, MetadataReadOutcome as O, procedure_effect_revision,
+        };
+        if !query.validate() {
+            return Err(StoreError::InvalidInput);
+        }
+        if let ExactReadQuery::Record(record) = query
+            && let Some(revision) = procedure_effect_revision(&record.reference.stable_key)
+        {
+            if record
+                .reference
+                .revision_ref
+                .as_ref()
+                .is_some_and(|expected| *expected != revision.to_string())
+            {
+                return Ok(O::Conflict(state.frontier));
+            }
+            let row = {
+                let mut sqlite = self.lock_sqlite()?;
+                let stamp = sqlite.stamp()?;
+                if stamp.object_checkpoint != state.frontier
+                    || stamp.object_generation != crate::projections::PROJECTION_GENERATION
+                {
+                    return Ok(O::Conflict(state.frontier));
+                }
+                let row = sqlite.object_row(&record.reference.stable_key)?;
+                if row.as_ref().is_some_and(|row| {
+                    row.object_kind.as_deref() != Some("procedure_context_effect")
+                        || row.projection_generation != stamp.object_generation
+                        || row.source_event_seq > state.frontier
+                }) {
+                    return Err(StoreError::StoreCorrupt);
+                }
+                row
+            };
+            return self
+                .admission_state
+                .stored_fields_context_for_row(row, state, cancelled, deadline, budget);
+        }
         let current = self.admission_state.stored_fields_context(
             query,
             state.clone(),

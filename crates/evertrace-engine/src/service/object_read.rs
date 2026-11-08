@@ -930,6 +930,7 @@ impl EngineService {
         } else {
             let payload = root.payload_json.clone().ok_or(ErrorCode::StoreCorrupt)?;
             let selected_query = query.clone();
+            let current_effect = root.object_kind.as_deref() == Some("procedure_context_effect");
             let source_rows = if root.object_kind.as_deref() == Some("work_artifact") {
                 before
                     .rows
@@ -957,6 +958,15 @@ impl EngineService {
                     };
                     let read = || {
                         check()?;
+                        if current_effect {
+                            let value: evertrace_domain::procedure::ProcedureContextEffectProjection =
+                                serde_json::from_str(&payload).map_err(|_| ErrorCode::StoreCorrupt)?;
+                            value.validate().map_err(|_| ErrorCode::StoreCorrupt)?;
+                            let data = semantic_record(&value, None, &selected_query, &check)?
+                                .map(|(_, window)| (evertrace_domain::query::ExactRecordInfo::CurrentProcedureEffect, window));
+                            check()?;
+                            return Ok((if data.is_some() { State::Ready } else { State::Unsupported }, data));
+                        }
                         let payload =
                             serde_json::from_str(&payload).map_err(|_| ErrorCode::StoreCorrupt)?;
                         let data =
