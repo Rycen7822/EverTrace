@@ -108,6 +108,9 @@ pub fn source_references_for(row: &ObjectRow, payload: &JournalPayload) -> BTree
         JournalPayload::ResultEvidenceRecorded(value) => {
             refs.extend(value.parent_revision_id.map(|id| id.to_string()));
         }
+        JournalPayload::RecoveryApplicationRecorded(value) => {
+            refs.extend(value.parent_revision_id.map(|id| id.to_string()));
+        }
         JournalPayload::RecoveryCaptureRequestRecorded(value) => {
             refs.extend(value.parent_request_revision_id.map(|id| id.to_string()));
         }
@@ -236,6 +239,7 @@ impl JournalAdmissionState {
                     | "worktree_snapshot"
                     | "recovery_capture_request"
                     | "recovery_bundle"
+                    | "recovery_application_revision"
                     | "work_artifact"
                     | "experiment_run"
                     | "result_evidence"
@@ -321,6 +325,14 @@ impl JournalAdmissionState {
                     (
                         episode.workstream_id == stream.workstream_id,
                         episode.revision_id,
+                    )
+                }))
+            }
+            Some(JournalPayload::RecoveryBundleRecorded(bundle)) => {
+                Box::new(self.recovery_applications.values().map(|(application, _)| {
+                    (
+                        application.recovery_bundle_id == bundle.recovery_bundle_id,
+                        application.revision_id,
                     )
                 }))
             }

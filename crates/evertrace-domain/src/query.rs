@@ -2799,6 +2799,7 @@ impl ExactRecordQuery {
                     || key.parse::<crate::ids::WorktreeSnapshotId>().is_ok()
                     || key.parse::<crate::ids::RecoveryCaptureRequestId>().is_ok()
                     || key.parse::<crate::ids::RecoveryBundleId>().is_ok()
+                    || key.parse::<crate::ids::RecoveryApplicationId>().is_ok()
                     || key.parse::<crate::ids::WorkArtifactId>().is_ok()
                     || key.parse::<crate::ids::ExperimentRunId>().is_ok()
                     || key.parse::<crate::ids::ResultEvidenceId>().is_ok()

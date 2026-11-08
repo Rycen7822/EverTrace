@@ -3452,6 +3452,41 @@ pub fn read_dependencies_for(row: &ObjectRow, payload: &JournalPayload) -> BTree
             refs.extend(value.config_and_run_refs.iter().cloned());
             refs.extend(value.attempt_anchor_ids.iter().map(ToString::to_string));
         }
+        JournalPayload::RecoveryApplicationRecorded(value) => {
+            refs.insert(value.recovery_bundle_id.to_string());
+            refs.insert(value.target_worktree_instance_id.to_string());
+            refs.insert(value.pre_application_snapshot_id.to_string());
+            refs.extend(value.post_application_snapshot_id.map(|id| id.to_string()));
+            if let Some((operation, revision)) = value.operation_id.zip(value.operation_revision) {
+                refs.insert(format!("{operation}@{revision}"));
+            }
+            refs.extend(value.execution_lane_id.map(|id| id.to_string()));
+            refs.extend(value.capture_receipt_revision_id.map(|id| id.to_string()));
+            refs.extend(value.scope_effect_ids.iter().map(ToString::to_string));
+            refs.extend(
+                value
+                    .input_source_observation_ids
+                    .iter()
+                    .map(ToString::to_string),
+            );
+            refs.extend(
+                value
+                    .result_source_observation_ids
+                    .iter()
+                    .map(ToString::to_string),
+            );
+            for receipt in &value.verifier_receipts {
+                refs.insert(receipt.result_source_observation_id.to_string());
+                refs.insert(receipt.post_application_snapshot_id.to_string());
+            }
+            for receipt in &value.anchor_verifier_receipts {
+                refs.insert(receipt.result_source_observation_id.to_string());
+                refs.insert(receipt.source_attempt_revision_id.to_string());
+                refs.insert(receipt.revalidated_attempt_revision_id.to_string());
+                refs.insert(receipt.source_snapshot_id.to_string());
+                refs.insert(receipt.post_application_snapshot_id.to_string());
+            }
+        }
         JournalPayload::WorktreeInstanceRecorded(value) => {
             refs.insert(value.repository_instance_id.to_string());
             refs.extend(value.current_snapshot_id.map(|id| id.to_string()));
@@ -6207,6 +6242,19 @@ impl JournalAdmissionState {
                 *seq,
             )?);
         }
+        let application = reference
+            .parse::<RevisionId>()
+            .ok()
+            .and_then(|id| self.recovery_application_revisions.get(&id))
+            .or_else(|| {
+                reference
+                    .parse::<RecoveryApplicationId>()
+                    .ok()
+                    .and_then(|id| self.recovery_applications.get(&id))
+            });
+        if let Some((value, seq)) = application {
+            rows.push(recovery::application_row(value.clone(), *seq)?);
+        }
         if let Ok(id) = reference.parse::<RecoveryBundleId>()
             && let Some((value, seq)) = self.recovery_bundles.get(&id)
         {
@@ -6380,6 +6428,10 @@ impl JournalAdmissionState {
                 self.work_artifacts
                     .get(&id)
                     .map(|(value, _)| value.revision.revision_id.to_string())
+            } else if let Ok(id) = reference.parse::<RecoveryApplicationId>() {
+                self.recovery_applications
+                    .get(&id)
+                    .map(|(value, _)| value.revision_id.to_string())
             } else if let Ok(id) = reference.parse::<RecoveryCaptureRequestId>() {
                 self.recovery_requests
                     .get(&id)
@@ -6674,6 +6726,7 @@ impl JournalAdmissionState {
                                 | "worktree_snapshot"
                                 | "recovery_capture_request"
                                 | "recovery_bundle"
+                                | "recovery_application_revision"
                                 | "work_artifact"
                                 | "experiment_run"
                                 | "result_evidence"
@@ -6900,7 +6953,8 @@ impl JournalAdmissionState {
                     "worktree"
                     | "worktree_snapshot"
                     | "recovery_capture_request"
-                    | "recovery_bundle",
+                    | "recovery_bundle"
+                    | "recovery_application_revision",
                 ) => {
                     let payload: JournalPayload = serde_json::from_str(
                         row.payload_json
@@ -6915,6 +6969,11 @@ impl JournalAdmissionState {
                         JournalPayload::RecoveryCaptureRequestRecorded(value) => {
                             value.repository_instance_id
                         }
+                        JournalPayload::RecoveryApplicationRecorded(value) => self
+                            .worktrees
+                            .get(&value.target_worktree_instance_id)
+                            .map(|(tree, _)| tree.repository_instance_id)
+                            .ok_or(StoreError::StoreCorrupt)?,
                         JournalPayload::RecoveryBundleRecorded(value) => self
                             .worktrees
                             .get(&value.source_worktree_instance_id)

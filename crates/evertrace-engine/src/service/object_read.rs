@@ -596,6 +596,7 @@ fn record_data(
         P::WorktreeSnapshotRecorded(value) => semantic_record(&value, None, query, check),
         P::RecoveryCaptureRequestRecorded(value) => semantic_record(&value, None, query, check),
         P::RecoveryBundleRecorded(value) => semantic_record(&value, None, query, check),
+        P::RecoveryApplicationRecorded(value) => semantic_record(&value, None, query, check),
         P::CaptureReceiptRecorded(value) => semantic_record(&value, None, query, check),
         P::ExperimentRunRecorded(value) => semantic_record(&value, None, query, check),
         P::ResultEvidenceRecorded(value) => semantic_record(&value, None, query, check),

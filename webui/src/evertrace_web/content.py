@@ -103,6 +103,7 @@ DETAIL_KINDS = {"atom_revision": "atom", "procedure_revision": "procedure", "cor
                 "host_occurrence": "host_occurrence", "scope_effect": "scope_effect",
                 "worktree": "worktree", "worktree_snapshot": "worktree_snapshot",
                 "recovery_capture_request": "recovery_capture_request", "recovery_bundle": "recovery_bundle",
+                "recovery_application_revision": "recovery_application",
                 "work_artifact": "work_artifact", "experiment_run": "experiment_run", "result_evidence": "result_evidence",
                 "recall_need": "recall_need", "procedure_usage_revision": "procedure_usage",
                 "procedure_negative_evidence": "procedure_negative", "procedure_negative_review": "procedure_negative_review",
@@ -110,7 +111,8 @@ DETAIL_KINDS = {"atom_revision": "atom", "procedure_revision": "procedure", "cor
                 "global_support_validation": "support_validation"}
 NATIVE_DETAIL_KINDS = {"task", "workstream", "work_episode", "attempt", "operation_burst", "operation",
                      "host_occurrence", "scope_effect", "worktree", "worktree_snapshot",
-                     "recovery_capture_request", "recovery_bundle", "work_artifact", "experiment_run", "result_evidence", "recall_need",
+                     "recovery_capture_request", "recovery_bundle", "recovery_application_revision",
+                     "work_artifact", "experiment_run", "result_evidence", "recall_need",
                      "procedure_usage_revision", "procedure_negative_evidence", "procedure_negative_review", "procedure_context_effect",
                      "global_support_contract", "global_support_validation"}
 
@@ -137,7 +139,7 @@ async def read_record_detail(backend, reference, frontier, revision, object_kind
     identity, selection = meta["state"]["data_identity"], meta["selection"]
     state, record, total = meta["content_state"], None, None
     if state == "ready" and DETAIL_KINDS[object_kind] is not None:
-        maximum = {"recovery_bundle": 65536, "experiment_run": 524288}.get(object_kind, _LIMIT)
+        maximum = {"recovery_bundle": 65536, "recovery_application_revision": 65536, "experiment_run": 524288}.get(object_kind, _LIMIT)
         deadline, encoded = time.monotonic()+2, bytearray()
         while True:
             if time.monotonic() >= deadline:

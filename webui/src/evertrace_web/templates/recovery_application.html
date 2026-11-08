@@ -1,0 +1,68 @@
+<h2>恢复应用 · 所选修订</h2>
+<p class="reading-note">这里只读已记录事实，不执行恢复。admitted 不等于输入已交付，delivered 也不等于 applied。
+  此修订的状态不冒充当前应用状态，不由退出码或 verifier 数量推定成功。</p>
+<dl>
+  <dt>应用 / 所选修订</dt><dd>{{ value.recovery_application_id }} / {{ value.revision_id }}</dd>
+  <dt>父修订</dt><dd>{{ value.parent_revision_id or '初始修订，无父修订' }}</dd>
+  <dt>恢复包 / 目标工作树</dt><dd>{{ value.recovery_bundle_id }} / {{ value.target_worktree_instance_id }}</dd>
+  <dt>应用种类</dt><dd>{{ value.application_kind }}</dd>
+  <dt>原应用状态</dt><dd data-recovery-status>{{ value.application_status }}</dd>
+  <dt>原输入交付</dt><dd data-recovery-delivery>{{ value.input_delivery_kind }} / {{ value.input_delivery_state }}</dd>
+  <dt>原前 / 后快照</dt><dd>{{ value.pre_application_snapshot_id }} / {{ value.post_application_snapshot_id or '未记录' }}</dd>
+  <dt>Operation / 原修订号</dt><dd>{{ value.operation_id or '未绑定' }} / {{ value.operation_revision or '未绑定' }}</dd>
+  <dt>原执行 lane / 采集凭证修订</dt><dd>{{ value.execution_lane_id or '未绑定' }} / {{ value.capture_receipt_revision_id or '未绑定' }}</dd>
+  <dt>已验证 claims 版本 / 原记录时间</dt><dd>{{ value.ticket_claims_version }} / {{ value.created_at_us }}</dd>
+</dl>
+<button class="button" type="button" data-link-key="{{ value.recovery_application_id }}"
+  data-revision="" data-object="{{ value.recovery_application_id }}" data-kind="recovery_application_revision">另读当前应用修订</button>
+{% if value.parent_revision_id %}
+<button class="button" type="button" data-link-key="{{ value.parent_revision_id }}"
+  data-revision="{{ value.parent_revision_id }}" data-object="{{ value.recovery_application_id }}"
+  data-kind="recovery_application_revision">读取原父修订</button>
+{% endif %}
+{% for title, refs in (
+  ('选定 CAS 引用（不是未脱敏内容）', value.selected_cas_refs), ('原 scope effects', value.scope_effect_ids),
+  ('原输入观察', value.input_source_observation_ids), ('原结果观察', value.result_source_observation_ids),
+  ('原相关 Attempt 锚点', value.relevant_attempt_anchor_ids)
+) %}
+<h3>{{ title }} · {{ refs|length }} 项</h3>
+{% if refs %}<ul>{% for ref in refs %}<li>{{ ref }}</li>{% endfor %}</ul>{% else %}<p>空列表（0 项）。</p>{% endif %}
+{% endfor %}
+<h3>原结果 verifier 收据 · {{ value.verifier_receipts|length }} 项</h3>
+{% for receipt in value.verifier_receipts %}
+<dl><dt>verification revision / verifier version</dt><dd>{{ receipt.verification_revision }} / {{ receipt.verifier_version }}</dd>
+  <dt>原观察 / 后快照</dt><dd>{{ receipt.result_source_observation_id }} / {{ receipt.post_application_snapshot_id }}</dd>
+  <dt>原验证结果</dt><dd>{{ receipt.outcome }}</dd></dl>
+{% else %}<p>空列表（0 项），不据此补造 verifier 结论。</p>{% endfor %}
+<h3>原 Attempt 锚点声明 · {{ value.attempt_anchor_claims|length }} 项</h3>
+{% for claim in value.attempt_anchor_claims %}
+<details><summary>{{ claim.attempt_id }} / {{ claim.attempt_revision_id }}</summary>
+  <p>策略指纹：{% for byte in claim.strategy_contract_fingerprint %}{{ '%02x'|format(byte) }}{% endfor %}</p>
+  <p>来源仓库 / 工作树 / 快照：{{ claim.source_repository_instance_id }} / {{ claim.source_worktree_instance_id }} / {{ claim.source_snapshot_id }}</p>
+  <p>受保护路径收据：{{ claim.affected_relative_path.cas_ref }}；字节数：{{ claim.affected_relative_path.protected_length }}。</p>
+  <p>文件身份 device/inode：{{ claim.source_file_identity.device }} / {{ claim.source_file_identity.inode }}。</p>
+  <p>文件长度：{{ claim.source_file_identity.size }}；
+    mtime 秒/纳秒：{{ claim.source_file_identity.mtime_seconds }} / {{ claim.source_file_identity.mtime_nanoseconds }}。</p>
+  <p>ctime 秒/纳秒：{{ claim.source_file_identity.ctime_seconds }} / {{ claim.source_file_identity.ctime_nanoseconds }}。</p>
+  {% for group in claim.competing_groups %}
+  <p>竞争组：{{ group.competing_group_id }} / {{ group.revision_id }} / {{ group.resolution_status }}</p>{% endfor %}
+</details>
+{% else %}<p>空列表（0 项）。</p>{% endfor %}
+<h3>原锚点 verifier 收据 · {{ value.anchor_verifier_receipts|length }} 项</h3>
+{% for receipt in value.anchor_verifier_receipts %}
+<details><summary>{{ receipt.attempt_id }} · verifier v{{ receipt.verifier_version }}</summary>
+  <p>源 / 重验证 Attempt 修订：{{ receipt.source_attempt_revision_id }} / {{ receipt.revalidated_attempt_revision_id }}</p>
+  <p>策略指纹：{% for byte in receipt.strategy_contract_fingerprint %}{{ '%02x'|format(byte) }}{% endfor %}</p>
+  <p>来源仓库 / 工作树 / 快照：{{ receipt.source_repository_instance_id }} / {{ receipt.source_worktree_instance_id }} / {{ receipt.source_snapshot_id }}</p>
+  <p>目标仓库 / 工作树 / 后快照：{{ receipt.target_repository_instance_id }} / {{ receipt.target_worktree_instance_id }} /
+    {{ receipt.post_application_snapshot_id }}</p>
+  <p>路径收据：{{ receipt.affected_relative_path.cas_ref }}；Operation：{{ receipt.operation_id }}@{{ receipt.operation_revision }}。</p>
+  <p>lane / 采集凭证：{{ receipt.execution_lane_id }} / {{ receipt.capture_receipt_revision_id }}</p>
+  <p>原结果观察 / recovery verification revision：{{ receipt.result_source_observation_id }} / {{ receipt.recovery_verification_revision }}</p>
+  {% for ref in receipt.scope_effect_ids %}<p>scope effect：{{ ref }}</p>{% endfor %}
+  {% for label, groups in (('原竞争组', receipt.competing_groups), ('重验证竞争组', receipt.revalidated_competing_groups)) %}
+  {% for group in groups %}<p>{{ label }}：{{ group.competing_group_id }} / {{ group.revision_id }} / {{ group.resolution_status }}</p>{% endfor %}
+  {% endfor %}
+</details>
+{% else %}<p>空列表（0 项），不授予 compatible lineage transfer。</p>{% endfor %}
+<p class="reading-note">当前可否恢复或转移谱系仍由原生业务门决定；本页不生成 ticket、不交付 CAS，也不重新验证或重写历史。</p>

@@ -884,23 +884,26 @@ pub(super) fn revision_rows(
         )?);
     }
     for (_, (value, seq)) in application_revisions {
-        let mut row = physical_object_row(
-            ObjectFamily::Work,
-            "recovery_application_revision",
-            value.recovery_application_id.to_string(),
-            value.revision_id.to_string(),
-            &JournalPayload::RecoveryApplicationRecorded(Box::new(value)),
-            seq,
-        )?;
-        row.row_id = format!(
-            "object:work:recovery_application_revision:{}",
-            row.current_revision_id
-                .as_deref()
-                .ok_or(StoreError::StoreCorrupt)?
-        );
-        rows.push(row);
+        rows.push(application_row(value, seq)?);
     }
     Ok(rows)
+}
+
+pub(super) fn application_row(
+    value: RecoveryApplication,
+    seq: u64,
+) -> Result<ObjectRow, StoreError> {
+    let revision = value.revision_id;
+    let mut row = physical_object_row(
+        ObjectFamily::Work,
+        "recovery_application_revision",
+        value.recovery_application_id.to_string(),
+        value.revision_id.to_string(),
+        &JournalPayload::RecoveryApplicationRecorded(Box::new(value)),
+        seq,
+    )?;
+    row.row_id = format!("object:work:recovery_application_revision:{revision}");
+    Ok(row)
 }
 
 pub(super) fn require_revision_row(
