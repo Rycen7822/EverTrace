@@ -91,6 +91,8 @@ async def read_comparison(backend, query, frontier, after=None, limit=8):
         if not isinstance(cursor["after_path"], str) or len(cursor["after_path"].encode()) > 1024:
             raise BackendError("invalid_input")
     pair = await backend.read_pair(query)
+    if pair["object_kind"] == "result":
+        raise BackendError("invalid_input")
     identity = pair["left"]["state"]["data_identity"]
     selection = _selection(pair)
     if cursor and (cursor["data_identity"] != identity or cursor["selection"] != selection):

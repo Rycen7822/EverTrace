@@ -21,9 +21,10 @@ use evertrace_domain::{
     work::{
         ArtifactActor, ArtifactPayloadStatus, ArtifactRevision, ArtifactScope, AssignmentStatus,
         Attempt, AttemptBindingStatus, ContractField, ControlledRunSourceEnvelope, ExperimentRun,
-        MultiCasMetricPolicy, RunContractValidity, RunExecutionStatus, RunObservability, RunOrigin,
-        SeedPolicy, Task, VariableDeclaration, WorkArtifact, WorkBindingRevision, WorkEpisode,
-        Workstream,
+        MultiCasMetricPolicy, ResultCohortAssessment, ResultComparisonIssue,
+        ResultComparisonReason, RunContractValidity, RunExecutionStatus, RunObservability,
+        RunOrigin, SeedPolicy, Task, VariableDeclaration, WorkArtifact, WorkBindingRevision,
+        WorkEpisode, Workstream,
     },
 };
 use evertrace_store::{
@@ -1231,48 +1232,14 @@ pub fn compatible_result_cohort(
     if members.len() > MAX_COMPARISON_MEMBERS {
         return Err(AutoresearchError::IncompatibleComparison);
     }
-    let expected = members[0].1.comparison_key;
-    let expected_attempt = members[0].1.attempt_id;
-    let expected_workstream = members[0].1.workstream_id;
-    let expected_strategy = members[0].1.strategy_contract_fingerprint;
-    let expected_unit = members[0]
-        .0
-        .parsed_metric
-        .as_ref()
-        .ok_or(AutoresearchError::EvidenceIncomplete)?
-        .unit
-        .clone();
+    if members[0].0.parsed_metric.is_none() {
+        return Err(AutoresearchError::EvidenceIncomplete);
+    }
     let mut ids = Vec::with_capacity(members.len());
     for (result, run) in members {
-        let terminal_scope_is_compatible = match result.result_scope {
-            ResultScope::Complete => run.execution_status == RunExecutionStatus::Completed,
-            ResultScope::Partial => matches!(
-                run.execution_status,
-                RunExecutionStatus::Completed
-                    | RunExecutionStatus::Failed
-                    | RunExecutionStatus::Interrupted
-            ),
-        };
-        if run.validate().is_err()
-            || result.validate().is_err()
-            || run.attempt_binding_status != AttemptBindingStatus::Resolved
-            || run.attempt_id.is_none()
-            || run.attempt_id != expected_attempt
-            || run.workstream_id != expected_workstream
-            || run.strategy_contract_fingerprint != expected_strategy
-            || run.observability != RunObservability::Full
-            || run.contract_validity != RunContractValidity::Valid
-            || !terminal_scope_is_compatible
-            || result.experiment_run_id != run.run_id
-            || result.experiment_run_revision_id != run.revision_id
-            || result.parser_receipt.parser_version != run.metric_extractor_version
-            || run.comparison_key != expected
-            || result.completeness != EvidenceCompleteness::Complete
-            || result.verifier_receipt.as_ref().is_none_or(|receipt| {
-                receipt.status != VerifierStatus::Passed
-                    || receipt.verifier_version != RESULT_VERIFIER_VERSION
-            })
-            || result.parsed_metric.as_ref().map(|metric| &metric.unit) != Some(&expected_unit)
+        if cohort_member_issues(result, run, members[0])
+            .next()
+            .is_some()
         {
             return Err(AutoresearchError::IncompatibleComparison);
         }
@@ -1285,6 +1252,201 @@ pub fn compatible_result_cohort(
     Ok(Some(CompatibleResultCohort {
         member_result_ids: ids,
     }))
+}
+
+fn cohort_member_issues(
+    result: &ResultEvidence,
+    run: &ExperimentRun,
+    expected: (&ResultEvidence, &ExperimentRun),
+) -> impl Iterator<Item = ResultComparisonReason> {
+    use ResultComparisonReason as R;
+    let terminal = match result.result_scope {
+        ResultScope::Complete => run.execution_status == RunExecutionStatus::Completed,
+        ResultScope::Partial => matches!(
+            run.execution_status,
+            RunExecutionStatus::Completed
+                | RunExecutionStatus::Failed
+                | RunExecutionStatus::Interrupted
+        ),
+    };
+    [
+        (run.validate().is_err(), R::InvalidRun),
+        (result.validate().is_err(), R::InvalidResult),
+        (
+            run.attempt_binding_status != AttemptBindingStatus::Resolved
+                || run.attempt_id.is_none(),
+            R::AttemptUnresolved,
+        ),
+        (run.attempt_id != expected.1.attempt_id, R::AttemptMismatch),
+        (
+            run.workstream_id != expected.1.workstream_id,
+            R::WorkstreamMismatch,
+        ),
+        (
+            run.strategy_contract_fingerprint != expected.1.strategy_contract_fingerprint,
+            R::StrategyMismatch,
+        ),
+        (
+            run.observability != RunObservability::Full,
+            R::ObservabilityInsufficient,
+        ),
+        (
+            run.contract_validity != RunContractValidity::Valid,
+            R::ContractNotValid,
+        ),
+        (!terminal, R::ExecutionScopeMismatch),
+        (result.experiment_run_id != run.run_id, R::RunMismatch),
+        (
+            result.experiment_run_revision_id != run.revision_id,
+            R::RunRevisionMismatch,
+        ),
+        (
+            result.parser_receipt.parser_version != run.metric_extractor_version,
+            R::ExtractorMismatch,
+        ),
+        (
+            run.comparison_key != expected.1.comparison_key,
+            R::ComparisonContractMismatch,
+        ),
+        (
+            result.completeness != EvidenceCompleteness::Complete,
+            R::EvidenceIncomplete,
+        ),
+        (
+            result.verifier_receipt.as_ref().is_none_or(|receipt| {
+                receipt.status != VerifierStatus::Passed
+                    || receipt.verifier_version != RESULT_VERIFIER_VERSION
+            }),
+            R::VerifierNotPassed,
+        ),
+        (result.parsed_metric.is_none(), R::MetricMissing),
+        (
+            result.parsed_metric.as_ref().map(|metric| &metric.unit)
+                != expected.0.parsed_metric.as_ref().map(|metric| &metric.unit),
+            R::UnitMismatch,
+        ),
+    ]
+    .into_iter()
+    .filter_map(|(failed, reason)| failed.then_some(reason))
+}
+
+pub fn assess_result_cohort(
+    members: &[(&ResultEvidence, &ExperimentRun)],
+) -> Result<ResultCohortAssessment, AutoresearchError> {
+    if members.is_empty() || members.len() > MAX_COMPARISON_MEMBERS {
+        return Err(AutoresearchError::InvalidInput);
+    }
+    let mut issues = Vec::new();
+    for (index, (result, run)) in members.iter().enumerate() {
+        let reasons = cohort_member_issues(result, run, members[0]).chain(
+            members[..index]
+                .iter()
+                .any(|(prior, _)| prior.result_evidence_id == result.result_evidence_id)
+                .then_some(ResultComparisonReason::DuplicateResult),
+        );
+        for reason in reasons {
+            let dimensions = if reason == ResultComparisonReason::ComparisonContractMismatch {
+                members[0].1.comparison_mismatches(run)
+            } else {
+                Vec::new()
+            };
+            issues.push(ResultComparisonIssue {
+                member: index as u16,
+                reason,
+                dimensions,
+            });
+        }
+    }
+    Ok(ResultCohortAssessment {
+        compatible: issues.is_empty(),
+        issues,
+    })
+}
+
+/// Reparse only an otherwise eligible cohort using the original parser and verified protected inputs.
+/// Reads are request-local, capped at 64 KiB per input / 1 MiB per member, and cancellation checked by CAS.
+pub fn read_result_cohort(
+    cas_dir: &std::path::Path,
+    members: &[(&ResultEvidence, &ExperimentRun)],
+    check: &mut dyn FnMut() -> Result<(), evertrace_capture::CasError>,
+) -> Result<ResultCohortAssessment, AutoresearchError> {
+    let mut assessment = assess_result_cohort(members)?;
+    if !assessment.compatible {
+        return Ok(assessment);
+    }
+    let cas = match CasStore::open_existing(cas_dir.to_owned()) {
+        Ok(cas) => cas,
+        Err(_) => {
+            assessment.compatible = false;
+            assessment
+                .issues
+                .extend((0..members.len()).map(|index| ResultComparisonIssue {
+                    member: index as u16,
+                    reason: ResultComparisonReason::RawEvidenceUnavailable,
+                    dimensions: Vec::new(),
+                }));
+            return Ok(assessment);
+        }
+    };
+    for (index, (result, run)) in members.iter().enumerate() {
+        let mut inputs = Vec::new();
+        let mut total = 0;
+        let mut reason = None;
+        for id in &result.raw_cas_refs {
+            match cas.read_text_window_checked(
+                &CasDigest::from_str(&hex(&id.as_digest()))
+                    .map_err(|_| AutoresearchError::InvalidInput)?,
+                0..65536,
+                check,
+            ) {
+                Ok((window, text)) => {
+                    total += window.bytes.len();
+                    if window.total_bytes > 65536 || total > 1024 * 1024 {
+                        reason = Some(ResultComparisonReason::EvidenceBudgetExceeded);
+                        break;
+                    }
+                    if !text {
+                        reason = Some(ResultComparisonReason::ReparseMismatch);
+                        break;
+                    }
+                    inputs.push(window.bytes);
+                }
+                Err(evertrace_capture::CasError::ReadBudgetExceeded) => {
+                    reason = Some(ResultComparisonReason::EvidenceBudgetExceeded);
+                    break;
+                }
+                Err(_) => {
+                    reason = Some(ResultComparisonReason::RawEvidenceUnavailable);
+                    break;
+                }
+            }
+        }
+        if reason.is_none() {
+            let matches = if run.comparison_execution_binding.is_some() {
+                matches!(inputs.as_slice(), [bytes] if matches!(
+                    ControlledRunSourceEnvelope::decode_canonical(bytes),
+                    Ok(ControlledRunSourceEnvelope::Terminal { run_id, ended_at_us, metric, artifact_refs, .. })
+                        if run_id == run.run_id && Some(ended_at_us) == run.ended_at_us
+                            && Some(&metric) == result.parsed_metric.as_ref()
+                            && artifact_refs == result.raw_artifact_refs && artifact_refs == run.work_artifact_refs))
+            } else {
+                matches!(parse_metric_set(&inputs, run.multi_cas_metric_policy),
+                    Ok((ParserStatus::Parsed, Some(metric), None)) if Some(&metric) == result.parsed_metric.as_ref())
+            };
+            if !matches {
+                reason = Some(ResultComparisonReason::ReparseMismatch);
+            }
+        }
+        if let Some(reason) = reason {
+            assessment.issues.push(ResultComparisonIssue {
+                member: index as u16,
+                reason,
+                dimensions: Vec::new(),
+            });
+        }
+    }
+    assessment.compatible = assessment.issues.is_empty();
+    Ok(assessment)
 }
 
 #[derive(Clone)]

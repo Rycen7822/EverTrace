@@ -849,6 +849,7 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
                         if let HumanGovernanceRequest::Read { request: HumanReadRequest::ReadRevisionPair { query } } = &command {
                             let page = EngineService::read_revision_pair(
                                 writer.clone(), query.clone(), config_snapshot.hash(), Arc::clone(&session_catalog_report),
+                                runtime_snapshot.cas_dir.clone(),
                             ).await?;
                             return Ok(Response::HumanGovernance(HumanGovernanceResponse::RevisionPair { page: Box::new(page) }));
                         }

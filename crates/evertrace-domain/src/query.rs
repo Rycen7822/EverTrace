@@ -3050,6 +3050,8 @@ pub struct RevisionPairFields {
     pub object_kind: Option<HumanRevisionKind>,
     pub left: ExactStoredFields,
     pub right: ExactStoredFields,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub result_assessment: Option<crate::work::ResultCohortAssessment>,
 }
 
 impl RevisionPairFields {
@@ -3058,6 +3060,18 @@ impl RevisionPairFields {
             && self.left.validate()
             && self.right.validate()
             && self.left.state == self.right.state
+            && match &self.result_assessment {
+                Some(value) => {
+                    self.object_kind == Some(HumanRevisionKind::Result)
+                        && value.compatible == value.issues.is_empty()
+                        && value.issues.len() <= 64
+                        && value
+                            .issues
+                            .iter()
+                            .all(|issue| issue.member < 2 && issue.dimensions.len() <= 16)
+                }
+                None => self.object_kind != Some(HumanRevisionKind::Result),
+            }
             && ((self.left.content_state == HumanContentState::Ready
                 && self.right.content_state == HumanContentState::Ready)
                 == self.object_kind.is_some())
@@ -4511,6 +4525,7 @@ pub enum HumanRevisionKind {
     CoreMembership,
     Proposal,
     Digest,
+    Result,
 }
 
 pub const HUMAN_CONTENT_LIMIT: u16 = 8192;

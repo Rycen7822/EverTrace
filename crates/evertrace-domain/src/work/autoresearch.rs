@@ -20,6 +20,48 @@ const MAX_FIELDS: usize = 128;
 const MAX_TEXT: usize = 1024;
 const CONTROLLED_SOURCE_VERSION: u32 = 1;
 
+/// Business eligibility diagnostics, independent of any presentation surface.
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ResultComparisonReason {
+    InvalidRun,
+    InvalidResult,
+    AttemptUnresolved,
+    AttemptMismatch,
+    WorkstreamMismatch,
+    StrategyMismatch,
+    ObservabilityInsufficient,
+    ContractNotValid,
+    ExecutionScopeMismatch,
+    RunMismatch,
+    RunRevisionMismatch,
+    ExtractorMismatch,
+    ComparisonContractMismatch,
+    EvidenceIncomplete,
+    VerifierNotPassed,
+    MetricMissing,
+    UnitMismatch,
+    DuplicateResult,
+    RawEvidenceUnavailable,
+    EvidenceBudgetExceeded,
+    ReparseMismatch,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct ResultComparisonIssue {
+    pub member: u16,
+    pub reason: ResultComparisonReason,
+    pub dimensions: Vec<String>,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct ResultCohortAssessment {
+    pub compatible: bool,
+    pub issues: Vec<ResultComparisonIssue>,
+}
+
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
 pub enum ControlledRunSourceEnvelope {
@@ -470,7 +512,7 @@ impl ExperimentRun {
         .map_err(|_| WorkError::InvalidAutoresearch)
     }
 
-    pub fn recompute_comparison_key(&self) -> Result<[u8; 32], WorkError> {
+    fn comparison_fields(&self) -> Vec<(String, CanonicalValue)> {
         let fixed = self
             .normalized_config
             .iter()
@@ -518,6 +560,28 @@ impl ExperimentRun {
                 binding.canonical(false),
             ));
         }
+        fields
+    }
+
+    pub fn comparison_mismatches(&self, other: &Self) -> Vec<String> {
+        let left = self
+            .comparison_fields()
+            .into_iter()
+            .collect::<std::collections::BTreeMap<_, _>>();
+        let right = other
+            .comparison_fields()
+            .into_iter()
+            .collect::<std::collections::BTreeMap<_, _>>();
+        left.keys()
+            .chain(right.keys())
+            .collect::<BTreeSet<_>>()
+            .into_iter()
+            .filter(|key| left.get(*key) != right.get(*key))
+            .cloned()
+            .collect()
+    }
+
+    pub fn recompute_comparison_key(&self) -> Result<[u8; 32], WorkError> {
         sha256(
             "evertrace.experiment_contract.comparison",
             if self.comparison_execution_binding.is_some() {
@@ -525,7 +589,7 @@ impl ExperimentRun {
             } else {
                 1
             },
-            &CanonicalValue::Map(fields),
+            &CanonicalValue::Map(self.comparison_fields()),
         )
         .map_err(|_| WorkError::InvalidAutoresearch)
     }

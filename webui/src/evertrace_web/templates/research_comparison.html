@@ -1,0 +1,44 @@
+<button class="button" type="button" data-nav-back hidden>返回上一条记录</button>
+<h2>结果对照</h2>
+{% set assessment = comparison.assessment %}
+{% if not assessment %}
+<p>两侧尚未同时获准读取，没有比较资格或数值计算结果。</p>
+{% elif assessment.compatible %}
+<p data-cohort-compatible>原生比较器允许这两份结果进入同一比较；原始受保护输入已重新解析核对。</p>
+{% else %}
+<p data-cohort-incompatible>原生比较器未允许合并比较。可分别核对可读记录，不计算差值、改善比例、均值或胜出者。</p>
+<ul>{% for issue in comparison.issues %}
+<li>{{ '左侧' if issue.member == 0 else '右侧' }}：{{ issue.label }}
+  {% if issue.dimensions %}（{{ issue.dimensions|join('、') }}）{% endif %}</li>
+{% endfor %}</ul>
+{% endif %}
+{% if comparison.difference is not none %}
+<p data-cohort-difference>点估计差（右 − 左）：{{ comparison.difference }}</p>
+<p>单位与下方原指标一致；未合并不确定度，不表示改善、统计显著或胜出。</p>
+{% elif comparison.difference_omitted %}<p>所需字段未完整取得或精确计算预算不足；没有舍入、转浮点或用 0 代替。</p>{% endif %}
+{% for name, label in [('left', '左侧'), ('right', '右侧')] %}
+{% set side = comparison[name] %}
+<section class="semantic-section"><h3>{{ label }}</h3>
+<p>读取状态：{{ side.state }}</p>
+{% if side.state == 'ready' and not side.result %}<p>字段超出展示预算，没有返回不完整指标或用原始 JSON 代替。</p>{% endif %}
+{% if side.result %}
+{% set result = side.result %}
+<p>结果：{{ result.result_evidence_id }} · 精确修订：{{ result.revision_id }}</p>
+<p>范围：{{ result.result_scope }} · 证据完整性：{{ result.completeness }}</p>
+<p>解析：{{ result.parser_receipt.status }} · {{ result.parser_receipt.parser_version }}</p>
+<p>验证：{% if result.verifier_receipt %}{{ result.verifier_receipt.status }} · {{ result.verifier_receipt.verifier_version }}
+  {% else %}未记录{% endif %}</p>
+{% if result.parsed_metric %}
+<p>Decimal：<span data-pair-decimal>{{ result.parsed_metric.decimal }}</span> · 单位：{{ result.parsed_metric.unit }}</p>
+<p>不确定度：{{ result.parsed_metric.uncertainty_decimal if result.parsed_metric.uncertainty_decimal is not none else '未记录' }}</p>
+{% else %}<p>未记录可读指标；不当作 0。</p>{% endif %}
+<button class="text-button" type="button" data-link-key="{{ comparison.query[name].stable_key }}"
+  data-revision="{{ result.revision_id }}" data-object="{{ result.result_evidence_id }}"
+  data-kind="result_evidence">读取{{ label }}原始结果</button>
+<button class="text-button" type="button" data-link-key="{{ result.experiment_run_id }}"
+  data-revision="{{ result.experiment_run_revision_id }}" data-object="{{ result.experiment_run_id }}"
+  data-kind="experiment_run">读取{{ label }} Run 的精确条件</button>
+{% endif %}
+</section>
+{% endfor %}
+<p class="reading-note">本页仅作读取和核对，不接受为长期结论，不生成 Claim，不改变历史事实或触发实验。</p>

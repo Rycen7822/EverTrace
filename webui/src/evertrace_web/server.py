@@ -17,6 +17,7 @@ from uvicorn.protocols.http.h11_impl import H11Protocol
 from .backend import Backend, BackendError, _decode
 from .jobs import read_jobs
 from .comparison import read_comparison
+from .research import read_research_comparison
 from .content import DETAIL_KINDS, WORK_DETAIL_KINDS, read_record_content, read_record_detail, read_source_content
 from .sources import read_revisions, read_source_catalog, read_source_archive, read_source_detail, read_source_links
 from .scopes import read_scopes
@@ -472,6 +473,16 @@ class App:
                         "matching_count": str(page["matching_count"]) if page["matching_count"] is not None else None,
                         "count_basis": page["count_basis"],
                     }
+            elif payload.get("kind") == "research_compare" and set(payload) == {"kind", "query", "frontier", "after"}:
+                if payload["after"] is not None:
+                    return JSONResponse({"error": "invalid_read"}, 400)
+                result = await read_research_comparison(self.backend, payload["query"], parse_frontier(payload["frontier"]))
+                if result["kind"] == "conflict":
+                    data = {"conflict": True}
+                else:
+                    page = result["comparison"]
+                    data = {"html": self.templates.get_template("research_comparison.html").render(comparison=page),
+                        "frontier": str(page["frontier"]), "next_cursor": None, "status": "ready"}
             elif payload.get("kind") == "compare" and set(payload) == {
                 "kind",
                 "query",

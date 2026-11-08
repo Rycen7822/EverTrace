@@ -133,6 +133,8 @@ function fragmentInto(target, html) {
   target.replaceChildren(template.content);
 }
 function navigationControls() {
+  for (const button of $("detail-body").querySelectorAll("[data-result-compare]"))
+    button.disabled = state.compareBase?.kind !== "result_evidence";
   for (const button of $("detail-body").querySelectorAll("[data-nav-back]"))
     button.hidden = !state.selected?.path?.length;
   for (const button of $("detail-body").querySelectorAll("[data-compare-key]"))
@@ -145,12 +147,12 @@ async function readComparison(comparison, controller, scroll = 0) {
   const frontier = comparison.after ? comparison.frontier : state.frontier;
   const result = await api(
     "read",
-    { kind: "compare", query: comparison.query, after: comparison.after, frontier },
+    { kind: comparison.research ? "research_compare" : "compare", query: comparison.query, after: comparison.after, frontier },
     controller.signal,
   );
   if (state.controller !== controller || document.hidden) return;
   if (result.conflict) {
-    state.comparison = { query: comparison.query, after: null, frontier: null };
+    state.comparison = { query: comparison.query, after: null, frontier: null, research: comparison.research === true };
     $("detail-ref").textContent = "";
     fragmentInto(
       $("detail-body"),
@@ -169,8 +171,11 @@ async function readComparison(comparison, controller, scroll = 0) {
     after: comparison.after,
     frontier: result.frontier,
     next: result.next_cursor,
+    research: comparison.research === true,
   };
-  $("detail-body").querySelector("[data-compare-next]").disabled = !result.next_cursor;
+  const next = $("detail-body").querySelector("[data-compare-next]");
+  if (next) next.disabled = !result.next_cursor;
+  if (comparison.research) notice("读取状态和比较资格见下方；此次对照未改变记录或生成结论。");
   $("detail-ref").textContent =
     result.status === "ready"
       ? comparison.query.left.revision_ref + " / " + comparison.query.right.revision_ref
@@ -195,6 +200,21 @@ async function openComparisonPage(after = null) {
   } finally {
     if (state.controller === controller) state.controller = null;
   }
+}
+function compareResult(button, pin) {
+  const current = { key: button.dataset.resultBase || button.dataset.resultCompare,
+    revision: button.dataset.revision, object: button.dataset.object, kind: "result_evidence" };
+  if (pin) {
+    state.compareBase = current;
+    navigationControls();
+    notice("已固定结果左侧；打开另一份结果后选择对照。资格由原生比较器判定。");
+    return;
+  }
+  const left = state.compareBase;
+  if (left?.kind !== "result_evidence") return;
+  const query = { left: { stable_key: left.key, revision_ref: left.revision },
+    right: { stable_key: current.key, revision_ref: current.revision } };
+  followRecord(current, { comparison: { query, after: null, frontier: state.frontier, research: true } });
 }
 function pinComparison() {
   const item = state.selected;
@@ -345,6 +365,7 @@ function followRecord(item, restore = null) {
           query: state.comparison.query,
           after: state.comparison.after,
           frontier: state.comparison.frontier,
+          research: state.comparison.research === true,
         }
       : null,
   };
@@ -1027,6 +1048,7 @@ $("detail-body").onclick = (event) => {
     [data-content-nav], [data-revisions-open], [data-revisions-next], [data-detail-open],
     [data-revision-key], [data-sources-open], [data-sources-next], [data-link-key],
     [data-nav-back], [data-compare-base], [data-compare-key], [data-compare-side],
+    [data-result-base], [data-result-compare],
     [data-compare-first], [data-compare-next], [data-compiled-first], [data-compiled-next], [data-compiled-refresh]`,
   );
   if (!button || button.disabled) return;
@@ -1092,7 +1114,9 @@ $("detail-body").onclick = (event) => {
     });
     return;
   }
-  if (button.hasAttribute("data-compare-base")) pinComparison();
+  if (button.hasAttribute("data-result-base")) compareResult(button, true);
+  else if (button.hasAttribute("data-result-compare")) compareResult(button, false);
+  else if (button.hasAttribute("data-compare-base")) pinComparison();
   else if (button.dataset.compareKey) compareRevision(button);
   else if (button.dataset.compareSide) readComparisonSide(button.dataset.compareSide);
   else if (button.hasAttribute("data-compare-first")) openComparisonPage();

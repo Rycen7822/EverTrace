@@ -19,7 +19,7 @@
 {% endif %}
 <p>策略合同指纹：{{ fingerprint(value.strategy_contract_fingerprint) }}</p>
 <p>实验合同指纹：{{ fingerprint(value.experiment_contract_fingerprint) }}</p>
-<p>比较键：{{ fingerprint(value.comparison_key) }}。键相同不单独证明可比，比较资格尚未接入此页。</p>
+<p>比较键：{{ fingerprint(value.comparison_key) }}。键相同不单独证明可比；请对照明确选择的结果，由原生比较器核对资格。</p>
 <section class="semantic-section"><h3>实验条件</h3>
   <p class="memory-prose">数据指纹：{{ value.data_fingerprint }}</p>
   <p class="memory-prose">环境指纹：{{ value.environment_fingerprint }}</p>
@@ -88,7 +88,11 @@
 {% else %}<p>未保存可读指标，不用 0 代替。</p>{% endif %}
 {% if value.failure %}<p>失败：{{ value.failure.kind }} · {{ value.failure.code }}</p>{% endif %}
 <p class="reading-note">局部结果不等于完整运行结果；解析与重解析验证不单独证明执行成功或具备比较资格。</p>
-<p>此页不计算均值、改善比例或胜出者，也不把 ResultEvidence 当作已接受的 Result Atom 或 Claim。</p>
+<p>可对照两份精确结果；资格由原生比较器判定。不默认求平均、计算改善比例或判断胜出，也不生成 Result Atom 或 Claim。</p>
+<button class="text-button" type="button" data-result-base="{{ item.stable_key }}"
+  data-revision="{{ item.revision_ref }}" data-object="{{ item.object_ref }}">将此结果固定为对照左侧</button>
+<button class="text-button" type="button" data-result-compare="{{ item.stable_key }}"
+  data-revision="{{ item.revision_ref }}" data-object="{{ item.object_ref }}">与已固定结果对照</button>
 <p>Run：{{ value.experiment_run_id }} · 精确 Run 修订：{{ value.experiment_run_revision_id }}</p>
 <button class="button" type="button" data-link-key="{{ value.experiment_run_id }}"
   data-revision="{{ value.experiment_run_revision_id }}" data-object="{{ value.experiment_run_id }}"

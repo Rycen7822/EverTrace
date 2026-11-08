@@ -1117,6 +1117,7 @@ impl EngineService {
         query: Box<evertrace_domain::query::RevisionCompareQuery>,
         effective_config_hash: [u8; 32],
         report: std::sync::Arc<tokio::sync::RwLock<Option<evertrace_codex::HostProbeReport>>>,
+        cas_dir: std::path::PathBuf,
     ) -> Result<evertrace_domain::query::RevisionPairFields, ErrorCode> {
         use evertrace_domain::query::{
             ExactFieldsQuery, HumanContentState as State, MetadataReadOutcome as Outcome,
@@ -1170,6 +1171,7 @@ impl EngineService {
                         P::CoreMembershipRecorded(value) => Some(serde_json::to_value(value)),
                         P::RevisionProposalRecorded(value) => Some(serde_json::to_value(value)),
                         P::SemanticDigestRecorded(value) => Some(serde_json::to_value(value)),
+                        P::ResultEvidenceRecorded(value) => Some(serde_json::to_value(value)),
                         _ => None,
                     };
                     if let Some(value) = value {
@@ -1185,6 +1187,67 @@ impl EngineService {
                 }
             }
             sides.push(side);
+        }
+        let mut result_assessment = None;
+        if sides.iter().all(|side| {
+            side.content_state == State::Ready
+                && side
+                    .selection
+                    .as_ref()
+                    .is_some_and(|value| value.object_kind == "result_evidence")
+        }) {
+            let mut members = Vec::with_capacity(2);
+            for context in before.iter() {
+                use evertrace_store::JournalPayload as P;
+                let root = context.selected.as_ref().ok_or(ErrorCode::StoreCorrupt)?;
+                let P::ResultEvidenceRecorded(result) = serde_json::from_str(
+                    root.payload_json
+                        .as_deref()
+                        .ok_or(ErrorCode::StoreCorrupt)?,
+                )
+                .map_err(|_| ErrorCode::StoreCorrupt)?
+                else {
+                    return Err(ErrorCode::StoreCorrupt);
+                };
+                let run_revision = result.experiment_run_revision_id.to_string();
+                let row = context
+                    .rows
+                    .iter()
+                    .find(|row| {
+                        row.object_kind.as_deref() == Some("experiment_run")
+                            && row.current_revision_id.as_deref() == Some(run_revision.as_str())
+                    })
+                    .ok_or(ErrorCode::StoreCorrupt)?;
+                let P::ExperimentRunRecorded(run) = serde_json::from_str(
+                    row.payload_json.as_deref().ok_or(ErrorCode::StoreCorrupt)?,
+                )
+                .map_err(|_| ErrorCode::StoreCorrupt)?
+                else {
+                    return Err(ErrorCode::StoreCorrupt);
+                };
+                members.push((result, run));
+            }
+            let stop = cancelled.clone();
+            result_assessment = Some(
+                tokio::task::spawn_blocking(move || {
+                    let refs = members
+                        .iter()
+                        .map(|(result, run)| (result.as_ref(), run.as_ref()))
+                        .collect::<Vec<_>>();
+                    crate::autoresearch::read_result_cohort(&cas_dir, &refs, &mut || {
+                        if stop.load(std::sync::atomic::Ordering::SeqCst)
+                            || Instant::now() >= deadline
+                        {
+                            Err(evertrace_capture::CasError::ReadCancelled)
+                        } else {
+                            Ok(())
+                        }
+                    })
+                })
+                .await
+                .map_err(|_| ErrorCode::Internal)?
+                .map_err(|_| ErrorCode::StoreCorrupt)?,
+            );
         }
         let after = writer
             .read_stored_pair_context(query.clone(), cancelled, deadline, effective_config_hash)
@@ -1224,7 +1287,9 @@ impl EngineService {
             if left.content_state == State::Ready && right.content_state == State::Ready {
                 let a = left.selection.as_ref().ok_or(ErrorCode::StoreCorrupt)?;
                 let b = right.selection.as_ref().ok_or(ErrorCode::StoreCorrupt)?;
-                if a.object_kind != b.object_kind || a.object_ref != b.object_ref {
+                if a.object_kind != b.object_kind
+                    || (a.object_kind != "result_evidence" && a.object_ref != b.object_ref)
+                {
                     return Err(ErrorCode::InvalidInput);
                 }
                 Some(match a.object_kind.as_str() {
@@ -1233,16 +1298,21 @@ impl EngineService {
                     "core_membership" => Kind::CoreMembership,
                     "revision_proposal_revision" => Kind::Proposal,
                     "semantic_digest" => Kind::Digest,
+                    "result_evidence" => Kind::Result,
                     _ => return Err(ErrorCode::InvalidInput),
                 })
             } else {
                 None
             };
+        if object_kind != Some(Kind::Result) {
+            result_assessment = None;
+        }
         let result = RevisionPairFields {
             query: *query,
             object_kind,
             left,
             right,
+            result_assessment,
         };
         if !result.validate() {
             return Err(ErrorCode::ResourceExhausted);
