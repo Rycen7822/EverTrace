@@ -1,7 +1,9 @@
-//! Read existing compiler output and exact source values; never rebuild or generate.
+//! Published compiler references and current access facts, never bodies or presentation summaries.
 use super::*;
 use crate::WriterActorError;
-use evertrace_domain::query::{CompiledProjectionMetadata, CompiledProjectionQuery};
+use evertrace_domain::query::{
+    CompiledProjectionPage, CompiledProjectionQuery, CompiledSourceMetadata, ReadDataIdentity,
+};
 use serde::{Deserialize, Serialize};
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
@@ -9,6 +11,7 @@ use serde::{Deserialize, Serialize};
 struct Cursor {
     query: CompiledProjectionQuery,
     frontier: u64,
+    data_identity: ReadDataIdentity,
     position: Position,
 }
 #[derive(Clone, Debug, Deserialize, Serialize)]
@@ -16,39 +19,6 @@ struct Cursor {
 enum Position {
     Directory { key: String },
     Entries { offset: u64 },
-}
-
-pub struct HumanCompiledEntry {
-    pub reference: String,
-    pub revision_ref: String,
-    pub contextual: bool,
-    pub membership_revision: Option<String>,
-    pub state: HumanContentState,
-    pub item: Option<HumanSummary>,
-}
-
-pub enum HumanCompiledPage {
-    Directory {
-        frontier: u64,
-        query: CompiledProjectionQuery,
-        items: Vec<CompiledProjectionMetadata>,
-        scope_available: bool,
-        complete: bool,
-        matching_count: Option<u64>,
-        next_cursor: Option<String>,
-    },
-    Entries {
-        frontier: u64,
-        query: CompiledProjectionQuery,
-        metadata: Option<CompiledProjectionMetadata>,
-        title: Option<String>,
-        state: HumanContentState,
-        scope_available: bool,
-        complete: bool,
-        matching_count: Option<u64>,
-        entries: Vec<HumanCompiledEntry>,
-        next_cursor: Option<String>,
-    },
 }
 
 fn actor_error(error: WriterActorError) -> HumanGovernanceError {
@@ -61,6 +31,7 @@ fn actor_error(error: WriterActorError) -> HumanGovernanceError {
 fn cursor(
     query: &CompiledProjectionQuery,
     frontier: u64,
+    data_identity: ReadDataIdentity,
     position: Option<Position>,
 ) -> Result<Option<String>, HumanGovernanceError> {
     position
@@ -68,6 +39,7 @@ fn cursor(
             serde_json::to_string(&Cursor {
                 query: query.clone(),
                 frontier,
+                data_identity,
                 position,
             })
             .map_err(|_| HumanGovernanceError::Store)
@@ -82,7 +54,7 @@ impl HumanGovernanceService {
         expected_frontier: Option<u64>,
         after: Option<&str>,
         limit: u16,
-    ) -> Result<Result<HumanCompiledPage, u64>, HumanGovernanceError> {
+    ) -> Result<Result<CompiledProjectionPage, u64>, HumanGovernanceError> {
         query
             .validate()
             .map_err(|_| HumanGovernanceError::InvalidInput)?;
@@ -92,6 +64,10 @@ impl HumanGovernanceService {
         {
             return Err(HumanGovernanceError::InvalidInput);
         }
+        let state =
+            crate::EngineService::read_state(self.writer.read_handle(), self.effective_config_hash)
+                .await
+                .map_err(|_| HumanGovernanceError::Store)?;
         let position = if let Some(after) = after {
             if after.len() > 4096 {
                 return Err(HumanGovernanceError::InvalidInput);
@@ -101,11 +77,14 @@ impl HumanGovernanceService {
             if value.query != query || expected_frontier != Some(value.frontier) {
                 return Err(HumanGovernanceError::InvalidInput);
             }
+            if value.data_identity != state.data_identity {
+                return Ok(Err(state.frontier));
+            }
             Some(value.position)
         } else {
             None
         };
-        match &query {
+        let result = match &query {
             CompiledProjectionQuery::Directory { .. } => {
                 let key = match position {
                     Some(Position::Directory { key }) => Some(key),
@@ -123,10 +102,12 @@ impl HumanGovernanceService {
                 let next_cursor = cursor(
                     &query,
                     context.frontier,
+                    state.data_identity,
                     context.next_key.map(|key| Position::Directory { key }),
                 )?;
-                Ok(Ok(HumanCompiledPage::Directory {
+                Ok(Ok(CompiledProjectionPage::Directory {
                     frontier: context.frontier,
+                    data_identity: state.data_identity,
                     query,
                     items: context.items,
                     scope_available: context.scope_available,
@@ -152,86 +133,52 @@ impl HumanGovernanceService {
                 if frontier != context.frontier {
                     return Ok(Err(context.frontier));
                 }
-                self.compiled_entries_page(query, context).await
+                self.compiled_entries_page(query, context, state.data_identity)
+                    .await
             }
+        };
+        let current =
+            crate::EngineService::read_state(self.writer.read_handle(), self.effective_config_hash)
+                .await
+                .map_err(|_| HumanGovernanceError::Store)?;
+        if current.frontier != state.frontier || current.data_identity != state.data_identity {
+            return Ok(Err(current.frontier));
         }
+        result
     }
 
     async fn compiled_entries_page(
         &self,
         query: CompiledProjectionQuery,
         context: evertrace_store::projections::CompiledEntriesContext,
-    ) -> Result<Result<HumanCompiledPage, u64>, HumanGovernanceError> {
-        let snapshot = if context.sources.is_empty() {
-            None
-        } else {
-            let snapshot = self.writer.project_objects().await.map_err(actor_error)?;
-            if snapshot.frontier != context.frontier {
-                return Ok(Err(snapshot.frontier));
-            }
-            Some(snapshot)
-        };
-        let deadline = std::time::Instant::now() + presentation::READ_DEADLINE;
-        let index = snapshot
-            .as_ref()
-            .map(|snapshot| export::presentation_index(snapshot, deadline))
-            .transpose();
+        data_identity: ReadDataIdentity,
+    ) -> Result<Result<CompiledProjectionPage, u64>, HumanGovernanceError> {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
         let mut entries = Vec::new();
         for source in context.sources {
-            let mut entry = HumanCompiledEntry {
-                reference: source.revision.to_string(),
-                revision_ref: source.revision.to_string(),
+            let mut entry = CompiledSourceMetadata {
+                revision_ref: source.revision,
                 contextual: source.contextual,
-                membership_revision: source.membership_revision.map(|id| id.to_string()),
-                state: HumanContentState::Unavailable,
-                item: None,
+                membership_revision: source.membership_revision,
+                object_kind: source.object_kind.into(),
+                state: HumanContentState::Ready,
             };
-            if let (Some(snapshot), Ok(Some(index))) = (&snapshot, &index) {
-                let row = index.get(entry.reference.as_str()).and_then(|rows| {
-                    rows.iter()
-                        .copied()
-                        .filter(|row| row.object_kind.as_deref() == Some(source.object_kind))
-                        .filter(|row| {
-                            row.current_revision_id.as_deref() == Some(entry.revision_ref.as_str())
-                        })
-                        .min_by_key(|row| row.row_class != Some(ObjectRowClass::Object))
-                });
-                if let Some(row) = row {
-                    let gate_row = match entry.membership_revision.as_deref() {
-                        Some(revision) => index.get(revision).and_then(|rows| {
-                            rows.iter()
-                                .copied()
-                                .find(|row| row.object_kind.as_deref() == Some("core_membership"))
-                        }),
-                        None => Some(row),
-                    };
-                    if let Some(gate_row) = gate_row {
-                        match self
-                            .readable_indexed_row(snapshot, gate_row, index, deadline)
-                            .await
-                        {
-                            Ok(()) => {
-                                let mut item = summary_fields(row, HumanSurface::Explorer);
-                                let detail = presentation::present(row)?;
-                                entry.state = detail.state;
-                                item.semantic_detail = Some(detail);
-                                entry.item = Some(item);
-                            }
-                            Err(export::Failure::Denied) => {
-                                entry.state = HumanContentState::AccessDenied
-                            }
-                            Err(_) => {}
-                        }
-                    } else {
-                        entry.state = HumanContentState::Missing;
-                    }
-                } else {
-                    entry.state = HumanContentState::Missing;
+            for reference in entry
+                .membership_revision
+                .iter()
+                .chain([&entry.revision_ref])
+            {
+                let state = self
+                    .compiled_source_access(reference, context.frontier, data_identity, deadline)
+                    .await;
+                if state != HumanContentState::Ready {
+                    entry.state = state;
+                    break;
                 }
             }
             entries.push(entry);
         }
-        let body_read = entries.iter().any(|entry| {
+        let title_readable = entries.iter().any(|entry| {
             !entry.contextual
                 && matches!(
                     entry.state,
@@ -255,15 +202,17 @@ impl HumanGovernanceService {
         let next_cursor = cursor(
             &query,
             context.frontier,
+            data_identity,
             context
                 .next_offset
                 .map(|offset| Position::Entries { offset }),
         )?;
-        Ok(Ok(HumanCompiledPage::Entries {
+        Ok(Ok(CompiledProjectionPage::Entries {
             frontier: context.frontier,
+            data_identity,
             query,
             metadata: context.metadata,
-            title: body_read.then_some(context.title).flatten(),
+            title: title_readable.then_some(context.title).flatten(),
             state,
             scope_available: context.scope_available,
             complete,
@@ -271,5 +220,45 @@ impl HumanGovernanceService {
             entries,
             next_cursor,
         }))
+    }
+
+    async fn compiled_source_access(
+        &self,
+        revision: &RevisionId,
+        frontier: u64,
+        data_identity: ReadDataIdentity,
+        deadline: std::time::Instant,
+    ) -> HumanContentState {
+        use evertrace_domain::query::{ExactRecordQuery, ExactRecordRef, MetadataReadOutcome};
+        let query = ExactRecordQuery {
+            reference: ExactRecordRef {
+                stable_key: revision.to_string(),
+                revision_ref: Some(revision.to_string()),
+            },
+            field: None,
+            range: None,
+            expected_data_identity: Some(data_identity),
+            expected_selection: None,
+        };
+        let result = tokio::time::timeout_at(
+            tokio::time::Instant::from_std(deadline),
+            crate::EngineService::read_exact_record(
+                self.writer.clone(),
+                Box::new(query),
+                self.effective_config_hash,
+                self.session_report.clone().unwrap_or_default(),
+                self.runtime_snapshot
+                    .as_ref()
+                    .map(|value| value.cas_dir.clone())
+                    .unwrap_or_default(),
+            ),
+        )
+        .await;
+        match result {
+            Ok(Ok(MetadataReadOutcome::Page(page))) if page.state.frontier == frontier => {
+                page.content_state
+            }
+            _ => HumanContentState::Unavailable,
+        }
     }
 }

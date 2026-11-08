@@ -1,6 +1,3 @@
-mod compiled;
-pub use compiled::{HumanCompiledEntry, HumanCompiledPage};
-
 pub use evertrace_domain::query::ExactReadQuery;
 use evertrace_domain::{
     evidence::IdentityStrength,
@@ -858,7 +855,7 @@ pub enum HumanGovernanceResponse {
         state: Box<evertrace_domain::query::ObjectReadState>,
     },
     CompiledProjections {
-        page: Box<HumanCompiledPage>,
+        page: Box<evertrace_domain::query::CompiledProjectionPage>,
     },
     Search {
         page: Box<evertrace_domain::query::HumanSearchPage>,

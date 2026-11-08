@@ -961,7 +961,7 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
                                         .await.map_err(map_human_error)?;
                                     match result {
                                         Ok(page) => HumanGovernanceResponse::CompiledProjections {
-                                            page: Box::new(map_human_compiled(page)),
+                                            page: Box::new(page),
                                         },
                                         Err(current_frontier) => HumanGovernanceResponse::Conflict {
                                             current_revision_ref: None, current_frontier,
@@ -1639,65 +1639,6 @@ fn map_semantic_detail(
                 Content::CoreMembership(value)
             }
         }),
-    }
-}
-
-fn map_human_compiled(
-    page: evertrace_engine::HumanCompiledPage,
-) -> evertrace_protocol::dto::HumanCompiledPage {
-    use evertrace_engine::HumanCompiledPage as E;
-    use evertrace_protocol::dto::{HumanCompiledEntry, HumanCompiledPage as P};
-    match page {
-        E::Directory {
-            frontier,
-            query,
-            items,
-            scope_available,
-            complete,
-            matching_count,
-            next_cursor,
-        } => P::Directory {
-            frontier,
-            query,
-            items,
-            scope_available,
-            complete,
-            matching_count,
-            next_cursor,
-        },
-        E::Entries {
-            frontier,
-            query,
-            metadata,
-            title,
-            state,
-            scope_available,
-            complete,
-            matching_count,
-            entries,
-            next_cursor,
-        } => P::Entries {
-            frontier,
-            query,
-            metadata,
-            title,
-            state,
-            scope_available,
-            complete,
-            matching_count,
-            entries: entries
-                .into_iter()
-                .map(|v| HumanCompiledEntry {
-                    reference: v.reference,
-                    revision_ref: v.revision_ref,
-                    contextual: v.contextual,
-                    membership_revision: v.membership_revision,
-                    state: v.state,
-                    item: v.item.map(|item| Box::new(map_human_item(item))),
-                })
-                .collect(),
-            next_cursor,
-        },
     }
 }
 

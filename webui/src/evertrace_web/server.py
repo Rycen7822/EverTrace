@@ -18,6 +18,7 @@ from .backend import Backend, BackendError, _decode
 from .jobs import read_jobs
 from .comparison import read_comparison
 from .research import read_research_comparison
+from .compiled import read_compiled
 from .content import DETAIL_KINDS, WORK_DETAIL_KINDS, read_record_content, read_record_detail, read_source_content
 from .sources import read_revisions, read_source_catalog, read_source_archive, read_source_detail, read_source_links
 from .scopes import read_scopes
@@ -313,7 +314,7 @@ class App:
                 after = payload.get("after")
                 if not valid_ref(after, optional=True):
                     return JSONResponse({"error": "invalid_read"}, 400)
-                result = await self.backend.compiled(payload.get("query"), frontier, after)
+                result = await read_compiled(self.backend, payload.get("query"), frontier, after)
                 if result["kind"] == "conflict":
                     data = {"conflict": True}
                 else:

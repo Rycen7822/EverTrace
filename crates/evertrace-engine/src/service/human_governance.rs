@@ -8,7 +8,6 @@ pub use crate::semantic::human_acceptance::{
 mod compiled;
 mod diagnostics;
 mod export;
-pub use compiled::{HumanCompiledEntry, HumanCompiledPage};
 mod presentation;
 mod reading;
 mod searching;

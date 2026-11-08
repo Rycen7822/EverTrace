@@ -109,11 +109,11 @@ WORK_DETAIL_KINDS = {"task", "workstream", "work_episode", "attempt", "operation
                      "recovery_capture_request", "recovery_bundle", "work_artifact", "experiment_run", "result_evidence"}
 
 
-async def read_record_detail(backend, reference, frontier, revision, object_kind):
+async def read_record_detail(backend, reference, frontier, revision, object_kind, *, data_identity=None):
     """A selected reading detail, never an Inbox/action or Work/System qualification projection."""
     if object_kind not in DETAIL_KINDS:
         raise BackendError("invalid_input")
-    reply = await backend.read_record_window(reference, revision)
+    reply = await backend.read_record_window(reference, revision, data_identity=data_identity)
     if reply["kind"] == "conflict":
         return reply
     meta = reply["page"]
