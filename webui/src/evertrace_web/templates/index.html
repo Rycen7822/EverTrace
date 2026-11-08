@@ -56,6 +56,7 @@
         <div class="nav-section">
           <div class="nav-title">证据与管理</div>
           <button class="nav-item" data-route="sources"><span>来源</span></button>
+          <button class="nav-item" data-route="usage"><span>使用证据</span></button>
           <button class="nav-item" data-route="review"><span>审核</span></button>
           <button class="nav-item" data-route="system"><span>系统</span></button>
         </div>
@@ -169,11 +170,12 @@
                   <option value="work_artifact">Artifact · 工作产物</option>
                   <option value="experiment_run">ExperimentRun · 实验执行</option>
                   <option value="result_evidence">ResultEvidence · 结果证据</option>
+                  <option value="recall_need">RecallNeed · 当前召回账本</option>
                   <option value="atom_revision">Atom · 假设 / 结果 / 主张 / 引用</option>
                 </select></label>
                 <label>精确修订（可选）<input id="work-record-revision" type="text" maxlength="512"
                   autocomplete="off" spellcheck="false" aria-label="工作记录修订" /></label>
-                <button class="text-button" type="submit">读取工作记录</button>
+                <button id="work-record-submit" class="text-button" type="submit">读取工作记录</button>
                 <p id="work-record-help" class="muted">也可从范围目录选择 Task。这里只读所选工作及有界关联，不把全局范围当空任务列表。</p>
               </form>
               <form id="job-lookup" class="time-filter" hidden>

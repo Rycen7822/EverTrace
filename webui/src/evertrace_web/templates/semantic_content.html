@@ -10,7 +10,9 @@
 {% endmacro %}
 {% set value = content.value %}
 <div class="semantic-content" data-semantic-kind="{{ content.kind }}">
-{% if content.kind == 'atom' %}
+{% if content.kind == 'recall_need' %}
+  {% include 'recall_ledger.html' %}
+{% elif content.kind == 'atom' %}
   <h2>{{ value.value.subject }}</h2>
   <p class="muted">类型：{{ value.kind }}</p>
   <div class="memory-prose semantic-body">{{ value.value.text }}</div>

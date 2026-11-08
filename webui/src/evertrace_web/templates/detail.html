@@ -15,7 +15,8 @@
       ('发布', 'publication_state'), ('支持', 'support_state')
     ] if item[field] %}<span class="badge">{{ label }}：{{ item[field] }}</span>{% endfor %}
   </div>{% endif %}
-  <p>{{ item.object_kind }} · 所选修订：{{ item.revision_ref or item.object_ref }}</p>
+  <p>{{ item.object_kind }} · {{ '当前快照，计划修订' if item.object_kind == 'recall_need' else '所选修订' }}：
+    {{ item.revision_ref or item.object_ref }}</p>
   {% if item.object_kind in ('task', 'workstream') %}
   <p class="reading-note">当前固定读取此修订。上方真值和生命周期来自这份记录，不表示它是该工作的最新版本。</p>
   {% endif %}
@@ -45,7 +46,8 @@
   <button class="button" type="button" data-content-open="text">分段读取完整正文</button>
   {% endif %}
   <button class="button" type="button" data-content-open="semantic_json">
-    {{ '分段读取完整采集覆盖凭证' if item.object_kind in ('capture_receipt', 'capture_receipt_revision') else '分段读取完整语义结构' }}
+    {{ '分段读取账本快照结构' if item.object_kind == 'recall_need' else
+       '分段读取完整采集覆盖凭证' if item.object_kind in ('capture_receipt', 'capture_receipt_revision') else '分段读取完整语义结构' }}
   </button>
 </div>
 {% if item.object_kind == 'capture_receipt' and detail.state == 'too_large' %}

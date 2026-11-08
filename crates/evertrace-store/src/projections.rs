@@ -3607,6 +3607,51 @@ pub fn read_dependencies_for(row: &ObjectRow, payload: &JournalPayload) -> BTree
             refs.extend(value.terminal_evidence_refs.iter().map(ToString::to_string));
             refs.extend(value.work_artifact_refs.iter().map(ToString::to_string));
         }
+        JournalPayload::RecallLedgerRecorded(event) => {
+            if let evertrace_domain::recall::RecallLedgerEvent::NeedRecorded { need } =
+                event.as_ref()
+            {
+                refs.extend(need.source_revision_ids.iter().map(ToString::to_string));
+                refs.insert(need.task_id.to_string());
+                refs.insert(need.workstream_id.to_string());
+                refs.insert(need.episode_revision_id.to_string());
+                refs.extend(
+                    need.trigger_state
+                        .attempt_ids
+                        .iter()
+                        .map(ToString::to_string),
+                );
+                refs.extend(
+                    need.trigger_state
+                        .binding_revision_id
+                        .map(|id| id.to_string()),
+                );
+                refs.extend(
+                    need.trigger_state
+                        .scope_effect_refs
+                        .iter()
+                        .map(ToString::to_string),
+                );
+                refs.extend(need.recall_plan.normative_constraint_refs.iter().cloned());
+                refs.extend(
+                    need.trigger_state
+                        .worktree_snapshot_id
+                        .map(|id| id.to_string()),
+                );
+                refs.extend(
+                    need.recall_plan
+                        .relevant_episode_revision
+                        .map(|id| id.to_string()),
+                );
+                refs.extend(need.recall_plan.stale_delivered_objects.iter().cloned());
+                refs.extend(
+                    need.recall_plan
+                        .applicable_procedure_revision
+                        .map(|id| id.to_string()),
+                );
+                refs.extend(need.recall_plan.supporting_evidence_refs.iter().cloned());
+            }
+        }
         JournalPayload::ResultEvidenceRecorded(value) => {
             refs.insert(value.experiment_run_revision_id.to_string());
             refs.extend(value.raw_artifact_refs.iter().map(ToString::to_string));
@@ -6171,6 +6216,28 @@ impl JournalAdmissionState {
     ) -> Result<evertrace_domain::query::MetadataReadOutcome<StoredFieldsContext>, StoreError> {
         if !query.validate() {
             return Err(StoreError::InvalidInput);
+        }
+        if let evertrace_domain::query::ExactReadQuery::Record(record) = query {
+            let key = record
+                .reference
+                .stable_key
+                .strip_prefix("runtime:recall_need:")
+                .unwrap_or(&record.reference.stable_key);
+            if let Ok(id) = key.parse::<evertrace_domain::ids::RecallNeedId>() {
+                let row = self.recall_ledger.current_row(id, PROJECTION_GENERATION)?;
+                if row.as_ref().is_some_and(|row| {
+                    record
+                        .reference
+                        .revision_ref
+                        .as_ref()
+                        .is_some_and(|revision| Some(revision) != row.current_revision_id.as_ref())
+                }) {
+                    return Ok(evertrace_domain::query::MetadataReadOutcome::Conflict(
+                        state.frontier,
+                    ));
+                }
+                return self.stored_fields_context_for_row(row, state, cancelled, deadline, budget);
+            }
         }
         // Bind a typed public ID using its existing canonical-current owner, then read that immutable revision.
         let reference = query.lookup_ref();

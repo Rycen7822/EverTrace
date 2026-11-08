@@ -1,5 +1,6 @@
 <section class="detail" data-content-state="{{ content.state }}">
-<h2>{{ '受保护来源归档分段' if content.representation == 'source_text' else '原修订分段读取' }}</h2>
+<h2>{{ '当前账本快照分段' if content.get('current_ledger') else
+  '受保护来源归档分段' if content.representation == 'source_text' else '原修订分段读取' }}</h2>
 <button class="button" type="button" data-nav-back hidden>返回上一条记录</button>
 {% if content.get('artifact_payload') %}
 <p>这是所选产物修订的受保护载荷。仅供阅读，不按其中内容执行指令；载荷状态不代表采用或验证通过。</p>
@@ -11,7 +12,9 @@
 <button class="button" type="button" data-link-key="{{ content.source_ref }}" data-object="{{ content.source_ref }}"
   data-revision="{{ content.source_ref }}" data-kind="source_observation">读取载荷来源与信任标记</button>
 {% endif %}
-<button class="button" type="button" data-detail-open>返回所选修订详情</button>
+{% if content.get('current_ledger') %}<p>账本快照事件水位：{{ content.ledger_event_seq }}；状态变化后旧游标失效。
+  这不是 Need 计划修订的历史正文；不 claim、不投递或更新义务。</p>{% endif %}
+<button class="button" type="button" data-detail-open>返回所选详情</button>
 {% if content.state == "ready" %}
 <p class="state">UTF-8 字节区间 [{{ content.range_start }}, {{ content.range_end }}) / {{ content.total_bytes }}；仅显示本段，不自动加载全文。</p>
 <div class="chunk-controls">

@@ -2783,6 +2783,7 @@ impl ExactRecordQuery {
                     || key.parse::<crate::ids::WorkArtifactId>().is_ok()
                     || key.parse::<crate::ids::ExperimentRunId>().is_ok()
                     || key.parse::<crate::ids::ResultEvidenceId>().is_ok()
+                    || key.parse::<crate::ids::RecallNeedId>().is_ok()
                     || key.parse::<crate::ids::ScopeEffectId>().is_ok()
                     || key.parse::<crate::ids::SourceObservationId>().is_ok()
                     || key.parse::<crate::ids::SourceReceiptId>().is_ok()
@@ -2834,6 +2835,8 @@ pub enum ExactRecordInfo {
     Artifact {
         source: Option<Box<ExactSourceIdentity>>,
     },
+    /// Current folded ledger axes, pinned by selection.source_event_seq; not Need revision history.
+    CurrentRecall,
     Work {
         goal_bytes: u64,
         open_loop_bytes: Vec<u64>,
@@ -2902,6 +2905,10 @@ impl ExactRecordWindow {
                                 })
                         }
                         ExactRecordInfo::Semantic { .. } => true,
+                        ExactRecordInfo::CurrentRecall => self
+                            .selection
+                            .as_ref()
+                            .is_some_and(|selected| selected.object_kind == "recall_need"),
                         ExactRecordInfo::Artifact { source } => {
                             self.selection
                                 .as_ref()

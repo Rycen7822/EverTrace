@@ -184,47 +184,23 @@ impl RecallLedgerState {
     pub fn rows(self, generation: u64) -> Result<Vec<ObjectRow>, StoreError> {
         self.needs
             .into_values()
-            .map(|(need, source_event_seq)| {
-                Ok(ObjectRow {
-                    row_id: format!("runtime:recall_need:{}", need.recall_need_id),
-                    row_kind: ObjectRowKind::Data,
-                    row_class: Some(ObjectRowClass::Runtime),
-                    object_family: None,
-                    object_kind: Some(RECALL_NEED_KIND.into()),
-                    object_id: None,
-                    current_revision_id: Some(need.revision_id.to_string()),
-                    lifecycle: Some(
-                        if need.obligation_state == RecallObligationState::Active {
-                            "active"
-                        } else {
-                            "inactive"
-                        }
-                        .into(),
-                    ),
-                    epistemic: Some("runtime_ledger".into()),
-                    authority: Some("none".into()),
-                    publication_state: None,
-                    support_state: None,
-                    project_id: None,
-                    repository_id: need.repository_id.map(|value| value.to_string()),
-                    worktree_id: need.worktree_id.map(|value| value.to_string()),
-                    task_id: Some(need.task_id.to_string()),
-                    workstream_id: Some(need.workstream_id.to_string()),
-                    session_id: Some(need.session_id.clone()),
-                    payload_json: Some(
-                        JournalPayload::RecallLedgerRecorded(Box::new(
-                            RecallLedgerEvent::NeedRecorded {
-                                need: Box::new(need),
-                            },
-                        ))
-                        .canonical_json()?
-                        .into(),
-                    ),
-                    source_event_seq,
-                    projection_generation: generation,
-                })
-            })
+            .map(|(need, seq)| need_row(need, seq, generation))
             .collect()
+    }
+
+    /// Current folded ledger, not an immutable historical Need revision.
+    pub(super) fn current_row(
+        &self,
+        id: RecallNeedId,
+        generation: u64,
+    ) -> Result<Option<ObjectRow>, StoreError> {
+        let Some((need, seq)) = self.needs.get(&id) else {
+            return Ok(None);
+        };
+        let mut row = need_row(need.clone(), *seq, generation)?;
+        // Only this finite read adapts the public identity; persisted runtime row shape is unchanged.
+        row.object_id = Some(id.to_string());
+        Ok(Some(row))
     }
 
     pub fn values(&self) -> impl Iterator<Item = &RecallNeed> {
@@ -239,6 +215,49 @@ impl RecallLedgerState {
             .get(&recall_need_id)
             .copied()
     }
+}
+
+fn need_row(
+    need: RecallNeed,
+    source_event_seq: u64,
+    generation: u64,
+) -> Result<ObjectRow, StoreError> {
+    Ok(ObjectRow {
+        row_id: format!("runtime:recall_need:{}", need.recall_need_id),
+        row_kind: ObjectRowKind::Data,
+        row_class: Some(ObjectRowClass::Runtime),
+        object_family: None,
+        object_kind: Some(RECALL_NEED_KIND.into()),
+        object_id: None,
+        current_revision_id: Some(need.revision_id.to_string()),
+        lifecycle: Some(
+            if need.obligation_state == RecallObligationState::Active {
+                "active"
+            } else {
+                "inactive"
+            }
+            .into(),
+        ),
+        epistemic: Some("runtime_ledger".into()),
+        authority: Some("none".into()),
+        publication_state: None,
+        support_state: None,
+        project_id: None,
+        repository_id: need.repository_id.map(|value| value.to_string()),
+        worktree_id: need.worktree_id.map(|value| value.to_string()),
+        task_id: Some(need.task_id.to_string()),
+        workstream_id: Some(need.workstream_id.to_string()),
+        session_id: Some(need.session_id.clone()),
+        payload_json: Some(
+            JournalPayload::RecallLedgerRecorded(Box::new(RecallLedgerEvent::NeedRecorded {
+                need: Box::new(need),
+            }))
+            .canonical_json()?
+            .into(),
+        ),
+        source_event_seq,
+        projection_generation: generation,
+    })
 }
 
 fn same_need_identity(current: &RecallNeed, next: &RecallNeed) -> bool {

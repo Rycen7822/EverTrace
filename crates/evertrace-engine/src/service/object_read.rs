@@ -597,6 +597,13 @@ fn record_data(
         P::CaptureReceiptRecorded(value) => semantic_record(&value, None, query, check),
         P::ExperimentRunRecorded(value) => semantic_record(&value, None, query, check),
         P::ResultEvidenceRecorded(value) => semantic_record(&value, None, query, check),
+        P::RecallLedgerRecorded(event) => match *event {
+            evertrace_domain::recall::RecallLedgerEvent::NeedRecorded { need } => {
+                Ok(semantic_record(&need, None, query, check)?
+                    .map(|(_, window)| (Info::CurrentRecall, window)))
+            }
+            _ => Ok(None),
+        },
         P::TaskRecorded(value) => {
             semantic_record(&value, Some(&value.canonical_goal), query, check)
         }
@@ -836,7 +843,7 @@ impl EngineService {
         let deadline = Instant::now() + std::time::Duration::from_secs(2);
         let (cancelled, _cancel_on_drop) = evertrace_store::StoreReadHandle::cancellation_scope();
         let request = Box::new(ExactReadQuery::Record((*query).clone()));
-        let Outcome::Page(before) = writer
+        let before = match writer
             .read_stored_fields_context(
                 request.clone(),
                 cancelled.clone(),
@@ -845,8 +852,10 @@ impl EngineService {
             )
             .await
             .map_err(|_| ErrorCode::Internal)?
-        else {
-            return Err(ErrorCode::ResourceExhausted);
+        {
+            Outcome::Page(context) => context,
+            Outcome::Conflict(frontier) => return Ok(Outcome::Conflict(frontier)),
+            Outcome::TooLarge => return Err(ErrorCode::ResourceExhausted),
         };
         if query
             .expected_data_identity
@@ -977,12 +986,14 @@ impl EngineService {
                 .await
                 .map_err(|_| ErrorCode::ResourceExhausted)??
         };
-        let Outcome::Page(current) = writer
+        let current = match writer
             .read_stored_fields_context(request, cancelled, deadline, effective_config_hash)
             .await
             .map_err(|_| ErrorCode::Internal)?
-        else {
-            return Err(ErrorCode::ResourceExhausted);
+        {
+            Outcome::Page(context) => context,
+            Outcome::Conflict(frontier) => return Ok(Outcome::Conflict(frontier)),
+            Outcome::TooLarge => return Err(ErrorCode::ResourceExhausted),
         };
         result.state = current.state.clone();
         result.selection = fields_metadata(&current)?.selection;

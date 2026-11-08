@@ -103,10 +103,11 @@ DETAIL_KINDS = {"atom_revision": "atom", "procedure_revision": "procedure", "cor
                 "host_occurrence": "host_occurrence", "scope_effect": "scope_effect",
                 "worktree": "worktree", "worktree_snapshot": "worktree_snapshot",
                 "recovery_capture_request": "recovery_capture_request", "recovery_bundle": "recovery_bundle",
-                "work_artifact": "work_artifact", "experiment_run": "experiment_run", "result_evidence": "result_evidence"}
+                "work_artifact": "work_artifact", "experiment_run": "experiment_run", "result_evidence": "result_evidence",
+                "recall_need": "recall_need"}
 WORK_DETAIL_KINDS = {"task", "workstream", "work_episode", "attempt", "operation_burst", "operation",
                      "host_occurrence", "scope_effect", "worktree", "worktree_snapshot",
-                     "recovery_capture_request", "recovery_bundle", "work_artifact", "experiment_run", "result_evidence"}
+                     "recovery_capture_request", "recovery_bundle", "work_artifact", "experiment_run", "result_evidence", "recall_need"}
 
 
 async def read_record_detail(backend, reference, frontier, revision, object_kind, *, data_identity=None):
@@ -119,6 +120,8 @@ async def read_record_detail(backend, reference, frontier, revision, object_kind
     meta = reply["page"]
     if meta["state"]["frontier"] < frontier:
         return {"kind": "conflict"}
+    if object_kind == "recall_need" and meta["content_state"] == "ready" and meta["info"] != {"kind":"current_recall"}:
+        raise BackendError("invalid_read_response")
     row = meta["metadata"]
     if row is None:
         return {"kind": "detail", "items": []}
@@ -161,7 +164,7 @@ async def read_record_detail(backend, reference, frontier, revision, object_kind
                 if not isinstance(record, dict):
                     raise BackendError("invalid_read_response")
                 break
-    # Recheck after decoding/projection, under the same immutable identity and current access rules.
+    # Recheck after decoding, under the same Native selection/watermark and current access rules.
     reply = await backend.read_record_window(reference, revision, data_identity=identity, selection=selection)
     if reply["kind"] == "conflict":
         return reply
@@ -176,6 +179,10 @@ async def read_record_detail(backend, reference, frontier, revision, object_kind
         "object_ref": row["object_id"], "revision_ref": revision, "state": state,
         "preview": None, "original_bytes": total,
         "content": {"kind": DETAIL_KINDS[object_kind], "value": record} if record is not None else None}
+    if object_kind == "recall_need" and record is not None:
+        detail["content"].update({"ledger_event_seq": selection["source_event_seq"],
+            "need_hash": bytes(record["recall_need_hash"]).hex(), "plan_fingerprint": bytes(record["recall_plan_fingerprint"]).hex(),
+            "matched_contracts": [bytes(value).hex() for value in record["matched_contract_ids"]]})
     if object_kind == "work_artifact" and record is not None:
         detail["payload_source"] = final["info"]["source"]
     item = {**row, "stable_key": row["row_id"], "object_ref": row["object_id"], "revision_ref": revision,
@@ -311,6 +318,8 @@ async def read_record_content(backend, reference, frontier, revision, representa
         or current["state"]["data_identity"] != identity):
         return {"kind": "conflict"}
     content = _unavailable(current, reference, revision, representation)["content"]
+    if info["kind"] == "current_recall":
+        content.update({"current_ledger": True, "ledger_event_seq": selection["source_event_seq"]})
     if representation == "text" and info["kind"] == "artifact":
         content["artifact_payload"] = True
         if info["source"] is not None:

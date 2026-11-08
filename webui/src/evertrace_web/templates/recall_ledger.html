@@ -1,0 +1,56 @@
+<h2>当前 Recall 账本</h2>
+<p class="muted">这是已存事件折叠后的当前快照，不是 Need 修订的历史正文，也没有重新判断当前是否 due。</p>
+<dl>
+  <dt>Need</dt><dd>{{ value.recall_need_id }}</dd>
+  <dt>账本快照事件水位</dt><dd>{{ content.ledger_event_seq }}</dd>
+  <dt>Need 计划修订</dt><dd>{{ value.revision_id }}</dd>
+  <dt>前驱计划修订</dt><dd>{{ value.parent_revision_id or '无' }}</dd>
+  <dt>投递状态</dt><dd data-recall-delivery>{{ value.delivery_state }}</dd>
+  <dt>Agent 响应记录</dt><dd data-recall-response>{{ value.agent_response }}</dd>
+  <dt>义务状态</dt><dd data-recall-obligation>{{ value.obligation_state }}</dd>
+</dl>
+<p>claimed_for_boundary 只是领取，emitted 不是已展示，host_presented 也不是已采用。
+  retrieval_returned 只表示账本记录了检索返回，不证明后续动作或效果。</p>
+<p data-request-trace="not_recorded">历史请求轨迹：not_recorded（当前快照未带逐次请求轨迹）。不从状态推测 agent 看过什么。</p>
+<details open>
+  <summary>已存归属与事件边界</summary>
+  <dl>
+    <dt>Session / lane</dt><dd>{{ value.session_id }} / {{ value.execution_lane_id }}</dd>
+    <dt>Task / Workstream</dt><dd>{{ value.task_id }} / {{ value.workstream_id }}</dd>
+    <dt>Episode 修订</dt><dd>{{ value.episode_revision_id }}</dd>
+    <dt>仓库 / 工作树</dt><dd>{{ value.repository_id or '无' }} / {{ value.worktree_id or '无' }}</dd>
+    <dt>边界</dt><dd class="memory-prose">{{ value.boundary_event_ref }}</dd>
+    <dt>触发族</dt><dd>{{ value.trigger_family }}</dd>
+    <dt>来源水位</dt><dd>{{ value.source_watermark }}</dd>
+    <dt>已存 phase / verifier</dt><dd>{{ value.trigger_state.phase_kind }} / {{ value.trigger_state.verifier_state }}</dd>
+    <dt>已存 worktree snapshot</dt><dd>{{ value.trigger_state.worktree_snapshot_id or '未记录' }}</dd>
+    <dt>已存 binding</dt><dd>{{ value.trigger_state.binding_revision_id or '未记录' }}</dd>
+    <dt>快照中的 presentation attempt</dt><dd>{{ value.active_presentation_attempt_id or '无' }}</dd>
+    <dt>快照中的 retrieval request</dt><dd class="memory-prose">{{ value.active_retrieval_request_id or '无' }}</dd>
+  </dl>
+</details>
+<section class="semantic-section">
+  <h3>已存召回计划</h3>
+  <p class="memory-prose">{{ value.recall_plan.reason }}</p>
+  <p>相关 Episode：{{ value.recall_plan.relevant_episode_revision or '未记录' }}；
+    Procedure：{{ value.recall_plan.applicable_procedure_revision or '未记录' }}</p>
+  {{ text_list('规范性约束引用', value.recall_plan.normative_constraint_refs) }}
+  {{ text_list('未闭合事项', value.recall_plan.open_loops) }}
+  {{ text_list('已交付但失效的对象', value.recall_plan.stale_delivered_objects) }}
+  {{ text_list('支持证据', value.recall_plan.supporting_evidence_refs) }}
+  {{ text_list('已存触发 attempts', value.trigger_state.attempt_ids) }}
+  {{ text_list('已存触发 ScopeEffect', value.trigger_state.scope_effect_refs) }}
+  {{ text_list('来源修订', value.source_revision_ids) }}
+  {{ text_list('已匹配的 trigger contracts', content.matched_contracts) }}
+</section>
+<details>
+  <summary>已有计划身份</summary>
+  <p>Need hash</p><code>{{ content.need_hash }}</code>
+  <p>Plan fingerprint</p><code>{{ content.plan_fingerprint }}</code>
+</details>
+<details>
+  <summary>记录时间</summary>
+  <p>创建：{{ value.created_at_us }}；展示截止：{{ value.presentation_expires_at_us }}；
+    义务截止：{{ value.obligation_expires_at_us if value.obligation_expires_at_us is not none else '未设' }}。</p>
+  <p>这里不推进过期状态、不 claim、不投递 cue，也不生成 usage 或新的召回判断。</p>
+</details>

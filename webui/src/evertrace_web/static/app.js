@@ -710,22 +710,29 @@ $("work-record-lookup").onsubmit = (event) => {
     object: null, path: [] });
 };
 async function readWork(controller) {
-  const research = state.route === "research";
+  const research = state.route === "research", usage = state.route === "usage";
   const scroll = $("detail-body").scrollTop;
   clear();
   state.frontier ??= "0";
-  if (!research && !state.selected && state.query.selection.kind === "task") {
+  if (!research && !usage && !state.selected && state.query.selection.kind === "task") {
     state.selected = { key: state.query.selection.task_id, kind: "task", revision: null, object: null, path: [] };
   }
-  $("memory-items").textContent = research
+  $("memory-items").textContent = usage
+    ? "读取精确 Need 的当前账本。这里不是请求清单，也不调用 @due；usage 和负面证据读取尚未接入。"
+    : research
     ? "读取已知 Run、ResultEvidence 或研究 Atom；从结果可回到其对应 Run 的精确条件。"
     : "按精确工作记录读取。Task 的工作线、Workstream 的片段可从详情中的关联逐项展开。";
-  $("page-count").textContent = research ? "精确研究记录 · 非全局实验清单" : "精确工作 · 非任务总数";
+  $("page-count").textContent = usage ? "当前 Recall 快照 · 非请求总数"
+    : research ? "精确研究记录 · 非全局实验清单" : "精确工作 · 非任务总数";
   if (state.selected) await readSelection(state.selected, controller, scroll);
-  else $("detail-body").textContent = research
+  else $("detail-body").textContent = usage
+    ? "输入已知 Need ID。未选或不可用不表示没有召回义务，不填入示例状态。"
+    : research
     ? "输入已知研究记录 ID。未选记录不显示为空实验清单，也不填入示例结果。"
     : "请从范围目录选择 Task，或输入已知工作 ID。没有把未选择工作显示成空列表。";
-  notice(research
+  notice(usage
+    ? "只读已存状态，不 claim、不投递、不推进 usage，也不从检索记录推断 agent 已采用。"
+    : research
     ? "只读原始条件和证据；不自动聚合、判断胜出或接受为长期结论。"
     : "只读所选修订；目标、计划、来源关联和工作状态不等于执行、采用或验证完成。");
 }
@@ -882,7 +889,7 @@ async function refresh() {
       await readObservations(controller, health);
       return;
     }
-    if (state.route === "work" || state.route === "research") {
+    if (["work", "research", "usage"].includes(state.route)) {
       await readWork(controller);
       return;
     }
@@ -1002,30 +1009,38 @@ function route(name) {
     else button.removeAttribute("aria-current");
   }
   const reading = ["overview", "memories"].includes(name);
-  const connected = ["overview", "memories", "sources", "work", "research", "review", "system"].includes(name);
+  const connected = ["overview", "memories", "sources", "work", "research", "usage", "review", "system"].includes(name);
   $("reader").hidden = !state.active || !connected;
   $("system-panel").hidden = !state.active || name !== "system";
   $("job-lookup").hidden = name !== "system";
   $("job-id").value = "";
   $("records-title").textContent =
-    { overview: "范围总览", sources: "已登记来源", work: "所选工作", research: "研究记录",
+    { overview: "范围总览", sources: "已登记来源", work: "所选工作", research: "研究记录", usage: "使用证据",
       review: "待处理条目", system: "后台任务" }[name] || "记忆记录";
   $("source-filter").hidden = name !== "sources";
   $("source-record-lookup").hidden = name !== "sources";
-  $("work-record-lookup").hidden = !["work", "research"].includes(name);
-  $("work-record-label").textContent = name === "research" ? "研究记录 ID" : "工作记录 ID";
+  $("work-record-lookup").hidden = !["work", "research", "usage"].includes(name);
+  $("work-record-label").textContent = name === "usage" ? "Need ID（当前快照）"
+    : name === "research" ? "研究记录 ID" : "工作记录 ID";
   $("work-record-id").setAttribute("aria-label", $("work-record-label").textContent);
-  $("work-record-help").textContent = name === "research"
+  $("work-record-submit").textContent = name === "usage" ? "读取账本快照" : "读取工作记录";
+  for (const option of $("work-record-kind").options) {
+    option.hidden = name === "usage" && option.value !== "recall_need";
+    option.disabled = option.hidden;
+  }
+  $("work-record-help").textContent = name === "usage"
+    ? "目前读取 RecallNeed。修订留空读当前；填入的修订只固定计划身份，不选择历史快照。"
+    : name === "research"
     ? "选择 Run、ResultEvidence 或 Atom，输入精确 ID；修订留空只绑定原生当前版本。"
     : "也可从范围目录选择 Task。这里只读所选工作及有界关联，不把全局范围当空任务列表。";
-  if (name === "work" || name === "research") {
-    $("work-record-kind").value = name === "research" ? "experiment_run" : "task";
+  if (["work", "research", "usage"].includes(name)) {
+    $("work-record-kind").value = name === "usage" ? "recall_need" : name === "research" ? "experiment_run" : "task";
     $("work-record-id").value = "";
     $("work-record-revision").value = "";
   }
   $("time-filter").hidden = !reading;
   $("overview-limit-control").hidden = name !== "overview";
-  $("first-page").parentElement.hidden = ["overview", "work", "research"].includes(name);
+  $("first-page").parentElement.hidden = ["overview", "work", "research", "usage"].includes(name);
   document.querySelector(".browse-filters").hidden = name !== "memories";
   $("scope-open").hidden = !reading && !["sources", "work"].includes(name);
   $("include-global").parentElement.hidden = !reading;
