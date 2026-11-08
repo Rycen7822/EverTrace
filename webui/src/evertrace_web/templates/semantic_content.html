@@ -294,4 +294,9 @@
     {% if value.supersedes_membership_revision_id %}<p>替代的 membership：{{ value.supersedes_membership_revision_id }}</p>{% endif %}
   </details>
 {% endif %}
+{% if content.kind in ('task', 'workstream') and value.predecessor_revision_id %}
+<button class="button" type="button" data-work-previous data-link-key="{{ item.object_ref }}"
+  data-object="{{ item.object_ref }}" data-revision="{{ value.predecessor_revision_id }}"
+  data-kind="{{ item.object_kind }}">读取前一修订</button>
+{% endif %}
 </div>
