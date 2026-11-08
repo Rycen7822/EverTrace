@@ -689,17 +689,24 @@ $("work-record-lookup").onsubmit = (event) => {
     object: null, path: [] });
 };
 async function readWork(controller) {
+  const research = state.route === "research";
   const scroll = $("detail-body").scrollTop;
   clear();
   state.frontier ??= "0";
-  if (!state.selected && state.query.selection.kind === "task") {
+  if (!research && !state.selected && state.query.selection.kind === "task") {
     state.selected = { key: state.query.selection.task_id, kind: "task", revision: null, object: null, path: [] };
   }
-  $("memory-items").textContent = "按精确工作记录读取。Task 的工作线、Workstream 的片段可从详情中的关联逐项展开。";
-  $("page-count").textContent = "精确工作 · 非任务总数";
+  $("memory-items").textContent = research
+    ? "读取已知 Run、ResultEvidence 或研究 Atom；从结果可回到其对应 Run 的精确条件。"
+    : "按精确工作记录读取。Task 的工作线、Workstream 的片段可从详情中的关联逐项展开。";
+  $("page-count").textContent = research ? "精确研究记录 · 非全局实验清单" : "精确工作 · 非任务总数";
   if (state.selected) await readSelection(state.selected, controller, scroll);
-  else $("detail-body").textContent = "请从范围目录选择 Task，或输入已知工作 ID。没有把未选择工作显示成空列表。";
-  notice("只读所选修订；目标、计划、来源关联和工作状态不等于执行、采用或验证完成。");
+  else $("detail-body").textContent = research
+    ? "输入已知研究记录 ID。未选记录不显示为空实验清单，也不填入示例结果。"
+    : "请从范围目录选择 Task，或输入已知工作 ID。没有把未选择工作显示成空列表。";
+  notice(research
+    ? "只读原始条件和证据；不自动聚合、判断胜出或接受为长期结论。"
+    : "只读所选修订；目标、计划、来源关联和工作状态不等于执行、采用或验证完成。");
 }
 async function readObservations(controller, health) {
   const system = state.route === "system";
@@ -854,7 +861,7 @@ async function refresh() {
       await readObservations(controller, health);
       return;
     }
-    if (state.route === "work") {
+    if (state.route === "work" || state.route === "research") {
       await readWork(controller);
       return;
     }
@@ -974,18 +981,30 @@ function route(name) {
     else button.removeAttribute("aria-current");
   }
   const reading = ["overview", "memories"].includes(name);
-  $("reader").hidden = !state.active || !["overview", "memories", "sources", "work", "review", "system"].includes(name);
+  const connected = ["overview", "memories", "sources", "work", "research", "review", "system"].includes(name);
+  $("reader").hidden = !state.active || !connected;
   $("system-panel").hidden = !state.active || name !== "system";
   $("job-lookup").hidden = name !== "system";
   $("job-id").value = "";
   $("records-title").textContent =
-    { overview: "范围总览", sources: "已登记来源", work: "所选工作", review: "待处理条目", system: "后台任务" }[name] || "记忆记录";
+    { overview: "范围总览", sources: "已登记来源", work: "所选工作", research: "研究记录",
+      review: "待处理条目", system: "后台任务" }[name] || "记忆记录";
   $("source-filter").hidden = name !== "sources";
   $("source-record-lookup").hidden = name !== "sources";
-  $("work-record-lookup").hidden = name !== "work";
+  $("work-record-lookup").hidden = !["work", "research"].includes(name);
+  $("work-record-label").textContent = name === "research" ? "研究记录 ID" : "工作记录 ID";
+  $("work-record-id").setAttribute("aria-label", $("work-record-label").textContent);
+  $("work-record-help").textContent = name === "research"
+    ? "选择 Run、ResultEvidence 或 Atom，输入精确 ID；修订留空只绑定原生当前版本。"
+    : "也可从范围目录选择 Task。这里只读所选工作及有界关联，不把全局范围当空任务列表。";
+  if (name === "work" || name === "research") {
+    $("work-record-kind").value = name === "research" ? "experiment_run" : "task";
+    $("work-record-id").value = "";
+    $("work-record-revision").value = "";
+  }
   $("time-filter").hidden = !reading;
   $("overview-limit-control").hidden = name !== "overview";
-  $("first-page").parentElement.hidden = name === "overview" || name === "work";
+  $("first-page").parentElement.hidden = ["overview", "work", "research"].includes(name);
   document.querySelector(".browse-filters").hidden = name !== "memories";
   $("scope-open").hidden = !reading && !["sources", "work"].includes(name);
   $("include-global").parentElement.hidden = !reading;
@@ -996,8 +1015,7 @@ function route(name) {
   $("page-description").textContent =
     "独立 Python Web，只读调用现有 daemon；未接入的页面不使用示例数据。";
   notice(
-    ["overview", "memories", "sources", "work", "review", "system"].includes(name)
-      ? "正在读取…"
+    connected ? "正在读取…"
       : "该页面尚未接入真实后端。",
   );
   refresh();

@@ -3599,6 +3599,18 @@ pub fn read_dependencies_for(row: &ObjectRow, payload: &JournalPayload) -> BTree
                     .cloned(),
             );
         }
+        JournalPayload::ExperimentRunRecorded(value) => {
+            refs.insert(value.workstream_id.to_string());
+            refs.insert(value.code_snapshot_id.to_string());
+            refs.extend(value.attempt_id.map(|id| id.to_string()));
+            refs.extend(value.source_receipt_refs.iter().map(ToString::to_string));
+            refs.extend(value.terminal_evidence_refs.iter().map(ToString::to_string));
+            refs.extend(value.work_artifact_refs.iter().map(ToString::to_string));
+        }
+        JournalPayload::ResultEvidenceRecorded(value) => {
+            refs.insert(value.experiment_run_revision_id.to_string());
+            refs.extend(value.raw_artifact_refs.iter().map(ToString::to_string));
+        }
         JournalPayload::WorkArtifactRecorded(value) => {
             for actor in value
                 .revision
@@ -5711,38 +5723,12 @@ impl JournalAdmissionState {
         }
         for (revision, (value, seq)) in &self.experiment_run_revisions {
             if matches(&revision.to_string()) || matches(&value.run_id.to_string()) {
-                let mut row = work_identity_row(
-                    "experiment_run",
-                    value.run_id.to_string(),
-                    value.revision_id.to_string(),
-                    value.execution_status.as_str(),
-                    None,
-                    Some(value.workstream_id.to_string()),
-                    None,
-                    None,
-                    &JournalPayload::ExperimentRunRecorded(Box::new(value.clone())),
-                    *seq,
-                )?;
-                row.row_id = format!("object:work:experiment_run:{revision}");
-                rows.push(row);
+                rows.push(experiment_run_row(value.clone(), *seq)?);
             }
         }
         for (revision, (value, seq)) in &self.result_evidence_revisions {
             if matches(&revision.to_string()) || matches(&value.result_evidence_id.to_string()) {
-                let mut row = work_identity_row(
-                    "result_evidence",
-                    value.result_evidence_id.to_string(),
-                    value.revision_id.to_string(),
-                    value.completeness.as_str(),
-                    None,
-                    None,
-                    None,
-                    None,
-                    &JournalPayload::ResultEvidenceRecorded(Box::new(value.clone())),
-                    *seq,
-                )?;
-                row.row_id = format!("object:work:result_evidence:{revision}");
-                rows.push(row);
+                rows.push(result_evidence_row(value.clone(), *seq)?);
             }
         }
         for (revision, (value, seq)) in &self.artifact_revisions {
@@ -5848,6 +5834,32 @@ impl JournalAdmissionState {
             });
         if let Some((value, seq)) = artifact {
             return Ok(vec![work_artifact_row(value, *seq)?]);
+        }
+        let run = reference
+            .parse::<RevisionId>()
+            .ok()
+            .and_then(|id| self.experiment_run_revisions.get(&id))
+            .or_else(|| {
+                reference
+                    .parse::<ExperimentRunId>()
+                    .ok()
+                    .and_then(|id| self.experiment_runs.get(&id))
+            });
+        if let Some((value, seq)) = run {
+            return Ok(vec![experiment_run_row(value.clone(), *seq)?]);
+        }
+        let result = reference
+            .parse::<RevisionId>()
+            .ok()
+            .and_then(|id| self.result_evidence_revisions.get(&id))
+            .or_else(|| {
+                reference
+                    .parse::<ResultEvidenceId>()
+                    .ok()
+                    .and_then(|id| self.result_evidence.get(&id))
+            });
+        if let Some((value, seq)) = result {
+            return Ok(vec![result_evidence_row(value.clone(), *seq)?]);
         }
         let refs = BTreeSet::from([reference.to_owned()]);
         let mut rows = self.reference_rows_unfiltered(&refs, false)?;
@@ -6209,6 +6221,14 @@ impl JournalAdmissionState {
                 self.host_occurrences
                     .get(&id)
                     .map(|(value, _)| format!("{id}@{}", value.normalization_revision))
+            } else if let Ok(id) = reference.parse::<ExperimentRunId>() {
+                self.experiment_runs
+                    .get(&id)
+                    .map(|(value, _)| value.revision_id.to_string())
+            } else if let Ok(id) = reference.parse::<ResultEvidenceId>() {
+                self.result_evidence
+                    .get(&id)
+                    .map(|(value, _)| value.revision_id.to_string())
             } else if let Ok(id) = reference.parse::<WorkArtifactId>() {
                 self.work_artifacts
                     .get(&id)
@@ -6503,6 +6523,8 @@ impl JournalAdmissionState {
                                 | "recovery_capture_request"
                                 | "recovery_bundle"
                                 | "work_artifact"
+                                | "experiment_run"
+                                | "result_evidence"
                                 | "capture_receipt"
                                 | "capture_receipt_revision"
                         )
@@ -17217,47 +17239,11 @@ impl ReducerState {
             self.recovery_bundles,
             self.recovery_application_revisions,
         )?);
-        for (_revision_id, (value, seq)) in self.experiment_run_revisions {
-            let mut row = work_identity_row(
-                "experiment_run",
-                value.run_id.to_string(),
-                value.revision_id.to_string(),
-                value.execution_status.as_str(),
-                None,
-                Some(value.workstream_id.to_string()),
-                None,
-                None,
-                &JournalPayload::ExperimentRunRecorded(Box::new(value)),
-                seq,
-            )?;
-            row.row_id = format!(
-                "object:work:experiment_run:{}",
-                row.current_revision_id
-                    .as_deref()
-                    .ok_or(StoreError::StoreCorrupt)?
-            );
-            rows.push(row);
+        for (value, seq) in self.experiment_run_revisions.into_values() {
+            rows.push(experiment_run_row(value, seq)?);
         }
-        for (_revision_id, (value, seq)) in self.result_evidence_revisions {
-            let mut row = work_identity_row(
-                "result_evidence",
-                value.result_evidence_id.to_string(),
-                value.revision_id.to_string(),
-                value.completeness.as_str(),
-                None,
-                None,
-                None,
-                None,
-                &JournalPayload::ResultEvidenceRecorded(Box::new(value)),
-                seq,
-            )?;
-            row.row_id = format!(
-                "object:work:result_evidence:{}",
-                row.current_revision_id
-                    .as_deref()
-                    .ok_or(StoreError::StoreCorrupt)?
-            );
-            rows.push(row);
+        for (value, seq) in self.result_evidence_revisions.into_values() {
+            rows.push(result_evidence_row(value, seq)?);
         }
         for (_revision_id, (value, seq)) in self.artifact_revisions {
             let mut row = work_identity_row(
@@ -17969,6 +17955,42 @@ fn evidence_object_row_fields(fields: EvidenceRowFields, source_event_seq: u64) 
         source_event_seq,
         projection_generation: PROJECTION_GENERATION,
     }
+}
+
+fn experiment_run_row(value: ExperimentRun, seq: u64) -> Result<ObjectRow, StoreError> {
+    let revision = value.revision_id;
+    let mut row = work_identity_row(
+        "experiment_run",
+        value.run_id.to_string(),
+        revision.to_string(),
+        value.execution_status.as_str(),
+        None,
+        Some(value.workstream_id.to_string()),
+        None,
+        None,
+        &JournalPayload::ExperimentRunRecorded(Box::new(value)),
+        seq,
+    )?;
+    row.row_id = format!("object:work:experiment_run:{revision}");
+    Ok(row)
+}
+
+fn result_evidence_row(value: ResultEvidence, seq: u64) -> Result<ObjectRow, StoreError> {
+    let revision = value.revision_id;
+    let mut row = work_identity_row(
+        "result_evidence",
+        value.result_evidence_id.to_string(),
+        revision.to_string(),
+        value.completeness.as_str(),
+        None,
+        None,
+        None,
+        None,
+        &JournalPayload::ResultEvidenceRecorded(Box::new(value)),
+        seq,
+    )?;
+    row.row_id = format!("object:work:result_evidence:{revision}");
+    Ok(row)
 }
 
 fn work_artifact_row(value: &WorkArtifact, seq: u64) -> Result<ObjectRow, StoreError> {

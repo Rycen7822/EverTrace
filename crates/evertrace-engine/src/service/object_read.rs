@@ -594,6 +594,8 @@ fn record_data(
         P::RecoveryCaptureRequestRecorded(value) => semantic_record(&value, None, query, check),
         P::RecoveryBundleRecorded(value) => semantic_record(&value, None, query, check),
         P::CaptureReceiptRecorded(value) => semantic_record(&value, None, query, check),
+        P::ExperimentRunRecorded(value) => semantic_record(&value, None, query, check),
+        P::ResultEvidenceRecorded(value) => semantic_record(&value, None, query, check),
         P::TaskRecorded(value) => {
             semantic_record(&value, Some(&value.canonical_goal), query, check)
         }

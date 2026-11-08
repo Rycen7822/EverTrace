@@ -1,0 +1,108 @@
+{% macro fingerprint(bytes) -%}
+  {%- for byte in bytes %}{{ '%02x'|format(byte) }}{% endfor -%}
+{%- endmacro %}
+{% if content.kind == 'experiment_run' %}
+<h2>实验执行</h2>
+<dl class="semantic-fields">
+  <dt>执行状态</dt><dd>{{ value.execution_status }}</dd>
+  <dt>可观察性</dt><dd>{{ value.observability }}</dd>
+  <dt>合同有效性</dt><dd>{{ value.contract_validity }}</dd>
+  <dt>Attempt 绑定</dt><dd>{{ value.attempt_binding_status }} · {{ value.attempt_id or '未记录' }}</dd>
+  <dt>来源</dt><dd>{{ value.origin }}</dd>
+  <dt>外部系统</dt><dd>{{ value.external_system_id or '未记录' }} · {{ value.external_run_key or '未记录' }}</dd>
+</dl>
+<p class="reading-note">执行完成、合同有效和结果有效是不同事实。声明记录不是执行回执；缺少终态时不补成成功或失败。</p>
+<p>Workstream：{{ value.workstream_id }} · 代码快照：{{ value.code_snapshot_id }}</p>
+{% if value.attempt_id %}
+<button class="text-button" type="button" data-link-key="{{ value.attempt_id }}"
+  data-object="{{ value.attempt_id }}" data-kind="attempt">读取所绑定 Attempt 的策略</button>
+{% endif %}
+<p>策略合同指纹：{{ fingerprint(value.strategy_contract_fingerprint) }}</p>
+<p>实验合同指纹：{{ fingerprint(value.experiment_contract_fingerprint) }}</p>
+<p>比较键：{{ fingerprint(value.comparison_key) }}。键相同不单独证明可比，比较资格尚未接入此页。</p>
+<section class="semantic-section"><h3>实验条件</h3>
+  <p class="memory-prose">数据指纹：{{ value.data_fingerprint }}</p>
+  <p class="memory-prose">环境指纹：{{ value.environment_fingerprint }}</p>
+  <p class="memory-prose">指标定义：{{ value.metric_definition }}</p>
+  <p>提取器版本：{{ value.metric_extractor_version }} · 多份输入策略：{{ value.multi_cas_metric_policy }}</p>
+  <p>Seed 策略：{{ value.seed_policy }} · 非确定性：{{ '是' if value.nondeterministic else '否' }}</p>
+  {{ text_list('Seed 值', value.seed_values) }}
+  {{ text_list('允许变化的变量', value.variable_declaration.varied) }}
+  {{ text_list('固定变量', value.variable_declaration.fixed) }}
+  {{ text_list('未控制的变量', value.variable_declaration.uncontrolled) }}
+  <h3>保存的规范化配置</h3>
+  {% if value.normalized_config %}
+  <dl class="semantic-fields">{% for field in value.normalized_config %}
+    <dt>{{ field.name }}</dt><dd class="memory-prose">{{ field.value }}</dd>
+  {% endfor %}</dl>
+  {% else %}<p class="muted">未记录。</p>{% endif %}
+</section>
+<section class="semantic-section"><h3>受控执行绑定</h3>
+{% set binding = value.get('comparison_execution_binding') %}
+{% if binding %}
+<dl class="semantic-fields">
+  {% for label, field in [
+    ('绑定版本', 'binding_version'), ('工具链', 'toolchain_revision'), ('模型', 'model_revision'),
+    ('Harness', 'harness_revision'), ('算法', 'algorithm_revision'), ('预算', 'budget'),
+    ('Procedure 暴露修订', 'procedure_exposure_revision_id'), ('指标方向', 'metric_direction'),
+    ('指标单位', 'metric_unit'), ('正向阈值', 'positive_delta_threshold'), ('负向阈值', 'negative_delta_threshold')
+  ] %}<dt>{{ label }}</dt><dd>{{ binding[field] if binding[field] is not none else '未记录' }}</dd>{% endfor %}
+</dl>
+{% else %}<p class="muted">未记录。不从配置或指标数值推测绑定、阈值或方向。</p>{% endif %}
+</section>
+{{ text_list('来源回执', value.source_receipt_refs) }}
+{{ text_list('终态证据', value.terminal_evidence_refs) }}
+<section class="semantic-section"><h3>工作产物</h3>
+{% for artifact in value.work_artifact_refs %}
+<button class="text-button" type="button" data-link-key="{{ artifact }}" data-object="{{ artifact }}"
+  data-kind="work_artifact">读取产物 {{ artifact }}</button>
+{% else %}<p class="muted">未记录。</p>{% endfor %}
+<p class="muted">产物 ID 打开其当前修订；历史内容需从产物记录的来源与关联中选择精确修订。</p>
+</section>
+<p>创建时间（微秒）：{{ value.created_at_us }}</p>
+<p>开始：{{ value.started_at_us if value.started_at_us is not none else '未记录' }} ·
+  结束：{{ value.ended_at_us if value.ended_at_us is not none else '未记录' }}</p>
+{% else %}
+<h2>结果证据</h2>
+<dl class="semantic-fields">
+  <dt>结果范围</dt><dd>{{ value.result_scope }}</dd>
+  <dt>证据完整性</dt><dd>{{ value.completeness }}</dd>
+  <dt>解析</dt><dd>{{ value.parser_receipt.status }} · {{ value.parser_receipt.parser_version }}</dd>
+  <dt>解析失败原因</dt><dd>{{ value.parser_receipt.failure_code or '未记录' }}</dd>
+  <dt>验证</dt><dd>{% if value.verifier_receipt %}
+    {{ value.verifier_receipt.status }} · {{ value.verifier_receipt.verifier_version }}
+    {% else %}未记录{% endif %}</dd>
+  <dt>验证失败原因</dt><dd>{{ value.verifier_receipt.failure_code if value.verifier_receipt
+    and value.verifier_receipt.failure_code else '未记录' }}</dd>
+</dl>
+{% if value.parsed_metric %}
+<section class="semantic-section"><h3>保存的指标</h3>
+<dl class="semantic-fields">
+  <dt>Decimal</dt><dd data-result-decimal>{{ value.parsed_metric.decimal }}</dd>
+  <dt>单位</dt><dd>{{ value.parsed_metric.unit }}</dd>
+  <dt>不确定度</dt><dd>{{ value.parsed_metric.uncertainty_decimal
+    if value.parsed_metric.uncertainty_decimal is not none else '未记录' }}</dd>
+</dl>
+<p class="reading-note">按保存的十进制字符串显示，不转浮点或舍入。负数同样保留，不按正负推断方法是否有效。</p>
+</section>
+{% else %}<p>未保存可读指标，不用 0 代替。</p>{% endif %}
+{% if value.failure %}<p>失败：{{ value.failure.kind }} · {{ value.failure.code }}</p>{% endif %}
+<p class="reading-note">局部结果不等于完整运行结果；解析与重解析验证不单独证明执行成功或具备比较资格。</p>
+<p>此页不计算均值、改善比例或胜出者，也不把 ResultEvidence 当作已接受的 Result Atom 或 Claim。</p>
+<p>Run：{{ value.experiment_run_id }} · 精确 Run 修订：{{ value.experiment_run_revision_id }}</p>
+<button class="button" type="button" data-link-key="{{ value.experiment_run_id }}"
+  data-revision="{{ value.experiment_run_revision_id }}" data-object="{{ value.experiment_run_id }}"
+  data-kind="experiment_run">读取对应 Run 的精确条件</button>
+{{ text_list('原始产物引用', value.raw_artifact_refs) }}
+{{ text_list('受保护输入 CAS 引用', value.raw_cas_refs) }}
+{{ text_list('解析器输入产物', value.parser_receipt.input_artifact_refs) }}
+{{ text_list('解析器输入 CAS', value.parser_receipt.input_cas_refs) }}
+<p>记录时间（微秒）：{{ value.created_at_us }}</p>
+{% endif %}
+<p>前序修订：{{ value.parent_revision_id or '无' }}</p>
+{% if value.parent_revision_id %}
+<button class="text-button" type="button" data-link-key="{{ value.parent_revision_id }}"
+  data-revision="{{ value.parent_revision_id }}" data-object="{{ item.object_ref }}" data-kind="{{ content.kind }}">
+  读取本记录的精确前序修订
+</button>
+{% endif %}

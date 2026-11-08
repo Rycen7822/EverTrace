@@ -103,10 +103,10 @@ DETAIL_KINDS = {"atom_revision": "atom", "procedure_revision": "procedure", "cor
                 "host_occurrence": "host_occurrence", "scope_effect": "scope_effect",
                 "worktree": "worktree", "worktree_snapshot": "worktree_snapshot",
                 "recovery_capture_request": "recovery_capture_request", "recovery_bundle": "recovery_bundle",
-                "work_artifact": "work_artifact"}
+                "work_artifact": "work_artifact", "experiment_run": "experiment_run", "result_evidence": "result_evidence"}
 WORK_DETAIL_KINDS = {"task", "workstream", "work_episode", "attempt", "operation_burst", "operation",
                      "host_occurrence", "scope_effect", "worktree", "worktree_snapshot",
-                     "recovery_capture_request", "recovery_bundle", "work_artifact"}
+                     "recovery_capture_request", "recovery_bundle", "work_artifact", "experiment_run", "result_evidence"}
 
 
 async def read_record_detail(backend, reference, frontier, revision, object_kind):
@@ -128,7 +128,7 @@ async def read_record_detail(backend, reference, frontier, revision, object_kind
     identity, selection = meta["state"]["data_identity"], meta["selection"]
     state, record, total = meta["content_state"], None, None
     if state == "ready" and DETAIL_KINDS[object_kind] is not None:
-        maximum = 65536 if object_kind == "recovery_bundle" else _LIMIT
+        maximum = {"recovery_bundle": 65536, "experiment_run": 524288}.get(object_kind, _LIMIT)
         deadline, encoded = time.monotonic()+2, bytearray()
         while True:
             if time.monotonic() >= deadline:

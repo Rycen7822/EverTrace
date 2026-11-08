@@ -193,6 +193,8 @@
   'attempt', 'operation_burst', 'operation', 'host_occurrence', 'scope_effect', 'worktree', 'worktree_snapshot', 'work_artifact'
 ) %}
   {% include 'work_records.html' %}
+{% elif content.kind in ('experiment_run', 'result_evidence') %}
+  {% include 'research_records.html' %}
 {% elif content.kind in ('recovery_capture_request', 'recovery_bundle') %}
   {% include 'recovery_records.html' %}
 {% elif content.kind == 'work_episode' %}

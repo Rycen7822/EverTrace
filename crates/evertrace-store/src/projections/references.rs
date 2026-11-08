@@ -102,6 +102,12 @@ pub fn source_references_for(row: &ObjectRow, payload: &JournalPayload) -> BTree
         JournalPayload::WorkArtifactRecorded(value) => {
             refs.extend(value.revision.parent_revision_id.map(|id| id.to_string()));
         }
+        JournalPayload::ExperimentRunRecorded(value) => {
+            refs.extend(value.parent_revision_id.map(|id| id.to_string()));
+        }
+        JournalPayload::ResultEvidenceRecorded(value) => {
+            refs.extend(value.parent_revision_id.map(|id| id.to_string()));
+        }
         JournalPayload::RecoveryCaptureRequestRecorded(value) => {
             refs.extend(value.parent_request_revision_id.map(|id| id.to_string()));
         }
@@ -231,6 +237,8 @@ impl JournalAdmissionState {
                     | "recovery_capture_request"
                     | "recovery_bundle"
                     | "work_artifact"
+                    | "experiment_run"
+                    | "result_evidence"
                     | "task"
                     | "workstream"
             )
@@ -249,7 +257,7 @@ impl JournalAdmissionState {
         )
         .map_err(|_| StoreError::StoreCorrupt)?;
         let mut refs = source_references_for(root, &payload);
-        // These are current children of the selected logical identity, not a reconstruction of its historical subtree.
+        // Current child revisions by canonical ownership/pinned input, not a reconstruction of a past subtree.
         let children: Box<dyn Iterator<Item = (bool, RevisionId)> + '_> = match &payload {
             JournalPayload::TaskRecorded(task) => Box::new(
                 self.workstreams
@@ -261,6 +269,15 @@ impl JournalAdmissionState {
                     (
                         episode.workstream_id == stream.workstream_id,
                         episode.revision_id,
+                    )
+                }))
+            }
+            JournalPayload::ExperimentRunRecorded(run) => {
+                Box::new(self.result_evidence.values().map(|(result, _)| {
+                    (
+                        result.experiment_run_id == run.run_id
+                            && result.experiment_run_revision_id == run.revision_id,
+                        result.revision_id,
                     )
                 }))
             }
