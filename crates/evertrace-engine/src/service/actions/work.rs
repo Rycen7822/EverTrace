@@ -885,32 +885,14 @@ impl McpActionService {
             {
                 Ok(_) => (),
                 Err(WriterActorError::StaleFrontier) => {
-                    let snapshot = self
-                        .writer
-                        .project()
-                        .await
-                        .map_err(|_| McpServiceError::Store)?;
-                    let current = WorkIdentityCurrentView::from_snapshot(&snapshot)
-                        .map_err(|_| McpServiceError::Store)?;
-                    return Ok(current.tasks.get(&task.task_id).map_or_else(
-                        || {
-                            let mut result =
-                                invalid(request_id, "frontier_changed_retry_same_target");
-                            result.status = McpServiceStatus::Conflict;
-                            result
-                        },
-                        |task| {
-                            conflict(
-                                request_id,
-                                task,
-                                declaration.workstream.as_ref().and_then(|value| {
-                                    current
-                                        .workstreams
-                                        .get(&value.workstream_id)
-                                        .filter(|stream| stream.task_id == task.task_id)
-                                }),
-                            )
-                        },
+                    // Journal progress is not necessarily a Work revision conflict.
+                    // Retry must recheck sources, permissions and revisions before returning facts.
+                    return Ok(empty_result(
+                        request_id,
+                        McpServiceStatus::Conflict,
+                        "explicit_work_evidence",
+                        "unknown",
+                        ["frontier_changed_retry_same_target"],
                     ));
                 }
                 Err(_) => return Err(McpServiceError::Store),
