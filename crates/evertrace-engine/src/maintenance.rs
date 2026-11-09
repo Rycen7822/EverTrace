@@ -2521,6 +2521,11 @@ impl BackgroundScheduler {
                     );
                     let weak_process =
                         physical && is_unqualified_process_source(observation, receipt);
+                    let weak_live = physical
+                        && evertrace_capture::host_events::is_unqualified_execution(
+                            observation,
+                            receipt,
+                        );
                     if current_manifest.is_none()
                         && (!physical
                             || retained_manifests
@@ -2528,6 +2533,7 @@ impl BackgroundScheduler {
                                 .is_empty())
                         && !weak_import
                         && !weak_process
+                        && !weak_live
                     {
                         return Ok(None);
                     }
@@ -2536,6 +2542,7 @@ impl BackgroundScheduler {
                     let manifest = receipt.adapter_manifest_ref.as_str();
                     Ok((weak_import
                         || weak_process
+                        || weak_live
                         || current_manifest == Some(manifest)
                         || (physical
                             && retained_manifests
@@ -5163,6 +5170,47 @@ fn resolve_capture_report(
     current: Option<&HostProbeReport>,
     runtime: &RuntimeSnapshot,
 ) -> Option<HostProbeReport> {
+    if item.dependencies.iter().any(|dependency| {
+        matches!(&dependency.payload, JournalPayload::SourceReceiptRecorded(receipt)
+            if receipt.source_revision.as_str() == evertrace_capture::host_events::SOURCE_REVISION
+                && receipt.adapter_revision == 4 && receipt.parser_revision == 4)
+    }) {
+        // This report supplies only the original closed manifest. It cannot grant
+        // Exact correlation, capture completeness, namespace or semantic Work.
+        if item.target_kind != DirtyTargetKind::PhysicalNormalization {
+            return None;
+        }
+        let mut observed = false;
+        for dependency in &item.dependencies {
+            let JournalPayload::SourceObservationRecorded(observation) = &dependency.payload else {
+                continue;
+            };
+            let receipt =
+                item.dependencies
+                    .iter()
+                    .find_map(|dependency| match &dependency.payload {
+                        JournalPayload::SourceReceiptRecorded(receipt)
+                            if receipt.source_receipt_id == observation.source_receipt_ref =>
+                        {
+                            Some(receipt)
+                        }
+                        _ => None,
+                    })?;
+            if !evertrace_capture::host_events::is_unqualified_execution(observation, receipt) {
+                return None;
+            }
+            observed = true;
+        }
+        if !observed {
+            return None;
+        }
+        let report = HostProbeReport::unobserved_source_contract(
+            evertrace_capture::host_events::ADAPTER_VERSION,
+            evertrace_capture::host_events::ELIGIBLE_EVENTS,
+        )
+        .ok()?;
+        return capture_item_manifest_matches(item, &report).then_some(report);
+    }
     if item.dependencies.iter().any(|dependency| {
         matches!(&dependency.payload, JournalPayload::SourceReceiptRecorded(receipt)
             if receipt.source_kind == evertrace_domain::evidence::EvidenceSourceKind::Other

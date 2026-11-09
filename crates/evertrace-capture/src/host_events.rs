@@ -6,8 +6,10 @@ use std::{
 };
 
 use evertrace_domain::evidence::{
-    CaptureCompleteness, ContentTrust, CorrelationAdmission, EvidenceByteRange, EvidenceSourceKind,
-    HostCorrelationEvidence, IdentityStrength, ObservationRole, SourceRevisionMode, SourceRole,
+    CanonicalEventFamily, CaptureCompleteness, ContentTrust, CorrelationAdmission,
+    CorrelationField, CorrelationFieldClaim, EvidenceByteRange, EvidenceSourceKind,
+    HostCorrelationEvidence, IdentityStrength, ObservationRole, SourceObservation, SourceReceipt,
+    SourceRevisionMode, SourceRole,
 };
 use rustix::event::{PollFd, PollFlags, poll};
 use serde::{Deserialize, Deserializer, de::IgnoredAny};
@@ -18,7 +20,7 @@ use tungstenite::{
 use crate::{CaptureRecordBody, CaptureRecordInput, CaptureRuntime, RuntimeSnapshot, goal_source};
 
 pub const SOURCE_REVISION: &str = "native-user-shell-live-0.166.0-v1";
-pub const ADAPTER_VERSION: &str = "native-user-shell-live-0.166.0-v1:capture-3";
+pub const ADAPTER_VERSION: &str = "native-user-shell-live-0.166.0-v1:capture-4";
 pub const ELIGIBLE_EVENTS: &str = "native-user-shell-state-events-v1";
 const INPUT_LIMIT: usize = 2 * 1024 * 1024;
 
@@ -123,17 +125,30 @@ impl Event {
     }
 }
 
-fn correlation(role: ObservationRole, manifest: &str, revision: u32) -> HostCorrelationEvidence {
+fn correlation(
+    role: ObservationRole,
+    manifest: &str,
+    revision: u32,
+    reference: &str,
+) -> HostCorrelationEvidence {
     HostCorrelationEvidence {
         occurrence_schema_version: 1,
         host_instance_id: None,
         host_trace_lineage_id: None,
         host_lane_key: None,
-        canonical_event_family: None,
+        canonical_event_family: (revision == 4).then_some(CanonicalEventFamily::OtherExecutable),
         native_request_id: None,
         physical_execution_ordinal: None,
         pairing_role: role,
-        field_provenance: vec![],
+        field_provenance: if revision == 4 {
+            vec![CorrelationFieldClaim {
+                field: CorrelationField::CanonicalEventFamily,
+                source_ref: reference.into(),
+                evidence_ref: reference.into(),
+            }]
+        } else {
+            vec![]
+        },
         adapter_manifest_ref: manifest.into(),
         adapter_revision: revision,
         strong_gate_receipt_ref: None,
@@ -145,7 +160,7 @@ fn correlation(role: ObservationRole, manifest: &str, revision: u32) -> HostCorr
 
 /// Recheck the protected original against a reserved live-source envelope at ingestion.
 /// This proves neither source origin (sealed ingress does that) nor namespace/Work authority.
-/// Historical parser 1/2 records keep their original metadata-only semantics.
+/// Historical parser 1/2 records remain metadata-only; parser 3 keeps its unclassified roles.
 pub fn record_matches(body: &CaptureRecordBody, protected: &[u8], manifest: &str) -> bool {
     let Some(event) = std::str::from_utf8(protected).ok().and_then(Event::decode) else {
         return false;
@@ -153,7 +168,7 @@ pub fn record_matches(body: &CaptureRecordBody, protected: &[u8], manifest: &str
     let role = match body.parser_revision {
         1 if body.original_length <= 65_536 => ObservationRole::StateProbe,
         2 => ObservationRole::StateProbe,
-        3 => event.role(),
+        3 | 4 => event.role(),
         _ => return false,
     };
     body.adapter_revision == body.parser_revision
@@ -166,7 +181,7 @@ pub fn record_matches(body: &CaptureRecordBody, protected: &[u8], manifest: &str
         && body.source_record_identity.as_str() == event.identity()
         && body.source_ref == event.reference()
         && body.observation_role == role
-        && body.correlation == correlation(role, manifest, body.parser_revision)
+        && body.correlation == correlation(role, manifest, body.parser_revision, &event.reference())
         && body.adapter_manifest_ref == manifest
         && body.eligible_event_manifest_ref == ELIGIBLE_EVENTS
         && body.source_role == SourceRole::Host
@@ -191,6 +206,43 @@ pub fn record_matches(body: &CaptureRecordBody, protected: &[u8], manifest: &str
         && body.lifecycle.is_none()
         && body.unsupported_record_classification.is_none()
         && body.recovery_preflight.is_none()
+}
+
+/// The original async normalizer may consume these facts only as independent weak candidates.
+/// Admission already checked the protected original; this does not enable any Host capability.
+pub fn is_unqualified_execution(observation: &SourceObservation, receipt: &SourceReceipt) -> bool {
+    matches!(
+        observation.observation_role,
+        ObservationRole::Intent | ObservationRole::Result
+    ) && receipt.source_kind == EvidenceSourceKind::Other
+        && receipt.source_revision.as_str() == SOURCE_REVISION
+        && receipt.identity_domain == SOURCE_REVISION
+        && receipt.adapter_revision == 4
+        && receipt.parser_revision == 4
+        && receipt.canonicalization_revision == 1
+        && receipt.eligible_event_manifest_ref == ELIGIBLE_EVENTS
+        && observation.source_receipt_ref == receipt.source_receipt_id
+        && observation.source_observation_id == receipt.source_observation_id
+        && observation.source_instance_id == receipt.source_instance_id
+        && observation.source_revision == receipt.source_revision
+        && observation.source_record_identity == receipt.source_record_identity
+        && observation.observation_role == receipt.observation_role
+        && observation.adapter_revision == receipt.adapter_revision
+        && observation.parser_revision == receipt.parser_revision
+        && observation.canonicalization_revision == receipt.canonicalization_revision
+        && observation.source_role == SourceRole::Host
+        && observation.content_trust == ContentTrust::Observed
+        && observation.capture_completeness == CaptureCompleteness::Partial
+        && observation.correlation
+            == correlation(
+                observation.observation_role,
+                &receipt.adapter_manifest_ref,
+                4,
+                &receipt.source_ref,
+            )
+        && observation.scope_effect_claims.is_empty()
+        && observation.source_local_evidence.is_none()
+        && receipt.lifecycle.is_none()
 }
 
 fn observation(raw: &str, instance: &str, sequence: u64, manifest: &str) -> Option<Observation> {
@@ -224,7 +276,7 @@ fn observation(raw: &str, instance: &str, sequence: u64, manifest: &str) -> Opti
         previous_source_revision: None,
         close_watermark: None,
         observation_role: event.role(),
-        correlation: correlation(event.role(), manifest, 3),
+        correlation: correlation(event.role(), manifest, 4, &event.reference()),
         scope_effect_claims: vec![],
         source_local_evidence: None,
         lifecycle: None,
@@ -233,10 +285,10 @@ fn observation(raw: &str, instance: &str, sequence: u64, manifest: &str) -> Opti
         content_trust: ContentTrust::Observed,
         capture_completeness: CaptureCompleteness::Partial,
         surface_eligible: false,
-        adapter_revision: 3,
+        adapter_revision: 4,
         adapter_manifest_ref: manifest.into(),
         eligible_event_manifest_ref: ELIGIBLE_EVENTS.into(),
-        parser_revision: 3,
+        parser_revision: 4,
         canonicalization_revision: 1,
         event_time_us: None,
         event_time_provenance: None,
