@@ -201,7 +201,16 @@ impl CaptureRuntime {
     }
 
     pub fn capture(&mut self, input: CaptureRecordInput) -> Result<CaptureOutcome, CaptureError> {
+        reject_caller_goal(&input)?;
         self.capture_inner(input, None, None, &mut None)
+    }
+
+    pub fn capture_native_goal(
+        &mut self,
+        observation: crate::goal_source::Observation,
+        manifest: &str,
+    ) -> Result<CaptureOutcome, CaptureError> {
+        self.capture_inner(observation.into_record(manifest), None, None, &mut None)
     }
 
     pub fn capture_isolated(
@@ -210,6 +219,7 @@ impl CaptureRuntime {
         command_id: CommandId,
         routing_hint: &str,
     ) -> Result<IsolatedCaptureOutcome, CaptureError> {
+        reject_caller_goal(&input)?;
         let mut segment = None;
         let outcome =
             self.capture_inner(input, None, Some((command_id, routing_hint)), &mut segment)?;
@@ -243,6 +253,7 @@ impl CaptureRuntime {
         input: CaptureRecordInput,
         pending: RecoveryPreflightCandidate,
     ) -> Result<CaptureOutcome, CaptureError> {
+        reject_caller_goal(&input)?;
         self.capture_inner(input, Some(pending), None, &mut None)
     }
 
@@ -581,6 +592,13 @@ impl From<crate::frame::SpoolFrameError> for CaptureError {
     fn from(_: crate::frame::SpoolFrameError) -> Self {
         Self::Serialization
     }
+}
+
+fn reject_caller_goal(input: &CaptureRecordInput) -> Result<(), CaptureError> {
+    if input.source_revision == crate::goal_source::SOURCE_REVISION {
+        return Err(CaptureError::InvalidInput);
+    }
+    Ok(())
 }
 
 fn validate_input(input: &CaptureRecordInput) -> Result<(), CaptureError> {

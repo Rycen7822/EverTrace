@@ -59,6 +59,18 @@ fn run() -> Result<(), ()> {
     let mut arguments = env::args_os().skip(1);
     let mode = arguments.next().ok_or(())?;
     let path = arguments.next().ok_or(())?;
+    if mode == "--observe-host-goal" {
+        let socket = arguments.next().ok_or(())?;
+        let thread = arguments.next().ok_or(())?;
+        if arguments.next().is_some() {
+            return Err(());
+        }
+        return observe_host_goal(
+            Path::new(&path),
+            Path::new(&socket),
+            thread.to_str().ok_or(())?,
+        );
+    }
     if arguments.next().is_some() {
         return Err(());
     }
@@ -98,6 +110,24 @@ fn run() -> Result<(), ()> {
         Some("--launcher-root") => launch(Path::new(&path), &bytes, started),
         _ => Err(()),
     }
+}
+
+fn observe_host_goal(snapshot: &Path, socket: &Path, thread: &str) -> Result<(), ()> {
+    let observation = evertrace_capture::goal_source::read(socket, thread).map_err(|_| ())?;
+    let Some(observation) = observation else {
+        return Ok(());
+    };
+    let report = evertrace_codex::probe::HostProbeReport::unobserved_source_contract(
+        &evertrace_capture::goal_source::adapter_version(),
+        evertrace_capture::goal_source::ELIGIBLE_EVENTS,
+    )
+    .map_err(|_| ())?;
+    let snapshot = RuntimeSnapshot::load(snapshot).map_err(|_| ())?;
+    let mut runtime = CaptureRuntime::open_for_admission(snapshot).map_err(|_| ())?;
+    runtime
+        .capture_native_goal(observation, &report.manifest().adapter_manifest_id)
+        .map_err(|_| ())?;
+    Ok(())
 }
 
 fn read_input() -> Result<Vec<u8>, ()> {
