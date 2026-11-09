@@ -64,6 +64,12 @@
 {% endif %}
 {% endif %}
 {% endif %}
+{% if item.object_kind == 'recall_need' and detail and detail.state == 'ready' %}
+<label>request ID（可留空，读取此 Need 的账本）
+  <input id="recall-trace-request" type="text" maxlength="512" autocomplete="off" placeholder="原请求 ID，可留空">
+</label>
+<button class="button" type="button" data-content-open="recall_trace">读取原账本轨迹</button>
+{% endif %}
 {% if item.object_kind in ('task', 'workstream', 'work_episode') %}
 <button class="button" type="button" data-content-open="text">
   {{ '读取目标与未解决事项文本' if item.object_kind == 'work_episode' else '分段读取完整目标文本' }}

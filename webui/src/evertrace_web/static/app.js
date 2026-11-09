@@ -447,18 +447,11 @@ async function openRevisions(after = null) {
   }
 }
 async function readContent(item, representation, after, controller, scroll = 0) {
-  const result = await api(
-    "read",
-    {
-      kind: "content",
-      reference: item.key,
-      revision: item.revision,
-      frontier: state.frontier,
-      representation,
-      after,
-    },
-    controller.signal,
-  );
+  const query = representation === "recall_trace"
+    ? { kind: "recall_trace", reference: item.object, revision: item.revision,
+      request_id: state.content?.requestId || null, after }
+    : { kind: "content", reference: item.key, revision: item.revision, frontier: state.frontier, representation, after };
+  const result = await api("read", query, controller.signal);
   if (state.controller !== controller || document.hidden) return;
   if (result.conflict) {
     state.content = null;
@@ -480,6 +473,7 @@ async function readContent(item, representation, after, controller, scroll = 0) 
   state.content = {
     representation,
     after,
+    requestId: representation === "recall_trace" ? query.request_id : null,
     previous: result.previous_cursor,
     next: result.next_cursor,
   };
@@ -488,13 +482,16 @@ async function readContent(item, representation, after, controller, scroll = 0) 
 async function openContent(representation, after = null) {
   const item = state.selected;
   if (!item?.revision || !state.active || document.hidden) return;
+  const requestInput = $("recall-trace-request");
+  const requestId = representation === "recall_trace"
+    ? (requestInput ? requestInput.value || null : state.content?.requestId || null) : null;
   cancel();
   const controller = new AbortController();
   state.controller = controller;
   state.comparison = null;
   state.links = null;
   state.revisions = null;
-  state.content = { representation, after };
+  state.content = { representation, after, requestId };
   $("detail-body").replaceChildren();
   $("detail-ref").textContent = "";
   try {

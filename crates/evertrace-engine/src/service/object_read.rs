@@ -1736,7 +1736,10 @@ impl EngineService {
             if !query.items.iter().any(|item| {
                 matches!(
                     item,
-                    Q::Scopes { .. } | Q::Archive { .. } | Q::References { .. }
+                    Q::Scopes { .. }
+                        | Q::Archive { .. }
+                        | Q::References { .. }
+                        | Q::RecallLedger { .. }
                 )
             }) {
                 return Self::read_stored_metadata_batch(
@@ -1766,7 +1769,10 @@ impl EngineService {
                 .filter(|item| {
                     !matches!(
                         item,
-                        Q::Scopes { .. } | Q::Archive { .. } | Q::References { .. }
+                        Q::Scopes { .. }
+                            | Q::Archive { .. }
+                            | Q::References { .. }
+                            | Q::RecallLedger { .. }
                     )
                 })
                 .cloned()
@@ -1819,6 +1825,29 @@ impl EngineService {
                         .await?
                         {
                             O::Page(page) => P::Scopes { page },
+                            O::TooLarge => return Ok(O::TooLarge),
+                            O::Conflict(frontier) => return Ok(O::Conflict(frontier)),
+                        }
+                    } else if let Q::RecallLedger {
+                        reference,
+                        after,
+                        limit,
+                    } = item
+                    {
+                        match Self::read_recall_ledger_metadata(
+                            &writer,
+                            reference,
+                            *after,
+                            *limit,
+                            &state,
+                            effective_config_hash,
+                            &cancelled,
+                            deadline,
+                            &report,
+                        )
+                        .await?
+                        {
+                            O::Page(page) => P::RecallLedger { page },
                             O::TooLarge => return Ok(O::TooLarge),
                             O::Conflict(frontier) => return Ok(O::Conflict(frontier)),
                         }
@@ -1890,6 +1919,106 @@ impl EngineService {
             Ok(result) => result,
             Err(_) => Ok(O::TooLarge),
         }
+    }
+
+    async fn read_recall_ledger_metadata(
+        writer: &crate::WriterHandle,
+        reference: &evertrace_domain::query::ExactRecordRef,
+        after: Option<u64>,
+        limit: u16,
+        state: &evertrace_domain::query::ObjectReadState,
+        effective_config_hash: [u8; 32],
+        cancelled: &std::sync::Arc<std::sync::atomic::AtomicBool>,
+        deadline: Instant,
+        report: &std::sync::Arc<tokio::sync::RwLock<Option<evertrace_codex::HostProbeReport>>>,
+    ) -> Result<
+        evertrace_domain::query::MetadataReadOutcome<evertrace_domain::query::RecallLedgerPage>,
+        crate::WriterActorError,
+    > {
+        use evertrace_domain::query::{
+            ExactReadQuery, ExactRecordQuery, HumanContentState as S, MetadataReadOutcome as O,
+            RecallLedgerPage,
+        };
+        if after.is_some_and(|value| value > state.frontier) {
+            return Err(crate::WriterActorError::InvalidInput);
+        }
+        let request = Box::new(ExactReadQuery::Record(ExactRecordQuery {
+            reference: reference.clone(),
+            field: None,
+            range: None,
+            expected_selection: None,
+            expected_data_identity: Some(state.data_identity.clone()),
+        }));
+        let context = match writer
+            .read_stored_fields_context(request, cancelled.clone(), deadline, effective_config_hash)
+            .await?
+        {
+            O::Page(context) if context.state == *state => context,
+            O::Page(context) => return Ok(O::Conflict(context.state.frontier)),
+            O::Conflict(frontier) => return Ok(O::Conflict(frontier)),
+            O::TooLarge => return Ok(O::TooLarge),
+        };
+        let mut page = RecallLedgerPage {
+            reference: reference.clone(),
+            content_state: S::Missing,
+            records: Vec::new(),
+            next_scan: None,
+        };
+        let mut need_id = None;
+        if let Some(root) = &context.selected {
+            let matches = root.row_id == reference.stable_key
+                || root.object_id.as_deref() == Some(reference.stable_key.as_str());
+            page.content_state = if !matches {
+                S::Missing
+            } else if root.object_kind.as_deref() != Some("recall_need") {
+                S::Unsupported
+            } else if let Err(code) = fields_access(writer, &context, report, deadline).await {
+                if code == ErrorCode::Untrusted {
+                    S::AccessDenied
+                } else {
+                    S::Unavailable
+                }
+            } else {
+                need_id = root
+                    .object_id
+                    .as_deref()
+                    .and_then(|value| value.parse().ok());
+                if need_id.is_some() {
+                    S::Ready
+                } else {
+                    S::Unavailable
+                }
+            };
+        }
+        if let Some(need_id) = need_id {
+            match writer
+                .read_handle()
+                .recall_ledger_page(
+                    reference.clone(),
+                    need_id,
+                    after.unwrap_or(0),
+                    limit,
+                    state.clone(),
+                )
+                .await
+            {
+                Ok(Some(value)) => page = value,
+                Ok(None) => return Ok(O::Conflict(state.frontier)),
+                Err(_) => return Ok(O::TooLarge),
+            }
+        }
+        if page.content_state == S::Ready
+            && let Err(code) = fields_access(writer, &context, report, deadline).await
+        {
+            page.content_state = if code == ErrorCode::Untrusted {
+                S::AccessDenied
+            } else {
+                S::Unavailable
+            };
+            page.records.clear();
+            page.next_scan = None;
+        }
+        Ok(O::Page(Box::new(page)))
     }
 
     async fn read_stored_metadata_batch(

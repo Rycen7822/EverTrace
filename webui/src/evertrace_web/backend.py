@@ -426,6 +426,20 @@ class Backend:
                     "after": after,
                     "limit": item.get("limit", 32),
                 }
+            elif kind == "recall_ledger":
+                if set(item) != {"kind", "reference", "after", "limit"} or len(items) != 1:
+                    raise BackendError("invalid_input")
+                reference, after = item["reference"], item["after"]
+                if (not isinstance(reference, dict) or set(reference) != {"stable_key", "revision_ref"}
+                    or reference["revision_ref"] is not None or not isinstance(reference["stable_key"], str)
+                    or not 0 < len(reference["stable_key"].encode()) <= 512
+                    or any(ord(char) < 32 or 127 <= ord(char) < 160 for char in reference["stable_key"])):
+                    raise BackendError("invalid_input")
+                if after is not None and (type(after) is not int or not 0 <= after < 2**64
+                    or frontier is None or identity is None):
+                    raise BackendError("invalid_input")
+                value = {"kind":kind, "reference":{"stable_key":reference["stable_key"], "revision_ref":None},
+                         "after":after, "limit":item["limit"]}
             elif kind == "references":
                 if set(item) - {"kind", "reference", "after", "limit"}:
                     raise BackendError("invalid_input")

@@ -1967,7 +1967,8 @@ impl JournalWriter {
                     // Source-authorized directory matching is performed by the Native async read owner.
                     MetadataReadQuery::Scopes { .. }
                     | MetadataReadQuery::Archive { .. }
-                    | MetadataReadQuery::References { .. } => {
+                    | MetadataReadQuery::References { .. }
+                    | MetadataReadQuery::RecallLedger { .. } => {
                         return Err(StoreError::InvalidInput);
                     }
                     MetadataReadQuery::Sources {
@@ -2159,7 +2160,8 @@ impl JournalWriter {
             | MetadataReadQuery::Scopes { .. }
             | MetadataReadQuery::Sources { .. }
             | MetadataReadQuery::Archive { .. }
-            | MetadataReadQuery::References { .. } => false,
+            | MetadataReadQuery::References { .. }
+            | MetadataReadQuery::RecallLedger { .. } => false,
         });
         let result = if needs_times {
             self.lock_sqlite()?

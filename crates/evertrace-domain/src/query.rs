@@ -3134,6 +3134,11 @@ impl RevisionPairFields {
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
 pub enum MetadataReadQuery {
+    RecallLedger {
+        reference: ExactRecordRef,
+        after: Option<u64>,
+        limit: u16,
+    },
     References {
         reference: ExactRecordRef,
         after: Option<String>,
@@ -3187,12 +3192,25 @@ impl MetadataReadQuery {
             | Self::Scopes { limit, .. }
             | Self::Sources { limit, .. }
             | Self::Archive { limit, .. }
-            | Self::References { limit, .. } => *limit,
+            | Self::References { limit, .. }
+            | Self::RecallLedger { limit, .. } => *limit,
         }
     }
 
     fn validate(&self, batch: &MetadataBatchQuery) -> bool {
         match self {
+            Self::RecallLedger {
+                reference, after, ..
+            } => {
+                !reference.stable_key.is_empty()
+                    && reference.stable_key.len() <= 512
+                    && !reference.stable_key.chars().any(char::is_control)
+                    && reference.revision_ref.is_none()
+                    && (after.is_none()
+                        || (batch.expected_frontier.is_some()
+                            && batch.expected_data_identity.is_some()))
+                    && batch.items.len() == 1
+            }
             Self::Archive {
                 query,
                 after,
@@ -3338,6 +3356,9 @@ pub struct MemoryMetadataPage {
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
 pub enum MetadataReadPage {
+    RecallLedger {
+        page: Box<RecallLedgerPage>,
+    },
     References {
         page: Box<ReferenceMetadataPage>,
     },
@@ -3479,6 +3500,30 @@ impl ReferenceMetadataPage {
     }
 }
 
+/// Existing ledger facts under one permission-checked current Need, not a request log.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct RecallLedgerPage {
+    pub reference: ExactRecordRef,
+    pub content_state: HumanContentState,
+    pub records: Vec<serde_json::Value>,
+    /// The bounded journal scan position, not an event time or a count of matching facts.
+    pub next_scan: Option<u64>,
+}
+
+impl RecallLedgerPage {
+    pub fn validate(&self) -> bool {
+        self.records.len() <= usize::from(METADATA_READ_LIMIT)
+            && valid_metadata_records(&self.records)
+            && self
+                .records
+                .iter()
+                .all(|row| row["source_event_seq"].as_u64().is_some())
+            && (self.content_state == HumanContentState::Ready
+                || (self.records.is_empty() && self.next_scan.is_none()))
+    }
+}
+
 /// Scope identities and permitted input fields, not directory titles or access grants.
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
@@ -3579,6 +3624,10 @@ impl ObjectReadBatch {
         self.state.validate()
             && (1..=METADATA_BATCH_LIMIT).contains(&self.items.len())
             && self.items.iter().all(|item| match item {
+                MetadataReadPage::RecallLedger { page } => {
+                    count += page.records.len();
+                    page.validate()
+                }
                 MetadataReadPage::References { page } => {
                     count += page.records.len();
                     page.validate()

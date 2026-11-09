@@ -1,13 +1,102 @@
 """Read-only usage/support evidence with separately gated current canonical metadata."""
 import asyncio
+import json
 
 from . import BackendError
+from .backend import _decode
 from .content import read_record_detail
 from .sources import read_source_links
 
 SUPPORT_DETAIL_KINDS = {"global_support_contract", "global_support_validation"}
 
 USAGE_DETAIL_KINDS = {"procedure_usage_revision", "procedure_negative_evidence", "procedure_negative_review", "procedure_context_effect"}
+
+
+async def read_recall_trace(backend, reference, revision, request_id=None, after=None):
+    """Read existing Need-scoped facts, never due/claim/cue or a generated request log."""
+    try:
+        return await _read_recall_trace(backend, reference, revision, request_id, after)
+    except TimeoutError as error:
+        raise BackendError("resource_exhausted") from error
+
+
+async def _read_recall_trace(backend, reference, revision, request_id, after):
+    if request_id is not None and (not isinstance(request_id, str)
+        or any(ord(char) < 32 or 127 <= ord(char) < 160 or 0xD800 <= ord(char) <= 0xDFFF for char in request_id)
+        or not 0 < len(request_id.encode()) <= 512):
+        raise BackendError("invalid_input")
+    cursor = None
+    if after is not None:
+        if not isinstance(after, str) or not 0 < len(after.encode()) <= 4096:
+            raise BackendError("invalid_input")
+        cursor = _decode(after.encode())
+        keys = {"algorithm", "reference", "revision", "request_id", "frontier", "data_identity", "after"}
+        if (not isinstance(cursor, dict) or set(cursor) != keys or cursor["algorithm"] != "recall-ledger-1"
+            or cursor["reference"] != reference or cursor["revision"] != revision or cursor["request_id"] != request_id
+            or type(cursor["after"]) is not int or not 0 < cursor["after"] < 2**64):
+            raise BackendError("invalid_input")
+    async with asyncio.timeout(2):
+        metadata = await backend.read_record_window(reference, None)
+        if metadata["kind"] == "conflict":
+            return metadata
+        current = metadata["page"]
+        state = current["state"]
+        page = {"reference":reference, "revision":revision, "request_id":request_id, "frontier":state["frontier"],
+                "state":current["content_state"], "events":[], "history_state":"unknown", "agent_seen":"unknown",
+                "next_cursor":None, "previous_cursor":None}
+        if page["state"] != "ready":
+            return {"kind":"recall_trace", "page":page}
+        if current["info"]["kind"] != "current_recall":
+            raise BackendError("invalid_input")
+        if current["selection"]["revision_ref"] != revision:
+            return {"kind":"conflict"}
+        if cursor is not None and (cursor["frontier"] != state["frontier"]
+                                   or cursor["data_identity"] != state["data_identity"]):
+            return {"kind":"conflict"}
+        result = await backend.read_batch([{"kind":"recall_ledger", "reference":{"stable_key":reference, "revision_ref":None},
+            "after":cursor["after"] if cursor else None, "limit":32}], state["frontier"], state["data_identity"])
+        if result["kind"] == "conflict":
+            return result
+        batch = result["page"]
+        item, = batch["items"]
+        if item["kind"] != "recall_ledger" or batch["state"] != state:
+            raise BackendError("invalid_read_response")
+        native = item["page"]
+        if native["reference"] != {"stable_key":reference, "revision_ref":None}:
+            raise BackendError("invalid_read_response")
+        page["state"] = native["content_state"]
+        if page["state"] != "ready":
+            return {"kind":"recall_trace", "page":page}
+        events = native["records"]
+        if not isinstance(events, list) or len(events) > 32:
+            raise BackendError("invalid_read_response")
+        last, matched = cursor["after"] if cursor else 0, False
+        for event in events:
+            seq = event.get("source_event_seq")
+            if type(seq) is not int or not last < seq <= state["frontier"]:
+                raise BackendError("invalid_read_response")
+            last = seq
+            if event.get("kind") not in ("need_recorded", "presentation_attempt", "retrieval_outcome"):
+                raise BackendError("invalid_read_response")
+            if event["kind"] == "retrieval_outcome":
+                if request_id is not None and event["outcome"]["request_id"] != request_id:
+                    continue
+                matched = True
+            page["events"].append(event)
+        next_scan = native["next_scan"]
+        if next_scan is not None:
+            minimum = max(last, cursor["after"] if cursor else 0)
+            if type(next_scan) is not int or not minimum <= next_scan < state["frontier"]:
+                raise BackendError("invalid_read_response")
+            page["next_cursor"] = json.dumps({"algorithm":"recall-ledger-1", "reference":reference, "revision":revision,
+                "request_id":request_id, "frontier":state["frontier"], "data_identity":state["data_identity"], "after":next_scan},
+                separators=(",", ":"))
+        # Later empty pages do not prove that no earlier page recorded this request.
+        if matched or request_id is None and events:
+            page["history_state"] = "recorded"
+        elif cursor is None and next_scan is None:
+            page["history_state"] = "not_recorded"
+        return {"kind":"recall_trace", "page":page}
 
 
 def _same_page(before, after):

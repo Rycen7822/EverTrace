@@ -19,7 +19,7 @@ from .jobs import read_jobs
 from .comparison import read_comparison
 from .research import read_research_comparison
 from .compiled import read_compiled
-from .usage import SUPPORT_DETAIL_KINDS, USAGE_DETAIL_KINDS, read_support_detail, read_usage_detail
+from .usage import SUPPORT_DETAIL_KINDS, USAGE_DETAIL_KINDS, read_support_detail, read_usage_detail, read_recall_trace
 from .content import DETAIL_KINDS, NATIVE_DETAIL_KINDS, read_record_content, read_record_detail, read_source_content
 from .sources import read_revisions, read_source_catalog, read_source_archive, read_source_detail, read_source_links
 from .scopes import read_scopes
@@ -507,6 +507,20 @@ class App:
                         "next_cursor": comparison["next_cursor"],
                         "status": comparison["status"],
                     }
+            elif payload.get("kind") == "recall_trace" and set(payload) == {
+                "kind", "reference", "revision", "request_id", "after"
+            }:
+                if not valid_ref(payload["reference"]) or not valid_ref(payload["revision"]):
+                    return JSONResponse({"error":"invalid_read"}, 400)
+                result = await read_recall_trace(self.backend, payload["reference"], payload["revision"],
+                                                 payload["request_id"], payload["after"])
+                if result["kind"] == "conflict":
+                    data = {"conflict":True}
+                else:
+                    page = result["page"]
+                    data = {"html":self.templates.get_template("recall_trace.html").render(page=page),
+                            "state":page["state"], "history_state":page["history_state"],
+                            "next_cursor":page["next_cursor"], "previous_cursor":None, "text":""}
             elif payload.get("kind") == "content" and set(payload) == {
                 "kind",
                 "reference",

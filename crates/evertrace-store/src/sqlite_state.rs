@@ -1780,6 +1780,88 @@ pub(crate) fn validate_read_header(connection: &Connection) -> Result<(), StoreE
     Ok(())
 }
 
+/// Scan at most 256 journal positions. Only one Need's existing ledger facts leave SQL.
+/// Old plans/source references are not returned through this metadata selector.
+pub(crate) fn read_recall_ledger_page(
+    connection: &Connection,
+    need_id: evertrace_domain::ids::RecallNeedId,
+    after: u64,
+    frontier: u64,
+    limit: u16,
+) -> Result<Option<(Vec<serde_json::Value>, Option<u64>)>, StoreError> {
+    use evertrace_domain::recall::RecallLedgerEvent as Event;
+    let selected = "event_type = 'recall_ledger_recorded_v1' AND COALESCE(\
+        json_extract(payload_json, '$.value.need.recall_need_id'), \
+        json_extract(payload_json, '$.value.attempt.recall_need_id'), \
+        json_extract(payload_json, '$.value.outcome.recall_need_id')) = ?3";
+    let sql = format!(
+        "SELECT seq, CASE WHEN {selected} THEN length(CAST(payload_json AS BLOB)) END, \
+         CASE WHEN {selected} THEN substr(payload_json, 1, 65537) END \
+         FROM journal_events WHERE seq > ?1 AND seq <= ?2 ORDER BY seq LIMIT 256"
+    );
+    let mut statement = connection.prepare(&sql).map_err(|_| StoreError::Io)?;
+    let mut rows = statement
+        .query(rusqlite::params![
+            after.to_be_bytes().as_slice(),
+            frontier.to_be_bytes().as_slice(),
+            need_id.to_string()
+        ])
+        .map_err(|_| StoreError::Io)?;
+    let mut records = Vec::new();
+    let mut last = after;
+    let mut scanned = 0;
+    while let Some(row) = rows.next().map_err(|_| StoreError::Io)? {
+        last = seq_from_blob(
+            &row.get::<_, Vec<u8>>(0)
+                .map_err(|_| StoreError::StoreCorrupt)?,
+        )?;
+        scanned += 1;
+        let Some(length) = row
+            .get::<_, Option<i64>>(1)
+            .map_err(|_| StoreError::StoreCorrupt)?
+        else {
+            continue;
+        };
+        if !(0..=65_536).contains(&length) {
+            return Ok(None);
+        }
+        let payload: crate::JournalPayload = serde_json::from_str(
+            &row.get::<_, String>(2)
+                .map_err(|_| StoreError::StoreCorrupt)?,
+        )
+        .map_err(|_| StoreError::StoreCorrupt)?;
+        let crate::JournalPayload::RecallLedgerRecorded(event) = payload else {
+            return Err(StoreError::StoreCorrupt);
+        };
+        if !event.validate() {
+            return Err(StoreError::StoreCorrupt);
+        }
+        let mut value = match *event {
+            Event::NeedRecorded { need } if need.recall_need_id == need_id => serde_json::json!({
+                "kind":"need_recorded", "recall_need_id":need.recall_need_id, "revision_id":need.revision_id,
+                "trigger_family":need.trigger_family, "source_watermark":need.source_watermark,
+                "delivery_state":need.delivery_state, "agent_response":need.agent_response,
+                "obligation_state":need.obligation_state, "at_time_us":need.created_at_us,
+            }),
+            Event::PresentationAttempt { attempt } if attempt.recall_need_id == need_id => {
+                serde_json::json!({"kind":"presentation_attempt", "attempt":attempt})
+            }
+            Event::RetrievalOutcome { outcome } if outcome.recall_need_id == need_id => {
+                serde_json::json!({"kind":"retrieval_outcome", "outcome":outcome})
+            }
+            _ => return Err(StoreError::StoreCorrupt),
+        };
+        value["source_event_seq"] = last.into();
+        records.push(value);
+        if records.len() >= usize::from(limit) {
+            break;
+        }
+    }
+    let next = (last < frontier && (scanned == 256 || records.len() >= usize::from(limit)))
+        .then_some(last);
+    Ok(Some((records, next)))
+}
+
 /// The persisted committed frontier as seen by one read-only connection.
 pub(crate) fn read_persisted_frontier(connection: &Connection) -> Result<u64, StoreError> {
     validate_read_header(connection)?;

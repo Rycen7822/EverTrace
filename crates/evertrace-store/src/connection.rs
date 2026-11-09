@@ -501,6 +501,50 @@ impl StoreReadHandle {
         .await
     }
 
+    /// One bounded history page. The caller must authorize the selected current Need;
+    /// this reader never claims it, emits a cue or writes a new request log.
+    pub async fn recall_ledger_page(
+        &self,
+        reference: evertrace_domain::query::ExactRecordRef,
+        need_id: evertrace_domain::ids::RecallNeedId,
+        after: u64,
+        limit: u16,
+        state: evertrace_domain::query::ObjectReadState,
+    ) -> Result<Option<evertrace_domain::query::RecallLedgerPage>, crate::StoreError> {
+        self.read_bound(move |connection, cancel, identity| {
+            use evertrace_domain::query::{HumanContentState, ReadDataIdentity, RecallLedgerPage};
+            cancel.check()?;
+            let transaction = connection
+                .unchecked_transaction()
+                .map_err(|_| crate::StoreError::Io)?;
+            let frontier = crate::sqlite_state::read_persisted_frontier(connection)?;
+            let current = ReadDataIdentity {
+                database_device: identity.file_identity.0,
+                database_inode: identity.file_identity.1,
+                incarnation: identity.incarnation,
+            };
+            if frontier != state.frontier || current != state.data_identity {
+                return Ok(None);
+            }
+            let data = crate::sqlite_state::read_recall_ledger_page(
+                connection, need_id, after, frontier, limit,
+            )?;
+            cancel.check()?;
+            drop(transaction);
+            let (content_state, records, next_scan) = match data {
+                Some((records, next)) => (HumanContentState::Ready, records, next),
+                None => (HumanContentState::Unavailable, Vec::new(), None),
+            };
+            Ok(Some(RecallLedgerPage {
+                reference,
+                content_state,
+                records,
+                next_scan,
+            }))
+        })
+        .await
+    }
+
     /// Drain every reader lease and block new ones. The returned guard is
     /// held across the closed backup window; readers that arrive while the
     /// store is closed queue behind it and run against the reopened handle.

@@ -1,0 +1,23 @@
+<button class="button" type="button" data-nav-back hidden>返回上一条记录</button>
+<section class="source-reading">
+  <h2>Recall 账本轨迹</h2>
+  <p>{{ page.reference }} · 固定水位 {{ page.frontier }}</p>
+  {% if page.request_id %}<p>检索请求：{{ page.request_id }}</p>{% endif %}
+  {% if page.state != 'ready' %}
+  <p>读取状态：{{ page.state }}。未返回旧轨迹，也不将不可读解释为没有记录。</p>
+  {% else %}
+  <p>这里只列选中 Need 的原有账本事实，不是全量请求日志。展示或发送成功不表示 agent 看过。</p>
+  {% if page.request_id %}<p>请求筛选只用于原有 request ID 的检索结果。
+  Need 与呈现尝试是 Need 级事实，没有据此归属到该请求。</p>{% endif %}
+  {% if page.history_state == 'not_recorded' %}<p>not_recorded：可核对范围内未记录该请求的检索结果。</p>
+  {% elif not page.events %}<p>本页没有匹配事实；扫描未完成或前页可能有记录，不能据此判断请求未发生。</p>{% endif %}
+  {% for event in page.events %}
+  <article class="memory-item">
+    <h3>{{ {'need_recorded':'Need 状态记录', 'presentation_attempt':'呈现尝试', 'retrieval_outcome':'检索结果'}[event.kind] }}</h3>
+    <p>原账本序列 {{ event.source_event_seq }}</p>
+    <pre class="memory-prose">{{ event|pretty }}</pre>
+  </article>
+  {% endfor %}
+  {% if page.next_cursor %}<button class="button" type="button" data-content-nav="next">继续读取账本</button>{% endif %}
+  {% endif %}
+</section>
