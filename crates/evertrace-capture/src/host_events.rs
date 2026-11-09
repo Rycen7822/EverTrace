@@ -10,7 +10,7 @@ use evertrace_domain::evidence::{
     HostCorrelationEvidence, IdentityStrength, ObservationRole, SourceRevisionMode, SourceRole,
 };
 use rustix::event::{PollFd, PollFlags, poll};
-use serde_json::Value;
+use serde::{Deserialize, Deserializer, de::IgnoredAny};
 use tungstenite::{
     Error as WireError, Message, client::client_with_config, protocol::WebSocketConfig,
 };
@@ -18,10 +18,9 @@ use tungstenite::{
 use crate::{CaptureRecordInput, CaptureRuntime, RuntimeSnapshot, goal_source};
 
 pub const SOURCE_REVISION: &str = "native-user-shell-live-0.166.0-v1";
-pub const ADAPTER_VERSION: &str = "native-user-shell-live-0.166.0-v1:capture-1";
+pub const ADAPTER_VERSION: &str = "native-user-shell-live-0.166.0-v1:capture-2";
 pub const ELIGIBLE_EVENTS: &str = "native-user-shell-state-events-v1";
 const INPUT_LIMIT: usize = 2 * 1024 * 1024;
-const CAPTURE_LIMIT: usize = 65_536;
 
 #[derive(Debug, thiserror::Error)]
 #[error("live host source unavailable")]
@@ -36,8 +35,38 @@ impl Observation {
     }
 }
 
-fn uuid(value: &Value) -> Option<&str> {
-    let text = value.as_str()?;
+// Only decode the eligibility header. Ignore tool output/history without copying it into a JSON tree.
+#[derive(Deserialize)]
+struct Event {
+    #[serde(default, deserialize_with = "id_present")]
+    id: bool,
+    method: String,
+    params: EventParams,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct EventParams {
+    thread_id: String,
+    turn_id: String,
+    item: EventItem,
+}
+
+#[derive(Deserialize)]
+struct EventItem {
+    #[serde(rename = "type")]
+    kind: String,
+    source: String,
+    id: String,
+    status: String,
+}
+
+fn id_present<'de, D: Deserializer<'de>>(deserializer: D) -> std::result::Result<bool, D::Error> {
+    IgnoredAny::deserialize(deserializer)?;
+    Ok(true)
+}
+
+fn uuid(text: &str) -> Option<&str> {
     uuid::Uuid::parse_str(text)
         .ok()
         .filter(|id| !id.is_nil() && id.to_string() == text)?;
@@ -45,25 +74,22 @@ fn uuid(value: &Value) -> Option<&str> {
 }
 
 fn observation(raw: &str, instance: &str, sequence: u64, manifest: &str) -> Option<Observation> {
-    if raw.len() > CAPTURE_LIMIT {
-        return None;
-    }
-    let value: Value = serde_json::from_str(raw).ok()?;
-    let method = value.get("method")?.as_str()?;
-    let state = value.pointer("/params/item/status")?.as_str()?;
-    if value.get("id").is_some()
+    let event: Event = serde_json::from_str(raw).ok()?;
+    let method = event.method.as_str();
+    let item = &event.params.item;
+    if event.id
         || !matches!(
-            (method, state),
+            (method, item.status.as_str()),
             ("item/started", "inProgress") | ("item/completed", "completed" | "failed")
         )
-        || value.pointer("/params/item/type")?.as_str()? != "commandExecution"
-        || value.pointer("/params/item/source")?.as_str()? != "userShell"
+        || item.kind != "commandExecution"
+        || item.source != "userShell"
     {
         return None;
     }
-    let thread = uuid(value.pointer("/params/threadId")?)?;
-    let turn = uuid(value.pointer("/params/turnId")?)?;
-    let item = uuid(value.pointer("/params/item/id")?)?;
+    let thread = uuid(&event.params.thread_id)?;
+    let turn = uuid(&event.params.turn_id)?;
+    let item = uuid(&item.id)?;
     if uuid::Uuid::parse_str(item).ok()?.get_version_num() != 4 {
         return None;
     }
@@ -104,7 +130,7 @@ fn observation(raw: &str, instance: &str, sequence: u64, manifest: &str) -> Opti
             pairing_role: ObservationRole::StateProbe,
             field_provenance: vec![],
             adapter_manifest_ref: manifest.into(),
-            adapter_revision: 1,
+            adapter_revision: 2,
             strong_gate_receipt_ref: None,
             admission: CorrelationAdmission::Unavailable,
             partial_correlation_ref: None,
@@ -118,10 +144,10 @@ fn observation(raw: &str, instance: &str, sequence: u64, manifest: &str) -> Opti
         content_trust: ContentTrust::Observed,
         capture_completeness: CaptureCompleteness::Partial,
         surface_eligible: false,
-        adapter_revision: 1,
+        adapter_revision: 2,
         adapter_manifest_ref: manifest.into(),
         eligible_event_manifest_ref: ELIGIBLE_EVENTS.into(),
-        parser_revision: 1,
+        parser_revision: 2,
         canonicalization_revision: 1,
         event_time_us: None,
         event_time_provenance: None,
