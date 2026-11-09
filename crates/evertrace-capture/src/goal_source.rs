@@ -13,13 +13,14 @@ use std::{
 
 use evertrace_domain::evidence::{
     CaptureCompleteness, ContentTrust, CorrelationAdmission, EvidenceSourceKind,
-    HostCorrelationEvidence, IdentityStrength, ObservationRole, SourceRevisionMode, SourceRole,
+    HostCorrelationEvidence, IdentityStrength, ObservationRole, SourceArchiveMode,
+    SourceObservation, SourceReceipt, SourceRevisionMode, SourceRole, hex, payload_fingerprint,
 };
 use serde::Deserialize;
 use sha2::{Digest, Sha256};
 use tungstenite::{Message, WebSocket, client::client_with_config, protocol::WebSocketConfig};
 
-use crate::{CaptureRecordInput, ConfinedRoot};
+use crate::{CaptureRecordInput, ConfinedRoot, DeviceKey, protect::protect};
 
 // Exact external executable and goal/get format; this is not an ordinary Host/namespace qualification.
 pub const SOURCE_REVISION: &str =
@@ -27,7 +28,7 @@ pub const SOURCE_REVISION: &str =
 pub const ELIGIBLE_EVENTS: &str = "host-goal-get-jsonrpc-v1";
 pub const ADAPTER_REVISION: u32 = 1;
 const LIMIT: usize = 65_536;
-const DOMAIN: &str = "native-host-goal-v1";
+pub const IDENTITY_DOMAIN: &str = "native-host-goal-v1";
 
 #[derive(Debug, thiserror::Error)]
 #[error("native goal source is unavailable or unverified")]
@@ -101,6 +102,108 @@ fn decode(raw: &[u8]) -> Result<Option<Goal>> {
     Ok(reply.result.goal)
 }
 
+/// Candidate text is not a root designation; only a revalidated publisher can supply that witness.
+pub fn observed_goal(raw: &[u8]) -> Result<Option<(String, String)>> {
+    Ok(decode(raw)?.map(|goal| (goal.root_ref(), goal.objective)))
+}
+
+/// A current publisher and the protected original bytes have independently agreed on this root.
+pub struct RootGoal {
+    reference: String,
+    objective: String,
+}
+
+impl RootGoal {
+    pub fn source_ref(&self) -> &str {
+        &self.reference
+    }
+
+    pub fn objective(&self) -> &str {
+        &self.objective
+    }
+}
+
+/// Re-read the actual publisher, not a claimed role, profile label or copied historical payload.
+pub fn revalidate(
+    receipt: &SourceReceipt,
+    observation: &SourceObservation,
+    bytes: &[u8],
+    key: &DeviceKey,
+) -> Result<RootGoal> {
+    if receipt.source_revision.as_str() != SOURCE_REVISION
+        || receipt.identity_domain != IDENTITY_DOMAIN
+        || receipt.source_kind != EvidenceSourceKind::Other
+        || receipt.protection_key_generation != key.generation()
+        || receipt.identity_strength != IdentityStrength::SynthesizedBestEffort
+        || observation.identity_strength != IdentityStrength::SynthesizedBestEffort
+        || receipt.observation_role != ObservationRole::StateProbe
+        || observation.observation_role != ObservationRole::StateProbe
+        || observation.correlation.admission != CorrelationAdmission::Unavailable
+        || receipt.source_sequence != 0
+        || receipt.source_sequence_origin != Some(0)
+        || receipt.source_revision_mode != SourceRevisionMode::Append
+        || receipt.previous_source_revision.is_some()
+        || receipt.close_watermark.is_some()
+        || receipt.source_byte_range.is_some()
+    {
+        return Err(GoalSourceError);
+    }
+    let pid = receipt
+        .source_instance_id
+        .as_str()
+        .split(':')
+        .nth(3)
+        .and_then(|value| value.parse::<u32>().ok())
+        .ok_or(GoalSourceError)?;
+    let publisher = peer(pid)?;
+    let current = read(&publisher.endpoint, &receipt.source_session_ref)?.ok_or(GoalSourceError)?;
+    if current.instance != receipt.source_instance_id.as_str()
+        || current.reference != receipt.source_ref
+    {
+        return Err(GoalSourceError);
+    }
+    let protected = protect(&current.raw, key).map_err(|_| GoalSourceError)?;
+    let archive = match protected.archive_mode() {
+        crate::ArchiveMode::Exact => SourceArchiveMode::Exact,
+        crate::ArchiveMode::Redacted => SourceArchiveMode::Redacted,
+    };
+    if protected.protected_bytes() != bytes
+        || protected.raw_length() != receipt.original_length
+        || protected.detector_revision() != receipt.detector_revision
+        || protected.redaction_revision() != receipt.redaction_revision
+        || protected
+            .protected_secret_digest()
+            .map(|digest| evertrace_domain::evidence::hex(&digest))
+            != receipt.protected_secret_digest
+        || archive != receipt.archive_mode
+    {
+        return Err(GoalSourceError);
+    }
+    let fingerprint = payload_fingerprint(
+        receipt.canonicalization_revision,
+        bytes,
+        protected.protected_secret_digest(),
+    )
+    .map_err(|_| GoalSourceError)?;
+    if observation.source_receipt_ref != receipt.source_receipt_id
+        || observation.source_instance_id != receipt.source_instance_id
+        || observation.source_revision != receipt.source_revision
+        || observation.source_record_identity != receipt.source_record_identity
+        || observation.payload_fingerprint != hex(&fingerprint)
+    {
+        return Err(GoalSourceError);
+    }
+    let goal = decode(&current.raw)?.ok_or(GoalSourceError)?;
+    // A redacted archive is not necessarily JSON. Derive the safe field from the independently
+    // witnessed original, never from the optional L0 presentation or an unverified caller string.
+    let objective = protect(goal.objective.as_bytes(), key).map_err(|_| GoalSourceError)?;
+    Ok(RootGoal {
+        reference: goal.root_ref(),
+        objective: String::from_utf8(objective.protected_bytes().to_vec())
+            .map_err(|_| GoalSourceError)?,
+    })
+}
+
 // Private construction prevents typed Hook/SDK input from manufacturing a verified source observation.
 pub struct Observation {
     raw: Vec<u8>,
@@ -115,6 +218,7 @@ struct Peer {
     start: String,
     namespace: u64,
     executable: (u64, u64),
+    endpoint: std::path::PathBuf,
 }
 
 fn peer(pid: u32) -> Result<Peer> {
@@ -130,6 +234,16 @@ fn peer(pid: u32) -> Result<Peer> {
         || args.get(1).copied() != Some(b"app-server".as_slice())
         || args.contains(&b"proxy".as_slice())
     {
+        return Err(GoalSourceError);
+    }
+    let endpoint = args
+        .windows(2)
+        .find(|pair| pair[0] == b"--listen")
+        .and_then(|pair| std::str::from_utf8(pair[1]).ok())
+        .and_then(|value| value.strip_prefix("unix://"))
+        .ok_or(GoalSourceError)?;
+    let endpoint = std::path::PathBuf::from(endpoint);
+    if !endpoint.is_absolute() {
         return Err(GoalSourceError);
     }
     let stat = fs::read_to_string(root.join("stat")).map_err(|_| GoalSourceError)?;
@@ -148,6 +262,7 @@ fn peer(pid: u32) -> Result<Peer> {
         start,
         namespace,
         executable: (metadata.dev(), metadata.ino()),
+        endpoint,
     })
 }
 
@@ -334,7 +449,7 @@ impl Observation {
             source_record_identity: None,
             identity_strength: Some(IdentityStrength::SynthesizedBestEffort),
             source_kind: EvidenceSourceKind::Other,
-            identity_domain: DOMAIN.into(),
+            identity_domain: IDENTITY_DOMAIN.into(),
             source_ref: self.reference,
             session_ref: self.thread,
             turn_ref: None,

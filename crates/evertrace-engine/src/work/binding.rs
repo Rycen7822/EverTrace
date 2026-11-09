@@ -1,10 +1,14 @@
 use std::collections::BTreeSet;
 
 use evertrace_domain::{
-    ids::{OperationId, ScopeEffectId, TaskId, WorkBindingRevisionId, WorkstreamId},
+    ids::{
+        OperationId, ScopeEffectId, SourceObservationId, TaskId, WorkBindingRevisionId,
+        WorkstreamId,
+    },
+    revision::RevisionId,
     work::{
-        AssignmentStatus, PrimaryWorkBinding, SecondaryWorkBinding, TaskIdentityConfidence,
-        WorkBindingRevision,
+        AssignmentStatus, PrimaryWorkBinding, SecondaryWorkBinding, Task, TaskIdentityConfidence,
+        TaskLifecycle, WorkBindingRevision,
     },
 };
 use evertrace_store::{JournalCommand, JournalEventDraft, JournalPayload, WorkIdentityCurrentView};
@@ -12,6 +16,71 @@ use evertrace_store::{JournalCommand, JournalEventDraft, JournalPayload, WorkIde
 use super::{WorkCommandContext, WorkIdentityError};
 
 const MAX_EVIDENCE: usize = 64;
+
+/// Root intent comes from a live publisher witness, never an annotation or a caller-supplied confidence.
+pub(crate) fn source_root_task(
+    context: WorkCommandContext,
+    tasks: &std::collections::BTreeMap<TaskId, Task>,
+    root: &evertrace_capture::goal_source::RootGoal,
+    source: SourceObservationId,
+    watermark: u64,
+) -> Result<Option<JournalCommand>, WorkIdentityError> {
+    let mut matching = tasks.values().filter(|task| {
+        task.request_root_refs
+            .iter()
+            .any(|key| key == root.source_ref())
+    });
+    let current = matching.next();
+    if matching.next().is_some() {
+        return Err(WorkIdentityError::Conflict);
+    }
+    let mut refs = vec![root.source_ref().to_owned(), source.to_string()];
+    refs.sort();
+    if let Some(current) = current {
+        if current.identity_confidence != TaskIdentityConfidence::Explicit {
+            return Err(WorkIdentityError::Conflict);
+        }
+        if current.canonical_goal == root.objective()
+            || current.lifecycle.is_terminal()
+            || watermark <= current.source_watermark
+        {
+            return Ok(None);
+        }
+        let mut successor = current.clone();
+        successor.revision_id = RevisionId::new_v7();
+        successor.predecessor_revision_id = Some(current.revision_id);
+        successor.canonical_goal = root.objective().to_owned();
+        successor.request_root_refs = refs;
+        successor.source_watermark = watermark;
+        return super::task::revise_task(
+            context,
+            current,
+            successor,
+            super::TypedTaskChange::Goal,
+            &[source.to_string()],
+        )
+        .map(Some);
+    }
+    let task = Task {
+        task_id: TaskId::new_v7(),
+        revision_id: RevisionId::new_v7(),
+        predecessor_revision_id: None,
+        request_root_refs: refs,
+        canonical_goal: root.objective().to_owned(),
+        scope_memberships: vec![],
+        identity_confidence: TaskIdentityConfidence::Explicit,
+        lifecycle: TaskLifecycle::Active,
+        continuation_of_task_id: None,
+        split_from_task_id: None,
+        split_into_task_ids: vec![],
+        merged_from_task_ids: vec![],
+        merged_into_task_id: None,
+        created_at_us: context.occurred_at_us,
+        closed_at_us: None,
+        source_watermark: watermark,
+    };
+    super::task::create_task(context, task).map(Some)
+}
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum BindingResolution {

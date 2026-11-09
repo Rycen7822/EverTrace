@@ -341,7 +341,7 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
             "ordinary-hook-ingest-v1",
         )?
         .with_config(Arc::clone(&config_reload))
-        .with_recovery_wakeup(session_import_wakeup_tx.clone());
+        .with_scheduler_wakeup(session_import_wakeup_tx.clone());
         Ok::<_, Box<dyn std::error::Error>>((
             config_reload,
             runtime_snapshot,

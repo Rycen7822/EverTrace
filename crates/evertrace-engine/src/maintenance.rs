@@ -1912,9 +1912,27 @@ impl BackgroundScheduler {
                 effective_config_hash: self.runtime.effective_config_hash,
                 algorithm_revision: "controlled_run_resolver_v1",
             };
-            let command = match resolver.resolve_source(&snapshot, source, &context) {
+            let native_goal = current
+                .source_observation(source)
+                .is_some_and(|(value, _)| {
+                    value.source_revision.as_str()
+                        == evertrace_capture::goal_source::SOURCE_REVISION
+                });
+            let resolution = if native_goal {
+                let resolver = resolver.clone();
+                let key_dir = self.runtime.device_key_dir.clone();
+                tokio::task::spawn_blocking(move || {
+                    resolver.resolve_source(&snapshot, source, &context, Some(&key_dir))
+                })
+                .await
+                .map_err(|_| BackgroundSchedulerError::Store)?
+            } else {
+                resolver.resolve_source(&snapshot, source, &context, None)
+            };
+            let command = match resolution {
                 Ok(ControlledRunCommand::NoDelta) => continue,
-                Ok(ControlledRunCommand::Declaration { command, .. })
+                Ok(ControlledRunCommand::WorkRoot { command })
+                | Ok(ControlledRunCommand::Declaration { command, .. })
                 | Ok(ControlledRunCommand::Terminal { command, .. }) => command,
                 Err(AutoresearchError::Store(_)) => return Err(BackgroundSchedulerError::Store),
                 // Absent/contradictory/untrusted evidence is not a write or a fabricated terminal result.

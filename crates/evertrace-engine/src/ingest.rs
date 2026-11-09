@@ -43,12 +43,12 @@ pub struct EvidenceIngestor {
     algorithm_revision: String,
     config: Option<std::sync::Arc<crate::ConfigReloadService>>,
     operation_config: Option<std::sync::Arc<evertrace_domain::config::EffectiveConfig>>,
-    recovery_wakeup: Option<tokio::sync::watch::Sender<u64>>,
+    scheduler_wakeup: Option<tokio::sync::watch::Sender<u64>>,
 }
 
 impl EvidenceIngestor {
-    pub fn with_recovery_wakeup(mut self, wakeup: tokio::sync::watch::Sender<u64>) -> Self {
-        self.recovery_wakeup = Some(wakeup);
+    pub fn with_scheduler_wakeup(mut self, wakeup: tokio::sync::watch::Sender<u64>) -> Self {
+        self.scheduler_wakeup = Some(wakeup);
         self
     }
     pub fn with_operation_config(
@@ -100,10 +100,19 @@ impl EvidenceIngestor {
             let result = self.drain_page(&mut cursor, &shutdown).await;
             drop(guard);
             match result {
-                Ok(_) => recovering = false,
+                Ok(progress) => {
+                    // The journal notification can precede carrier acknowledgement. Wake again only
+                    // after durable drain, so optional source consumers do not sleep behind a cleared backlog.
+                    if progress.sealed_segments != 0
+                        && let Some(wakeup) = &self.scheduler_wakeup
+                    {
+                        wakeup.send_modify(|value| *value = value.wrapping_add(1));
+                    }
+                    recovering = false;
+                }
                 Err(IngestError::Busy) => {}
                 Err(IngestError::Recovering) => {
-                    if !recovering && let Some(wakeup) = &self.recovery_wakeup {
+                    if !recovering && let Some(wakeup) = &self.scheduler_wakeup {
                         wakeup.send_modify(|value| *value = value.wrapping_add(1));
                     }
                     recovering = true;
@@ -197,7 +206,7 @@ impl EvidenceIngestor {
             algorithm_revision,
             config: None,
             operation_config: None,
-            recovery_wakeup: None,
+            scheduler_wakeup: None,
         })
     }
 
