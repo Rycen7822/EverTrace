@@ -78,9 +78,13 @@ fn run() -> Result<(), ()> {
                     &contract.manifest().adapter_manifest_id,
                 )
                 .map_err(|_| ())?;
+                let closed = evertrace_capture::process_source::closed_records(&record, path);
                 let snapshot = RuntimeSnapshot::load(path).map_err(|_| ())?;
                 let mut runtime = CaptureRuntime::open_for_admission(snapshot).map_err(|_| ())?;
                 runtime.capture(record).map_err(|_| ())?;
+                for record in closed.map_err(|_| ())? {
+                    runtime.capture(record).map_err(|_| ())?;
+                }
                 Ok(())
             } else {
                 capture(

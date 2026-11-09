@@ -3,26 +3,33 @@
 //! Live peer/record identity is checked here. Namespace canaries and semantic Work
 //! binding are not yet qualified, so every accepted record remains untrusted/partial.
 
-use std::{fs, io::Read, os::unix::fs::MetadataExt, path::Path};
+use std::{
+    collections::BTreeSet,
+    fs,
+    io::Read,
+    os::unix::fs::MetadataExt,
+    path::{Path, PathBuf},
+    time::{Duration, Instant},
+};
 
 use evertrace_domain::evidence::{
     CanonicalEventFamily, CaptureCompleteness, ContentTrust, CorrelationAdmission,
-    CorrelationField, CorrelationFieldClaim, EvidenceSourceKind, HostCorrelationEvidence,
-    IdentityStrength, ObservationRole, SourceInstanceId, SourceRecordIdentity, SourceRevision,
-    SourceRevisionMode, SourceRole, source_observation_id,
+    CorrelationField, CorrelationFieldClaim, EvidenceByteRange, EvidenceSourceKind,
+    HostCorrelationEvidence, IdentityStrength, ObservationRole, SourceInstanceId,
+    SourceRecordIdentity, SourceRevision, SourceRevisionMode, SourceRole, source_observation_id,
 };
 use serde::Deserialize;
 use serde_json::Value;
 use sha2::{Digest, Sha256};
 use uuid::Uuid;
 
-use crate::CaptureRecordInput;
+use crate::{CaptureRecordInput, ConfinedReadLimits, ConfinedRoot};
 
 const PREFIX: &[u8] = b"{\"format\":\"process-trial-source-v2\",";
 const FORMAT: &str = "process-trial-source-v2";
 pub const SOURCE_REVISION: &str =
     "process-trial-source-v2:79ba882813eea69af109ace6016462953d63b7c97677392d6673c96bebeee9d6";
-pub const ADAPTER_REVISION: u32 = 3;
+pub const ADAPTER_REVISION: u32 = 4;
 pub const ELIGIBLE_EVENTS: &str = "process-trial-source-events-v2";
 const LIMIT: usize = 65_536;
 
@@ -40,7 +47,7 @@ pub struct ProcessSourceError;
 
 type Result<T> = std::result::Result<T, ProcessSourceError>;
 
-#[derive(Deserialize)]
+#[derive(Deserialize, Eq, PartialEq)]
 #[serde(deny_unknown_fields)]
 struct ProcessIdentity {
     pid: u32,
@@ -123,7 +130,7 @@ fn uuid(value: &str) -> bool {
     Uuid::parse_str(value).is_ok_and(|id| !id.is_nil() && id.to_string() == value)
 }
 
-fn peer(header: &Header, executable: &Path, snapshot: &Path) -> Result<()> {
+fn peer(header: &Header, executable: &Path, snapshot: &Path) -> Result<PathBuf> {
     let parent = stat("self")?.parent;
     let root = Path::new("/proc").join(parent.to_string());
     let own_uid = fs::metadata("/proc/self")
@@ -182,7 +189,7 @@ fn peer(header: &Header, executable: &Path, snapshot: &Path) -> Result<()> {
             return Err(ProcessSourceError);
         }
     }
-    Ok(())
+    fs::canonicalize(script).map_err(|_| ProcessSourceError)
 }
 
 // The physical unit is this source's single child process lifetime, not its opaque trial UUID.
@@ -242,16 +249,8 @@ fn physical_scope(header: &Header) -> Result<String> {
     ))
 }
 
-/// The same Hook transport calls this only for the recorder's exact original version signature.
-/// No peer/header can select Observed, Complete, an active binding, or an Exact admission.
-pub fn record(raw: &[u8], snapshot: &Path, manifest_ref: &str) -> Result<CaptureRecordInput> {
-    if !is_record(raw)
-        || manifest_ref.len() != 64
-        || !manifest_ref.bytes().all(|value| value.is_ascii_hexdigit())
-    {
-        return Err(ProcessSourceError);
-    }
-    if raw.len() > LIMIT {
+fn decode(raw: &[u8]) -> Result<(Header, ObservationRole)> {
+    if !is_record(raw) || raw.len() > LIMIT {
         return Err(ProcessSourceError);
     }
     let value: Value = serde_json::from_slice(raw).map_err(|_| ProcessSourceError)?;
@@ -299,8 +298,18 @@ pub fn record(raw: &[u8], snapshot: &Path, manifest_ref: &str) -> Result<Capture
     {
         return Err(ProcessSourceError);
     }
+    Ok((header, role))
+}
+
+/// The same Hook transport calls this only for the recorder's exact original version signature.
+/// No peer/header can select Observed, Complete, an active binding, or an Exact admission.
+pub fn record(raw: &[u8], snapshot: &Path, manifest_ref: &str) -> Result<CaptureRecordInput> {
+    if manifest_ref.len() != 64 || !manifest_ref.bytes().all(|value| value.is_ascii_hexdigit()) {
+        return Err(ProcessSourceError);
+    }
+    let (header, role) = decode(raw)?;
     let executable = std::env::current_exe().map_err(|_| ProcessSourceError)?;
-    peer(&header, &executable, snapshot)?;
+    let _ = peer(&header, &executable, snapshot)?;
     let source_instance_id = format!(
         "process:{}:{}:{}:{}",
         header.controller.boot_id,
@@ -399,4 +408,136 @@ pub fn record(raw: &[u8], snapshot: &Path, manifest_ref: &str) -> Result<Capture
         event_time_provenance: None,
         raw_payload: raw.to_vec(),
     })
+}
+
+/// Observe this exact source's actual closed file, not a second label on its Hook payload.
+/// Failure is returned separately so the caller still durably admits the original Hook record.
+pub fn closed_records(
+    primary: &CaptureRecordInput,
+    snapshot: &Path,
+) -> Result<Vec<CaptureRecordInput>> {
+    let Some(watermark) = primary.close_watermark else {
+        return Ok(vec![]);
+    };
+    let (closing, _) = decode(&primary.raw_payload)?;
+    if closing.event != "controller_finished" || watermark != closing.sequence || watermark > 64 {
+        return Err(ProcessSourceError);
+    }
+    let executable = std::env::current_exe().map_err(|_| ProcessSourceError)?;
+    let script = peer(&closing, &executable, snapshot)?;
+    let root = script.parent().ok_or(ProcessSourceError)?;
+    let command = bytes(
+        &Path::new("/proc")
+            .join(closing.controller.pid.to_string())
+            .join("cmdline"),
+    )?;
+    let args: Vec<_> = command
+        .split(|byte| *byte == 0)
+        .filter(|part| !part.is_empty())
+        .collect();
+    let series = args
+        .iter()
+        .rposition(|arg| *arg == b"--series")
+        .map(|index| args.get(index + 1).ok_or(ProcessSourceError))
+        .transpose()?
+        .copied()
+        .unwrap_or(b"recording-v2");
+    if series.is_empty()
+        || series.len() > 48
+        || !series
+            .iter()
+            .all(|byte| byte.is_ascii_alphanumeric() || *byte == b'-')
+    {
+        return Err(ProcessSourceError);
+    }
+    let series = std::str::from_utf8(series).map_err(|_| ProcessSourceError)?;
+    let relative = format!("events-{series}.jsonl");
+    let path = root.join(&relative);
+    let metadata = fs::symlink_metadata(&path).map_err(|_| ProcessSourceError)?;
+    if !metadata.is_file()
+        || metadata.mode() & 0o022 != 0
+        || metadata.uid()
+            != fs::metadata("/proc/self")
+                .map_err(|_| ProcessSourceError)?
+                .uid()
+    {
+        return Err(ProcessSourceError);
+    }
+    let deadline = Instant::now() + Duration::from_millis(50);
+    // This is the live, code-verified publisher's owned output root, not an arbitrary
+    // Host locator. Pin its owned directory and file; do not relax the generic
+    // external-source ancestor policy or mutate permissions to make a probe pass.
+    let file = ConfinedRoot::open_owned_private(root)
+        .map_err(|_| ProcessSourceError)?
+        .read(
+            Path::new(&relative),
+            ConfinedReadLimits {
+                single_file_remaining: 262_144,
+                untracked_total_remaining: 262_144,
+                bundle_remaining: 262_144,
+                deadline,
+            },
+        )
+        .map_err(|_| ProcessSourceError)?;
+    if metadata.dev() != file.identity.device
+        || metadata.ino() != file.identity.inode
+        || !file.bytes.ends_with(b"\n")
+    {
+        return Err(ProcessSourceError);
+    }
+    let instance = format!(
+        "{}:file:{}:{}",
+        primary.source_instance_id, file.identity.device, file.identity.inode
+    );
+    let mut records = Vec::new();
+    let mut keys = BTreeSet::new();
+    let mut offset = 0;
+    for line in file.bytes.split_inclusive(|byte| *byte == b'\n') {
+        let (header, role) = decode(line)?;
+        if Instant::now() >= deadline
+            || header.controller != closing.controller
+            || header.source_epoch != closing.source_epoch
+            || header.study_key != closing.study_key
+            || !keys.insert(header.event_key.clone())
+            || header.sequence != records.len() as u64 + 1
+            || header.sequence > watermark
+            || (header.sequence == 1 && header.event != "study_opened")
+            || (header.event == "controller_finished") != (header.sequence == watermark)
+        {
+            return Err(ProcessSourceError);
+        }
+        let id = source_observation_id(
+            &SourceInstanceId::parse(&instance).map_err(|_| ProcessSourceError)?,
+            &SourceRevision::parse(SOURCE_REVISION).map_err(|_| ProcessSourceError)?,
+            &SourceRecordIdentity::parse(&header.event_key).map_err(|_| ProcessSourceError)?,
+        )
+        .map_err(|_| ProcessSourceError)?;
+        let mut record = primary.clone();
+        record.spool_record_id = Some(id.to_string());
+        record.source_observation_id_hint = Some(id.to_string());
+        record.source_instance_id = instance.clone();
+        record.source_ref = format!("file:{}", path.display());
+        record.source_record_identity = Some(header.event_key);
+        record.source_sequence = header.sequence;
+        record.close_watermark = (header.sequence == watermark).then_some(watermark);
+        record.source_byte_range = Some(EvidenceByteRange {
+            start: offset,
+            end: offset + line.len() as u64,
+        });
+        record.observation_role = role;
+        // The closing primary has no kernel correlation. Do not re-observe dead children or
+        // promote declarations from a file into independently verified physical facts.
+        record.correlation.pairing_role = role;
+        record.raw_payload = line.to_vec();
+        records.push(record);
+        offset += line.len() as u64;
+    }
+    if records.len() as u64 != watermark
+        || records
+            .last()
+            .is_none_or(|record| record.raw_payload != primary.raw_payload)
+    {
+        return Err(ProcessSourceError);
+    }
+    Ok(records)
 }
