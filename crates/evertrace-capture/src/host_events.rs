@@ -15,10 +15,10 @@ use tungstenite::{
     Error as WireError, Message, client::client_with_config, protocol::WebSocketConfig,
 };
 
-use crate::{CaptureRecordInput, CaptureRuntime, RuntimeSnapshot, goal_source};
+use crate::{CaptureRecordBody, CaptureRecordInput, CaptureRuntime, RuntimeSnapshot, goal_source};
 
 pub const SOURCE_REVISION: &str = "native-user-shell-live-0.166.0-v1";
-pub const ADAPTER_VERSION: &str = "native-user-shell-live-0.166.0-v1:capture-2";
+pub const ADAPTER_VERSION: &str = "native-user-shell-live-0.166.0-v1:capture-3";
 pub const ELIGIBLE_EVENTS: &str = "native-user-shell-state-events-v1";
 const INPUT_LIMIT: usize = 2 * 1024 * 1024;
 
@@ -73,36 +73,141 @@ fn uuid(text: &str) -> Option<&str> {
     Some(text)
 }
 
-fn observation(raw: &str, instance: &str, sequence: u64, manifest: &str) -> Option<Observation> {
-    let event: Event = serde_json::from_str(raw).ok()?;
-    let method = event.method.as_str();
-    let item = &event.params.item;
-    if event.id
-        || !matches!(
-            (method, item.status.as_str()),
-            ("item/started", "inProgress") | ("item/completed", "completed" | "failed")
+impl Event {
+    fn decode(raw: &str) -> Option<Self> {
+        let event: Self = serde_json::from_str(raw).ok()?;
+        let item = &event.params.item;
+        if event.id
+            || !matches!(
+                (event.method.as_str(), item.status.as_str()),
+                ("item/started", "inProgress") | ("item/completed", "completed" | "failed")
+            )
+            || item.kind != "commandExecution"
+            || item.source != "userShell"
+        {
+            return None;
+        }
+        uuid(&event.params.thread_id)?;
+        uuid(&event.params.turn_id)?;
+        if uuid::Uuid::parse_str(uuid(&item.id)?)
+            .ok()?
+            .get_version_num()
+            != 4
+        {
+            return None;
+        }
+        Some(event)
+    }
+
+    fn role(&self) -> ObservationRole {
+        if self.method == "item/started" {
+            ObservationRole::Intent
+        } else {
+            ObservationRole::Result
+        }
+    }
+
+    fn identity(&self) -> String {
+        format!(
+            "{}:{}:{}",
+            self.params.turn_id, self.params.item.id, self.method
         )
-        || item.kind != "commandExecution"
-        || item.source != "userShell"
-    {
-        return None;
     }
-    let thread = uuid(&event.params.thread_id)?;
-    let turn = uuid(&event.params.turn_id)?;
-    let item = uuid(&item.id)?;
-    if uuid::Uuid::parse_str(item).ok()?.get_version_num() != 4 {
-        return None;
+
+    fn reference(&self) -> String {
+        format!(
+            "native-user-shell:{}:{}",
+            self.params.thread_id,
+            self.identity()
+        )
     }
+}
+
+fn correlation(role: ObservationRole, manifest: &str, revision: u32) -> HostCorrelationEvidence {
+    HostCorrelationEvidence {
+        occurrence_schema_version: 1,
+        host_instance_id: None,
+        host_trace_lineage_id: None,
+        host_lane_key: None,
+        canonical_event_family: None,
+        native_request_id: None,
+        physical_execution_ordinal: None,
+        pairing_role: role,
+        field_provenance: vec![],
+        adapter_manifest_ref: manifest.into(),
+        adapter_revision: revision,
+        strong_gate_receipt_ref: None,
+        admission: CorrelationAdmission::Unavailable,
+        partial_correlation_ref: None,
+        possible_duplicate_group_id: None,
+    }
+}
+
+/// Recheck the protected original against a reserved live-source envelope at ingestion.
+/// This proves neither source origin (sealed ingress does that) nor namespace/Work authority.
+/// Historical parser 1/2 records keep their original metadata-only semantics.
+pub fn record_matches(body: &CaptureRecordBody, protected: &[u8], manifest: &str) -> bool {
+    let Some(event) = std::str::from_utf8(protected).ok().and_then(Event::decode) else {
+        return false;
+    };
+    let role = match body.parser_revision {
+        1 if body.original_length <= 65_536 => ObservationRole::StateProbe,
+        2 => ObservationRole::StateProbe,
+        3 => event.role(),
+        _ => return false,
+    };
+    body.adapter_revision == body.parser_revision
+        && body.canonicalization_revision == 1
+        && body.source_revision.as_str() == SOURCE_REVISION
+        && body.source_kind == EvidenceSourceKind::Other
+        && body.identity_domain == SOURCE_REVISION
+        && body.identity_strength == IdentityStrength::StableNative
+        && body.source_session_ref == event.params.thread_id
+        && body.source_record_identity.as_str() == event.identity()
+        && body.source_ref == event.reference()
+        && body.observation_role == role
+        && body.correlation == correlation(role, manifest, body.parser_revision)
+        && body.adapter_manifest_ref == manifest
+        && body.eligible_event_manifest_ref == ELIGIBLE_EVENTS
+        && body.source_role == SourceRole::Host
+        && body.content_trust == ContentTrust::Observed
+        && body.capture_completeness == CaptureCompleteness::Partial
+        && !body.surface_eligible
+        && body.source_observation_id_hint.is_none()
+        && body.task_id.is_none()
+        && body.repository_instance_id.is_none()
+        && body.worktree_instance_id.is_none()
+        && body.source_sequence_origin == Some(0)
+        && body.source_revision_mode == SourceRevisionMode::Append
+        && body.previous_source_revision.is_none()
+        && body.close_watermark.is_none()
+        && body.source_byte_range
+            == Some(EvidenceByteRange {
+                start: 0,
+                end: body.original_length,
+            })
+        && body.scope_effect_claims.is_empty()
+        && body.source_local_evidence.is_none()
+        && body.lifecycle.is_none()
+        && body.unsupported_record_classification.is_none()
+        && body.recovery_preflight.is_none()
+}
+
+fn observation(raw: &str, instance: &str, sequence: u64, manifest: &str) -> Option<Observation> {
+    let event = Event::decode(raw)?;
+    let thread = event.params.thread_id.as_str();
+    let turn = event.params.turn_id.as_str();
+    let item = event.params.item.id.as_str();
     Some(Observation(CaptureRecordInput {
         spool_record_id: None,
         source_observation_id_hint: None,
         source_instance_id: instance.into(),
         source_revision: SOURCE_REVISION.into(),
-        source_record_identity: Some(format!("{turn}:{item}:{method}")),
+        source_record_identity: Some(event.identity()),
         identity_strength: Some(IdentityStrength::StableNative),
         source_kind: EvidenceSourceKind::Other,
         identity_domain: SOURCE_REVISION.into(),
-        source_ref: format!("native-user-shell:{thread}:{turn}:{item}:{method}"),
+        source_ref: event.reference(),
         session_ref: thread.into(),
         turn_ref: Some(turn.into()),
         tool_ref: Some(item.into()),
@@ -118,24 +223,8 @@ fn observation(raw: &str, instance: &str, sequence: u64, manifest: &str) -> Opti
         source_revision_mode: SourceRevisionMode::Append,
         previous_source_revision: None,
         close_watermark: None,
-        observation_role: ObservationRole::StateProbe,
-        correlation: HostCorrelationEvidence {
-            occurrence_schema_version: 1,
-            host_instance_id: None,
-            host_trace_lineage_id: None,
-            host_lane_key: None,
-            canonical_event_family: None,
-            native_request_id: None,
-            physical_execution_ordinal: None,
-            pairing_role: ObservationRole::StateProbe,
-            field_provenance: vec![],
-            adapter_manifest_ref: manifest.into(),
-            adapter_revision: 2,
-            strong_gate_receipt_ref: None,
-            admission: CorrelationAdmission::Unavailable,
-            partial_correlation_ref: None,
-            possible_duplicate_group_id: None,
-        },
+        observation_role: event.role(),
+        correlation: correlation(event.role(), manifest, 3),
         scope_effect_claims: vec![],
         source_local_evidence: None,
         lifecycle: None,
@@ -144,10 +233,10 @@ fn observation(raw: &str, instance: &str, sequence: u64, manifest: &str) -> Opti
         content_trust: ContentTrust::Observed,
         capture_completeness: CaptureCompleteness::Partial,
         surface_eligible: false,
-        adapter_revision: 2,
+        adapter_revision: 3,
         adapter_manifest_ref: manifest.into(),
         eligible_event_manifest_ref: ELIGIBLE_EVENTS.into(),
-        parser_revision: 2,
+        parser_revision: 3,
         canonicalization_revision: 1,
         event_time_us: None,
         event_time_provenance: None,

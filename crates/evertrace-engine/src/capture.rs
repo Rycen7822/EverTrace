@@ -146,6 +146,25 @@ pub(crate) fn verify_capture_frame_presented(
     {
         return Err(IngestError::CasMismatch);
     }
+    if body.source_revision.as_str() == evertrace_capture::host_events::SOURCE_REVISION {
+        let adapter_version = format!(
+            "{}:capture-{}",
+            evertrace_capture::host_events::SOURCE_REVISION,
+            body.parser_revision
+        );
+        let contract = evertrace_codex::probe::HostProbeReport::unobserved_source_contract(
+            &adapter_version,
+            evertrace_capture::host_events::ELIGIBLE_EVENTS,
+        )
+        .map_err(|_| IngestError::InvalidRecord)?;
+        if !evertrace_capture::host_events::record_matches(
+            &body,
+            &protected,
+            &contract.manifest().adapter_manifest_id,
+        ) {
+            return Err(IngestError::InvalidRecord);
+        }
+    }
     if matches!(
         body.event_time_provenance,
         Some(evertrace_domain::evidence::EventTimeProvenance::SourceTimestamp { .. })
