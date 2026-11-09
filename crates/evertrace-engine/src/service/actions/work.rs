@@ -363,10 +363,25 @@ fn work_visible(
             return Ok(false);
         }
     }
+    let mut missing = BTreeSet::new();
+    let mut source_roots = BTreeSet::new();
     for reference in &task.request_root_refs {
-        let Some((receipt, _)) = source_pair(snapshot, reference)? else {
-            return Ok(false);
+        let Some((receipt, observation)) = source_pair(snapshot, reference)? else {
+            missing.insert(reference);
+            continue;
         };
+        // A source-backed Task carries both a logical root and its exact observation.
+        // The alias is visible only through that retained pair, never by its spelling alone.
+        if receipt.identity_domain == evertrace_capture::goal_source::IDENTITY_DOMAIN
+            && receipt.source_kind == EvidenceSourceKind::Other
+            && receipt.observation_role == ObservationRole::StateProbe
+            && observation.source_role == SourceRole::Host
+            && observation.content_trust == ContentTrust::Observed
+            && observation.observation_role == ObservationRole::StateProbe
+            && receipt.source_ref == format!("native-host-goal:{}", receipt.source_session_ref)
+        {
+            source_roots.insert(receipt.source_ref.clone());
+        }
         if let Some(repository) = receipt.repository_instance_id
             && !repository_visible(
                 snapshot,
@@ -379,7 +394,9 @@ fn work_visible(
             return Ok(false);
         }
     }
-    Ok(true)
+    Ok(missing
+        .iter()
+        .all(|reference| source_roots.contains(*reference)))
 }
 
 fn missing_stream_fields(value: Option<&StreamDeclaration>) -> Vec<String> {
@@ -479,11 +496,30 @@ fn work_result(
         instruction_authority: InstructionAuthority::None,
         text: Some(text),
     };
-    let mut items = vec![item("task", task.task_id.to_string(), task.revision_id,
-        serde_json::to_string(&serde_json::json!({"outcome":outcome,"goal":task.canonical_goal,"identity_confidence":task.identity_confidence,"source_refs":task.request_root_refs})).map_err(|_| McpServiceError::Store)?)];
+    let mut items = vec![item(
+        "task",
+        task.task_id.to_string(),
+        task.revision_id,
+        serde_json::to_string(&serde_json::json!({
+            "outcome": outcome,
+            "goal": task.canonical_goal,
+            "identity_confidence": task.identity_confidence,
+            "source_refs": task.request_root_refs,
+        }))
+        .map_err(|_| McpServiceError::Store)?,
+    )];
     if let Some(stream) = stream {
-        items.push(item("workstream", stream.workstream_id.to_string(), stream.revision_id,
-            serde_json::to_string(&serde_json::json!({"goal":stream.workstream_goal,"phase":stream.phase_contract,"acceptance":stream.acceptance_boundary})).map_err(|_| McpServiceError::Store)?));
+        items.push(item(
+            "workstream",
+            stream.workstream_id.to_string(),
+            stream.revision_id,
+            serde_json::to_string(&serde_json::json!({
+                "goal": stream.workstream_goal,
+                "phase": stream.phase_contract,
+                "acceptance": stream.acceptance_boundary,
+            }))
+            .map_err(|_| McpServiceError::Store)?,
+        ));
     }
     Ok(passive_result(request_id, items, warnings))
 }
