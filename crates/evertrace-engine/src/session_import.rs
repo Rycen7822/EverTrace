@@ -439,18 +439,28 @@ impl SessionCatalogService {
 
         let mut metadata = item.metadata.clone();
         let location = workspace_location(&metadata, deadline)
-            .map_err(|_| SessionImportServiceError::Unavailable)?
-            .ok_or(SessionImportServiceError::Unavailable)?;
-        if crate::repository::read_report_path_trust_before(
-            report,
-            location.worktree_path.to_str(),
-            deadline,
-        )
-        .state
-            != RepositoryTrustState::Trusted
-        {
-            return Ok(false);
+            .map_err(|_| SessionImportServiceError::Unavailable)?;
+        let trusted = location.as_ref().is_some_and(|location| {
+            crate::repository::read_report_path_trust_before(
+                report,
+                location.worktree_path.to_str(),
+                deadline,
+            )
+            .state
+                == RepositoryTrustState::Trusted
+        });
+        if !trusted {
+            return self
+                .observe_source_metadata(
+                    request_id,
+                    &item,
+                    location.as_ref(),
+                    deadline,
+                    budget.max_entries,
+                )
+                .await;
         }
+        let location = location.ok_or(SessionImportServiceError::Corrupt)?;
 
         let mut workspace_hints = BTreeSet::new();
         if let Some(workspace) = metadata.workspace_hint.as_ref() {
@@ -722,6 +732,111 @@ impl SessionCatalogService {
         .map_err(|_| SessionImportServiceError::Unavailable)?
         .map_err(map_writer)?;
         Ok(true)
+    }
+
+    async fn observe_source_metadata(
+        &self,
+        request_id: RequestId,
+        item: &CatalogedSession,
+        location: Option<&crate::repository::WorkspaceGitLocation>,
+        deadline: Instant,
+        attempts: usize,
+    ) -> Result<bool, SessionImportServiceError> {
+        // A verified current locator admits metadata, not retrospective scope or body access.
+        for _ in 0..attempts {
+            let current = tokio::time::timeout_at(
+                tokio::time::Instant::from_std(deadline),
+                self.writer.session_catalog_current_context(),
+            )
+            .await
+            .map_err(|_| SessionImportServiceError::Unavailable)?
+            .map_err(map_writer)?;
+            let mut contexts = BTreeMap::new();
+            for key in BTreeSet::from([item.session_id.clone(), item.source_instance_id.clone()]) {
+                let context = tokio::time::timeout_at(
+                    tokio::time::Instant::from_std(deadline),
+                    self.writer.session_import_context(&key),
+                )
+                .await
+                .map_err(|_| SessionImportServiceError::Unavailable)?
+                .map_err(map_writer)?;
+                if let Some(context) = context {
+                    if context.current.source_key() != key {
+                        return Err(SessionImportServiceError::Corrupt);
+                    }
+                    contexts.insert(key, context);
+                }
+            }
+            let sources = SessionImportCurrentView {
+                frontier: current.frontier,
+                sessions: contexts
+                    .iter()
+                    .map(|(key, context)| (key.clone(), context.current.clone()))
+                    .collect(),
+            };
+            let old = current_catalog_source(&sources, item);
+            if let Some(source) = old {
+                let context = contexts
+                    .get(&source.source_key())
+                    .ok_or(SessionImportServiceError::Corrupt)?;
+                if context.repository_purged
+                    || context.watermark.is_some()
+                    || context.recorded_prefix_end.is_some()
+                    || source.access_decision == Some(SessionAccessDecision::Revoked)
+                    || source.metadata.prospective_origin.is_some()
+                    || !matches!(
+                        source.body_state,
+                        SessionBodyState::NotImported | SessionBodyState::SourceReplaced
+                    )
+                {
+                    return Ok(false);
+                }
+            }
+            let mut metadata = item.metadata.clone();
+            retain_read_restrictions(
+                &mut metadata,
+                old.map(|source| &source.metadata),
+                &current.repositories,
+                location,
+            )?;
+            if old.is_some_and(|source| source.metadata == metadata) {
+                return Ok(false);
+            }
+            let occurred_at_us = now_us().map_err(|_| SessionImportServiceError::Corrupt)?;
+            let mut payloads = Vec::new();
+            metadata_events(
+                old,
+                item.session_id.clone(),
+                old.map_or_else(
+                    || Some(item.source_instance_id.clone()),
+                    |source| source.source_instance_id.clone(),
+                ),
+                metadata,
+                occurred_at_us,
+                &mut payloads,
+            )?;
+            let command = command(
+                request_id,
+                &item.session_id,
+                occurred_at_us,
+                self.effective_config_hash,
+                SourceKind::System,
+                payloads,
+            )?;
+            let result = tokio::time::timeout_at(
+                tokio::time::Instant::from_std(deadline),
+                self.writer
+                    .commit_if_frontier(command, occurred_at_us, current.frontier),
+            )
+            .await
+            .map_err(|_| SessionImportServiceError::Unavailable)?;
+            match result {
+                Ok(_) => return Ok(true),
+                Err(WriterActorError::StaleFrontier) => continue,
+                Err(error) => return Err(map_writer(error)),
+            }
+        }
+        Err(SessionImportServiceError::Unavailable)
     }
 
     pub async fn native_session_source_observed(
@@ -1698,6 +1813,12 @@ fn compatible_source_observation_replay(
 ) -> bool {
     if committed.command_id != command_id {
         return false;
+    }
+    if let [JournalPayload::SessionImportEventRecorded(event)] = committed.payloads.as_slice() {
+        return event.session_id == session_id
+            && event.source_instance_id.as_deref() == Some(source.as_str())
+            && matches!(&event.event, SessionImportEventKind::MetadataObserved { metadata }
+                if metadata.prospective_origin.is_none());
     }
     let mut origin_ref = None;
     let mut metadata_events = 0;
