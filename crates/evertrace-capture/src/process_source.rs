@@ -1,7 +1,7 @@
 //! A fixed source-side recorder's original bytes, never a caller-selected authority level.
 //!
-//! Live peer/record identity is checked here. Namespace canaries and semantic Work
-//! binding are not yet qualified, so every accepted record remains untrusted/partial.
+//! Publisher claims remain untrusted/partial. Separately read kernel state is observed
+//! metadata only: it supplies no inherited namespace, execution, or semantic Work authority.
 
 use std::{
     collections::BTreeSet,
@@ -31,6 +31,9 @@ pub const SOURCE_REVISION: &str =
     "process-trial-source-v2:79ba882813eea69af109ace6016462953d63b7c97677392d6673c96bebeee9d6";
 pub const ADAPTER_REVISION: u32 = 6;
 pub const ELIGIBLE_EVENTS: &str = "process-trial-source-events-v3";
+pub const KERNEL_SOURCE_REVISION: &str = "linux-proc-stat-v1";
+pub const KERNEL_ADAPTER_REVISION: u32 = 1;
+pub const KERNEL_ELIGIBLE_EVENTS: &str = "linux-proc-state-snapshot-v1";
 const LIMIT: usize = 65_536;
 const SOURCE_BYTES: u64 = 262_144;
 const SOURCE_RECORDS: u64 = 64;
@@ -48,6 +51,19 @@ pub fn is_record(raw: &[u8]) -> bool {
 pub struct ProcessSourceError;
 
 type Result<T> = std::result::Result<T, ProcessSourceError>;
+
+/// Only the live source reader can construct these original observations.
+pub struct Observation(CaptureRecordInput);
+
+impl Observation {
+    pub(crate) fn into_record(self) -> CaptureRecordInput {
+        self.0
+    }
+}
+
+pub fn kernel_adapter_version() -> String {
+    format!("{KERNEL_SOURCE_REVISION}:capture-{KERNEL_ADAPTER_REVISION}")
+}
 
 #[derive(Deserialize, Eq, PartialEq)]
 #[serde(deny_unknown_fields)]
@@ -310,10 +326,18 @@ fn decode(raw: &[u8]) -> Result<(Header, ObservationRole)> {
     Ok((header, role))
 }
 
-/// The same Hook transport calls this only for the recorder's exact original version signature.
-/// No peer/header can select Observed, Complete, an active binding, or an Exact admission.
-pub fn records(raw: &[u8], snapshot: &Path, manifest_ref: &str) -> Result<Vec<CaptureRecordInput>> {
-    if manifest_ref.len() != 64 || !manifest_ref.bytes().all(|value| value.is_ascii_hexdigit()) {
+/// Publisher headers never choose trust. Only separately read OS bytes become observed state;
+/// neither source supplies Complete capture, an active Work binding, or Exact admission.
+pub fn records(
+    raw: &[u8],
+    snapshot: &Path,
+    manifest_ref: &str,
+    kernel_manifest: &str,
+) -> Result<Vec<Observation>> {
+    if [manifest_ref, kernel_manifest]
+        .iter()
+        .any(|value| value.len() != 64 || !value.bytes().all(|byte| byte.is_ascii_hexdigit()))
+    {
         return Err(ProcessSourceError);
     }
     let (header, role) = decode(raw)?;
@@ -420,52 +444,97 @@ pub fn records(raw: &[u8], snapshot: &Path, manifest_ref: &str) -> Result<Vec<Ca
         event_time_provenance: None,
         raw_payload: raw.to_vec(),
     };
-    let Some(raw) = kernel else {
-        return Ok(vec![primary]);
-    };
-    let process = header.process.as_ref().ok_or(ProcessSourceError)?;
-    let mut probe = primary.clone();
-    probe.spool_record_id = None;
-    probe.source_observation_id_hint = None;
-    probe.source_instance_id = format!(
-        "procfs:{}:{}",
-        primary.source_instance_id,
-        primary
-            .source_record_identity
-            .as_deref()
-            .ok_or(ProcessSourceError)?
+    let mut observations = vec![Observation(primary)];
+    if let (Some(raw), Some(process)) = (kernel, header.process.as_ref())
+        && let Ok(probe) = kernel_observation(raw, process, kernel_manifest)
+    {
+        observations.push(probe);
+    }
+    Ok(observations)
+}
+
+fn kernel_observation(
+    raw: Vec<u8>,
+    process: &ProcessIdentity,
+    manifest: &str,
+) -> Result<Observation> {
+    let observer = stat("self")?;
+    let boot = text(Path::new("/proc/sys/kernel/random/boot_id"))?;
+    let namespace = fs::metadata("/proc/self/ns/pid")
+        .map_err(|_| ProcessSourceError)?
+        .ino();
+    let instance = format!(
+        "procfs:{boot}:{namespace}:{}:{}",
+        std::process::id(),
+        observer.start
     );
-    probe.source_record_identity = None;
-    probe.identity_strength = Some(IdentityStrength::SynthesizedBestEffort);
-    probe.identity_domain = "linux-proc-stat-v1".into();
-    probe.source_ref = format!("procfs:/proc/{}/stat@{}", process.pid, process.start_ticks);
-    probe.source_sequence = 0;
-    probe.source_sequence_origin = Some(0);
-    probe.source_byte_range = Some(EvidenceByteRange {
-        start: 0,
-        end: raw.len() as u64,
-    });
-    probe.close_watermark = Some(0);
-    probe.observation_role = ObservationRole::StateProbe;
-    probe.surface_eligible = false;
-    probe.correlation.pairing_role = ObservationRole::StateProbe;
-    probe.correlation.canonical_event_family = None;
-    probe
-        .correlation
-        .field_provenance
-        .retain(|claim| claim.field != CorrelationField::CanonicalEventFamily);
-    // Namespace/request context still cites the primary. The separate original kernel bytes
-    // support only the actual process state; this is not an independent Exact-key witness.
-    probe.raw_payload = raw;
-    Ok(vec![primary, probe])
+    let probe = CaptureRecordInput {
+        spool_record_id: None,
+        source_observation_id_hint: None,
+        source_instance_id: instance.clone(),
+        source_revision: KERNEL_SOURCE_REVISION.into(),
+        source_record_identity: None,
+        identity_strength: Some(IdentityStrength::SynthesizedBestEffort),
+        source_kind: EvidenceSourceKind::Other,
+        identity_domain: KERNEL_SOURCE_REVISION.into(),
+        source_ref: format!("procfs:/proc/{}/stat@{}", process.pid, process.start_ticks),
+        session_ref: instance,
+        turn_ref: None,
+        tool_ref: None,
+        source_sequence: 0,
+        source_sequence_origin: Some(0),
+        task_id: None,
+        repository_instance_id: None,
+        worktree_instance_id: None,
+        source_byte_range: Some(EvidenceByteRange {
+            start: 0,
+            end: raw.len() as u64,
+        }),
+        source_revision_mode: SourceRevisionMode::Append,
+        previous_source_revision: None,
+        close_watermark: Some(0),
+        observation_role: ObservationRole::StateProbe,
+        correlation: HostCorrelationEvidence {
+            occurrence_schema_version: 1,
+            host_instance_id: None,
+            host_trace_lineage_id: None,
+            host_lane_key: None,
+            canonical_event_family: None,
+            native_request_id: None,
+            physical_execution_ordinal: None,
+            pairing_role: ObservationRole::StateProbe,
+            field_provenance: vec![],
+            adapter_manifest_ref: manifest.into(),
+            adapter_revision: KERNEL_ADAPTER_REVISION,
+            strong_gate_receipt_ref: None,
+            admission: CorrelationAdmission::Unavailable,
+            partial_correlation_ref: None,
+            possible_duplicate_group_id: None,
+        },
+        scope_effect_claims: vec![],
+        source_local_evidence: None,
+        lifecycle: None,
+        unsupported_record_classification: None,
+        source_role: SourceRole::Tool,
+        content_trust: ContentTrust::Observed,
+        capture_completeness: CaptureCompleteness::Partial,
+        surface_eligible: false,
+        adapter_revision: KERNEL_ADAPTER_REVISION,
+        adapter_manifest_ref: manifest.into(),
+        eligible_event_manifest_ref: KERNEL_ELIGIBLE_EVENTS.into(),
+        parser_revision: 1,
+        canonicalization_revision: 1,
+        event_time_us: None,
+        event_time_provenance: None,
+        raw_payload: raw,
+    };
+    Ok(Observation(probe))
 }
 
 /// Observe this exact source's actual closed file, not a second label on its Hook payload.
 /// Failure is returned separately so the caller still durably admits the original Hook record.
-pub fn closed_records(
-    primary: &CaptureRecordInput,
-    snapshot: &Path,
-) -> Result<Vec<CaptureRecordInput>> {
+pub fn closed_records(primary: &Observation, snapshot: &Path) -> Result<Vec<Observation>> {
+    let primary = &primary.0;
     let Some(watermark) = primary.close_watermark else {
         return Ok(vec![]);
     };
@@ -524,13 +593,13 @@ pub fn closed_records(
         // promote declarations from a file into independently verified physical facts.
         record.correlation.pairing_role = role;
         record.raw_payload = line.to_vec();
-        records.push(record);
+        records.push(Observation(record));
         offset += line.len() as u64;
     }
     if records.len() as u64 != watermark
         || records
             .last()
-            .is_none_or(|record| record.raw_payload != primary.raw_payload)
+            .is_none_or(|record| record.0.raw_payload != primary.raw_payload)
     {
         return Err(ProcessSourceError);
     }

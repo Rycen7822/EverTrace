@@ -84,10 +84,17 @@ fn run() -> Result<(), ()> {
                     evertrace_capture::process_source::ELIGIBLE_EVENTS,
                 )
                 .map_err(|_| ())?;
+                let kernel_contract =
+                    evertrace_codex::probe::HostProbeReport::unobserved_source_contract(
+                        &evertrace_capture::process_source::kernel_adapter_version(),
+                        evertrace_capture::process_source::KERNEL_ELIGIBLE_EVENTS,
+                    )
+                    .map_err(|_| ())?;
                 let mut records = evertrace_capture::process_source::records(
                     &bytes,
                     path,
                     &contract.manifest().adapter_manifest_id,
+                    &kernel_contract.manifest().adapter_manifest_id,
                 )
                 .map_err(|_| ())?
                 .into_iter();
@@ -95,12 +102,18 @@ fn run() -> Result<(), ()> {
                 let closed = evertrace_capture::process_source::closed_records(&record, path);
                 let snapshot = RuntimeSnapshot::load(path).map_err(|_| ())?;
                 let mut runtime = CaptureRuntime::open_for_admission(snapshot).map_err(|_| ())?;
-                runtime.capture(record).map_err(|_| ())?;
+                runtime
+                    .capture_process_observation(record)
+                    .map_err(|_| ())?;
                 for record in records {
-                    runtime.capture(record).map_err(|_| ())?;
+                    runtime
+                        .capture_process_observation(record)
+                        .map_err(|_| ())?;
                 }
                 for record in closed.map_err(|_| ())? {
-                    runtime.capture(record).map_err(|_| ())?;
+                    runtime
+                        .capture_process_observation(record)
+                        .map_err(|_| ())?;
                 }
                 Ok(())
             } else {
