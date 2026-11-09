@@ -84,16 +84,21 @@ fn run() -> Result<(), ()> {
                     evertrace_capture::process_source::ELIGIBLE_EVENTS,
                 )
                 .map_err(|_| ())?;
-                let record = evertrace_capture::process_source::record(
+                let mut records = evertrace_capture::process_source::records(
                     &bytes,
                     path,
                     &contract.manifest().adapter_manifest_id,
                 )
-                .map_err(|_| ())?;
+                .map_err(|_| ())?
+                .into_iter();
+                let record = records.next().ok_or(())?;
                 let closed = evertrace_capture::process_source::closed_records(&record, path);
                 let snapshot = RuntimeSnapshot::load(path).map_err(|_| ())?;
                 let mut runtime = CaptureRuntime::open_for_admission(snapshot).map_err(|_| ())?;
                 runtime.capture(record).map_err(|_| ())?;
+                for record in records {
+                    runtime.capture(record).map_err(|_| ())?;
+                }
                 for record in closed.map_err(|_| ())? {
                     runtime.capture(record).map_err(|_| ())?;
                 }

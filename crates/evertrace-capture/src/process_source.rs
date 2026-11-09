@@ -29,8 +29,8 @@ const PREFIX: &[u8] = b"{\"format\":\"process-trial-source-v2\",";
 const FORMAT: &str = "process-trial-source-v2";
 pub const SOURCE_REVISION: &str =
     "process-trial-source-v2:79ba882813eea69af109ace6016462953d63b7c97677392d6673c96bebeee9d6";
-pub const ADAPTER_REVISION: u32 = 5;
-pub const ELIGIBLE_EVENTS: &str = "process-trial-source-events-v2";
+pub const ADAPTER_REVISION: u32 = 6;
+pub const ELIGIBLE_EVENTS: &str = "process-trial-source-events-v3";
 const LIMIT: usize = 65_536;
 const SOURCE_BYTES: u64 = 262_144;
 const SOURCE_RECORDS: u64 = 64;
@@ -77,6 +77,7 @@ struct Header {
 }
 
 struct ProcessStat {
+    raw: Vec<u8>,
     parent: u32,
     start: u64,
     state: String,
@@ -102,8 +103,9 @@ fn text(path: &Path) -> Result<String> {
 }
 
 fn stat(pid: &str) -> Result<ProcessStat> {
-    let raw = text(&Path::new("/proc").join(pid).join("stat"))?;
-    let (_, fields) = raw.rsplit_once(") ").ok_or(ProcessSourceError)?;
+    let raw = bytes(&Path::new("/proc").join(pid).join("stat"))?;
+    let text = std::str::from_utf8(&raw).map_err(|_| ProcessSourceError)?;
+    let (_, fields) = text.rsplit_once(") ").ok_or(ProcessSourceError)?;
     let fields: Vec<_> = fields.split_whitespace().collect();
     let parent = fields
         .get(1)
@@ -122,6 +124,7 @@ fn stat(pid: &str) -> Result<ProcessStat> {
         .parse()
         .map_err(|_| ProcessSourceError)?;
     Ok(ProcessStat {
+        raw,
         parent,
         start,
         state,
@@ -198,7 +201,7 @@ fn peer(header: &Header, executable: &Path, snapshot: &Path) -> Result<PathBuf> 
 // The physical unit is this source's single child process lifetime, not its opaque trial UUID.
 // The source holds a pipe before execution and uses WNOWAIT after exit. Both endpoints
 // can therefore be checked against the kernel here without a cache, lookup or claimed birth.
-fn physical_scope(header: &Header) -> Result<String> {
+fn physical_scope(header: &Header) -> Result<(String, Vec<u8>)> {
     let identity = header.process.as_ref().ok_or(ProcessSourceError)?;
     if !header.execution_key.as_deref().is_some_and(uuid) {
         return Err(ProcessSourceError);
@@ -246,9 +249,12 @@ fn physical_scope(header: &Header) -> Result<String> {
             }
         }
     }
-    Ok(format!(
-        "process:{}:{}:{}:{}",
-        identity.boot_id, identity.pid_namespace, identity.pid, observed.start
+    Ok((
+        format!(
+            "process:{}:{}:{}:{}",
+            identity.boot_id, identity.pid_namespace, identity.pid, observed.start
+        ),
+        observed.raw,
     ))
 }
 
@@ -306,7 +312,7 @@ fn decode(raw: &[u8]) -> Result<(Header, ObservationRole)> {
 
 /// The same Hook transport calls this only for the recorder's exact original version signature.
 /// No peer/header can select Observed, Complete, an active binding, or an Exact admission.
-pub fn record(raw: &[u8], snapshot: &Path, manifest_ref: &str) -> Result<CaptureRecordInput> {
+pub fn records(raw: &[u8], snapshot: &Path, manifest_ref: &str) -> Result<Vec<CaptureRecordInput>> {
     if manifest_ref.len() != 64 || !manifest_ref.bytes().all(|value| value.is_ascii_hexdigit()) {
         return Err(ProcessSourceError);
     }
@@ -341,7 +347,9 @@ pub fn record(raw: &[u8], snapshot: &Path, manifest_ref: &str) -> Result<Capture
     };
     // Failed/missing kernel evidence remains an original untrusted/partial record with no
     // physical claims. Even verified fields cannot form an Exact key without a qualified gate.
-    if let (Ok(scope), Some(ordinal)) = (physical_scope(&header), ordinal) {
+    let mut kernel = None;
+    if let (Ok((scope, stat)), Some(ordinal)) = (physical_scope(&header), ordinal) {
+        kernel = Some(stat);
         let evidence = source_observation_id(
             &SourceInstanceId::parse(&source_instance_id).map_err(|_| ProcessSourceError)?,
             &SourceRevision::parse(SOURCE_REVISION).map_err(|_| ProcessSourceError)?,
@@ -370,7 +378,7 @@ pub fn record(raw: &[u8], snapshot: &Path, manifest_ref: &str) -> Result<Capture
         })
         .collect();
     }
-    Ok(CaptureRecordInput {
+    let primary = CaptureRecordInput {
         spool_record_id: Some(header.event_key.clone()),
         source_observation_id_hint: None,
         source_instance_id,
@@ -405,13 +413,51 @@ pub fn record(raw: &[u8], snapshot: &Path, manifest_ref: &str) -> Result<Capture
         adapter_revision: ADAPTER_REVISION,
         adapter_manifest_ref: manifest_ref.into(),
         eligible_event_manifest_ref: ELIGIBLE_EVENTS.into(),
-        parser_revision: 3,
+        parser_revision: 4,
         canonicalization_revision: 1,
         // The original clock value remains in raw bytes; its uncertainty is not qualified.
         event_time_us: None,
         event_time_provenance: None,
         raw_payload: raw.to_vec(),
-    })
+    };
+    let Some(raw) = kernel else {
+        return Ok(vec![primary]);
+    };
+    let process = header.process.as_ref().ok_or(ProcessSourceError)?;
+    let mut probe = primary.clone();
+    probe.spool_record_id = None;
+    probe.source_observation_id_hint = None;
+    probe.source_instance_id = format!(
+        "procfs:{}:{}",
+        primary.source_instance_id,
+        primary
+            .source_record_identity
+            .as_deref()
+            .ok_or(ProcessSourceError)?
+    );
+    probe.source_record_identity = None;
+    probe.identity_strength = Some(IdentityStrength::SynthesizedBestEffort);
+    probe.identity_domain = "linux-proc-stat-v1".into();
+    probe.source_ref = format!("procfs:/proc/{}/stat@{}", process.pid, process.start_ticks);
+    probe.source_sequence = 0;
+    probe.source_sequence_origin = Some(0);
+    probe.source_byte_range = Some(EvidenceByteRange {
+        start: 0,
+        end: raw.len() as u64,
+    });
+    probe.close_watermark = Some(0);
+    probe.observation_role = ObservationRole::StateProbe;
+    probe.surface_eligible = false;
+    probe.correlation.pairing_role = ObservationRole::StateProbe;
+    probe.correlation.canonical_event_family = None;
+    probe
+        .correlation
+        .field_provenance
+        .retain(|claim| claim.field != CorrelationField::CanonicalEventFamily);
+    // Namespace/request context still cites the primary. The separate original kernel bytes
+    // support only the actual process state; this is not an independent Exact-key witness.
+    probe.raw_payload = raw;
+    Ok(vec![primary, probe])
 }
 
 /// Observe this exact source's actual closed file, not a second label on its Hook payload.
