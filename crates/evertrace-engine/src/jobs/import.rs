@@ -2080,6 +2080,7 @@ mod tests {
                     surface_eligible: false,
                 },
             );
+            old.parser_revision = 1;
             old.capture_completeness = evertrace_domain::evidence::CaptureCompleteness::Complete;
             capture.capture(old).unwrap();
             capture.seal_active().unwrap();
@@ -3168,6 +3169,7 @@ mod tests {
             );
             // Reproduce the prior producer's durable declaration, without using
             // this synthetic frame as the independent old-binary migration oracle.
+            input.parser_revision = 1;
             input.capture_completeness = CaptureCompleteness::Complete;
             assert!(matches!(
                 CaptureRuntime::open(runtime.clone())
@@ -3450,6 +3452,8 @@ enum CompletedItem {
     CommandExecution {
         #[serde(rename = "id")]
         _id: String,
+        #[serde(rename = "process_id")]
+        _process_id: Option<String>,
         #[serde(rename = "command")]
         _command: Vec<String>,
         #[serde(rename = "cwd")]
@@ -3760,7 +3764,7 @@ fn capture_input(
         adapter_revision: 1,
         adapter_manifest_ref: "codex-session-import-v1".into(),
         eligible_event_manifest_ref: "codex-session-import-events-v1".into(),
-        parser_revision: 1,
+        parser_revision: 2,
         canonicalization_revision: 1,
         event_time_us: visibility.source_time.map(|time| time.timestamp_us),
         event_time_provenance: visibility.source_time.map(|time| time.provenance),
