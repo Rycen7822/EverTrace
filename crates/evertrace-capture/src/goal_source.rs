@@ -278,56 +278,27 @@ fn timeout(stream: &UnixStream, deadline: Instant) -> Result<()> {
         .map_err(|_| GoalSourceError)
 }
 
-fn response(socket: &mut WebSocket<UnixStream>, id: u64, deadline: Instant) -> Result<Vec<u8>> {
-    for _ in 0..8 {
-        timeout(socket.get_ref(), deadline)?;
-        let message = socket.read().map_err(|_| GoalSourceError)?;
-        if let Message::Text(text) = message {
-            let raw = text.as_bytes();
-            let body: serde_json::Value =
-                serde_json::from_slice(raw).map_err(|_| GoalSourceError)?;
-            if body.get("id").and_then(serde_json::Value::as_u64) == Some(id) {
-                return Ok(raw.to_vec());
-            }
-        }
+impl Peer {
+    fn instance(&self, prefix: &str) -> Result<String> {
+        let boot =
+            fs::read_to_string("/proc/sys/kernel/random/boot_id").map_err(|_| GoalSourceError)?;
+        Ok(format!(
+            "{prefix}:{}:{}:{}:{}",
+            boot.trim(),
+            self.namespace,
+            self.pid,
+            self.start
+        ))
     }
-    Err(GoalSourceError)
 }
 
-/// One bounded, read-only exchange with the actual supported publisher. Never spawn or poll a host.
-pub fn read(path: &Path, thread: &str) -> Result<Option<Observation>> {
-    let deadline = Instant::now() + Duration::from_secs(3);
-    let selected = uuid::Uuid::parse_str(thread).map_err(|_| GoalSourceError)?;
-    if selected.is_nil() || selected.hyphenated().to_string() != thread {
-        return Err(GoalSourceError);
-    }
-    let parent = path.parent().ok_or(GoalSourceError)?;
-    let confined = ConfinedRoot::open_owned_private(parent).map_err(|_| GoalSourceError)?;
-    let locator = fs::symlink_metadata(path).map_err(|_| GoalSourceError)?;
-    let uid = fs::metadata("/proc/self")
-        .map_err(|_| GoalSourceError)?
-        .uid();
-    if locator.uid() != uid {
-        return Err(GoalSourceError);
-    }
-    // The publisher advertises a single owned alias to its shorter, private Unix socket.
-    let (endpoint, endpoint_root) = if locator.file_type().is_symlink() {
-        let target = fs::read_link(path).map_err(|_| GoalSourceError)?;
-        let root = ConfinedRoot::open_owned_private(target.parent().ok_or(GoalSourceError)?)
-            .map_err(|_| GoalSourceError)?;
-        (target, Some(root))
-    } else {
-        (path.to_path_buf(), None)
-    };
-    let metadata = fs::symlink_metadata(&endpoint).map_err(|_| GoalSourceError)?;
-    if !metadata.file_type().is_socket() || metadata.uid() != uid || metadata.mode() & 0o022 != 0 {
-        return Err(GoalSourceError);
-    }
-    let stream = UnixStream::connect(&endpoint).map_err(|_| GoalSourceError)?;
-    timeout(&stream, deadline)?;
-    let credentials =
-        rustix::net::sockopt::socket_peercred(&stream).map_err(|_| GoalSourceError)?;
-    if credentials.uid.as_raw() != uid {
+fn verified_publisher(stream: &UnixStream, deadline: Instant) -> Result<Peer> {
+    let credentials = rustix::net::sockopt::socket_peercred(stream).map_err(|_| GoalSourceError)?;
+    if credentials.uid.as_raw()
+        != fs::metadata("/proc/self")
+            .map_err(|_| GoalSourceError)?
+            .uid()
+    {
         return Err(GoalSourceError);
     }
     let pid = credentials.pid.as_raw_nonzero().get() as u32;
@@ -353,7 +324,114 @@ pub fn read(path: &Path, thread: &str) -> Result<Option<Observation>> {
     {
         return Err(GoalSourceError);
     }
+    Ok(before)
+}
+
+pub(crate) struct Publisher {
+    peer: Peer,
+    locator: std::path::PathBuf,
+    confined: ConfinedRoot,
+    locator_identity: (u64, u64),
+    endpoint: std::path::PathBuf,
+    endpoint_root: Option<ConfinedRoot>,
+    endpoint_identity: (u64, u64),
+}
+
+impl Publisher {
+    pub(crate) fn instance(&self, prefix: &str) -> Result<String> {
+        self.peer.instance(prefix)
+    }
+
+    pub(crate) fn revalidate(&self) -> Result<()> {
+        self.confined
+            .revalidate_stable()
+            .map_err(|_| GoalSourceError)?;
+        if let Some(root) = &self.endpoint_root {
+            root.revalidate_stable().map_err(|_| GoalSourceError)?;
+            if fs::read_link(&self.locator).map_err(|_| GoalSourceError)? != self.endpoint {
+                return Err(GoalSourceError);
+            }
+        }
+        let after = fs::symlink_metadata(&self.endpoint).map_err(|_| GoalSourceError)?;
+        let locator = fs::symlink_metadata(&self.locator).map_err(|_| GoalSourceError)?;
+        if peer(self.peer.pid)? != self.peer
+            || self.endpoint_identity != (after.dev(), after.ino())
+            || self.locator_identity != (locator.dev(), locator.ino())
+            || after.uid()
+                != fs::metadata("/proc/self")
+                    .map_err(|_| GoalSourceError)?
+                    .uid()
+            || after.mode() & 0o022 != 0
+        {
+            return Err(GoalSourceError);
+        }
+        Ok(())
+    }
+}
+
+pub(crate) fn connect_publisher(path: &Path, deadline: Instant) -> Result<(UnixStream, Publisher)> {
+    let parent = path.parent().ok_or(GoalSourceError)?;
+    let confined = ConfinedRoot::open_owned_private(parent).map_err(|_| GoalSourceError)?;
+    let locator = fs::symlink_metadata(path).map_err(|_| GoalSourceError)?;
+    let uid = fs::metadata("/proc/self")
+        .map_err(|_| GoalSourceError)?
+        .uid();
+    if locator.uid() != uid {
+        return Err(GoalSourceError);
+    }
+    // The publisher advertises one owned alias to its shorter, private Unix socket.
+    let (endpoint, endpoint_root) = if locator.file_type().is_symlink() {
+        let target = fs::read_link(path).map_err(|_| GoalSourceError)?;
+        let root = ConfinedRoot::open_owned_private(target.parent().ok_or(GoalSourceError)?)
+            .map_err(|_| GoalSourceError)?;
+        (target, Some(root))
+    } else {
+        (path.to_path_buf(), None)
+    };
+    let metadata = fs::symlink_metadata(&endpoint).map_err(|_| GoalSourceError)?;
+    if !metadata.file_type().is_socket() || metadata.uid() != uid || metadata.mode() & 0o022 != 0 {
+        return Err(GoalSourceError);
+    }
+    let stream = UnixStream::connect(&endpoint).map_err(|_| GoalSourceError)?;
     timeout(&stream, deadline)?;
+    let publisher = Publisher {
+        peer: verified_publisher(&stream, deadline)?,
+        locator: path.to_path_buf(),
+        confined,
+        locator_identity: (locator.dev(), locator.ino()),
+        endpoint,
+        endpoint_root,
+        endpoint_identity: (metadata.dev(), metadata.ino()),
+    };
+    publisher.revalidate()?;
+    timeout(&stream, deadline)?;
+    Ok((stream, publisher))
+}
+
+fn response(socket: &mut WebSocket<UnixStream>, id: u64, deadline: Instant) -> Result<Vec<u8>> {
+    for _ in 0..8 {
+        timeout(socket.get_ref(), deadline)?;
+        let message = socket.read().map_err(|_| GoalSourceError)?;
+        if let Message::Text(text) = message {
+            let raw = text.as_bytes();
+            let body: serde_json::Value =
+                serde_json::from_slice(raw).map_err(|_| GoalSourceError)?;
+            if body.get("id").and_then(serde_json::Value::as_u64) == Some(id) {
+                return Ok(raw.to_vec());
+            }
+        }
+    }
+    Err(GoalSourceError)
+}
+
+/// One bounded, read-only exchange with the actual supported publisher. Never spawn or poll a host.
+pub fn read(path: &Path, thread: &str) -> Result<Option<Observation>> {
+    let deadline = Instant::now() + Duration::from_secs(3);
+    let selected = uuid::Uuid::parse_str(thread).map_err(|_| GoalSourceError)?;
+    if selected.is_nil() || selected.hyphenated().to_string() != thread {
+        return Err(GoalSourceError);
+    }
+    let (stream, publisher) = connect_publisher(path, deadline)?;
     let config = WebSocketConfig::default()
         .read_buffer_size(4096)
         .write_buffer_size(0)
@@ -403,37 +481,16 @@ pub fn read(path: &Path, thread: &str) -> Result<Option<Observation>> {
     {
         return Err(GoalSourceError);
     }
-    confined.revalidate_stable().map_err(|_| GoalSourceError)?;
-    if let Some(root) = endpoint_root {
-        root.revalidate_stable().map_err(|_| GoalSourceError)?;
-        if fs::read_link(path).map_err(|_| GoalSourceError)? != endpoint {
-            return Err(GoalSourceError);
-        }
-    }
-    let after = fs::symlink_metadata(&endpoint).map_err(|_| GoalSourceError)?;
-    let locator_after = fs::symlink_metadata(path).map_err(|_| GoalSourceError)?;
-    if peer(pid)? != before
-        || (metadata.dev(), metadata.ino()) != (after.dev(), after.ino())
-        || (locator.dev(), locator.ino()) != (locator_after.dev(), locator_after.ino())
-    {
-        return Err(GoalSourceError);
-    }
+    publisher.revalidate()?;
     let Some(goal) = goal else {
         return Ok(None);
     };
     if goal.thread_id != thread {
         return Err(GoalSourceError);
     }
-    let boot =
-        fs::read_to_string("/proc/sys/kernel/random/boot_id").map_err(|_| GoalSourceError)?;
     Ok(Some(Observation {
         raw,
-        instance: format!(
-            "host-goal:{}:{}:{pid}:{}",
-            boot.trim(),
-            before.namespace,
-            before.start
-        ),
+        instance: publisher.instance("host-goal")?,
         reference: goal.root_ref(),
         thread: goal.thread_id,
     }))

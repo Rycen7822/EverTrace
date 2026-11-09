@@ -212,6 +212,13 @@ impl CaptureRuntime {
         self.capture_inner(observation.into_record(), None, None, &mut None)
     }
 
+    pub(crate) fn capture_host_event(
+        &mut self,
+        observation: crate::host_events::Observation,
+    ) -> Result<CaptureOutcome, CaptureError> {
+        self.capture_inner(observation.into_record(), None, None, &mut None)
+    }
+
     pub fn capture_native_goal(
         &mut self,
         observation: crate::goal_source::Observation,
@@ -240,6 +247,7 @@ impl CaptureRuntime {
         &self,
         input: &CaptureRecordInput,
     ) -> Result<CaptureOutcome, CaptureError> {
+        reject_caller_source(input)?;
         validate_input(input)?;
         let spool_record_id = Uuid::now_v7().hyphenated().to_string();
         let mut digest = Sha256::new();
@@ -604,6 +612,7 @@ impl From<crate::frame::SpoolFrameError> for CaptureError {
 fn reject_caller_source(input: &CaptureRecordInput) -> Result<(), CaptureError> {
     if input.source_revision == crate::goal_source::SOURCE_REVISION
         || input.source_revision == crate::process_source::KERNEL_SOURCE_REVISION
+        || input.source_revision == crate::host_events::SOURCE_REVISION
     {
         return Err(CaptureError::InvalidInput);
     }

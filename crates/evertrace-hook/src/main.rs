@@ -59,6 +59,24 @@ fn run() -> Result<(), ()> {
     let mut arguments = env::args_os().skip(1);
     let mode = arguments.next().ok_or(())?;
     let path = arguments.next().ok_or(())?;
+    if mode == "--source-host" {
+        let endpoint = arguments.next().ok_or(())?;
+        if arguments.next().is_some() {
+            return Err(());
+        }
+        let contract = evertrace_codex::probe::HostProbeReport::unobserved_source_contract(
+            evertrace_capture::host_events::ADAPTER_VERSION,
+            evertrace_capture::host_events::ELIGIBLE_EVENTS,
+        )
+        .map_err(|_| ())?;
+        let snapshot = RuntimeSnapshot::load(Path::new(&path)).map_err(|_| ())?;
+        return evertrace_capture::host_events::relay(
+            snapshot,
+            Path::new(&endpoint),
+            &contract.manifest().adapter_manifest_id,
+        )
+        .map_err(|_| ());
+    }
     if mode == "--observe-host-goal" {
         let socket = arguments.next().ok_or(())?;
         let thread = arguments.next().ok_or(())?;
