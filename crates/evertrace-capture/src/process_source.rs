@@ -6,8 +6,10 @@
 use std::{fs, io::Read, os::unix::fs::MetadataExt, path::Path};
 
 use evertrace_domain::evidence::{
-    CaptureCompleteness, ContentTrust, CorrelationAdmission, EvidenceSourceKind,
-    HostCorrelationEvidence, IdentityStrength, ObservationRole, SourceRevisionMode, SourceRole,
+    CanonicalEventFamily, CaptureCompleteness, ContentTrust, CorrelationAdmission,
+    CorrelationField, CorrelationFieldClaim, EvidenceSourceKind, HostCorrelationEvidence,
+    IdentityStrength, ObservationRole, SourceInstanceId, SourceRecordIdentity, SourceRevision,
+    SourceRevisionMode, SourceRole, source_observation_id,
 };
 use serde::Deserialize;
 use serde_json::Value;
@@ -16,10 +18,10 @@ use uuid::Uuid;
 
 use crate::CaptureRecordInput;
 
-const PREFIX: &[u8] = b"{\"format\":\"process-trial-source-v1\",";
-const FORMAT: &str = "process-trial-source-v1";
+const PREFIX: &[u8] = b"{\"format\":\"process-trial-source-v2\",";
+const FORMAT: &str = "process-trial-source-v2";
 const MANIFEST: &str =
-    "process-trial-source-v1:87ec8be34c7583b9b0e7c9d97ccdeb78aecefd08914f935f6fa013539478b00d";
+    "process-trial-source-v2:79ba882813eea69af109ace6016462953d63b7c97677392d6673c96bebeee9d6";
 const LIMIT: usize = 65_536;
 
 #[derive(Debug, thiserror::Error)]
@@ -48,6 +50,17 @@ struct Header {
     sequence: u64,
     time_us: i64,
     controller: ProcessIdentity,
+    process: Option<ProcessIdentity>,
+    execution_key: Option<String>,
+    argv: Option<Vec<String>>,
+    returncode: Option<i32>,
+}
+
+struct ProcessStat {
+    parent: u32,
+    start: u64,
+    state: String,
+    exit_status: u32,
 }
 
 fn bytes(path: &Path) -> Result<Vec<u8>> {
@@ -68,7 +81,7 @@ fn text(path: &Path) -> Result<String> {
         .map_err(|_| ProcessSourceError)
 }
 
-fn stat(pid: &str) -> Result<(u32, u64)> {
+fn stat(pid: &str) -> Result<ProcessStat> {
     let raw = text(&Path::new("/proc").join(pid).join("stat"))?;
     let (_, fields) = raw.rsplit_once(") ").ok_or(ProcessSourceError)?;
     let fields: Vec<_> = fields.split_whitespace().collect();
@@ -82,7 +95,18 @@ fn stat(pid: &str) -> Result<(u32, u64)> {
         .ok_or(ProcessSourceError)?
         .parse()
         .map_err(|_| ProcessSourceError)?;
-    Ok((parent, start))
+    let state = fields.first().ok_or(ProcessSourceError)?.to_string();
+    let exit_status = fields
+        .get(49)
+        .ok_or(ProcessSourceError)?
+        .parse()
+        .map_err(|_| ProcessSourceError)?;
+    Ok(ProcessStat {
+        parent,
+        start,
+        state,
+        exit_status,
+    })
 }
 
 fn uuid(value: &str) -> bool {
@@ -90,12 +114,12 @@ fn uuid(value: &str) -> bool {
 }
 
 fn peer(header: &Header, executable: &Path, snapshot: &Path) -> Result<()> {
-    let (parent, _) = stat("self")?;
+    let parent = stat("self")?.parent;
     let root = Path::new("/proc").join(parent.to_string());
     let own_uid = fs::metadata("/proc/self")
         .map_err(|_| ProcessSourceError)?
         .uid();
-    let (_, start) = stat(&parent.to_string())?;
+    let start = stat(&parent.to_string())?.start;
     let identity = &header.controller;
     if identity.pid != parent
         || identity.start_ticks != start
@@ -151,6 +175,63 @@ fn peer(header: &Header, executable: &Path, snapshot: &Path) -> Result<()> {
     Ok(())
 }
 
+// The physical unit is this source's single child process lifetime, not its opaque trial UUID.
+// The source holds a pipe before execution and uses WNOWAIT after exit. Both endpoints
+// can therefore be checked against the kernel here without a cache, lookup or claimed birth.
+fn physical_scope(header: &Header) -> Result<String> {
+    let identity = header.process.as_ref().ok_or(ProcessSourceError)?;
+    if !header.execution_key.as_deref().is_some_and(uuid) {
+        return Err(ProcessSourceError);
+    }
+    let root = Path::new("/proc").join(identity.pid.to_string());
+    let observed = stat(&identity.pid.to_string())?;
+    if observed.parent != header.controller.pid
+        || observed.start != identity.start_ticks
+        || identity.boot_id != header.controller.boot_id
+        || identity.pid_namespace
+            != fs::metadata(root.join("ns/pid"))
+                .map_err(|_| ProcessSourceError)?
+                .ino()
+    {
+        return Err(ProcessSourceError);
+    }
+    if header.event == "trial_finished" {
+        let code = if observed.exit_status & 0x7f == 0 {
+            (observed.exit_status >> 8 & 0xff) as i32
+        } else {
+            -((observed.exit_status & 0x7f) as i32)
+        };
+        if observed.state != "Z" || header.returncode != Some(code) {
+            return Err(ProcessSourceError);
+        }
+    } else {
+        if !matches!(header.event.as_str(), "trial_launch" | "trial_started")
+            || observed.state == "Z"
+            || identity.executable
+                != fs::read_link(root.join("exe"))
+                    .map_err(|_| ProcessSourceError)?
+                    .to_string_lossy()
+        {
+            return Err(ProcessSourceError);
+        }
+        if header.event == "trial_launch" {
+            let args = header.argv.as_ref().ok_or(ProcessSourceError)?;
+            let mut command = Vec::new();
+            for arg in args {
+                command.extend_from_slice(arg.as_bytes());
+                command.push(0);
+            }
+            if bytes(&root.join("cmdline"))? != command {
+                return Err(ProcessSourceError);
+            }
+        }
+    }
+    Ok(format!(
+        "process:{}:{}:{}:{}",
+        identity.boot_id, identity.pid_namespace, identity.pid, observed.start
+    ))
+}
+
 /// The same Hook transport calls this only for the recorder's exact original version signature.
 /// No peer/header can select Observed, Complete, an active binding, or an Exact admission.
 pub fn record(raw: &[u8], snapshot: &Path) -> Result<Option<CaptureRecordInput>> {
@@ -180,6 +261,7 @@ pub fn record(raw: &[u8], snapshot: &Path) -> Result<Option<CaptureRecordInput>>
                 | "source_anchor"
                 | "launch_event"
                 | "process"
+                | "execution_key"
                 | "returncode"
                 | "scorer"
                 | "outcomes"
@@ -206,22 +288,72 @@ pub fn record(raw: &[u8], snapshot: &Path) -> Result<Option<CaptureRecordInput>>
     }
     let executable = std::env::current_exe().map_err(|_| ProcessSourceError)?;
     peer(&header, &executable, snapshot)?;
+    let source_instance_id = format!(
+        "process:{}:{}:{}:{}",
+        header.controller.boot_id,
+        header.controller.pid_namespace,
+        header.controller.pid,
+        header.controller.start_ticks,
+    );
+    let source_ref = format!("session:{}", header.source_epoch);
+    let mut correlation = HostCorrelationEvidence {
+        occurrence_schema_version: 1,
+        host_instance_id: None,
+        host_trace_lineage_id: None,
+        host_lane_key: None,
+        canonical_event_family: None,
+        native_request_id: None,
+        physical_execution_ordinal: None,
+        pairing_role: role,
+        field_provenance: vec![],
+        adapter_manifest_ref: MANIFEST.into(),
+        adapter_revision: 2,
+        strong_gate_receipt_ref: None,
+        admission: CorrelationAdmission::Unavailable,
+        partial_correlation_ref: None,
+        possible_duplicate_group_id: None,
+    };
+    // Failed/missing kernel evidence remains an original untrusted/partial record with no
+    // physical claims. Even verified fields cannot form an Exact key without a qualified gate.
+    if let Ok(scope) = physical_scope(&header) {
+        let evidence = source_observation_id(
+            &SourceInstanceId::parse(&source_instance_id).map_err(|_| ProcessSourceError)?,
+            &SourceRevision::parse(MANIFEST).map_err(|_| ProcessSourceError)?,
+            &SourceRecordIdentity::parse(&header.event_key).map_err(|_| ProcessSourceError)?,
+        )
+        .map_err(|_| ProcessSourceError)?;
+        correlation.host_instance_id = Some(source_instance_id.clone());
+        correlation.host_trace_lineage_id = Some(header.source_epoch.clone());
+        correlation.host_lane_key = Some(scope);
+        correlation.canonical_event_family = Some(CanonicalEventFamily::Verify);
+        correlation.native_request_id = header.execution_key.clone();
+        correlation.physical_execution_ordinal = Some(1);
+        correlation.field_provenance = [
+            CorrelationField::HostInstanceId,
+            CorrelationField::HostTraceLineageId,
+            CorrelationField::HostLaneKey,
+            CorrelationField::CanonicalEventFamily,
+            CorrelationField::NativeRequestId,
+            CorrelationField::PhysicalExecutionOrdinal,
+        ]
+        .into_iter()
+        .map(|field| CorrelationFieldClaim {
+            field,
+            source_ref: source_ref.clone(),
+            evidence_ref: evidence.to_string(),
+        })
+        .collect();
+    }
     Ok(Some(CaptureRecordInput {
         spool_record_id: Some(header.event_key.clone()),
         source_observation_id_hint: None,
-        source_instance_id: format!(
-            "process:{}:{}:{}:{}",
-            header.controller.boot_id,
-            header.controller.pid_namespace,
-            header.controller.pid,
-            header.controller.start_ticks
-        ),
+        source_instance_id,
         source_revision: MANIFEST.into(),
         source_record_identity: Some(header.event_key),
         identity_strength: Some(IdentityStrength::StableNative),
         source_kind: EvidenceSourceKind::Other,
         identity_domain: FORMAT.into(),
-        source_ref: format!("session:{}", header.source_epoch),
+        source_ref,
         session_ref: header.source_epoch,
         turn_ref: None,
         tool_ref: None,
@@ -235,23 +367,7 @@ pub fn record(raw: &[u8], snapshot: &Path) -> Result<Option<CaptureRecordInput>>
         previous_source_revision: None,
         close_watermark: (header.event == "controller_finished").then_some(header.sequence),
         observation_role: role,
-        correlation: HostCorrelationEvidence {
-            occurrence_schema_version: 1,
-            host_instance_id: None,
-            host_trace_lineage_id: None,
-            host_lane_key: None,
-            canonical_event_family: None,
-            native_request_id: None,
-            physical_execution_ordinal: None,
-            pairing_role: role,
-            field_provenance: vec![],
-            adapter_manifest_ref: MANIFEST.into(),
-            adapter_revision: 1,
-            strong_gate_receipt_ref: None,
-            admission: CorrelationAdmission::Unavailable,
-            partial_correlation_ref: None,
-            possible_duplicate_group_id: None,
-        },
+        correlation,
         scope_effect_claims: vec![],
         source_local_evidence: None,
         lifecycle: None,
@@ -260,10 +376,10 @@ pub fn record(raw: &[u8], snapshot: &Path) -> Result<Option<CaptureRecordInput>>
         content_trust: ContentTrust::UntrustedSourceContent,
         capture_completeness: CaptureCompleteness::Partial,
         surface_eligible: true,
-        adapter_revision: 1,
+        adapter_revision: 2,
         adapter_manifest_ref: MANIFEST.into(),
-        eligible_event_manifest_ref: "process-trial-source-events-v1".into(),
-        parser_revision: 1,
+        eligible_event_manifest_ref: "process-trial-source-events-v2".into(),
+        parser_revision: 2,
         canonicalization_revision: 1,
         // The original clock value remains in raw bytes; its uncertainty is not qualified.
         event_time_us: None,
