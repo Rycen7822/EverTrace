@@ -23,15 +23,17 @@ use serde_json::Value;
 use sha2::{Digest, Sha256};
 use uuid::Uuid;
 
-use crate::{CaptureRecordInput, ConfinedReadLimits, ConfinedRoot};
+use crate::{CaptureRecordInput, ConfinedFile, ConfinedReadLimits, ConfinedRoot};
 
 const PREFIX: &[u8] = b"{\"format\":\"process-trial-source-v2\",";
 const FORMAT: &str = "process-trial-source-v2";
 pub const SOURCE_REVISION: &str =
     "process-trial-source-v2:79ba882813eea69af109ace6016462953d63b7c97677392d6673c96bebeee9d6";
-pub const ADAPTER_REVISION: u32 = 4;
+pub const ADAPTER_REVISION: u32 = 5;
 pub const ELIGIBLE_EVENTS: &str = "process-trial-source-events-v2";
 const LIMIT: usize = 65_536;
+const SOURCE_BYTES: u64 = 262_144;
+const SOURCE_RECORDS: u64 = 64;
 
 pub fn adapter_version() -> String {
     format!("{SOURCE_REVISION}:capture-{ADAPTER_REVISION}")
@@ -69,6 +71,7 @@ struct Header {
     controller: ProcessIdentity,
     process: Option<ProcessIdentity>,
     execution_key: Option<String>,
+    launch_event: Option<String>,
     argv: Option<Vec<String>>,
     returncode: Option<i32>,
 }
@@ -309,7 +312,8 @@ pub fn record(raw: &[u8], snapshot: &Path, manifest_ref: &str) -> Result<Capture
     }
     let (header, role) = decode(raw)?;
     let executable = std::env::current_exe().map_err(|_| ProcessSourceError)?;
-    let _ = peer(&header, &executable, snapshot)?;
+    let script = peer(&header, &executable, snapshot)?;
+    let (source_range, ordinal) = published_record(raw, &header, &script)?;
     let source_instance_id = format!(
         "process:{}:{}:{}:{}",
         header.controller.boot_id,
@@ -337,7 +341,7 @@ pub fn record(raw: &[u8], snapshot: &Path, manifest_ref: &str) -> Result<Capture
     };
     // Failed/missing kernel evidence remains an original untrusted/partial record with no
     // physical claims. Even verified fields cannot form an Exact key without a qualified gate.
-    if let Ok(scope) = physical_scope(&header) {
+    if let (Ok(scope), Some(ordinal)) = (physical_scope(&header), ordinal) {
         let evidence = source_observation_id(
             &SourceInstanceId::parse(&source_instance_id).map_err(|_| ProcessSourceError)?,
             &SourceRevision::parse(SOURCE_REVISION).map_err(|_| ProcessSourceError)?,
@@ -349,7 +353,7 @@ pub fn record(raw: &[u8], snapshot: &Path, manifest_ref: &str) -> Result<Capture
         correlation.host_lane_key = Some(scope);
         correlation.canonical_event_family = Some(CanonicalEventFamily::Verify);
         correlation.native_request_id = header.execution_key.clone();
-        correlation.physical_execution_ordinal = Some(1);
+        correlation.physical_execution_ordinal = Some(ordinal);
         correlation.field_provenance = [
             CorrelationField::HostInstanceId,
             CorrelationField::HostTraceLineageId,
@@ -384,7 +388,7 @@ pub fn record(raw: &[u8], snapshot: &Path, manifest_ref: &str) -> Result<Capture
         task_id: None,
         repository_instance_id: None,
         worktree_instance_id: None,
-        source_byte_range: None,
+        source_byte_range: Some(source_range),
         source_revision_mode: SourceRevisionMode::Append,
         previous_source_revision: None,
         close_watermark: (header.event == "controller_finished").then_some(header.sequence),
@@ -401,7 +405,7 @@ pub fn record(raw: &[u8], snapshot: &Path, manifest_ref: &str) -> Result<Capture
         adapter_revision: ADAPTER_REVISION,
         adapter_manifest_ref: manifest_ref.into(),
         eligible_event_manifest_ref: ELIGIBLE_EVENTS.into(),
-        parser_revision: 2,
+        parser_revision: 3,
         canonicalization_revision: 1,
         // The original clock value remains in raw bytes; its uncertainty is not qualified.
         event_time_us: None,
@@ -420,71 +424,16 @@ pub fn closed_records(
         return Ok(vec![]);
     };
     let (closing, _) = decode(&primary.raw_payload)?;
-    if closing.event != "controller_finished" || watermark != closing.sequence || watermark > 64 {
+    if closing.event != "controller_finished"
+        || watermark != closing.sequence
+        || watermark > SOURCE_RECORDS
+    {
         return Err(ProcessSourceError);
     }
     let executable = std::env::current_exe().map_err(|_| ProcessSourceError)?;
     let script = peer(&closing, &executable, snapshot)?;
-    let root = script.parent().ok_or(ProcessSourceError)?;
-    let command = bytes(
-        &Path::new("/proc")
-            .join(closing.controller.pid.to_string())
-            .join("cmdline"),
-    )?;
-    let args: Vec<_> = command
-        .split(|byte| *byte == 0)
-        .filter(|part| !part.is_empty())
-        .collect();
-    let series = args
-        .iter()
-        .rposition(|arg| *arg == b"--series")
-        .map(|index| args.get(index + 1).ok_or(ProcessSourceError))
-        .transpose()?
-        .copied()
-        .unwrap_or(b"recording-v2");
-    if series.is_empty()
-        || series.len() > 48
-        || !series
-            .iter()
-            .all(|byte| byte.is_ascii_alphanumeric() || *byte == b'-')
-    {
-        return Err(ProcessSourceError);
-    }
-    let series = std::str::from_utf8(series).map_err(|_| ProcessSourceError)?;
-    let relative = format!("events-{series}.jsonl");
-    let path = root.join(&relative);
-    let metadata = fs::symlink_metadata(&path).map_err(|_| ProcessSourceError)?;
-    if !metadata.is_file()
-        || metadata.mode() & 0o022 != 0
-        || metadata.uid()
-            != fs::metadata("/proc/self")
-                .map_err(|_| ProcessSourceError)?
-                .uid()
-    {
-        return Err(ProcessSourceError);
-    }
     let deadline = Instant::now() + Duration::from_millis(50);
-    // This is the live, code-verified publisher's owned output root, not an arbitrary
-    // Host locator. Pin its owned directory and file; do not relax the generic
-    // external-source ancestor policy or mutate permissions to make a probe pass.
-    let file = ConfinedRoot::open_owned_private(root)
-        .map_err(|_| ProcessSourceError)?
-        .read(
-            Path::new(&relative),
-            ConfinedReadLimits {
-                single_file_remaining: 262_144,
-                untracked_total_remaining: 262_144,
-                bundle_remaining: 262_144,
-                deadline,
-            },
-        )
-        .map_err(|_| ProcessSourceError)?;
-    if metadata.dev() != file.identity.device
-        || metadata.ino() != file.identity.inode
-        || !file.bytes.ends_with(b"\n")
-    {
-        return Err(ProcessSourceError);
-    }
+    let (path, file) = published_file(&script, &closing.controller, deadline)?;
     let instance = format!(
         "{}:file:{}:{}",
         primary.source_instance_id, file.identity.device, file.identity.inode
@@ -540,4 +489,130 @@ pub fn closed_records(
         return Err(ProcessSourceError);
     }
     Ok(records)
+}
+
+/// Read only the live verified publisher's owned output, never a caller-supplied locator.
+fn published_file(
+    script: &Path,
+    controller: &ProcessIdentity,
+    deadline: Instant,
+) -> Result<(PathBuf, ConfinedFile)> {
+    let root = script.parent().ok_or(ProcessSourceError)?;
+    let command = bytes(
+        &Path::new("/proc")
+            .join(controller.pid.to_string())
+            .join("cmdline"),
+    )?;
+    let args: Vec<_> = command
+        .split(|byte| *byte == 0)
+        .filter(|part| !part.is_empty())
+        .collect();
+    let series = args
+        .iter()
+        .rposition(|arg| *arg == b"--series")
+        .map(|index| args.get(index + 1).ok_or(ProcessSourceError))
+        .transpose()?
+        .copied()
+        .unwrap_or(b"recording-v2");
+    if series.is_empty()
+        || series.len() > 48
+        || !series
+            .iter()
+            .all(|byte| byte.is_ascii_alphanumeric() || *byte == b'-')
+    {
+        return Err(ProcessSourceError);
+    }
+    let series = std::str::from_utf8(series).map_err(|_| ProcessSourceError)?;
+    let relative = format!("events-{series}.jsonl");
+    let path = root.join(&relative);
+    let metadata = fs::symlink_metadata(&path).map_err(|_| ProcessSourceError)?;
+    if !metadata.is_file()
+        || metadata.mode() & 0o022 != 0
+        || metadata.uid()
+            != fs::metadata("/proc/self")
+                .map_err(|_| ProcessSourceError)?
+                .uid()
+    {
+        return Err(ProcessSourceError);
+    }
+    // This is the live, code-verified publisher's owned output root, not an arbitrary
+    // Host locator. Pin its owned directory and file; do not relax the generic
+    // external-source ancestor policy or mutate permissions to make a probe pass.
+    let file = ConfinedRoot::open_owned_private(root)
+        .map_err(|_| ProcessSourceError)?
+        .read(
+            Path::new(&relative),
+            ConfinedReadLimits {
+                single_file_remaining: SOURCE_BYTES,
+                untracked_total_remaining: SOURCE_BYTES,
+                bundle_remaining: SOURCE_BYTES,
+                deadline,
+            },
+        )
+        .map_err(|_| ProcessSourceError)?;
+    if metadata.dev() != file.identity.device
+        || metadata.ino() != file.identity.inode
+        || !file.bytes.ends_with(b"\n")
+    {
+        return Err(ProcessSourceError);
+    }
+    Ok((path, file))
+}
+
+fn published_record(
+    raw: &[u8],
+    selected: &Header,
+    script: &Path,
+) -> Result<(EvidenceByteRange, Option<u32>)> {
+    let deadline = Instant::now() + Duration::from_millis(50);
+    let (_, file) = published_file(script, &selected.controller, deadline)?;
+    let mut keys = BTreeSet::new();
+    let mut offset = 0;
+    let mut found = None;
+    let mut launch = None;
+    let mut count = 0;
+    for line in file.bytes.split_inclusive(|byte| *byte == b'\n') {
+        let (header, _) = decode(line)?;
+        count += 1;
+        if count > SOURCE_RECORDS
+            || Instant::now() >= deadline
+            || header.sequence != count
+            || !keys.insert(header.event_key.clone())
+            || header.controller != selected.controller
+            || header.source_epoch != selected.source_epoch
+            || header.study_key != selected.study_key
+            || (count == 1 && header.event != "study_opened")
+        {
+            return Err(ProcessSourceError);
+        }
+        if header.event_key == selected.event_key {
+            if line != raw {
+                return Err(ProcessSourceError);
+            }
+            found = Some(EvidenceByteRange {
+                start: offset,
+                end: offset + line.len() as u64,
+            });
+        }
+        if header.event == "trial_launch"
+            && (header.event_key == selected.event_key
+                || selected.launch_event.as_deref() == Some(header.event_key.as_str()))
+        {
+            if launch.is_some()
+                || header.execution_key != selected.execution_key
+                || header.process != selected.process
+                || header.sequence > selected.sequence
+            {
+                return Err(ProcessSourceError);
+            }
+            // Use the publisher's actual launch cursor, not an invented retry count.
+            launch = Some(u32::try_from(header.sequence).map_err(|_| ProcessSourceError)?);
+        }
+        offset += line.len() as u64;
+    }
+    let range = found.ok_or(ProcessSourceError)?;
+    if matches!(selected.event.as_str(), "trial_started" | "trial_finished") && launch.is_none() {
+        return Err(ProcessSourceError);
+    }
+    Ok((range, launch))
 }
