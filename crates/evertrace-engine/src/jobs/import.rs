@@ -2001,8 +2001,16 @@ mod tests {
         let other = dated.join(format!(
             "rollout-2026-08-30T00-00-00-{session}_{second}.jsonl"
         ));
-        let header = serde_json::json!({"timestamp":"2026-08-30T00:00:00Z", "type":"session_meta", "payload":{"id":session,"session_id":session,"originator":"codex_cli_rs","model_provider":"openai","cwd":"/non-repository","git":null}});
-        let line = serde_json::json!({"type":"event_msg", "payload":{"type":"item_completed","thread_id":session,"turn_id":"turn","item":{"type":"UserMessage","id":"message","content":[{"type":"text","text":"read quantum"}]}}});
+        let header = serde_json::json!({
+            "timestamp":"2026-08-30T00:00:00Z", "type":"session_meta",
+            "payload":{"id":session,"session_id":session,"originator":"codex_cli_rs",
+                "model_provider":"openai","cwd":"/non-repository","git":null}
+        });
+        let line = serde_json::json!({
+            "type":"event_msg",
+            "payload":{"type":"item_completed","thread_id":session,"turn_id":"turn",
+                "item":{"type":"UserMessage","id":"message","content":[{"type":"text","text":"read quantum"}]}}
+        });
         let content = format!("{header}\n{}", format!("{line}\n").repeat(6));
         fs::write(&first, &content).unwrap();
         fs::write(&other, &content).unwrap();
@@ -2222,7 +2230,9 @@ mod tests {
             });
             let overflow_line = serde_json::json!({
                 "type":"event_msg",
-                "payload":{"type":"item_completed","thread_id":id,"turn_id":format!("turn-overflow-{index}"),"item":{"type":"UserMessage","id":format!("message-overflow-{index}"),"content":[{"type":"text","text":"slot-cap work"}]}}
+                "payload":{"type":"item_completed","thread_id":id,"turn_id":format!("turn-overflow-{index}"),
+                    "item":{"type":"UserMessage","id":format!("message-overflow-{index}"),
+                        "content":[{"type":"text","text":"slot-cap work"}]}}
             });
             let overflow_content = format!(
                 "{overflow_header}\n{}",
@@ -2429,7 +2439,9 @@ mod tests {
             serde_json::json!({
                 "timestamp":"2026-08-30T00:00:01Z",
                 "type":"event_msg",
-                "payload":{"type":"item_completed","thread_id":session,"turn_id":id,"item":{"type":"UserMessage","id":id,"content":[{"type":"text","text":format!("terminal handoff recovery {id}")}]}}
+                "payload":{"type":"item_completed","thread_id":session,"turn_id":id,
+                    "item":{"type":"UserMessage","id":id,
+                        "content":[{"type":"text","text":format!("terminal handoff recovery {id}")}]}}
             })
         };
         let content = format!("{}\n{}\n{}\n", header, message("last-1"), message("last-2"));
@@ -2842,7 +2854,9 @@ mod tests {
                 serde_json::json!({
                     "timestamp":"2026-10-06T00:01:02Z",
                     "type":"event_msg",
-                    "payload":{"type":"item_completed","thread_id":session,"turn_id":id,"item":{"type":"UserMessage","id":id,"content":[{"type":"text","text":format!("split recovery {id}")}]},"completed_at_ms":1_791_244_862_000_i64}
+                    "payload":{"type":"item_completed","thread_id":session,"turn_id":id,
+                        "item":{"type":"UserMessage","id":id,"content":[{"type":"text","text":format!("split recovery {id}")}]},
+                        "completed_at_ms":1_791_244_862_000_i64}
                 })
                 .to_string()
             })
@@ -3276,12 +3290,28 @@ mod tests {
 
     #[test]
     fn completed_display_messages_require_exact_text_variants() {
-        let mut record = serde_json::json!({"type":"event_msg","payload":{"type":"item_completed","thread_id":"019d0000-0000-7000-8000-000000000028","turn_id":"turn","item":null}});
+        let mut record = serde_json::json!({
+            "type":"event_msg",
+            "payload":{"type":"item_completed","thread_id":"019d0000-0000-7000-8000-000000000028","turn_id":"turn","item":null}
+        });
         for item in [
-            serde_json::json!({"type":"UserMessage","id":"u","client_id":"client","content":[{"type":"text","text":"text","text_elements":[{"byte_range":{"start":0,"end":4},"placeholder":null}]}]}),
+            serde_json::json!({
+                "type":"UserMessage","id":"u","client_id":"client",
+                "content":[{"type":"text","text":"text",
+                    "text_elements":[{"byte_range":{"start":0,"end":4},"placeholder":null}]}]
+            }),
             serde_json::json!({"type":"AgentMessage","id":"a","phase":"commentary","content":[{"type":"Text","text":"text"}]}),
-            serde_json::json!({"type":"AgentMessage","id":"a","content":[{"type":"Text","text":"text"}],"memory_citation":null,"delivery":null,"questions":null}),
-            serde_json::json!({"type":"AgentMessage","id":"a","content":[{"type":"Text","text":"text"}],"memory_citation":{"entries":[{"path":"notes.md","lineStart":1,"lineEnd":2,"note":"source claim"}],"rolloutIds":["prior-rollout"]},"delivery":"async","questions":[{"title":"Choose","options":["one","two"]},{"title":"Explain","options":null},{"title":"Continue"}]}),
+            serde_json::json!({
+                "type":"AgentMessage","id":"a","content":[{"type":"Text","text":"text"}],
+                "memory_citation":null,"delivery":null,"questions":null
+            }),
+            serde_json::json!({
+                "type":"AgentMessage","id":"a","content":[{"type":"Text","text":"text"}],
+                "memory_citation":{"entries":[{"path":"notes.md","lineStart":1,"lineEnd":2,"note":"source claim"}],
+                    "rolloutIds":["prior-rollout"]},
+                "delivery":"async","questions":[{"title":"Choose","options":["one","two"]},
+                    {"title":"Explain","options":null},{"title":"Continue"}]
+            }),
         ] {
             record["payload"]["item"] = item;
             let visibility = classify_record(&serde_json::to_vec(&record).unwrap()).unwrap();
@@ -3293,7 +3323,10 @@ mod tests {
             serde_json::json!({"type":"AgentMessage","id":"a","content":[{"type":"text","text":"text"}]}),
             serde_json::json!({"type":"AgentMessage","id":"a","content":[{"type":"Text","text":7}]}),
             serde_json::json!({"type":"AgentMessage","id":"a","content":[{"type":"Text","text":"text","encrypted_content":"opaque"}]}),
-            serde_json::json!({"type":"UserMessage","id":"u","content":[{"type":"text","text":"text"},{"type":"image","image_url":"data:image/png;base64,AA=="}]}),
+            serde_json::json!({
+                "type":"UserMessage","id":"u",
+                "content":[{"type":"text","text":"text"},{"type":"image","image_url":"data:image/png;base64,AA=="}]
+            }),
             serde_json::json!({"type":"UserMessage","id":"u","content":[{"type":"text","text":"text","text_elements":"invalid"}]}),
             serde_json::json!({"type":"AgentMessage","id":"a","content":[]}),
             serde_json::json!({"type":"Reasoning","id":"r","summary_text":[],"raw_content":["not visible"]}),
@@ -3372,19 +3405,19 @@ struct ResponseMetadata {
     _mcp_attribution: Option<serde::de::IgnoredAny>,
 }
 
-// The supported display-message subset of protocol/src/{protocol,items,user_input}.rs
-// at the same fixed source. Unknown/complex content remains an archived Other;
-// no raw ResponseItem or other TurnItem becomes a message by resemblance.
+// Closed source shapes from protocol/src/{protocol,items,user_input}.rs. Completed
+// command records remain ImportedClaim evidence, not Host/Work or outcome authority.
+// Unknown/complex content stays Other; no item becomes a message by resemblance.
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
-struct CompletedMessageEvent {
+struct CompletedItemEvent {
     #[serde(rename = "type")]
     _event_type: String,
     #[serde(rename = "thread_id")]
     _thread_id: String,
     #[serde(rename = "turn_id")]
     _turn_id: String,
-    item: CompletedMessage,
+    item: CompletedItem,
     #[serde(rename = "started_at_ms")]
     _started_at_ms: Option<i64>,
     #[serde(default, rename = "completed_at_ms")]
@@ -3393,7 +3426,7 @@ struct CompletedMessageEvent {
 
 #[derive(Deserialize)]
 #[serde(tag = "type", deny_unknown_fields)]
-enum CompletedMessage {
+enum CompletedItem {
     UserMessage {
         #[serde(rename = "id")]
         _id: String,
@@ -3414,6 +3447,43 @@ enum CompletedMessage {
         #[serde(rename = "questions")]
         _questions: Option<Vec<MessageQuestion>>,
     },
+    CommandExecution {
+        #[serde(rename = "id")]
+        _id: String,
+        #[serde(rename = "command")]
+        _command: Vec<String>,
+        #[serde(rename = "cwd")]
+        _cwd: String,
+        #[serde(rename = "parsed_cmd")]
+        _parsed_cmd: Vec<serde::de::IgnoredAny>,
+        #[serde(rename = "source")]
+        _source: CommandSource,
+        #[serde(rename = "status")]
+        _status: CommandStatus,
+        #[serde(rename = "aggregated_output")]
+        _aggregated_output: Option<String>,
+        #[serde(rename = "exit_code")]
+        _exit_code: Option<i32>,
+        #[serde(rename = "duration")]
+        _duration: Option<std::time::Duration>,
+    },
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "snake_case")]
+enum CommandSource {
+    Agent,
+    UserShell,
+    UnifiedExecStartup,
+    UnifiedExecInteraction,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "snake_case")]
+enum CommandStatus {
+    Completed,
+    Failed,
+    Declined,
 }
 
 // Optional display fields are source content, never authority or adoption proof.
@@ -3496,32 +3566,32 @@ enum AgentText {
     Text { text: String },
 }
 
-fn completed_message_visibility(payload: &serde_json::Value) -> RecordVisibility {
-    let message = CompletedMessageEvent::deserialize(payload)
+fn completed_item_visibility(payload: &serde_json::Value) -> RecordVisibility {
+    let role = CompletedItemEvent::deserialize(payload)
         .ok()
-        .is_some_and(|event| match event.item {
-            CompletedMessage::UserMessage { content, .. } => content
+        .and_then(|event| match event.item {
+            CompletedItem::UserMessage { content, .. } => content
                 .iter()
-                .any(|UserText::Text { text, .. }| !text.trim().is_empty()),
-            CompletedMessage::AgentMessage { content, .. } => content
+                .any(|UserText::Text { text, .. }| !text.trim().is_empty())
+                .then_some(ObservationRole::Message),
+            CompletedItem::AgentMessage { content, .. } => content
                 .iter()
-                .any(|AgentText::Text { text }| !text.trim().is_empty()),
+                .any(|AgentText::Text { text }| !text.trim().is_empty())
+                .then_some(ObservationRole::Message),
+            CompletedItem::CommandExecution { .. } => Some(ObservationRole::Result),
         });
+    let supported = role.is_some();
     RecordVisibility {
         source_time: None,
-        role: if message {
-            ObservationRole::Message
-        } else {
-            ObservationRole::Other
-        },
-        unsupported: (!message).then_some(
+        role: role.unwrap_or(ObservationRole::Other),
+        unsupported: (!supported).then_some(
             if payload["item"]["type"].as_str() == Some("Reasoning") {
                 UnsupportedRecordClassification::Reasoning
             } else {
                 UnsupportedRecordClassification::UnknownRecordType
             },
         ),
-        surface_eligible: message,
+        surface_eligible: supported,
     }
 }
 
@@ -3556,7 +3626,7 @@ fn classify_record(bytes: &[u8]) -> Result<RecordVisibility, SessionImportError>
             }
         }
         "event_msg" if record.payload["type"].as_str() == Some("item_completed") => {
-            completed_message_visibility(&record.payload)
+            completed_item_visibility(&record.payload)
         }
         "event_msg" => RecordVisibility {
             source_time: None,
