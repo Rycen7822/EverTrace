@@ -2501,12 +2501,15 @@ impl BackgroundScheduler {
                         dirty.target_kind,
                         &dirty.target_id,
                     );
+                    let weak_process =
+                        physical && is_unqualified_process_source(observation, receipt);
                     if current_manifest.is_none()
                         && (!physical
                             || retained_manifests
                                 .get_or_insert_with(&load_retained_manifests)
                                 .is_empty())
                         && !weak_import
+                        && !weak_process
                     {
                         return Ok(None);
                     }
@@ -2514,6 +2517,7 @@ impl BackgroundScheduler {
                     // the complete dependency manifest check below remains authoritative.
                     let manifest = receipt.adapter_manifest_ref.as_str();
                     Ok((weak_import
+                        || weak_process
                         || current_manifest == Some(manifest)
                         || (physical
                             && retained_manifests
@@ -5071,6 +5075,46 @@ fn is_verified_importer_weak_normalization(
         && receipt.lifecycle.is_none()
 }
 
+// This ABI has no host authority. A matching source version must not rescue a
+// forged Exact, adopted scope or trusted-role claim through a weak contract.
+fn is_unqualified_process_source(
+    observation: &evertrace_domain::evidence::SourceObservation,
+    receipt: &evertrace_domain::evidence::SourceReceipt,
+) -> bool {
+    use evertrace_domain::evidence::{
+        CaptureCompleteness, ContentTrust, CorrelationAdmission, EvidenceSourceKind, SourceRole,
+    };
+    receipt.source_kind == EvidenceSourceKind::Other
+        && receipt.source_revision.as_str() == evertrace_capture::process_source::SOURCE_REVISION
+        && receipt.adapter_revision == evertrace_capture::process_source::ADAPTER_REVISION
+        && receipt.eligible_event_manifest_ref == evertrace_capture::process_source::ELIGIBLE_EVENTS
+        && receipt.source_observation_id == observation.source_observation_id
+        && observation.source_receipt_ref == receipt.source_receipt_id
+        && observation.source_instance_id == receipt.source_instance_id
+        && observation.source_revision == receipt.source_revision
+        && observation.source_record_identity == receipt.source_record_identity
+        && observation.adapter_revision == receipt.adapter_revision
+        && observation.correlation.adapter_revision == receipt.adapter_revision
+        && observation.correlation.adapter_manifest_ref == receipt.adapter_manifest_ref
+        && observation.source_role == SourceRole::Tool
+        && observation.content_trust == ContentTrust::UntrustedSourceContent
+        && observation.capture_completeness == CaptureCompleteness::Partial
+        && receipt.capture_completeness == CaptureCompleteness::Partial
+        && observation.correlation.admission == CorrelationAdmission::Unavailable
+        && observation.correlation.strong_gate_receipt_ref.is_none()
+        && observation.correlation.partial_correlation_ref.is_none()
+        && observation
+            .correlation
+            .possible_duplicate_group_id
+            .is_none()
+        && observation.scope_effect_claims.is_empty()
+        && observation.source_local_evidence.is_none()
+        && receipt.lifecycle.is_none()
+        && receipt.task_id.is_none()
+        && receipt.repository_instance_id.is_none()
+        && receipt.worktree_instance_id.is_none()
+}
+
 fn capture_item_manifest_matches(
     item: &evertrace_store::ReconciliationWorkItem,
     report: &HostProbeReport,
@@ -5101,6 +5145,41 @@ fn resolve_capture_report(
     current: Option<&HostProbeReport>,
     runtime: &RuntimeSnapshot,
 ) -> Option<HostProbeReport> {
+    if item.dependencies.iter().any(|dependency| {
+        matches!(&dependency.payload, JournalPayload::SourceReceiptRecorded(receipt)
+            if receipt.source_kind == evertrace_domain::evidence::EvidenceSourceKind::Other
+                && receipt.source_revision.as_str() == evertrace_capture::process_source::SOURCE_REVISION
+                && receipt.adapter_revision == evertrace_capture::process_source::ADAPTER_REVISION
+                && receipt.eligible_event_manifest_ref == evertrace_capture::process_source::ELIGIBLE_EVENTS)
+    }) {
+        if item.target_kind != DirtyTargetKind::PhysicalNormalization {
+            return None;
+        }
+        let mut observed = false;
+        for dependency in &item.dependencies {
+            let JournalPayload::SourceObservationRecorded(observation) = &dependency.payload else {
+                continue;
+            };
+            let receipt = item.dependencies.iter().find_map(|dependency| match &dependency.payload {
+                JournalPayload::SourceReceiptRecorded(receipt)
+                    if receipt.source_receipt_id == observation.source_receipt_ref => Some(receipt),
+                _ => None,
+            })?;
+            if !is_unqualified_process_source(observation, receipt) {
+                return None;
+            }
+            observed = true;
+        }
+        if !observed {
+            return None;
+        }
+        let report = HostProbeReport::unobserved_source_contract(
+            &evertrace_capture::process_source::adapter_version(),
+            evertrace_capture::process_source::ELIGIBLE_EVENTS,
+        )
+        .ok()?;
+        return capture_item_manifest_matches(item, &report).then_some(report);
+    }
     if let Some(report) = current.filter(|report| capture_item_manifest_matches(item, report)) {
         return Some(report.clone());
     }

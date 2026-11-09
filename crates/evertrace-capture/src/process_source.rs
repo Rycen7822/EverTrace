@@ -20,9 +20,19 @@ use crate::CaptureRecordInput;
 
 const PREFIX: &[u8] = b"{\"format\":\"process-trial-source-v2\",";
 const FORMAT: &str = "process-trial-source-v2";
-const MANIFEST: &str =
+pub const SOURCE_REVISION: &str =
     "process-trial-source-v2:79ba882813eea69af109ace6016462953d63b7c97677392d6673c96bebeee9d6";
+pub const ADAPTER_REVISION: u32 = 3;
+pub const ELIGIBLE_EVENTS: &str = "process-trial-source-events-v2";
 const LIMIT: usize = 65_536;
+
+pub fn adapter_version() -> String {
+    format!("{SOURCE_REVISION}:capture-{ADAPTER_REVISION}")
+}
+
+pub fn is_record(raw: &[u8]) -> bool {
+    raw.starts_with(PREFIX)
+}
 
 #[derive(Debug, thiserror::Error)]
 #[error("process source record or live peer is unavailable")]
@@ -153,7 +163,7 @@ fn peer(header: &Header, executable: &Path, snapshot: &Path) -> Result<()> {
     if !metadata.is_file() || metadata.uid() != own_uid || metadata.mode() & 0o022 != 0 {
         return Err(ProcessSourceError);
     }
-    if format!("{FORMAT}:{:x}", Sha256::digest(bytes(&script)?)) != MANIFEST {
+    if format!("{FORMAT}:{:x}", Sha256::digest(bytes(&script)?)) != SOURCE_REVISION {
         return Err(ProcessSourceError);
     }
     for (flag, expected) in [
@@ -234,9 +244,12 @@ fn physical_scope(header: &Header) -> Result<String> {
 
 /// The same Hook transport calls this only for the recorder's exact original version signature.
 /// No peer/header can select Observed, Complete, an active binding, or an Exact admission.
-pub fn record(raw: &[u8], snapshot: &Path) -> Result<Option<CaptureRecordInput>> {
-    if !raw.starts_with(PREFIX) {
-        return Ok(None);
+pub fn record(raw: &[u8], snapshot: &Path, manifest_ref: &str) -> Result<CaptureRecordInput> {
+    if !is_record(raw)
+        || manifest_ref.len() != 64
+        || !manifest_ref.bytes().all(|value| value.is_ascii_hexdigit())
+    {
+        return Err(ProcessSourceError);
     }
     if raw.len() > LIMIT {
         return Err(ProcessSourceError);
@@ -306,8 +319,8 @@ pub fn record(raw: &[u8], snapshot: &Path) -> Result<Option<CaptureRecordInput>>
         physical_execution_ordinal: None,
         pairing_role: role,
         field_provenance: vec![],
-        adapter_manifest_ref: MANIFEST.into(),
-        adapter_revision: 2,
+        adapter_manifest_ref: manifest_ref.into(),
+        adapter_revision: ADAPTER_REVISION,
         strong_gate_receipt_ref: None,
         admission: CorrelationAdmission::Unavailable,
         partial_correlation_ref: None,
@@ -318,7 +331,7 @@ pub fn record(raw: &[u8], snapshot: &Path) -> Result<Option<CaptureRecordInput>>
     if let Ok(scope) = physical_scope(&header) {
         let evidence = source_observation_id(
             &SourceInstanceId::parse(&source_instance_id).map_err(|_| ProcessSourceError)?,
-            &SourceRevision::parse(MANIFEST).map_err(|_| ProcessSourceError)?,
+            &SourceRevision::parse(SOURCE_REVISION).map_err(|_| ProcessSourceError)?,
             &SourceRecordIdentity::parse(&header.event_key).map_err(|_| ProcessSourceError)?,
         )
         .map_err(|_| ProcessSourceError)?;
@@ -344,11 +357,11 @@ pub fn record(raw: &[u8], snapshot: &Path) -> Result<Option<CaptureRecordInput>>
         })
         .collect();
     }
-    Ok(Some(CaptureRecordInput {
+    Ok(CaptureRecordInput {
         spool_record_id: Some(header.event_key.clone()),
         source_observation_id_hint: None,
         source_instance_id,
-        source_revision: MANIFEST.into(),
+        source_revision: SOURCE_REVISION.into(),
         source_record_identity: Some(header.event_key),
         identity_strength: Some(IdentityStrength::StableNative),
         source_kind: EvidenceSourceKind::Other,
@@ -376,14 +389,14 @@ pub fn record(raw: &[u8], snapshot: &Path) -> Result<Option<CaptureRecordInput>>
         content_trust: ContentTrust::UntrustedSourceContent,
         capture_completeness: CaptureCompleteness::Partial,
         surface_eligible: true,
-        adapter_revision: 2,
-        adapter_manifest_ref: MANIFEST.into(),
-        eligible_event_manifest_ref: "process-trial-source-events-v2".into(),
+        adapter_revision: ADAPTER_REVISION,
+        adapter_manifest_ref: manifest_ref.into(),
+        eligible_event_manifest_ref: ELIGIBLE_EVENTS.into(),
         parser_revision: 2,
         canonicalization_revision: 1,
         // The original clock value remains in raw bytes; its uncertainty is not qualified.
         event_time_us: None,
         event_time_provenance: None,
         raw_payload: raw.to_vec(),
-    }))
+    })
 }

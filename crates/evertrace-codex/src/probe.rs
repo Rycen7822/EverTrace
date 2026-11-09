@@ -407,6 +407,25 @@ pub struct GateQualification {
 }
 
 impl HostProbeReport {
+    /// A content-bound contract, not evidence of any observed host capability.
+    /// Both the source producer and its weak-normalization consumer compile this
+    /// same manifest. This never enables capture, correlation, policy or recovery.
+    pub fn unobserved_source_contract(
+        adapter_revision: &str,
+        eligible_event_manifest_ref: &str,
+    ) -> Result<Self, ProbeError> {
+        Self::evaluate(
+            &ProbeContext {
+                adapter_kind: AdapterKind::Other,
+                adapter_revision: adapter_revision.into(),
+                observed_host_version_range: "unobserved".into(),
+                eligible_event_manifest_ref: eligible_event_manifest_ref.into(),
+                evidence_source: EvidenceSourceKind::NoHostEvidence,
+            },
+            &ProbeEvidence::empty(),
+        )
+    }
+
     pub fn with_inventory_host(
         mut self,
         observation: crate::inventory::InventoryHostObservation,

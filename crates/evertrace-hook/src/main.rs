@@ -66,9 +66,18 @@ fn run() -> Result<(), ()> {
     match mode.to_str() {
         Some("--runtime-snapshot") => {
             let path = Path::new(&path);
-            if let Some(record) =
-                evertrace_capture::process_source::record(&bytes, path).map_err(|_| ())?
-            {
+            if evertrace_capture::process_source::is_record(&bytes) {
+                let contract = evertrace_codex::probe::HostProbeReport::unobserved_source_contract(
+                    &evertrace_capture::process_source::adapter_version(),
+                    evertrace_capture::process_source::ELIGIBLE_EVENTS,
+                )
+                .map_err(|_| ())?;
+                let record = evertrace_capture::process_source::record(
+                    &bytes,
+                    path,
+                    &contract.manifest().adapter_manifest_id,
+                )
+                .map_err(|_| ())?;
                 let snapshot = RuntimeSnapshot::load(path).map_err(|_| ())?;
                 let mut runtime = CaptureRuntime::open_for_admission(snapshot).map_err(|_| ())?;
                 runtime.capture(record).map_err(|_| ())?;
