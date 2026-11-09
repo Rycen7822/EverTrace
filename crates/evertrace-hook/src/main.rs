@@ -507,25 +507,24 @@ fn launch(root: &Path, bytes: &[u8], started: Instant) -> Result<(), ()> {
         child: None,
         snapshot: invocation,
     };
-    let normalized;
-    let bytes = if !binding_mode && let Some(native) = native_input {
-        normalized = CaptureHookInput::from_native(native, generation.generation)
-            .map_err(|_| ())?
-            .to_json()
-            .map_err(|_| ())?;
-        normalized.as_slice()
+    let normalized = if !binding_mode && let Some(native) = native_input {
+        Some(CaptureHookInput::from_native(native, generation.generation).map_err(|_| ())?)
     } else if let Some(submission) = submission {
-        normalized = CaptureHookInput::from_submission(submission, generation.generation)
-            .map_err(|_| ())?
-            .to_json()
-            .map_err(|_| ())?;
-        normalized.as_slice()
+        Some(CaptureHookInput::from_submission(submission, generation.generation).map_err(|_| ())?)
     } else if let Some(session_start) = session_start {
-        normalized = CaptureHookInput::from_session_start(session_start, generation.generation)
-            .map_err(|_| ())?
-            .to_json()
-            .map_err(|_| ())?;
-        normalized.as_slice()
+        Some(
+            CaptureHookInput::from_session_start(session_start, generation.generation)
+                .map_err(|_| ())?,
+        )
+    } else {
+        None
+    };
+    let encoded;
+    let bytes = if let Some(mut normalized) = normalized {
+        // Typed decoding supplies routing metadata, not replacement source bytes.
+        normalized.payload = std::str::from_utf8(bytes).map_err(|_| ())?.to_owned();
+        encoded = normalized.to_json().map_err(|_| ())?;
+        encoded.as_slice()
     } else {
         bytes
     };
