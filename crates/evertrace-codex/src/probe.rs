@@ -1135,6 +1135,7 @@ fn normalization_receipt(
             && !observation.host_lane_key.is_empty()
             && !observation.canonical_event_family.is_empty()
             && !observation.native_request_id.is_empty()
+            && observation.physical_execution_ordinal != 0
     }) && evidence.observations.iter().collect::<BTreeSet<_>>().len()
         == evidence.observations.len();
     let reason = if !valid_summary(&summary) || !observations_valid {
