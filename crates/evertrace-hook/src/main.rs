@@ -161,7 +161,7 @@ fn observe_host_goal(snapshot: &Path, socket: &Path, thread: &str) -> Result<(),
         return Ok(());
     };
     let report = evertrace_codex::probe::HostProbeReport::unobserved_source_contract(
-        &evertrace_capture::goal_source::adapter_version(),
+        &observation.adapter_version(),
         evertrace_capture::goal_source::ELIGIBLE_EVENTS,
     )
     .map_err(|_| ())?;

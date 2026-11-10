@@ -222,7 +222,7 @@ fn source_candidate(
     {
         return None;
     }
-    if observation.source_revision.as_str() == evertrace_capture::goal_source::SOURCE_REVISION {
+    if evertrace_capture::goal_source::is_source_revision(observation.source_revision.as_str()) {
         let (receipt, _) = current.source_receipt(observation.source_receipt_ref)?;
         if receipt.identity_domain != evertrace_capture::goal_source::IDENTITY_DOMAIN
             || receipt.source_ref != format!("native-host-goal:{}", receipt.source_session_ref)
@@ -573,7 +573,7 @@ impl ControlledRunResolver {
     ) -> Result<ControlledRunCommand, AutoresearchError> {
         let facts = ControlledFacts::from_snapshot(snapshot)?;
         if facts.observations.get(&source).is_some_and(|value| {
-            value.source_revision.as_str() == evertrace_capture::goal_source::SOURCE_REVISION
+            evertrace_capture::goal_source::is_source_revision(value.source_revision.as_str())
         }) {
             return self.resolve_root_goal(snapshot, &facts, source, context, goal_key_dir);
         }
@@ -618,7 +618,8 @@ impl ControlledRunResolver {
             .get(&source)
             .ok_or(AutoresearchError::EvidenceIncomplete)?;
         let report = evertrace_codex::probe::HostProbeReport::unobserved_source_contract(
-            &goal_source::adapter_version(),
+            &goal_source::adapter_version(receipt.source_revision.as_str())
+                .map_err(|_| AutoresearchError::UntrustedRunEvidence)?,
             goal_source::ELIGIBLE_EVENTS,
         )
         .map_err(|_| AutoresearchError::UntrustedRunEvidence)?;

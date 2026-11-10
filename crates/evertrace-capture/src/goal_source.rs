@@ -35,8 +35,24 @@ pub const IDENTITY_DOMAIN: &str = "native-host-goal-v1";
 pub struct GoalSourceError;
 type Result<T> = std::result::Result<T, GoalSourceError>;
 
-pub fn adapter_version() -> String {
-    format!("{SOURCE_REVISION}:capture-{ADAPTER_REVISION}")
+pub fn is_source_revision(revision: &str) -> bool {
+    revision == SOURCE_REVISION || revision == publisher_revision(true)
+}
+
+pub fn adapter_version(revision: &str) -> Result<String> {
+    if !is_source_revision(revision) {
+        return Err(GoalSourceError);
+    }
+    Ok(format!("{revision}:capture-{ADAPTER_REVISION}"))
+}
+
+fn publisher_revision(standalone: bool) -> String {
+    if standalone {
+        let (abi, _) = SOURCE_REVISION.rsplit_once(':').expect("fixed goal ABI");
+        format!("{abi}:{EXECUTION_BINARY_SHA256}")
+    } else {
+        SOURCE_REVISION.into()
+    }
 }
 
 #[derive(Deserialize)]
@@ -130,7 +146,7 @@ pub fn revalidate(
     bytes: &[u8],
     key: &DeviceKey,
 ) -> Result<RootGoal> {
-    if receipt.source_revision.as_str() != SOURCE_REVISION
+    if !is_source_revision(receipt.source_revision.as_str())
         || receipt.identity_domain != IDENTITY_DOMAIN
         || receipt.source_kind != EvidenceSourceKind::Other
         || receipt.protection_key_generation != key.generation()
@@ -159,6 +175,7 @@ pub fn revalidate(
     let current = read(&publisher.endpoint, &receipt.source_session_ref)?.ok_or(GoalSourceError)?;
     if current.instance != receipt.source_instance_id.as_str()
         || current.reference != receipt.source_ref
+        || current.revision != receipt.source_revision.as_str()
     {
         return Err(GoalSourceError);
     }
@@ -210,12 +227,7 @@ pub struct Observation {
     instance: String,
     reference: String,
     thread: String,
-}
-
-#[derive(Clone, Copy, Eq, PartialEq)]
-enum SourcePurpose {
-    Goal,
-    Events,
+    revision: String,
 }
 
 // One canonical fingerprint for the authorized source extension, including its whole stripped ELF.
@@ -304,11 +316,7 @@ impl Peer {
     }
 }
 
-fn verified_publisher(
-    stream: &UnixStream,
-    deadline: Instant,
-    purpose: SourcePurpose,
-) -> Result<Peer> {
+fn verified_publisher(stream: &UnixStream, deadline: Instant) -> Result<Peer> {
     let credentials = rustix::net::sockopt::socket_peercred(stream).map_err(|_| GoalSourceError)?;
     if credentials.uid.as_raw()
         != fs::metadata("/proc/self")
@@ -319,9 +327,6 @@ fn verified_publisher(
     }
     let pid = credentials.pid.as_raw_nonzero().get() as u32;
     let before = peer(pid)?;
-    if purpose == SourcePurpose::Goal && before.standalone {
-        return Err(GoalSourceError);
-    }
     let mut file = fs::File::open(format!("/proc/{pid}/exe")).map_err(|_| GoalSourceError)?;
     if file.metadata().map_err(|_| GoalSourceError)?.len() > 512 << 20 {
         return Err(GoalSourceError);
@@ -404,21 +409,6 @@ impl Publisher {
 }
 
 pub(crate) fn connect_publisher(path: &Path, deadline: Instant) -> Result<(UnixStream, Publisher)> {
-    connect_source(path, deadline, SourcePurpose::Goal)
-}
-
-pub(crate) fn connect_event_publisher(
-    path: &Path,
-    deadline: Instant,
-) -> Result<(UnixStream, Publisher)> {
-    connect_source(path, deadline, SourcePurpose::Events)
-}
-
-fn connect_source(
-    path: &Path,
-    deadline: Instant,
-    purpose: SourcePurpose,
-) -> Result<(UnixStream, Publisher)> {
     let parent = path.parent().ok_or(GoalSourceError)?;
     let confined = ConfinedRoot::open_owned_private(parent).map_err(|_| GoalSourceError)?;
     let locator = fs::symlink_metadata(path).map_err(|_| GoalSourceError)?;
@@ -444,7 +434,7 @@ fn connect_source(
     let stream = UnixStream::connect(&endpoint).map_err(|_| GoalSourceError)?;
     timeout(&stream, deadline)?;
     let publisher = Publisher {
-        peer: verified_publisher(&stream, deadline, purpose)?,
+        peer: verified_publisher(&stream, deadline)?,
         locator: path.to_path_buf(),
         confined,
         locator_identity: (locator.dev(), locator.ino()),
@@ -539,6 +529,7 @@ pub fn read(path: &Path, thread: &str) -> Result<Option<Observation>> {
     }
     Ok(Some(Observation {
         raw,
+        revision: publisher_revision(publisher.execution_receipts()),
         instance: publisher.instance("host-goal")?,
         reference: goal.root_ref(),
         thread: goal.thread_id,
@@ -546,12 +537,16 @@ pub fn read(path: &Path, thread: &str) -> Result<Option<Observation>> {
 }
 
 impl Observation {
+    pub fn adapter_version(&self) -> String {
+        format!("{}:capture-{ADAPTER_REVISION}", self.revision)
+    }
+
     pub(crate) fn into_record(self, manifest: &str) -> CaptureRecordInput {
         CaptureRecordInput {
             spool_record_id: None,
             source_observation_id_hint: None,
             source_instance_id: self.instance,
-            source_revision: SOURCE_REVISION.into(),
+            source_revision: self.revision,
             source_record_identity: None,
             identity_strength: Some(IdentityStrength::SynthesizedBestEffort),
             source_kind: EvidenceSourceKind::Other,

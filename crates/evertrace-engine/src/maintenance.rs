@@ -1915,8 +1915,9 @@ impl BackgroundScheduler {
             let native_goal = current
                 .source_observation(source)
                 .is_some_and(|(value, _)| {
-                    value.source_revision.as_str()
-                        == evertrace_capture::goal_source::SOURCE_REVISION
+                    evertrace_capture::goal_source::is_source_revision(
+                        value.source_revision.as_str(),
+                    )
                 });
             let resolution = if native_goal {
                 let resolver = resolver.clone();

@@ -616,7 +616,7 @@ impl From<crate::frame::SpoolFrameError> for CaptureError {
 }
 
 fn reject_caller_source(input: &CaptureRecordInput) -> Result<(), CaptureError> {
-    if input.source_revision == crate::goal_source::SOURCE_REVISION
+    if crate::goal_source::is_source_revision(&input.source_revision)
         || input.source_revision == crate::process_source::KERNEL_SOURCE_REVISION
         || input.source_revision == crate::host_events::SOURCE_REVISION
         || input.source_revision == crate::execution_source::SOURCE_REVISION

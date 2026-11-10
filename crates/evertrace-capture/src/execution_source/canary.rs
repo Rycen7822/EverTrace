@@ -60,7 +60,7 @@ impl Client {
         capture: &mut Capture,
     ) -> Result<Self> {
         let (stream, publisher) =
-            goal_source::connect_event_publisher(endpoint, deadline).map_err(|_| CanaryError)?;
+            goal_source::connect_publisher(endpoint, deadline).map_err(|_| CanaryError)?;
         if !publisher.execution_receipts() || !publisher.matches_executable(executable) {
             return Err(CanaryError);
         }

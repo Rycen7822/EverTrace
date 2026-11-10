@@ -401,7 +401,7 @@ pub fn relay(
 ) -> Result<()> {
     let deadline = Instant::now() + Duration::from_secs(3);
     let (stream, publisher) =
-        goal_source::connect_event_publisher(endpoint, deadline).map_err(|_| HostEventError)?;
+        goal_source::connect_publisher(endpoint, deadline).map_err(|_| HostEventError)?;
     // This is a connection-local capture epoch, never a physical execution/retry identity.
     let instance = format!(
         "{}:capture:{}",
