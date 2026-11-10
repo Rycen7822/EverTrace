@@ -146,22 +146,39 @@ pub(crate) fn verify_capture_frame_presented(
     {
         return Err(IngestError::CasMismatch);
     }
-    if body.source_revision.as_str() == evertrace_capture::host_events::SOURCE_REVISION {
-        let adapter_version = format!(
-            "{}:capture-{}",
-            evertrace_capture::host_events::SOURCE_REVISION,
-            body.parser_revision
-        );
-        let contract = evertrace_codex::probe::HostProbeReport::unobserved_source_contract(
-            &adapter_version,
+    let native_contract = if body.source_revision.as_str()
+        == evertrace_capture::host_events::SOURCE_REVISION
+    {
+        Some((
+            format!(
+                "{}:capture-{}",
+                evertrace_capture::host_events::SOURCE_REVISION,
+                body.parser_revision
+            ),
             evertrace_capture::host_events::ELIGIBLE_EVENTS,
-        )
-        .map_err(|_| IngestError::InvalidRecord)?;
-        if !evertrace_capture::host_events::record_matches(
-            &body,
-            &protected,
-            &contract.manifest().adapter_manifest_id,
-        ) {
+        ))
+    } else if body.source_revision.as_str() == evertrace_capture::execution_source::SOURCE_REVISION
+    {
+        Some((
+            evertrace_capture::execution_source::ADAPTER_VERSION.to_owned(),
+            evertrace_capture::execution_source::ELIGIBLE_EVENTS,
+        ))
+    } else {
+        None
+    };
+    if let Some((version, eligible)) = native_contract {
+        let contract =
+            evertrace_codex::probe::HostProbeReport::unobserved_source_contract(&version, eligible)
+                .map_err(|_| IngestError::InvalidRecord)?;
+        let manifest = &contract.manifest().adapter_manifest_id;
+        let valid = if body.source_revision.as_str()
+            == evertrace_capture::execution_source::SOURCE_REVISION
+        {
+            evertrace_capture::execution_source::record_matches(&body, &protected, manifest)
+        } else {
+            evertrace_capture::host_events::record_matches(&body, &protected, manifest)
+        };
+        if !valid {
             return Err(IngestError::InvalidRecord);
         }
     }

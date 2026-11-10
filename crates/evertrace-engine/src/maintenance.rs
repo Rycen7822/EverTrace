@@ -2522,10 +2522,13 @@ impl BackgroundScheduler {
                     let weak_process =
                         physical && is_unqualified_process_source(observation, receipt);
                     let weak_live = physical
-                        && evertrace_capture::host_events::is_unqualified_execution(
+                        && (evertrace_capture::host_events::is_unqualified_execution(
                             observation,
                             receipt,
-                        );
+                        ) || evertrace_capture::execution_source::is_unqualified_execution(
+                            observation,
+                            receipt,
+                        ));
                     if current_manifest.is_none()
                         && (!physical
                             || retained_manifests
@@ -5170,7 +5173,7 @@ fn resolve_capture_report(
     current: Option<&HostProbeReport>,
     runtime: &RuntimeSnapshot,
 ) -> Option<HostProbeReport> {
-    if let Some(revision) =
+    if let Some((version, eligible)) =
         item.dependencies
             .iter()
             .find_map(|dependency| match &dependency.payload {
@@ -5180,7 +5183,26 @@ fn resolve_capture_report(
                         && matches!(receipt.parser_revision, 4 | 5)
                         && receipt.adapter_revision == receipt.parser_revision =>
                 {
-                    Some(receipt.parser_revision)
+                    Some((
+                        format!(
+                            "{}:capture-{}",
+                            evertrace_capture::host_events::SOURCE_REVISION,
+                            receipt.parser_revision
+                        ),
+                        evertrace_capture::host_events::ELIGIBLE_EVENTS,
+                    ))
+                }
+                JournalPayload::SourceReceiptRecorded(receipt)
+                    if receipt.source_revision.as_str()
+                        == evertrace_capture::execution_source::SOURCE_REVISION
+                        && receipt.parser_revision
+                            == evertrace_capture::execution_source::REVISION
+                        && receipt.adapter_revision == receipt.parser_revision =>
+                {
+                    Some((
+                        evertrace_capture::execution_source::ADAPTER_VERSION.to_owned(),
+                        evertrace_capture::execution_source::ELIGIBLE_EVENTS,
+                    ))
                 }
                 _ => None,
             })
@@ -5206,7 +5228,12 @@ fn resolve_capture_report(
                         }
                         _ => None,
                     })?;
-            if !evertrace_capture::host_events::is_unqualified_execution(observation, receipt) {
+            if !evertrace_capture::host_events::is_unqualified_execution(observation, receipt)
+                && !evertrace_capture::execution_source::is_unqualified_execution(
+                    observation,
+                    receipt,
+                )
+            {
                 return None;
             }
             observed = true;
@@ -5214,15 +5241,7 @@ fn resolve_capture_report(
         if !observed {
             return None;
         }
-        let version = format!(
-            "{}:capture-{revision}",
-            evertrace_capture::host_events::SOURCE_REVISION
-        );
-        let report = HostProbeReport::unobserved_source_contract(
-            &version,
-            evertrace_capture::host_events::ELIGIBLE_EVENTS,
-        )
-        .ok()?;
+        let report = HostProbeReport::unobserved_source_contract(&version, eligible).ok()?;
         return capture_item_manifest_matches(item, &report).then_some(report);
     }
     if item.dependencies.iter().any(|dependency| {

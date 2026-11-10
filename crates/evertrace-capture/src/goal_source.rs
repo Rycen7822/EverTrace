@@ -212,12 +212,23 @@ pub struct Observation {
     thread: String,
 }
 
+#[derive(Clone, Copy, Eq, PartialEq)]
+enum SourcePurpose {
+    Goal,
+    Events,
+}
+
+// One canonical fingerprint for the authorized source extension, including its whole stripped ELF.
+const EXECUTION_BINARY_SHA256: &str =
+    "87b73337e44523eba731eb9326c96dbcc8a565657cb7de3ee3e36667c258498e";
+
 #[derive(Eq, PartialEq)]
 struct Peer {
     pid: u32,
     start: String,
     namespace: u64,
     executable: (u64, u64),
+    standalone: bool,
     endpoint: std::path::PathBuf,
 }
 
@@ -231,7 +242,7 @@ fn peer(pid: u32) -> Result<Peer> {
         .map_err(|_| GoalSourceError)?;
     let args = argv.split(|byte| *byte == 0).collect::<Vec<_>>();
     if argv.len() > LIMIT
-        || args.get(1).copied() != Some(b"app-server".as_slice())
+        || !matches!(args.get(1).copied(), Some(b"app-server" | b"--listen"))
         || args.contains(&b"proxy".as_slice())
     {
         return Err(GoalSourceError);
@@ -262,6 +273,7 @@ fn peer(pid: u32) -> Result<Peer> {
         start,
         namespace,
         executable: (metadata.dev(), metadata.ino()),
+        standalone: args.get(1).copied() == Some(b"--listen".as_slice()),
         endpoint,
     })
 }
@@ -292,7 +304,11 @@ impl Peer {
     }
 }
 
-fn verified_publisher(stream: &UnixStream, deadline: Instant) -> Result<Peer> {
+fn verified_publisher(
+    stream: &UnixStream,
+    deadline: Instant,
+    purpose: SourcePurpose,
+) -> Result<Peer> {
     let credentials = rustix::net::sockopt::socket_peercred(stream).map_err(|_| GoalSourceError)?;
     if credentials.uid.as_raw()
         != fs::metadata("/proc/self")
@@ -303,6 +319,9 @@ fn verified_publisher(stream: &UnixStream, deadline: Instant) -> Result<Peer> {
     }
     let pid = credentials.pid.as_raw_nonzero().get() as u32;
     let before = peer(pid)?;
+    if purpose == SourcePurpose::Goal && before.standalone {
+        return Err(GoalSourceError);
+    }
     let mut file = fs::File::open(format!("/proc/{pid}/exe")).map_err(|_| GoalSourceError)?;
     if file.metadata().map_err(|_| GoalSourceError)?.len() > 512 << 20 {
         return Err(GoalSourceError);
@@ -319,9 +338,12 @@ fn verified_publisher(stream: &UnixStream, deadline: Instant) -> Result<Peer> {
         }
         digest.update(&buffer[..count]);
     }
-    if format!("{digest:x}", digest = digest.finalize())
-        != SOURCE_REVISION.rsplit(':').next().ok_or(GoalSourceError)?
-    {
+    let expected = if before.standalone {
+        EXECUTION_BINARY_SHA256
+    } else {
+        SOURCE_REVISION.rsplit(':').next().ok_or(GoalSourceError)?
+    };
+    if format!("{digest:x}", digest = digest.finalize()) != expected {
         return Err(GoalSourceError);
     }
     Ok(before)
@@ -338,6 +360,10 @@ pub(crate) struct Publisher {
 }
 
 impl Publisher {
+    pub(crate) fn execution_receipts(&self) -> bool {
+        self.peer.standalone
+    }
+
     pub(crate) fn instance(&self, prefix: &str) -> Result<String> {
         self.peer.instance(prefix)
     }
@@ -370,6 +396,21 @@ impl Publisher {
 }
 
 pub(crate) fn connect_publisher(path: &Path, deadline: Instant) -> Result<(UnixStream, Publisher)> {
+    connect_source(path, deadline, SourcePurpose::Goal)
+}
+
+pub(crate) fn connect_event_publisher(
+    path: &Path,
+    deadline: Instant,
+) -> Result<(UnixStream, Publisher)> {
+    connect_source(path, deadline, SourcePurpose::Events)
+}
+
+fn connect_source(
+    path: &Path,
+    deadline: Instant,
+    purpose: SourcePurpose,
+) -> Result<(UnixStream, Publisher)> {
     let parent = path.parent().ok_or(GoalSourceError)?;
     let confined = ConfinedRoot::open_owned_private(parent).map_err(|_| GoalSourceError)?;
     let locator = fs::symlink_metadata(path).map_err(|_| GoalSourceError)?;
@@ -395,7 +436,7 @@ pub(crate) fn connect_publisher(path: &Path, deadline: Instant) -> Result<(UnixS
     let stream = UnixStream::connect(&endpoint).map_err(|_| GoalSourceError)?;
     timeout(&stream, deadline)?;
     let publisher = Publisher {
-        peer: verified_publisher(&stream, deadline)?,
+        peer: verified_publisher(&stream, deadline, purpose)?,
         locator: path.to_path_buf(),
         confined,
         locator_identity: (locator.dev(), locator.ino()),

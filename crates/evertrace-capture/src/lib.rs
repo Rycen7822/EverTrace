@@ -6,6 +6,7 @@
 pub mod admission;
 pub mod cas;
 pub mod confined_read;
+pub mod execution_source;
 pub mod frame;
 pub mod goal_source;
 pub mod host_events;

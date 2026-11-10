@@ -274,7 +274,7 @@ impl CaptureRuntime {
 
     fn capture_inner(
         &mut self,
-        input: CaptureRecordInput,
+        mut input: CaptureRecordInput,
         pending: Option<RecoveryPreflightCandidate>,
         isolated: Option<(CommandId, &str)>,
         isolated_segment: &mut Option<SealedSegment>,
@@ -330,6 +330,12 @@ impl CaptureRuntime {
         }
         let key = DeviceKeyStore::new(self.snapshot.device_key_dir.clone()).load()?;
         let protected = protect(&input.raw_payload, &key)?;
+        if input.source_revision == crate::execution_source::SOURCE_REVISION
+            && let Some(correlation) =
+                crate::execution_source::protected_correlation(&input, protected.protected_bytes())
+        {
+            input.correlation = correlation;
+        }
         // Lock order is maintenance fence, then CAS parent, then spool. The CAS
         // parent lock is released before spool acquisition, so purge never
         // observes a published blob before its referencing frame is durable.
@@ -613,6 +619,7 @@ fn reject_caller_source(input: &CaptureRecordInput) -> Result<(), CaptureError> 
     if input.source_revision == crate::goal_source::SOURCE_REVISION
         || input.source_revision == crate::process_source::KERNEL_SOURCE_REVISION
         || input.source_revision == crate::host_events::SOURCE_REVISION
+        || input.source_revision == crate::execution_source::SOURCE_REVISION
     {
         return Err(CaptureError::InvalidInput);
     }

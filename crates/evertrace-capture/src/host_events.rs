@@ -63,7 +63,9 @@ struct EventItem {
     status: String,
 }
 
-fn id_present<'de, D: Deserializer<'de>>(deserializer: D) -> std::result::Result<bool, D::Error> {
+pub(crate) fn id_present<'de, D: Deserializer<'de>>(
+    deserializer: D,
+) -> std::result::Result<bool, D::Error> {
     IgnoredAny::deserialize(deserializer)?;
     Ok(true)
 }
@@ -129,10 +131,7 @@ fn native_uuid(value: &str) -> bool {
     uuid::Uuid::parse_str(value).is_ok_and(|id| id.to_string() == value)
 }
 
-fn native_coordinates<'a>(
-    instance: &'a str,
-    reference: &'a str,
-) -> Option<(&'a str, [&'a str; 3])> {
+pub(crate) fn peer_instance(instance: &str) -> Option<&str> {
     let (peer, capture) = instance.rsplit_once(":capture:")?;
     if !native_uuid(capture) {
         return None;
@@ -151,6 +150,14 @@ fn native_coordinates<'a>(
     if parts.next().is_some() {
         return None;
     }
+    Some(peer)
+}
+
+fn native_coordinates<'a>(
+    instance: &'a str,
+    reference: &'a str,
+) -> Option<(&'a str, [&'a str; 3])> {
+    let peer = peer_instance(instance)?;
     let mut fields = reference.strip_prefix("native-user-shell:")?.split(':');
     let ids = [fields.next()?, fields.next()?, fields.next()?];
     if !ids.iter().all(|id| native_uuid(id))
@@ -375,10 +382,15 @@ fn blocked(error: &WireError) -> bool {
 
 /// Explicit source connection only. Never start a host, send hidden requests or poll work state.
 /// Native JSONRPC text is forwarded unchanged, with stdio's newline framing.
-pub fn relay(snapshot: RuntimeSnapshot, endpoint: &Path, manifest: &str) -> Result<()> {
+pub fn relay(
+    snapshot: RuntimeSnapshot,
+    endpoint: &Path,
+    manifest: &str,
+    execution_manifest: &str,
+) -> Result<()> {
     let deadline = Instant::now() + Duration::from_secs(3);
     let (stream, publisher) =
-        goal_source::connect_publisher(endpoint, deadline).map_err(|_| HostEventError)?;
+        goal_source::connect_event_publisher(endpoint, deadline).map_err(|_| HostEventError)?;
     // This is a connection-local capture epoch, never a physical execution/retry identity.
     let instance = format!(
         "{}:capture:{}",
@@ -439,7 +451,21 @@ pub fn relay(snapshot: RuntimeSnapshot, endpoint: &Path, manifest: &str) -> Resu
                         .map_err(|_| HostEventError)?;
                     stdout.write_all(b"\n").map_err(|_| HostEventError)?;
                     stdout.flush().map_err(|_| HostEventError)?;
-                    if let Some(observed) = observation(&text, &instance, sequence, manifest) {
+                    let execution = publisher
+                        .execution_receipts()
+                        .then(|| {
+                            crate::execution_source::input(
+                                &text,
+                                &instance,
+                                sequence,
+                                execution_manifest,
+                            )
+                        })
+                        .flatten()
+                        .map(Observation);
+                    if let Some(observed) =
+                        execution.or_else(|| observation(&text, &instance, sequence, manifest))
+                    {
                         if publisher.revalidate().is_ok()
                             && let Some(runtime) = &mut runtime
                         {
