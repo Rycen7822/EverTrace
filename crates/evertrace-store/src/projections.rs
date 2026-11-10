@@ -1443,6 +1443,7 @@ fn reconciliation_artifact_item(
     };
     collect_artifact_outages(snapshot, &session_ref, &source_ref, &mut dependencies)?;
     let mut affected_cohort = false;
+    let mut seen_cohorts = BTreeSet::new();
     for (receipt, _) in snapshot.source_receipts() {
         if receipt.source_session_ref != session_ref
             || receipt.source_ref != source_ref
@@ -1451,14 +1452,16 @@ fn reconciliation_artifact_item(
         {
             continue;
         }
-        if snapshot
-            .source_observation(receipt.source_observation_id)
-            .is_some()
-        {
-            dependencies.insert(source_observation_dependency(
-                snapshot,
-                receipt.source_observation_id,
-            )?)?;
+        if let Some(lifecycle) = &receipt.lifecycle {
+            let key = (
+                &lifecycle.host_session_id,
+                &lifecycle.agent_id,
+                &lifecycle.host_lane_key,
+                source_incarnation_ref(receipt),
+            );
+            if !seen_cohorts.insert(key) {
+                continue;
+            }
         }
         let (_, has_current_lane_receipt, _) =
             collect_capture_dependencies(snapshot, receipt, &mut dependencies)?;
@@ -1943,36 +1946,13 @@ fn collect_observation_relations(
             dependencies.insert(dependency)?;
         }
     }
-    let occurrence_needles = occurrence_ids
+    let needles = occurrence_ids
         .iter()
         .map(ToString::to_string)
         .collect::<Vec<_>>();
-    let mut operations = BTreeMap::<_, NamedCurrentDependency>::new();
-    for row in rows_referencing(snapshot, "operation", &occurrence_needles) {
-        let dependency = current_payload(row)?;
-        let JournalPayload::OperationDerived(value) = &dependency.payload else {
-            return Err(StoreError::StoreCorrupt);
-        };
-        if !occurrence_ids.contains(&value.host_occurrence_id) {
-            continue;
-        }
-        let replace = match operations.get(&value.operation_id) {
-            None => true,
-            Some(previous) => {
-                let JournalPayload::OperationDerived(current) = &previous.payload else {
-                    unreachable!()
-                };
-                if current.operation_revision == value.operation_revision && current != value {
-                    return Err(StoreError::StoreCorrupt);
-                }
-                (current.operation_revision, previous.source_event_seq)
-                    < (value.operation_revision, dependency.source_event_seq)
-            }
-        };
-        if replace {
-            operations.insert(value.operation_id, dependency);
-        }
-    }
+    let operations = current_operation_dependencies(snapshot, &needles, |operation| {
+        occurrence_ids.contains(&operation.host_occurrence_id)
+    })?;
     let operation_needles = operations
         .keys()
         .map(ToString::to_string)
@@ -1997,6 +1977,40 @@ fn collect_observation_relations(
     Ok(())
 }
 
+fn current_operation_dependencies(
+    snapshot: &CurrentFacts,
+    needles: &[String],
+    mut selected: impl FnMut(&evertrace_domain::evidence::Operation) -> bool,
+) -> Result<BTreeMap<OperationId, NamedCurrentDependency>, StoreError> {
+    let mut operations = BTreeMap::<_, NamedCurrentDependency>::new();
+    for row in rows_referencing(snapshot, "operation", needles) {
+        let dependency = current_payload(row)?;
+        let JournalPayload::OperationDerived(value) = &dependency.payload else {
+            return Err(StoreError::StoreCorrupt);
+        };
+        if !selected(value) {
+            continue;
+        }
+        let replace = match operations.get(&value.operation_id) {
+            None => true,
+            Some(previous) => {
+                let JournalPayload::OperationDerived(current) = &previous.payload else {
+                    unreachable!()
+                };
+                if current.operation_revision == value.operation_revision && current != value {
+                    return Err(StoreError::StoreCorrupt);
+                }
+                (current.operation_revision, previous.source_event_seq)
+                    < (value.operation_revision, dependency.source_event_seq)
+            }
+        };
+        if replace {
+            operations.insert(value.operation_id, dependency);
+        }
+    }
+    Ok(operations)
+}
+
 fn collect_capture_dependencies(
     snapshot: &CurrentFacts,
     selected: &SourceReceipt,
@@ -2007,6 +2021,7 @@ fn collect_capture_dependencies(
     };
     let incarnation_ref = source_incarnation_ref(selected).ok_or(StoreError::StoreCorrupt)?;
     let mut cohort_observation_ids = BTreeSet::from([selected.source_observation_id]);
+    let mut manifests = BTreeSet::new();
     for (value, _) in snapshot.source_receipts() {
         if value.lifecycle.as_ref().is_some_and(|candidate| {
             candidate.host_session_id == lifecycle.host_session_id
@@ -2015,22 +2030,23 @@ fn collect_capture_dependencies(
                 && source_incarnation_ref(value).as_ref() == Some(&incarnation_ref)
         }) {
             cohort_observation_ids.insert(value.source_observation_id);
-            if snapshot
-                .source_observation(value.source_observation_id)
-                .is_some()
-            {
-                dependencies.insert(source_observation_dependency(
+            if manifests.insert(value.adapter_manifest_ref.clone()) {
+                dependencies.insert(source_receipt_dependency(
                     snapshot,
-                    value.source_observation_id,
+                    value.source_receipt_id,
                 )?)?;
+                if snapshot
+                    .source_observation(value.source_observation_id)
+                    .is_some()
+                {
+                    dependencies.insert(source_observation_dependency(
+                        snapshot,
+                        value.source_observation_id,
+                    )?)?;
+                }
             }
-            dependencies.insert(source_receipt_dependency(
-                snapshot,
-                value.source_receipt_id,
-            )?)?;
         }
     }
-    collect_observation_relations(snapshot, &cohort_observation_ids, dependencies)?;
     let mut import_watermark = 0;
     let mut receipt_event_seq = 0;
     let mut has_current_lane_receipt = false;
@@ -2087,7 +2103,19 @@ fn collect_capture_dependencies(
     // Source import can precede physical normalization. Materialized or unlinked
     // operations must wake this target without another source event.
     let mut operations = BTreeMap::new();
-    for dependency in dependencies.by_row_id.values() {
+    let needles = cohort_observation_ids
+        .iter()
+        .map(ToString::to_string)
+        .collect::<Vec<_>>();
+    for dependency in current_operation_dependencies(snapshot, &needles, |operation| {
+        operation
+            .input_source_observation_refs
+            .iter()
+            .chain(&operation.result_source_observation_refs)
+            .any(|id| cohort_observation_ids.contains(id))
+    })?
+    .into_values()
+    {
         let JournalPayload::OperationDerived(operation) = &dependency.payload else {
             continue;
         };
@@ -2213,6 +2241,81 @@ pub struct CurrentFacts {
 }
 
 impl CurrentFacts {
+    /// Compiler inputs from this exact read frontier, not a transaction's
+    /// bounded physical-correlation dependencies. No raw observation history
+    /// is copied merely because another operation shares an execution lane.
+    pub fn capture_reconciliation_inputs(
+        &self,
+        observation_ids: Vec<SourceObservationId>,
+    ) -> Result<impl Iterator<Item = Result<NamedCurrentDependency, StoreError>> + '_, StoreError>
+    {
+        let mut keys = BTreeSet::new();
+        let mut selected = observation_ids.into_iter().collect::<BTreeSet<_>>();
+        for id in &selected {
+            let (observation, _) = self
+                .source_observation(*id)
+                .ok_or(StoreError::StoreCorrupt)?;
+            let (receipt, _) = self
+                .source_receipt(observation.source_receipt_ref)
+                .ok_or(StoreError::StoreCorrupt)?;
+            if let Some(lifecycle) = &receipt.lifecycle {
+                keys.insert((
+                    lifecycle.host_session_id.clone(),
+                    lifecycle.agent_id.clone(),
+                    lifecycle.host_lane_key.clone(),
+                    source_incarnation_ref(receipt),
+                ));
+            }
+        }
+        for (receipt, _) in self.source_receipts() {
+            if receipt.lifecycle.as_ref().is_some_and(|lifecycle| {
+                keys.contains(&(
+                    lifecycle.host_session_id.clone(),
+                    lifecycle.agent_id.clone(),
+                    lifecycle.host_lane_key.clone(),
+                    source_incarnation_ref(receipt),
+                ))
+            }) {
+                selected.insert(receipt.source_observation_id);
+            }
+        }
+        let needles = selected.iter().map(ToString::to_string).collect::<Vec<_>>();
+        let operations = current_operation_dependencies(self, &needles, |operation| {
+            operation
+                .input_source_observation_refs
+                .iter()
+                .chain(&operation.result_source_observation_refs)
+                .any(|id| selected.contains(id))
+        })?;
+        let mut supports = BTreeMap::new();
+        for dependency in operations.values() {
+            let JournalPayload::OperationDerived(operation) = &dependency.payload else {
+                unreachable!()
+            };
+            if operation.execution_lane_id.is_none() {
+                let ids = operation
+                    .input_source_observation_refs
+                    .iter()
+                    .chain(&operation.result_source_observation_refs)
+                    .copied()
+                    .collect();
+                let mut physical = DependencyCollector::default();
+                collect_observation_relations(self, &ids, &mut physical)?;
+                supports.extend(physical.by_row_id);
+            }
+        }
+        supports.extend(
+            operations
+                .into_values()
+                .map(|dependency| (dependency.row_id.clone(), dependency)),
+        );
+        Ok(self
+            .source_receipts()
+            .filter(move |(receipt, _)| selected.contains(&receipt.source_observation_id))
+            .map(|(receipt, _)| source_receipt_dependency(self, receipt.source_receipt_id))
+            .chain(supports.into_values().map(Ok)))
+    }
+
     pub fn other_data_rows(&self) -> impl Iterator<Item = &ObjectRow> {
         self.other_rows
             .iter()

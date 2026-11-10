@@ -750,25 +750,27 @@ async fn reconcile_selected(
     } else {
         None
     };
+    let current = writer
+        .project_current(false)
+        .await
+        .map_err(map_reconcile_writer)?;
     let dirty_frontier = if let Some(context) = &selected_artifact_context {
         evertrace_store::ReconciliationFrontier {
             frontier: context.frontier,
             items: Vec::new(),
         }
     } else if let Some(observation_ids) = observation_ids {
-        // Selection needs current objects; the post-barrier below syncs indexes.
-        writer
-            .project_current(false)
-            .await
-            .map_err(map_reconcile_writer)?
+        current
             .reconciliation_frontier_for_observations(observation_ids)
             .map_err(|_| ReconcileError::Projection)?
     } else {
-        writer
+        current
             .reconciliation_frontier(input.max_items)
-            .await
-            .map_err(map_reconcile_writer)?
+            .map_err(|_| ReconcileError::Projection)?
     };
+    if current.frontier() != dirty_frontier.frontier {
+        return Err(ReconcileError::StaleFrontier);
+    }
     let quarantine_start = dirty_frontier.frontier.wrapping_add(
         u64::try_from(input.occurred_at_us).map_err(|_| ReconcileError::InvalidInput)?,
     );
@@ -915,9 +917,6 @@ async fn reconcile_selected(
         &mut progress,
         &mut remaining,
     )?;
-    let source_receipts = state.source_receipts.clone();
-    let groups = lane_groups(&source_receipts)?;
-    let lane_ids = lane_ids_for_groups(&groups, &state)?;
     let mut selected = dirty_rows(&dirty_frontier, remaining);
     remaining = remaining.saturating_sub(selected.len());
     let scopes = observe_execution_scopes(
@@ -937,6 +936,21 @@ async fn reconcile_selected(
         &mut payloads,
         &mut progress,
     )?;
+    let observations = state
+        .source_receipts
+        .iter()
+        .map(|receipt| receipt.source_observation_id)
+        .collect();
+    for dependency in current
+        .capture_reconciliation_inputs(observations)
+        .map_err(|_| ReconcileError::Projection)?
+    {
+        state.absorb_dependency(dependency.map_err(|_| ReconcileError::Projection)?)?;
+    }
+    progress.inspected_source_receipts = state.source_receipts.len();
+    let source_receipts = state.source_receipts.clone();
+    let groups = lane_groups(&source_receipts)?;
+    let lane_ids = lane_ids_for_groups(&groups, &state)?;
     selected.retain(|dirty| dirty.target_kind == DirtyTargetKind::CaptureReconciliation);
     reconcile_lane_groups(
         LaneReconcileContext {
@@ -1124,80 +1138,112 @@ impl CurrentCaptureState {
             }
         }
         for dependency in unique.into_values() {
-            match dependency.payload {
-                JournalPayload::SourceReceiptRecorded(value) => {
-                    state
-                        .source_receipt_event_seq
-                        .insert(value.source_observation_id, dependency.source_event_seq);
-                    state.source_receipts.push(*value);
-                }
-                JournalPayload::SourceObservationRecorded(value) => {
-                    state
-                        .observation_event_seq
-                        .insert(value.source_observation_id, dependency.source_event_seq);
-                    state
-                        .source_observations
-                        .insert(value.source_observation_id, *value);
-                }
-                JournalPayload::OperationDerived(value) => {
-                    // Dependencies retain immutable revisions. Current state must not depend on row order.
-                    match state
-                        .operations
-                        .iter_mut()
-                        .find(|current| current.operation_id == value.operation_id)
-                    {
-                        Some(current)
-                            if current.operation_revision == value.operation_revision
-                                && current != value.as_ref() =>
-                        {
-                            return Err(ReconcileError::Projection);
-                        }
-                        Some(current) if current.operation_revision < value.operation_revision => {
-                            *current = *value
-                        }
-                        Some(_) => (),
-                        None => state.operations.push(*value),
-                    }
-                }
-                JournalPayload::HostOccurrenceNormalized(value) => {
-                    state.host_occurrences.push(*value);
-                }
-                JournalPayload::ScopeEffectDerived(value) => state.scope_effects.push(*value),
-                JournalPayload::NormalizationWatermark(value) => {
-                    state
-                        .normalization_watermarks
-                        .insert(value.source_observation_id, value);
-                }
-                JournalPayload::ExecutionLaneRecorded(value) => {
-                    state
-                        .execution_lane_event_seq
-                        .insert(value.execution_lane_id, dependency.source_event_seq);
-                    state
-                        .execution_lanes
-                        .insert(value.execution_lane_id, *value);
-                }
-                JournalPayload::CaptureReceiptRecorded(value) => {
-                    state
-                        .capture_receipts
-                        .insert(value.execution_lane_id, *value);
-                }
-                JournalPayload::CaptureGapMarkerRecorded(value) => {
-                    state.capture_gaps.insert(value.marker_id.clone(), *value);
-                }
-                JournalPayload::CaptureOutageIntervalRecorded(value) => {
-                    state
-                        .capture_outages
-                        .insert(value.capture_outage_interval_id, *value);
-                }
-                JournalPayload::SourceCloseReconciliation(value) => {
-                    state
-                        .source_close_reconciliations
-                        .insert(value.reconciliation_ref.clone(), value);
-                }
-                _ => {}
-            }
+            state.absorb_dependency(dependency)?;
         }
         Ok(state)
+    }
+
+    fn absorb_dependency(
+        &mut self,
+        dependency: NamedCurrentDependency,
+    ) -> Result<(), ReconcileError> {
+        match dependency.payload {
+            JournalPayload::SourceReceiptRecorded(value) => {
+                if self
+                    .source_receipt_event_seq
+                    .insert(value.source_observation_id, dependency.source_event_seq)
+                    .is_none()
+                {
+                    self.source_receipts.push(*value);
+                }
+            }
+            JournalPayload::SourceObservationRecorded(value) => {
+                self.observation_event_seq
+                    .insert(value.source_observation_id, dependency.source_event_seq);
+                self.source_observations
+                    .insert(value.source_observation_id, *value);
+            }
+            JournalPayload::OperationDerived(value) => {
+                // Read inputs may name immutable revisions; current state never follows row order.
+                match self
+                    .operations
+                    .iter_mut()
+                    .find(|current| current.operation_id == value.operation_id)
+                {
+                    Some(current)
+                        if current.operation_revision == value.operation_revision
+                            && current != value.as_ref() =>
+                    {
+                        return Err(ReconcileError::Projection);
+                    }
+                    Some(current) if current.operation_revision < value.operation_revision => {
+                        *current = *value
+                    }
+                    Some(_) => (),
+                    None => self.operations.push(*value),
+                }
+            }
+            JournalPayload::HostOccurrenceNormalized(value) => {
+                match self
+                    .host_occurrences
+                    .iter_mut()
+                    .find(|current| current.host_occurrence_id == value.host_occurrence_id)
+                {
+                    Some(current)
+                        if current.normalization_revision < value.normalization_revision =>
+                    {
+                        *current = *value
+                    }
+                    Some(current)
+                        if current.normalization_revision == value.normalization_revision
+                            && current != value.as_ref() =>
+                    {
+                        return Err(ReconcileError::Projection);
+                    }
+                    Some(_) => (),
+                    None => self.host_occurrences.push(*value),
+                }
+            }
+            JournalPayload::ScopeEffectDerived(value) => {
+                if let Some(current) = self
+                    .scope_effects
+                    .iter()
+                    .find(|effect| effect.scope_effect_id == value.scope_effect_id)
+                {
+                    if current != value.as_ref() {
+                        return Err(ReconcileError::Projection);
+                    }
+                } else {
+                    self.scope_effects.push(*value);
+                }
+            }
+            JournalPayload::NormalizationWatermark(value) => {
+                self.normalization_watermarks
+                    .insert(value.source_observation_id, value);
+            }
+            JournalPayload::ExecutionLaneRecorded(value) => {
+                self.execution_lane_event_seq
+                    .insert(value.execution_lane_id, dependency.source_event_seq);
+                self.execution_lanes.insert(value.execution_lane_id, *value);
+            }
+            JournalPayload::CaptureReceiptRecorded(value) => {
+                self.capture_receipts
+                    .insert(value.execution_lane_id, *value);
+            }
+            JournalPayload::CaptureGapMarkerRecorded(value) => {
+                self.capture_gaps.insert(value.marker_id.clone(), *value);
+            }
+            JournalPayload::CaptureOutageIntervalRecorded(value) => {
+                self.capture_outages
+                    .insert(value.capture_outage_interval_id, *value);
+            }
+            JournalPayload::SourceCloseReconciliation(value) => {
+                self.source_close_reconciliations
+                    .insert(value.reconciliation_ref.clone(), value);
+            }
+            _ => {}
+        }
+        Ok(())
     }
 }
 

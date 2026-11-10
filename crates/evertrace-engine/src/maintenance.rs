@@ -109,7 +109,7 @@ const TOTAL_LIMIT: usize = 32;
 pub(crate) const PER_LANE_LIMIT: usize = 8;
 const CAPTURE_PROBE_LIMIT: usize = TOTAL_LIMIT + PER_LANE_LIMIT;
 const RETRY_DELAY: Duration = Duration::from_secs(5);
-const CAPTURE_ALGORITHM_REVISION: &str = "capture-reconciliation-v7";
+const CAPTURE_ALGORITHM_REVISION: &str = "capture-reconciliation-v8";
 const PROCEDURE_PROMOTION_JOB_KIND: &str = "procedure_cohort_promotion_v1";
 
 fn procedure_promotion_budget() -> JobBudget {
@@ -2655,13 +2655,17 @@ impl BackgroundScheduler {
             if current_active == 1 {
                 continue;
             }
-            let covered = view.jobs.iter().any(|job| {
+            let matching = |job: &DurableJob| {
                 job.kind == kind
                     && job.idempotency_key == idempotency_key
                     && job.target_watermark == item.source_event_seq
                     && job.target_generation == item.source_event_seq.max(1)
                     && capture_job_is_current(job, self.runtime.effective_config_hash)
-            });
+            };
+            let covered = view
+                .jobs
+                .iter()
+                .any(|job| matching(job) && !capture_stale_retry(job));
             if covered
                 || (!is_verified_importer_weak_normalization(
                     &snapshot,
@@ -2669,6 +2673,26 @@ impl BackgroundScheduler {
                     &item.target_id,
                 ) && resolve_capture_manifests(&item, report.as_ref(), &self.runtime).is_none())
             {
+                continue;
+            }
+            if let Some(previous) = view
+                .jobs
+                .iter()
+                .find(|job| matching(job) && capture_stale_retry(job))
+            {
+                // A failed optimistic write did not consume this input. Retry
+                // the existing durable job, not a new identity/global-frontier tuple.
+                let mut retry = previous.clone();
+                retry.state = JobStatus::Queued;
+                retry.attempt = retry
+                    .attempt
+                    .checked_add(1)
+                    .ok_or(BackgroundSchedulerError::Store)?;
+                retry.terminal = None;
+                retry.lease_until_us = None;
+                retry.backoff_until_us =
+                    Some(occurred_at_us.saturating_add(RETRY_DELAY.as_micros() as i64));
+                capture_jobs.push(retry);
                 continue;
             }
             capture_jobs.push(DurableJob {
@@ -3931,10 +3955,12 @@ impl BackgroundScheduler {
             .jobs
             .iter()
             .filter(|job| {
-                matches!(
-                    job.kind.as_str(),
-                    "semantic_synthesis_v1" | crate::jobs::procedure::KIND
-                ) && matches!(job.state, JobStatus::Queued | JobStatus::Failed)
+                (is_capture_job(job)
+                    || matches!(
+                        job.kind.as_str(),
+                        "semantic_synthesis_v1" | crate::jobs::procedure::KIND
+                    ))
+                    && matches!(job.state, JobStatus::Queued | JobStatus::Failed)
             })
             .filter_map(|job| job.backoff_until_us)
             .filter(|due| *due > now)
@@ -5036,7 +5062,17 @@ fn capture_target_covered(
     }) {
         return false;
     }
-    view.jobs.iter().any(matching)
+    view.jobs
+        .iter()
+        .any(|job| matching(job) && !capture_stale_retry(job))
+}
+
+fn capture_stale_retry(job: &DurableJob) -> bool {
+    job.state == JobStatus::Failed
+        && job
+            .terminal
+            .as_ref()
+            .is_some_and(|terminal| terminal.reason == JobTerminalReason::StaleGeneration)
 }
 
 fn is_capture_job(job: &DurableJob) -> bool {
