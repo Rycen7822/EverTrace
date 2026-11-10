@@ -178,7 +178,8 @@ pub(crate) fn verify_capture_frame_presented(
             use evertrace_codex::probe::HostProbeReport;
             let contract = if evertrace_capture::execution_source::Profile::from_revision(
                 body.parser_revision,
-            ) == Some(evertrace_capture::execution_source::Profile::Context)
+            )
+            .is_some_and(evertrace_capture::execution_source::Profile::has_context)
             {
                 HostProbeReport::execution_source_contract
             } else {

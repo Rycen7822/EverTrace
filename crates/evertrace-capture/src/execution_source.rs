@@ -17,12 +17,14 @@ pub const QUALIFIED_ADAPTER_VERSION: &str = "native-local-execution-0.166.0-v1:c
 pub const ELIGIBLE_EVENTS: &str = "native-local-execution-events-v1";
 pub const REVISION: u32 = 6;
 pub const QUALIFIED_REVISION: u32 = 7;
-const CONTEXT_REVISION: u32 = 9;
+const OBSERVER_CONTEXT_REVISION: u32 = 9;
+const CONTEXT_REVISION: u32 = 11;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum Profile {
     ProcessOriginal,
     ProcessNative,
+    ObserverContext,
     Context,
 }
 
@@ -31,21 +33,28 @@ impl Profile {
         match revision {
             REVISION => Some(Self::ProcessOriginal),
             QUALIFIED_REVISION => Some(Self::ProcessNative),
+            OBSERVER_CONTEXT_REVISION => Some(Self::ObserverContext),
             CONTEXT_REVISION => Some(Self::Context),
             _ => None,
         }
     }
 
     pub fn from_adapter_version(version: &str) -> Option<Self> {
-        [Self::ProcessOriginal, Self::ProcessNative, Self::Context]
-            .into_iter()
-            .find(|profile| profile.adapter_version() == version)
+        [
+            Self::ProcessOriginal,
+            Self::ProcessNative,
+            Self::ObserverContext,
+            Self::Context,
+        ]
+        .into_iter()
+        .find(|profile| profile.adapter_version() == version)
     }
 
     pub fn revision(self) -> u32 {
         match self {
             Self::ProcessOriginal => REVISION,
             Self::ProcessNative => QUALIFIED_REVISION,
+            Self::ObserverContext => OBSERVER_CONTEXT_REVISION,
             Self::Context => CONTEXT_REVISION,
         }
     }
@@ -53,7 +62,7 @@ impl Profile {
     pub fn source_revision(self) -> &'static str {
         match self {
             Self::ProcessOriginal | Self::ProcessNative => SOURCE_REVISION,
-            Self::Context => "native-local-execution-0.166.0-v2",
+            Self::ObserverContext | Self::Context => "native-local-execution-0.166.0-v2",
         }
     }
 
@@ -61,7 +70,8 @@ impl Profile {
         match self {
             Self::ProcessOriginal => ADAPTER_VERSION,
             Self::ProcessNative => QUALIFIED_ADAPTER_VERSION,
-            Self::Context => "native-local-execution-0.166.0-v2:capture-9",
+            Self::ObserverContext => "native-local-execution-0.166.0-v2:capture-9",
+            Self::Context => "native-local-execution-0.166.0-v2:capture-11",
         }
     }
 
@@ -69,10 +79,23 @@ impl Profile {
         self != Self::ProcessOriginal
     }
 
+    pub fn has_context(self) -> bool {
+        matches!(self, Self::ObserverContext | Self::Context)
+    }
+
+    fn sequence_origin(self, sequence: u64) -> Option<u64> {
+        if self == Self::Context {
+            // Only receipt of the context's first emission witnesses this observer's prefix.
+            (sequence == 1).then_some(1)
+        } else {
+            Some(0)
+        }
+    }
+
     pub fn eligible_events(self) -> &'static str {
         match self {
             Self::ProcessOriginal | Self::ProcessNative => ELIGIBLE_EVENTS,
-            Self::Context => "native-local-execution-events-v2",
+            Self::ObserverContext | Self::Context => "native-local-execution-events-v2",
         }
     }
 }
@@ -190,7 +213,7 @@ impl Event {
     }
 
     fn accepts(&self, profile: Profile) -> bool {
-        (self.params.receipt_version == 2) == (profile == Profile::Context)
+        (self.params.receipt_version == 2) == profile.has_context()
     }
 
     fn reference(&self) -> String {
@@ -229,10 +252,10 @@ fn coordinates(reference: &str, revision: u32) -> Option<Coordinates<'_>> {
         .split(':')
         .collect::<Vec<_>>();
     let (thread, turn, context, ordinal, phase) = match fields.as_slice() {
-        [thread, turn, ordinal, phase] if format != Profile::Context => {
+        [thread, turn, ordinal, phase] if !format.has_context() => {
             (*thread, *turn, None, *ordinal, *phase)
         }
-        [thread, turn, context, sequence, ordinal, phase] if format == Profile::Context => {
+        [thread, turn, context, sequence, ordinal, phase] if format.has_context() => {
             let sequence = sequence.parse::<u64>().ok().filter(|value| *value > 0)?;
             if !uuid(context) {
                 return None;
@@ -251,6 +274,26 @@ fn coordinates(reference: &str, revision: u32) -> Option<Coordinates<'_>> {
         ordinal: ordinal.parse::<u32>().ok().filter(|value| *value > 0)?,
         phase,
     })
+}
+
+// Scope each observer's source to the native context and its measured counter.
+fn source_coordinates(
+    instance: &str,
+    reference: &str,
+    profile: Profile,
+    transport_sequence: u64,
+) -> Option<(String, u64)> {
+    if profile != Profile::Context {
+        return Some((instance.into(), transport_sequence));
+    }
+    let (context, sequence) = coordinates(reference, profile.revision())?.context?;
+    let observer = match instance.rsplit_once(":context:") {
+        Some((observer, existing)) if existing == context => observer,
+        Some(_) => return None,
+        None => instance,
+    };
+    host_events::peer_instance(observer)?;
+    Some((format!("{observer}:context:{context}"), sequence))
 }
 
 fn lane_key(coordinates: &Coordinates<'_>) -> String {
@@ -302,8 +345,17 @@ fn evidence(
     request: Option<&str>,
     revision: u32,
 ) -> Option<HostCorrelationEvidence> {
-    let peer = host_events::peer_instance(instance)?;
     let coordinates = coordinates(reference, revision)?;
+    let observer = if Profile::from_revision(revision)? == Profile::Context {
+        let (observer, context) = instance.rsplit_once(":context:")?;
+        if coordinates.context?.0 != context {
+            return None;
+        }
+        observer
+    } else {
+        instance
+    };
+    let peer = host_events::peer_instance(observer)?;
     if !matches!(
         (coordinates.phase, role),
         ("started", ObservationRole::Intent) | ("exited", ObservationRole::Result)
@@ -376,21 +428,23 @@ pub(crate) fn input_revision(
     if !event.accepts(format) {
         return None;
     }
+    let reference = event.reference();
+    let (instance, sequence) = source_coordinates(instance, &reference, format, sequence)?;
     Some(CaptureRecordInput {
         spool_record_id: None,
         source_observation_id_hint: None,
-        source_instance_id: instance.into(),
+        source_instance_id: instance.clone(),
         source_revision: format.source_revision().into(),
         source_record_identity: Some(event.identity()),
         identity_strength: Some(IdentityStrength::StableNative),
         source_kind: EvidenceSourceKind::Other,
         identity_domain: format.source_revision().into(),
-        source_ref: event.reference(),
+        source_ref: reference.clone(),
         session_ref: event.params.thread_id.clone(),
         turn_ref: Some(event.params.turn_id.clone()),
         tool_ref: None,
         source_sequence: sequence,
-        source_sequence_origin: Some(0),
+        source_sequence_origin: format.sequence_origin(sequence),
         task_id: None,
         repository_instance_id: None,
         worktree_instance_id: None,
@@ -403,8 +457,8 @@ pub(crate) fn input_revision(
         close_watermark: None,
         observation_role: event.role(),
         correlation: evidence(
-            instance,
-            &event.reference(),
+            &instance,
+            &reference,
             manifest,
             event.role(),
             None,
@@ -412,7 +466,7 @@ pub(crate) fn input_revision(
         )?,
         scope_effect_claims: vec![],
         source_local_evidence: None,
-        lifecycle: lifecycle(&event.reference(), manifest, revision),
+        lifecycle: lifecycle(&reference, manifest, revision),
         unsupported_record_classification: None,
         source_role: SourceRole::Host,
         content_trust: ContentTrust::Observed,
@@ -463,8 +517,9 @@ pub fn protected_measurement(
         return None;
     }
     let reference = event.reference();
+    let (instance, _) = source_coordinates(instance, &reference, format, 0)?;
     let correlation = evidence(
-        instance,
+        &instance,
         &reference,
         manifest,
         event.role(),
@@ -487,7 +542,9 @@ pub fn record_matches(body: &CaptureRecordBody, protected: &[u8], manifest: &str
     ) else {
         return false;
     };
-    body.source_revision.as_str() == expected.source_revision
+    body.source_instance_id.as_str() == expected.source_instance_id
+        && body.source_sequence == expected.source_sequence
+        && body.source_revision.as_str() == expected.source_revision
         && body.source_kind == expected.source_kind
         && body.identity_domain == expected.identity_domain
         && body.identity_strength == IdentityStrength::StableNative
@@ -510,7 +567,7 @@ pub fn record_matches(body: &CaptureRecordBody, protected: &[u8], manifest: &str
         && body.task_id.is_none()
         && body.repository_instance_id.is_none()
         && body.worktree_instance_id.is_none()
-        && body.source_sequence_origin == Some(0)
+        && body.source_sequence_origin == expected.source_sequence_origin
         && body.source_revision_mode == SourceRevisionMode::Append
         && body.previous_source_revision.is_none()
         && body.close_watermark.is_none()
@@ -541,7 +598,19 @@ pub fn is_execution(observation: &SourceObservation, receipt: &SourceReceipt) ->
         correlation.admission = CorrelationAdmission::Unavailable;
         correlation.strong_gate_receipt_ref = None;
     }
-    receipt.source_revision.as_str() == format.source_revision()
+    let source_matches = format != Profile::Context
+        || source_coordinates(
+            receipt.source_instance_id.as_str(),
+            &receipt.source_ref,
+            format,
+            receipt.source_sequence,
+        )
+        .is_some_and(|(instance, sequence)| {
+            instance == receipt.source_instance_id.as_str() && sequence == receipt.source_sequence
+        });
+    source_matches
+        && receipt.source_sequence_origin == format.sequence_origin(receipt.source_sequence)
+        && receipt.source_revision.as_str() == format.source_revision()
         && receipt.identity_domain == format.source_revision()
         && receipt.source_kind == EvidenceSourceKind::Other
         && receipt.adapter_revision == receipt.parser_revision

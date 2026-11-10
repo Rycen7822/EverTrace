@@ -109,7 +109,7 @@ const TOTAL_LIMIT: usize = 32;
 pub(crate) const PER_LANE_LIMIT: usize = 8;
 const CAPTURE_PROBE_LIMIT: usize = TOTAL_LIMIT + PER_LANE_LIMIT;
 const RETRY_DELAY: Duration = Duration::from_secs(5);
-const CAPTURE_ALGORITHM_REVISION: &str = "capture-reconciliation-v5";
+const CAPTURE_ALGORITHM_REVISION: &str = "capture-reconciliation-v6";
 const PROCEDURE_PROMOTION_JOB_KIND: &str = "procedure_cohort_promotion_v1";
 
 fn procedure_promotion_budget() -> JobBudget {
@@ -2660,7 +2660,7 @@ impl BackgroundScheduler {
                     &snapshot,
                     item.target_kind,
                     &item.target_id,
-                ) && resolve_capture_report(&item, report.as_ref(), &self.runtime).is_none())
+                ) && resolve_capture_manifests(&item, report.as_ref(), &self.runtime).is_none())
             {
                 continue;
             }
@@ -4103,11 +4103,8 @@ impl BackgroundScheduler {
         ) {
             Vec::new()
         } else {
-            let Some(report) = resolve_capture_report(item, report_guard.as_ref(), &self.runtime)
-            else {
-                return Err(BackgroundSchedulerError::Store);
-            };
-            vec![report.manifest().clone()]
+            resolve_capture_manifests(item, report_guard.as_ref(), &self.runtime)
+                .ok_or(BackgroundSchedulerError::Store)?
         };
         let reconciliation = reconcile_observations_once(
             ReconcileInput {
@@ -4823,7 +4820,7 @@ impl BackgroundScheduler {
                             &snapshot,
                             item.target_kind,
                             &item.target_id,
-                        ) || resolve_capture_report(item, report.as_ref(), &self.runtime)
+                        ) || resolve_capture_manifests(item, report.as_ref(), &self.runtime)
                             .is_some())
                 })
             {
@@ -5172,6 +5169,55 @@ fn capture_item_manifest_matches(
     count != 0
 }
 
+fn resolve_capture_manifests(
+    item: &evertrace_store::ReconciliationWorkItem,
+    current: Option<&HostProbeReport>,
+    runtime: &RuntimeSnapshot,
+) -> Option<Vec<evertrace_codex::adapter_manifest::AdapterCapabilityManifest>> {
+    let mut sources = BTreeMap::<_, BTreeSet<_>>::new();
+    for dependency in &item.dependencies {
+        if let JournalPayload::SourceReceiptRecorded(receipt) = &dependency.payload {
+            sources
+                .entry(receipt.adapter_manifest_ref.as_str())
+                .or_default()
+                .insert(receipt.source_receipt_id);
+        }
+    }
+    if sources.len() <= 1 {
+        return resolve_capture_report(item, current, runtime)
+            .map(|report| vec![report.manifest().clone()]);
+    }
+    // One lane can retain observations from real adapter upgrades. Verify each
+    // actual source contract; a current report cannot grant an older source's gate.
+    for dependency in &item.dependencies {
+        if let JournalPayload::SourceObservationRecorded(observation) = &dependency.payload
+            && !sources
+                .values()
+                .any(|ids| ids.contains(&observation.source_receipt_ref))
+        {
+            return None;
+        }
+    }
+    let mut manifests = Vec::with_capacity(sources.len());
+    for (manifest, receipt_ids) in sources {
+        let mut selected = item.clone();
+        selected
+            .dependencies
+            .retain(|dependency| match &dependency.payload {
+                JournalPayload::SourceReceiptRecorded(receipt) => {
+                    receipt.adapter_manifest_ref == manifest
+                }
+                JournalPayload::SourceObservationRecorded(observation) => {
+                    receipt_ids.contains(&observation.source_receipt_ref)
+                }
+                _ => true,
+            });
+        let report = resolve_capture_report(&selected, current, runtime)?;
+        manifests.push(report.manifest().clone());
+    }
+    Some(manifests)
+}
+
 fn resolve_capture_report(
     item: &evertrace_store::ReconciliationWorkItem,
     current: Option<&HostProbeReport>,
@@ -5254,7 +5300,7 @@ fn resolve_capture_report(
             {
                 let contract =
                     if evertrace_capture::execution_source::Profile::from_adapter_version(&version)
-                        == Some(evertrace_capture::execution_source::Profile::Context)
+                        .is_some_and(evertrace_capture::execution_source::Profile::has_context)
                     {
                         HostProbeReport::execution_source_contract
                     } else {

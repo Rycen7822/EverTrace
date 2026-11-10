@@ -237,7 +237,7 @@ impl Client {
                 return Err(CanaryError);
             }
         }
-        if self.profile == super::Profile::Context
+        if self.profile.has_context()
             && after["laneSequence"]
                 .as_u64()
                 .zip(before["laneSequence"].as_u64())
@@ -414,7 +414,7 @@ pub fn collect(
             && starts[..3]
                 .iter()
                 .all(|value| value["turnId"] != starts[3]["turnId"]);
-        if profile == super::Profile::Context {
+        if profile.has_context() {
             capture.facts.fork_isolated &=
                 starts[0]["executionContextId"] != starts[2]["executionContextId"];
             capture.facts.resume_isolated &= starts[0]["executionContextId"]

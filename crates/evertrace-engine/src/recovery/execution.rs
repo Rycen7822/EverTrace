@@ -139,7 +139,7 @@ impl HostCanaryService {
         ]
         .into_iter()
         .map(|profile| {
-            let contract = if profile == execution_source::Profile::Context {
+            let contract = if profile.has_context() {
                 HostProbeReport::execution_source_contract
             } else {
                 HostProbeReport::native_source_contract
@@ -209,7 +209,7 @@ impl HostCanaryService {
             },
             protected_digest: facts.protected_digest,
         });
-        let evaluate = if facts.profile == execution_source::Profile::Context {
+        let evaluate = if facts.profile.has_context() {
             HostProbeReport::evaluate_execution_source
         } else {
             HostProbeReport::evaluate

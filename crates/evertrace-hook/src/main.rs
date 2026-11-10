@@ -72,7 +72,7 @@ fn run() -> Result<(), ()> {
         use evertrace_capture::execution_source::Profile;
         let execution = [Profile::ProcessNative, Profile::Context].map(|format| {
             use evertrace_codex::probe::HostProbeReport;
-            let contract = if format == Profile::Context {
+            let contract = if format.has_context() {
                 HostProbeReport::execution_source_contract
             } else {
                 HostProbeReport::native_source_contract
