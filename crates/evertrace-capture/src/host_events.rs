@@ -20,7 +20,7 @@ use tungstenite::{
 use crate::{CaptureRecordBody, CaptureRecordInput, CaptureRuntime, RuntimeSnapshot, goal_source};
 
 pub const SOURCE_REVISION: &str = "native-user-shell-live-0.166.0-v1";
-pub const ADAPTER_VERSION: &str = "native-user-shell-live-0.166.0-v1:capture-4";
+pub const ADAPTER_VERSION: &str = "native-user-shell-live-0.166.0-v1:capture-5";
 pub const ELIGIBLE_EVENTS: &str = "native-user-shell-state-events-v1";
 const INPUT_LIMIT: usize = 2 * 1024 * 1024;
 
@@ -125,22 +125,61 @@ impl Event {
     }
 }
 
+fn native_uuid(value: &str) -> bool {
+    uuid::Uuid::parse_str(value).is_ok_and(|id| id.to_string() == value)
+}
+
+fn native_coordinates<'a>(
+    instance: &'a str,
+    reference: &'a str,
+) -> Option<(&'a str, [&'a str; 3])> {
+    let (peer, capture) = instance.rsplit_once(":capture:")?;
+    if !native_uuid(capture) {
+        return None;
+    }
+    let mut parts = peer.strip_prefix("native-events:")?.split(':');
+    if !native_uuid(parts.next()?) {
+        return None;
+    }
+    for maximum in [u64::MAX, u32::MAX as u64, u64::MAX] {
+        let raw = parts.next()?;
+        let value = raw.parse::<u64>().ok()?;
+        if value == 0 || value > maximum || value.to_string() != raw {
+            return None;
+        }
+    }
+    if parts.next().is_some() {
+        return None;
+    }
+    let mut fields = reference.strip_prefix("native-user-shell:")?.split(':');
+    let ids = [fields.next()?, fields.next()?, fields.next()?];
+    if !ids.iter().all(|id| native_uuid(id))
+        || !matches!(fields.next()?, "item/started" | "item/completed")
+        || fields.next().is_some()
+    {
+        return None;
+    }
+    Some((peer, ids))
+}
+
 fn correlation(
     role: ObservationRole,
     manifest: &str,
     revision: u32,
     reference: &str,
-) -> HostCorrelationEvidence {
-    HostCorrelationEvidence {
+    instance: &str,
+) -> Option<HostCorrelationEvidence> {
+    let mut evidence = HostCorrelationEvidence {
         occurrence_schema_version: 1,
         host_instance_id: None,
         host_trace_lineage_id: None,
         host_lane_key: None,
-        canonical_event_family: (revision == 4).then_some(CanonicalEventFamily::OtherExecutable),
+        canonical_event_family: matches!(revision, 4 | 5)
+            .then_some(CanonicalEventFamily::OtherExecutable),
         native_request_id: None,
         physical_execution_ordinal: None,
         pairing_role: role,
-        field_provenance: if revision == 4 {
+        field_provenance: if matches!(revision, 4 | 5) {
             vec![CorrelationFieldClaim {
                 field: CorrelationField::CanonicalEventFamily,
                 source_ref: reference.into(),
@@ -155,7 +194,31 @@ fn correlation(
         admission: CorrelationAdmission::Unavailable,
         partial_correlation_ref: None,
         possible_duplicate_group_id: None,
+    };
+    if revision == 5 {
+        let (peer, [thread, turn, item]) = native_coordinates(instance, reference)?;
+        evidence.host_instance_id = Some(peer.into());
+        evidence.host_trace_lineage_id = Some(format!("native-thread:{thread}:turn:{turn}"));
+        evidence.host_lane_key = Some(format!("native-thread:{thread}"));
+        evidence.native_request_id = Some(item.into());
+        evidence.field_provenance.push(CorrelationFieldClaim {
+            field: CorrelationField::HostInstanceId,
+            source_ref: peer.into(),
+            evidence_ref: instance.into(),
+        });
+        for field in [
+            CorrelationField::HostTraceLineageId,
+            CorrelationField::HostLaneKey,
+            CorrelationField::NativeRequestId,
+        ] {
+            evidence.field_provenance.push(CorrelationFieldClaim {
+                field,
+                source_ref: reference.into(),
+                evidence_ref: reference.into(),
+            });
+        }
     }
+    Some(evidence)
 }
 
 /// Recheck the protected original against a reserved live-source envelope at ingestion.
@@ -168,7 +231,7 @@ pub fn record_matches(body: &CaptureRecordBody, protected: &[u8], manifest: &str
     let role = match body.parser_revision {
         1 if body.original_length <= 65_536 => ObservationRole::StateProbe,
         2 => ObservationRole::StateProbe,
-        3 | 4 => event.role(),
+        3..=5 => event.role(),
         _ => return false,
     };
     body.adapter_revision == body.parser_revision
@@ -181,7 +244,15 @@ pub fn record_matches(body: &CaptureRecordBody, protected: &[u8], manifest: &str
         && body.source_record_identity.as_str() == event.identity()
         && body.source_ref == event.reference()
         && body.observation_role == role
-        && body.correlation == correlation(role, manifest, body.parser_revision, &event.reference())
+        && correlation(
+            role,
+            manifest,
+            body.parser_revision,
+            &event.reference(),
+            body.source_instance_id.as_str(),
+        )
+        .as_ref()
+            == Some(&body.correlation)
         && body.adapter_manifest_ref == manifest
         && body.eligible_event_manifest_ref == ELIGIBLE_EVENTS
         && body.source_role == SourceRole::Host
@@ -217,8 +288,8 @@ pub fn is_unqualified_execution(observation: &SourceObservation, receipt: &Sourc
     ) && receipt.source_kind == EvidenceSourceKind::Other
         && receipt.source_revision.as_str() == SOURCE_REVISION
         && receipt.identity_domain == SOURCE_REVISION
-        && receipt.adapter_revision == 4
-        && receipt.parser_revision == 4
+        && matches!(receipt.parser_revision, 4 | 5)
+        && receipt.adapter_revision == receipt.parser_revision
         && receipt.canonicalization_revision == 1
         && receipt.eligible_event_manifest_ref == ELIGIBLE_EVENTS
         && observation.source_receipt_ref == receipt.source_receipt_id
@@ -233,13 +304,15 @@ pub fn is_unqualified_execution(observation: &SourceObservation, receipt: &Sourc
         && observation.source_role == SourceRole::Host
         && observation.content_trust == ContentTrust::Observed
         && observation.capture_completeness == CaptureCompleteness::Partial
-        && observation.correlation
-            == correlation(
-                observation.observation_role,
-                &receipt.adapter_manifest_ref,
-                4,
-                &receipt.source_ref,
-            )
+        && correlation(
+            observation.observation_role,
+            &receipt.adapter_manifest_ref,
+            receipt.parser_revision,
+            &receipt.source_ref,
+            receipt.source_instance_id.as_str(),
+        )
+        .as_ref()
+            == Some(&observation.correlation)
         && observation.scope_effect_claims.is_empty()
         && observation.source_local_evidence.is_none()
         && receipt.lifecycle.is_none()
@@ -276,7 +349,7 @@ fn observation(raw: &str, instance: &str, sequence: u64, manifest: &str) -> Opti
         previous_source_revision: None,
         close_watermark: None,
         observation_role: event.role(),
-        correlation: correlation(event.role(), manifest, 4, &event.reference()),
+        correlation: correlation(event.role(), manifest, 5, &event.reference(), instance)?,
         scope_effect_claims: vec![],
         source_local_evidence: None,
         lifecycle: None,
@@ -285,10 +358,10 @@ fn observation(raw: &str, instance: &str, sequence: u64, manifest: &str) -> Opti
         content_trust: ContentTrust::Observed,
         capture_completeness: CaptureCompleteness::Partial,
         surface_eligible: false,
-        adapter_revision: 4,
+        adapter_revision: 5,
         adapter_manifest_ref: manifest.into(),
         eligible_event_manifest_ref: ELIGIBLE_EVENTS.into(),
-        parser_revision: 4,
+        parser_revision: 5,
         canonicalization_revision: 1,
         event_time_us: None,
         event_time_provenance: None,

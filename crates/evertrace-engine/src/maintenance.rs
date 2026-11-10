@@ -5170,11 +5170,21 @@ fn resolve_capture_report(
     current: Option<&HostProbeReport>,
     runtime: &RuntimeSnapshot,
 ) -> Option<HostProbeReport> {
-    if item.dependencies.iter().any(|dependency| {
-        matches!(&dependency.payload, JournalPayload::SourceReceiptRecorded(receipt)
-            if receipt.source_revision.as_str() == evertrace_capture::host_events::SOURCE_REVISION
-                && receipt.adapter_revision == 4 && receipt.parser_revision == 4)
-    }) {
+    if let Some(revision) =
+        item.dependencies
+            .iter()
+            .find_map(|dependency| match &dependency.payload {
+                JournalPayload::SourceReceiptRecorded(receipt)
+                    if receipt.source_revision.as_str()
+                        == evertrace_capture::host_events::SOURCE_REVISION
+                        && matches!(receipt.parser_revision, 4 | 5)
+                        && receipt.adapter_revision == receipt.parser_revision =>
+                {
+                    Some(receipt.parser_revision)
+                }
+                _ => None,
+            })
+    {
         // This report supplies only the original closed manifest. It cannot grant
         // Exact correlation, capture completeness, namespace or semantic Work.
         if item.target_kind != DirtyTargetKind::PhysicalNormalization {
@@ -5204,8 +5214,12 @@ fn resolve_capture_report(
         if !observed {
             return None;
         }
+        let version = format!(
+            "{}:capture-{revision}",
+            evertrace_capture::host_events::SOURCE_REVISION
+        );
         let report = HostProbeReport::unobserved_source_contract(
-            evertrace_capture::host_events::ADAPTER_VERSION,
+            &version,
             evertrace_capture::host_events::ELIGIBLE_EVENTS,
         )
         .ok()?;
