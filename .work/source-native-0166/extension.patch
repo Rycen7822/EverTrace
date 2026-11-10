@@ -516,7 +516,7 @@
 +    /// Source-owned receipt for an actual local process launch or observed exit.
 +    ExecutionAttempt(ExecutionAttemptEvent),
 +
-@@ -3871,0 +3875,22 @@
+@@ -3871,0 +3875,25 @@
 +}
 +
 +#[derive(Debug, Clone, Deserialize, Serialize, JsonSchema, TS)]
@@ -524,6 +524,9 @@
 +pub struct ExecutionAttemptEvent {
 +    pub receipt_version: u32,
 +    pub thread_id: String,
++    pub execution_context_id: String,
++    pub lane_sequence: u64,
++    pub working_directory: Option<String>,
 +    pub turn_id: String,
 +    pub call_id: String,
 +    pub origin: String,
@@ -575,23 +578,52 @@
 +        EventMsg::ExecutionAttempt(_) => None,
 --- a/core/src/execution_receipt.rs
 +++ b/core/src/execution_receipt.rs
-@@ -0,0 +1,86 @@
+@@ -0,0 +1,127 @@
 +//! Receipts emitted at real local spawn/exit boundaries, not from model or command text.
 +
-+use std::sync::atomic::{AtomicU32, Ordering};
++use std::sync::{
++    Arc,
++    atomic::{AtomicU32, AtomicU64, Ordering},
++};
 +
 +use async_channel::Sender;
 +use codex_protocol::protocol::{Event, EventMsg, ExecutionAttemptEvent, ExecutionAttemptPhase};
 +
 +static NEXT_EXECUTION: AtomicU32 = AtomicU32::new(0);
 +
++/// Source session lifetime and emission order, independent of physical process ordinals.
++pub(crate) struct ExecutionContext {
++    id: String,
++    sequence: AtomicU64,
++}
++
++impl ExecutionContext {
++    pub(crate) fn new() -> Self {
++        Self {
++            id: uuid::Uuid::now_v7().to_string(),
++            sequence: AtomicU64::new(0),
++        }
++    }
++
++    fn next_sequence(&self) -> Option<u64> {
++        self.sequence
++            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |value| {
++                value.checked_add(1)
++            })
++            .ok()?
++            .checked_add(1)
++    }
++}
++
 +#[derive(Clone)]
 +pub(crate) struct ExecutionSink {
++    context: Arc<ExecutionContext>,
 +    event: ExecutionAttemptEvent,
 +    sender: Sender<Event>,
 +}
 +
 +pub(crate) struct ExecutionRecorder {
++    context: Arc<ExecutionContext>,
 +    event: ExecutionAttemptEvent,
 +    sender: Sender<Event>,
 +}
@@ -599,15 +631,20 @@
 +impl ExecutionSink {
 +    pub(crate) fn new(
 +        thread_id: String,
++        context: Arc<ExecutionContext>,
 +        turn_id: String,
 +        call_id: String,
 +        origin: &str,
++        working_directory: Option<String>,
 +        sender: Sender<Event>,
 +    ) -> Self {
 +        Self {
 +            event: ExecutionAttemptEvent {
-+                receipt_version: 1,
++                receipt_version: 2,
 +                thread_id,
++                execution_context_id: context.id.clone(),
++                lane_sequence: 0,
++                working_directory,
 +                turn_id,
 +                call_id,
 +                origin: origin.to_owned(),
@@ -617,6 +654,7 @@
 +                process_start_ticks: None,
 +                exit_code: None,
 +            },
++            context,
 +            sender,
 +        }
 +    }
@@ -635,12 +673,14 @@
 +        self.event.execution_ordinal = ordinal;
 +        self.event.process_pid = identity.map(|value| value.pid);
 +        self.event.process_start_ticks = identity.map(|value| value.start_ticks);
++        self.event.lane_sequence = self.context.next_sequence()?;
 +        let event = Event {
 +            id: self.event.turn_id.clone(),
 +            msg: EventMsg::ExecutionAttempt(self.event.clone()),
 +        };
 +        self.sender.send(event).await.ok()?;
 +        Some(ExecutionRecorder {
++            context: self.context,
 +            event: self.event,
 +            sender: self.sender,
 +        })
@@ -653,6 +693,10 @@
 +        let Some(exit_code) = exit_code.filter(|code| *code >= 0) else {
 +            return;
 +        };
++        let Some(sequence) = self.context.next_sequence() else {
++            return;
++        };
++        self.event.lane_sequence = sequence;
 +        self.event.phase = ExecutionAttemptPhase::Exited;
 +        self.event.exit_code = Some(exit_code);
 +        let event = Event {
@@ -662,6 +706,13 @@
 +        let _ = self.sender.send(event).await;
 +    }
 +}
+--- a/core/src/session/session.rs
++++ b/core/src/session/session.rs
+@@ -61,0 +62,2 @@
++    /// Identity of this in-memory session incarnation, distinct after an unload/resume.
++    pub(crate) execution_context: Arc<crate::execution_receipt::ExecutionContext>,
+@@ -1892,0 +1895 @@
++                execution_context: Arc::new(crate::execution_receipt::ExecutionContext::new()),
 --- a/core/src/exec.rs
 +++ b/core/src/exec.rs
 @@ -298,0 +299 @@
@@ -691,12 +742,14 @@
 +    result
 --- a/core/src/tasks/user_shell.rs
 +++ b/core/src/tasks/user_shell.rs
-@@ -240,0 +241,7 @@
+@@ -240,0 +241,9 @@
 +        execution_sink: Some(crate::execution_receipt::ExecutionSink::new(
 +            session.thread_id.to_string(),
++            session.execution_context.clone(),
 +            turn_context.sub_id.clone(),
 +            call_id.clone(),
 +            "user_shell",
++            cwd.as_path().to_str().map(str::to_owned),
 +            session.get_tx_event(),
 +        )),
 --- a/core/src/unified_exec/process.rs
@@ -734,21 +787,27 @@
 +                        }
 --- a/core/src/unified_exec/process_manager.rs
 +++ b/core/src/unified_exec/process_manager.rs
-@@ -1374,0 +1375,13 @@
+@@ -1374,0 +1375,19 @@
 +        let execution_sink = if environment.is_remote() {
 +            None
 +        } else {
 +            tool_ctx.map(|ctx| {
 +                crate::execution_receipt::ExecutionSink::new(
 +                    ctx.session.thread_id.to_string(),
++                    ctx.session.execution_context.clone(),
 +                    ctx.step_context.turn.sub_id.clone(),
 +                    ctx.call_id.clone(),
 +                    "agent",
++                    request
++                        .cwd
++                        .to_abs_path()
++                        .ok()
++                        .and_then(|path| path.as_path().to_str().map(str::to_owned)),
 +                    ctx.session.get_tx_event(),
 +                )
 +            })
 +        };
-@@ -1407,2 +1420,20 @@
+@@ -1407,2 +1426,20 @@
 -            return UnifiedExecProcess::from_exec_server_started(started, output_drain_policy)
 -                .await;
 +            let execution = match execution_sink {
@@ -771,7 +830,7 @@
 +                execution,
 +            )
 +            .await;
-@@ -1479 +1510,5 @@
+@@ -1479 +1516,5 @@
 -        UnifiedExecProcess::from_spawned(spawned, request.sandbox).await
 +        let execution = match execution_sink {
 +            Some(sink) => sink.started(spawned.session.local_process_identity()).await,
