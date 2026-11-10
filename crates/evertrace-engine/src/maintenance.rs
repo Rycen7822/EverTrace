@@ -109,7 +109,7 @@ const TOTAL_LIMIT: usize = 32;
 pub(crate) const PER_LANE_LIMIT: usize = 8;
 const CAPTURE_PROBE_LIMIT: usize = TOTAL_LIMIT + PER_LANE_LIMIT;
 const RETRY_DELAY: Duration = Duration::from_secs(5);
-const CAPTURE_ALGORITHM_REVISION: &str = "capture-reconciliation-v1";
+const CAPTURE_ALGORITHM_REVISION: &str = "capture-reconciliation-v5";
 const PROCEDURE_PROMOTION_JOB_KIND: &str = "procedure_cohort_promotion_v1";
 
 fn procedure_promotion_budget() -> JobBudget {
@@ -2522,14 +2522,16 @@ impl BackgroundScheduler {
                     );
                     let weak_process =
                         physical && is_unqualified_process_source(observation, receipt);
-                    let weak_live = physical
-                        && (evertrace_capture::host_events::is_unqualified_execution(
+                    let weak_live = (physical
+                        && evertrace_capture::host_events::is_unqualified_execution(
                             observation,
                             receipt,
-                        ) || evertrace_capture::execution_source::is_execution(
-                            observation,
-                            receipt,
-                        ));
+                        ))
+                        || ((physical || receipt.lifecycle.is_some())
+                            && evertrace_capture::execution_source::is_execution(
+                                observation,
+                                receipt,
+                            ));
                     if current_manifest.is_none()
                         && (!physical
                             || retained_manifests
@@ -4118,7 +4120,7 @@ impl BackgroundScheduler {
                 effective_config_hash: self.runtime.effective_config_hash,
                 algorithm_revision: CAPTURE_ALGORITHM_REVISION.into(),
                 occurred_at_us: now_us()?,
-                max_items: 1,
+                max_items: claimed.job.budget.max_items as usize,
             },
             &self.writer,
             &[observation_id],
@@ -4982,7 +4984,8 @@ fn import_job_is_current(job: &DurableJob, effective_config_hash: [u8; 32]) -> b
 
 fn capture_job_budget() -> JobBudget {
     JobBudget {
-        max_items: 1,
+        // One observation can have both physical and lane dirty rows; reconcile their closure together.
+        max_items: 2,
         max_bytes: None,
         max_input_tokens: None,
         max_output_tokens: None,
@@ -5194,33 +5197,29 @@ fn resolve_capture_report(
                     ))
                 }
                 JournalPayload::SourceReceiptRecorded(receipt)
-                    if receipt.source_revision.as_str()
-                        == evertrace_capture::execution_source::SOURCE_REVISION
-                        && matches!(
-                            receipt.parser_revision,
-                            evertrace_capture::execution_source::REVISION
-                                | evertrace_capture::execution_source::QUALIFIED_REVISION
-                        )
-                        && receipt.adapter_revision == receipt.parser_revision =>
+                    if evertrace_capture::execution_source::is_source_revision(
+                        receipt.source_revision.as_str(),
+                    ) && receipt.adapter_revision == receipt.parser_revision =>
                 {
-                    Some((
-                        if receipt.parser_revision
-                            == evertrace_capture::execution_source::QUALIFIED_REVISION
-                        {
-                            evertrace_capture::execution_source::QUALIFIED_ADAPTER_VERSION
-                                .to_owned()
-                        } else {
-                            evertrace_capture::execution_source::ADAPTER_VERSION.to_owned()
-                        },
-                        evertrace_capture::execution_source::ELIGIBLE_EVENTS,
-                    ))
+                    let profile = evertrace_capture::execution_source::Profile::from_revision(
+                        receipt.parser_revision,
+                    )?;
+                    (receipt.source_revision.as_str() == profile.source_revision()).then(|| {
+                        (
+                            profile.adapter_version().to_owned(),
+                            profile.eligible_events(),
+                        )
+                    })
                 }
                 _ => None,
             })
     {
         // This report supplies only the original closed manifest. It cannot grant
         // Exact correlation, capture completeness, namespace or semantic Work.
-        if item.target_kind != DirtyTargetKind::PhysicalNormalization {
+        if !matches!(
+            item.target_kind,
+            DirtyTargetKind::PhysicalNormalization | DirtyTargetKind::CaptureReconciliation
+        ) {
             return None;
         }
         let mut observed = false;
@@ -5249,16 +5248,23 @@ fn resolve_capture_report(
         if !observed {
             return None;
         }
-        let report = if version == evertrace_capture::execution_source::QUALIFIED_ADAPTER_VERSION {
-            HostProbeReport::native_source_contract(
-                evertrace_capture::execution_source::QUALIFIED_ADAPTER_VERSION,
-                evertrace_capture::execution_source::ELIGIBLE_EVENTS,
-                "0.166.0",
-            )
-        } else {
-            HostProbeReport::unobserved_source_contract(&version, eligible)
-        }
-        .ok()?;
+        let report =
+            if evertrace_capture::execution_source::Profile::from_adapter_version(&version)
+                .is_some_and(evertrace_capture::execution_source::Profile::native_identity)
+            {
+                let contract =
+                    if evertrace_capture::execution_source::Profile::from_adapter_version(&version)
+                        == Some(evertrace_capture::execution_source::Profile::Context)
+                    {
+                        HostProbeReport::execution_source_contract
+                    } else {
+                        HostProbeReport::native_source_contract
+                    };
+                contract(&version, eligible, "0.166.0")
+            } else {
+                HostProbeReport::unobserved_source_contract(&version, eligible)
+            }
+            .ok()?;
         return capture_item_manifest_matches(item, &report).then_some(report);
     }
     if item.dependencies.iter().any(|dependency| {

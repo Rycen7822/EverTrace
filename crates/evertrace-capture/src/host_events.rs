@@ -397,7 +397,7 @@ pub fn relay(
     snapshot: RuntimeSnapshot,
     endpoint: &Path,
     manifest: &str,
-    execution_manifest: &str,
+    execution_manifests: &[(crate::execution_source::Profile, String)],
 ) -> Result<()> {
     let deadline = Instant::now() + Duration::from_secs(3);
     let (stream, publisher) =
@@ -462,18 +462,18 @@ pub fn relay(
                         .map_err(|_| HostEventError)?;
                     stdout.write_all(b"\n").map_err(|_| HostEventError)?;
                     stdout.flush().map_err(|_| HostEventError)?;
-                    let execution = publisher
-                        .execution_receipts()
-                        .then(|| {
-                            execution_observation(
-                                &text,
-                                &instance,
-                                sequence,
-                                execution_manifest,
-                                crate::execution_source::QUALIFIED_REVISION,
-                            )
-                        })
-                        .flatten();
+                    let execution = publisher.execution_profile().and_then(|format| {
+                        let (_, manifest) = execution_manifests
+                            .iter()
+                            .find(|(value, _)| *value == format)?;
+                        execution_observation(
+                            &text,
+                            &instance,
+                            sequence,
+                            manifest,
+                            format.revision(),
+                        )
+                    });
                     if let Some(observed) =
                         execution.or_else(|| observation(&text, &instance, sequence, manifest))
                     {

@@ -69,18 +69,29 @@ fn run() -> Result<(), ()> {
             evertrace_capture::host_events::ELIGIBLE_EVENTS,
         )
         .map_err(|_| ())?;
-        let execution = evertrace_codex::probe::HostProbeReport::native_source_contract(
-            evertrace_capture::execution_source::QUALIFIED_ADAPTER_VERSION,
-            evertrace_capture::execution_source::ELIGIBLE_EVENTS,
-            "0.166.0",
-        )
-        .map_err(|_| ())?;
+        use evertrace_capture::execution_source::Profile;
+        let execution = [Profile::ProcessNative, Profile::Context].map(|format| {
+            use evertrace_codex::probe::HostProbeReport;
+            let contract = if format == Profile::Context {
+                HostProbeReport::execution_source_contract
+            } else {
+                HostProbeReport::native_source_contract
+            };
+            let report = contract(
+                format.adapter_version(),
+                format.eligible_events(),
+                "0.166.0",
+            )
+            .map_err(|_| ())?;
+            Ok((format, report.manifest().adapter_manifest_id.clone()))
+        });
+        let execution = execution.into_iter().collect::<Result<Vec<_>, ()>>()?;
         let snapshot = RuntimeSnapshot::load(Path::new(&path)).map_err(|_| ())?;
         return evertrace_capture::host_events::relay(
             snapshot,
             Path::new(&endpoint),
             &contract.manifest().adapter_manifest_id,
-            &execution.manifest().adapter_manifest_id,
+            &execution,
         )
         .map_err(|_| ());
     }

@@ -17,6 +17,73 @@ pub const QUALIFIED_ADAPTER_VERSION: &str = "native-local-execution-0.166.0-v1:c
 pub const ELIGIBLE_EVENTS: &str = "native-local-execution-events-v1";
 pub const REVISION: u32 = 6;
 pub const QUALIFIED_REVISION: u32 = 7;
+const CONTEXT_REVISION: u32 = 9;
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum Profile {
+    ProcessOriginal,
+    ProcessNative,
+    Context,
+}
+
+impl Profile {
+    pub fn from_revision(revision: u32) -> Option<Self> {
+        match revision {
+            REVISION => Some(Self::ProcessOriginal),
+            QUALIFIED_REVISION => Some(Self::ProcessNative),
+            CONTEXT_REVISION => Some(Self::Context),
+            _ => None,
+        }
+    }
+
+    pub fn from_adapter_version(version: &str) -> Option<Self> {
+        [Self::ProcessOriginal, Self::ProcessNative, Self::Context]
+            .into_iter()
+            .find(|profile| profile.adapter_version() == version)
+    }
+
+    pub fn revision(self) -> u32 {
+        match self {
+            Self::ProcessOriginal => REVISION,
+            Self::ProcessNative => QUALIFIED_REVISION,
+            Self::Context => CONTEXT_REVISION,
+        }
+    }
+
+    pub fn source_revision(self) -> &'static str {
+        match self {
+            Self::ProcessOriginal | Self::ProcessNative => SOURCE_REVISION,
+            Self::Context => "native-local-execution-0.166.0-v2",
+        }
+    }
+
+    pub fn adapter_version(self) -> &'static str {
+        match self {
+            Self::ProcessOriginal => ADAPTER_VERSION,
+            Self::ProcessNative => QUALIFIED_ADAPTER_VERSION,
+            Self::Context => "native-local-execution-0.166.0-v2:capture-9",
+        }
+    }
+
+    pub fn native_identity(self) -> bool {
+        self != Self::ProcessOriginal
+    }
+
+    pub fn eligible_events(self) -> &'static str {
+        match self {
+            Self::ProcessOriginal | Self::ProcessNative => ELIGIBLE_EVENTS,
+            Self::Context => "native-local-execution-events-v2",
+        }
+    }
+}
+
+pub fn is_source_revision(revision: &str) -> bool {
+    revision == SOURCE_REVISION || revision == Profile::Context.source_revision()
+}
+
+pub fn is_qualified_revision(revision: u32) -> bool {
+    Profile::from_revision(revision).is_some_and(Profile::native_identity)
+}
 
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -36,6 +103,12 @@ struct Event {
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 struct Measurement {
     receipt_version: u32,
+    #[serde(default, deserialize_with = "present")]
+    execution_context_id: Option<String>,
+    #[serde(default, deserialize_with = "present")]
+    lane_sequence: Option<u64>,
+    #[serde(default, deserialize_with = "present")]
+    working_directory: Option<Option<String>>,
     thread_id: String,
     turn_id: String,
     call_id: String,
@@ -45,6 +118,15 @@ struct Measurement {
     process_pid: Option<u32>,
     process_start_ticks: Option<u64>,
     exit_code: Option<i32>,
+}
+
+// Preserve absent versus explicit null, and let the typed decoder reject duplicate fields.
+fn present<'de, D, T>(deserializer: D) -> Result<Option<T>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+    T: Deserialize<'de>,
+{
+    T::deserialize(deserializer).map(Some)
 }
 
 fn uuid(value: &str) -> bool {
@@ -58,7 +140,25 @@ impl Event {
         if event.id
             || event.jsonrpc.as_deref().is_some_and(|value| value != "2.0")
             || event.method != "item/commandExecution/attempt"
-            || value.receipt_version != 1
+            || !match value.receipt_version {
+                1 => {
+                    value.execution_context_id.is_none()
+                        && value.lane_sequence.is_none()
+                        && value.working_directory.is_none()
+                }
+                2 => {
+                    value.execution_context_id.as_deref().is_some_and(uuid)
+                        && value.lane_sequence.is_some_and(|value| value > 0)
+                        && value.working_directory.as_ref().is_some_and(|path| {
+                            path.as_ref().is_none_or(|path| {
+                                path.len() <= 4096
+                                    && !path.contains('\0')
+                                    && std::path::Path::new(path).is_absolute()
+                            })
+                        })
+                }
+                _ => false,
+            }
             || !uuid(&value.thread_id)
             || !uuid(&value.turn_id)
             || !matches!(value.origin.as_str(), "agent" | "user_shell")
@@ -89,14 +189,109 @@ impl Event {
         format!("{}:{}", self.params.execution_ordinal, self.params.phase)
     }
 
+    fn accepts(&self, profile: Profile) -> bool {
+        (self.params.receipt_version == 2) == (profile == Profile::Context)
+    }
+
     fn reference(&self) -> String {
+        let context = self
+            .params
+            .execution_context_id
+            .as_ref()
+            .map(|id| {
+                format!(
+                    "{id}:{}:",
+                    self.params.lane_sequence.expect("decoded context sequence")
+                )
+            })
+            .unwrap_or_default();
         format!(
-            "native-execution:{}:{}:{}",
+            "native-execution:{}:{}:{context}{}",
             self.params.thread_id,
             self.params.turn_id,
             self.identity()
         )
     }
+}
+
+struct Coordinates<'a> {
+    thread: &'a str,
+    turn: &'a str,
+    context: Option<(&'a str, u64)>,
+    ordinal: u32,
+    phase: &'a str,
+}
+
+fn coordinates(reference: &str, revision: u32) -> Option<Coordinates<'_>> {
+    let format = Profile::from_revision(revision)?;
+    let fields = reference
+        .strip_prefix("native-execution:")?
+        .split(':')
+        .collect::<Vec<_>>();
+    let (thread, turn, context, ordinal, phase) = match fields.as_slice() {
+        [thread, turn, ordinal, phase] if format != Profile::Context => {
+            (*thread, *turn, None, *ordinal, *phase)
+        }
+        [thread, turn, context, sequence, ordinal, phase] if format == Profile::Context => {
+            let sequence = sequence.parse::<u64>().ok().filter(|value| *value > 0)?;
+            if !uuid(context) {
+                return None;
+            }
+            (*thread, *turn, Some((*context, sequence)), *ordinal, *phase)
+        }
+        _ => return None,
+    };
+    if !uuid(thread) || !uuid(turn) {
+        return None;
+    }
+    Some(Coordinates {
+        thread,
+        turn,
+        context,
+        ordinal: ordinal.parse::<u32>().ok().filter(|value| *value > 0)?,
+        phase,
+    })
+}
+
+fn lane_key(coordinates: &Coordinates<'_>) -> String {
+    let base = format!("native-thread:{}", coordinates.thread);
+    match coordinates.context {
+        Some((context, _)) => format!("{base}:context:{context}"),
+        None => base,
+    }
+}
+
+fn lifecycle(
+    reference: &str,
+    manifest: &str,
+    revision: u32,
+) -> Option<evertrace_domain::work::LaneLifecycleEvidence> {
+    use evertrace_domain::work::{LaneLifecycleEvidence, LivenessState};
+    let coordinates = coordinates(reference, revision)?;
+    let (context, sequence) = coordinates.context?;
+    Some(LaneLifecycleEvidence {
+        host_session_id: coordinates.thread.into(),
+        agent_id: coordinates.thread.into(),
+        incarnation_ref: Some(format!("native-context:{context}")),
+        host_lane_key: lane_key(&coordinates),
+        lane_sequence: sequence,
+        adapter_manifest_ref: manifest.into(),
+        eligible_event_manifest_ref: Profile::Context.eligible_events().into(),
+        child_session_id: None,
+        parent_host_lane_key: None,
+        spawn_event_ref: None,
+        terminal_event_ref: None,
+        terminal_kind: None,
+        host_final_return: false,
+        source_close_ref: None,
+        parent_session_end_ref: None,
+        liveness_probe_ref: None,
+        liveness_state: LivenessState::Unknown,
+        delegated_goal_ref: None,
+        delegated_target_refs: vec![],
+        delegated_acceptance_refs: vec![],
+        reasoning_visibility: vec![],
+    })
 }
 
 fn evidence(
@@ -108,21 +303,11 @@ fn evidence(
     revision: u32,
 ) -> Option<HostCorrelationEvidence> {
     let peer = host_events::peer_instance(instance)?;
-    let fields: Vec<_> = reference
-        .strip_prefix("native-execution:")?
-        .split(':')
-        .collect();
-    let [thread, turn, ordinal, phase] = fields.as_slice() else {
-        return None;
-    };
-    let ordinal = ordinal.parse::<u32>().ok().filter(|value| *value > 0)?;
-    if !uuid(thread)
-        || !uuid(turn)
-        || !matches!(
-            (*phase, role),
-            ("started", ObservationRole::Intent) | ("exited", ObservationRole::Result)
-        )
-    {
+    let coordinates = coordinates(reference, revision)?;
+    if !matches!(
+        (coordinates.phase, role),
+        ("started", ObservationRole::Intent) | ("exited", ObservationRole::Result)
+    ) {
         return None;
     }
     let mut fields = vec![
@@ -150,11 +335,14 @@ fn evidence(
     Some(HostCorrelationEvidence {
         occurrence_schema_version: 1,
         host_instance_id: Some(peer.into()),
-        host_trace_lineage_id: Some(format!("native-thread:{thread}:turn:{turn}")),
-        host_lane_key: Some(format!("native-thread:{thread}")),
+        host_trace_lineage_id: Some(format!(
+            "native-thread:{}:turn:{}",
+            coordinates.thread, coordinates.turn
+        )),
+        host_lane_key: Some(lane_key(&coordinates)),
         canonical_event_family: Some(CanonicalEventFamily::OtherExecutable),
         native_request_id: request.map(str::to_owned),
-        physical_execution_ordinal: Some(ordinal),
+        physical_execution_ordinal: Some(coordinates.ordinal),
         pairing_role: role,
         field_provenance: claims,
         adapter_manifest_ref: manifest.into(),
@@ -176,15 +364,6 @@ fn request_id(value: &str) -> Option<&str> {
     .then_some(value)
 }
 
-pub(crate) fn input(
-    raw: &str,
-    instance: &str,
-    sequence: u64,
-    manifest: &str,
-) -> Option<CaptureRecordInput> {
-    input_revision(raw, instance, sequence, manifest, REVISION)
-}
-
 pub(crate) fn input_revision(
     raw: &str,
     instance: &str,
@@ -192,19 +371,20 @@ pub(crate) fn input_revision(
     manifest: &str,
     revision: u32,
 ) -> Option<CaptureRecordInput> {
-    if !matches!(revision, REVISION | QUALIFIED_REVISION) {
+    let format = Profile::from_revision(revision)?;
+    let event = Event::decode(raw.as_bytes())?;
+    if !event.accepts(format) {
         return None;
     }
-    let event = Event::decode(raw.as_bytes())?;
     Some(CaptureRecordInput {
         spool_record_id: None,
         source_observation_id_hint: None,
         source_instance_id: instance.into(),
-        source_revision: SOURCE_REVISION.into(),
+        source_revision: format.source_revision().into(),
         source_record_identity: Some(event.identity()),
         identity_strength: Some(IdentityStrength::StableNative),
         source_kind: EvidenceSourceKind::Other,
-        identity_domain: SOURCE_REVISION.into(),
+        identity_domain: format.source_revision().into(),
         source_ref: event.reference(),
         session_ref: event.params.thread_id.clone(),
         turn_ref: Some(event.params.turn_id.clone()),
@@ -232,7 +412,7 @@ pub(crate) fn input_revision(
         )?,
         scope_effect_claims: vec![],
         source_local_evidence: None,
-        lifecycle: None,
+        lifecycle: lifecycle(&event.reference(), manifest, revision),
         unsupported_record_classification: None,
         source_role: SourceRole::Host,
         content_trust: ContentTrust::Observed,
@@ -240,7 +420,7 @@ pub(crate) fn input_revision(
         surface_eligible: false,
         adapter_revision: revision,
         adapter_manifest_ref: manifest.into(),
-        eligible_event_manifest_ref: ELIGIBLE_EVENTS.into(),
+        eligible_event_manifest_ref: format.eligible_events().into(),
         parser_revision: revision,
         canonicalization_revision: 1,
         event_time_us: None,
@@ -254,7 +434,8 @@ pub(crate) fn protected_correlation(
     bytes: &[u8],
 ) -> Option<HostCorrelationEvidence> {
     let event = Event::decode(bytes)?;
-    if input.source_ref != event.reference()
+    if !event.accepts(Profile::from_revision(input.adapter_revision)?)
+        || input.source_ref != event.reference()
         || input.source_record_identity.as_deref() != Some(&event.identity())
     {
         return None;
@@ -276,10 +457,11 @@ pub fn protected_measurement(
     manifest: &str,
     revision: u32,
 ) -> Option<(String, HostCorrelationEvidence)> {
-    if !matches!(revision, REVISION | QUALIFIED_REVISION) {
+    let format = Profile::from_revision(revision)?;
+    let event = Event::decode(protected)?;
+    if !event.accepts(format) {
         return None;
     }
-    let event = Event::decode(protected)?;
     let reference = event.reference();
     let correlation = evidence(
         instance,
@@ -305,9 +487,9 @@ pub fn record_matches(body: &CaptureRecordBody, protected: &[u8], manifest: &str
     ) else {
         return false;
     };
-    body.source_revision.as_str() == SOURCE_REVISION
+    body.source_revision.as_str() == expected.source_revision
         && body.source_kind == expected.source_kind
-        && body.identity_domain == SOURCE_REVISION
+        && body.identity_domain == expected.identity_domain
         && body.identity_strength == IdentityStrength::StableNative
         && body.source_record_identity.as_str()
             == expected.source_record_identity.as_deref().unwrap_or("")
@@ -319,7 +501,7 @@ pub fn record_matches(body: &CaptureRecordBody, protected: &[u8], manifest: &str
         && body.parser_revision == expected.parser_revision
         && body.canonicalization_revision == 1
         && body.adapter_manifest_ref == manifest
-        && body.eligible_event_manifest_ref == ELIGIBLE_EVENTS
+        && body.eligible_event_manifest_ref == expected.eligible_event_manifest_ref
         && body.source_role == SourceRole::Host
         && body.content_trust == ContentTrust::Observed
         && body.capture_completeness == CaptureCompleteness::Partial
@@ -339,15 +521,18 @@ pub fn record_matches(body: &CaptureRecordBody, protected: &[u8], manifest: &str
             })
         && body.scope_effect_claims.is_empty()
         && body.source_local_evidence.is_none()
-        && body.lifecycle.is_none()
+        && body.lifecycle == expected.lifecycle
         && body.unsupported_record_classification.is_none()
         && body.recovery_preflight.is_none()
 }
 
 /// Canonical observations may retain a namespace admitted by the original ingestion command.
 pub fn is_execution(observation: &SourceObservation, receipt: &SourceReceipt) -> bool {
+    let Some(format) = Profile::from_revision(receipt.parser_revision) else {
+        return false;
+    };
     let mut correlation = observation.correlation.clone();
-    if receipt.parser_revision == QUALIFIED_REVISION
+    if is_qualified_revision(receipt.parser_revision)
         && correlation.admission == CorrelationAdmission::ExactCapable
     {
         if correlation.exact_key().is_none() || correlation.validate().is_err() {
@@ -356,13 +541,12 @@ pub fn is_execution(observation: &SourceObservation, receipt: &SourceReceipt) ->
         correlation.admission = CorrelationAdmission::Unavailable;
         correlation.strong_gate_receipt_ref = None;
     }
-    receipt.source_revision.as_str() == SOURCE_REVISION
-        && receipt.identity_domain == SOURCE_REVISION
+    receipt.source_revision.as_str() == format.source_revision()
+        && receipt.identity_domain == format.source_revision()
         && receipt.source_kind == EvidenceSourceKind::Other
-        && matches!(receipt.parser_revision, REVISION | QUALIFIED_REVISION)
         && receipt.adapter_revision == receipt.parser_revision
         && receipt.canonicalization_revision == 1
-        && receipt.eligible_event_manifest_ref == ELIGIBLE_EVENTS
+        && receipt.eligible_event_manifest_ref == format.eligible_events()
         && observation.source_receipt_ref == receipt.source_receipt_id
         && observation.source_observation_id == receipt.source_observation_id
         && observation.source_instance_id == receipt.source_instance_id
@@ -387,5 +571,10 @@ pub fn is_execution(observation: &SourceObservation, receipt: &SourceReceipt) ->
             == Some(&correlation)
         && observation.scope_effect_claims.is_empty()
         && observation.source_local_evidence.is_none()
-        && receipt.lifecycle.is_none()
+        && receipt.lifecycle
+            == lifecycle(
+                &receipt.source_ref,
+                &receipt.adapter_manifest_ref,
+                receipt.parser_revision,
+            )
 }

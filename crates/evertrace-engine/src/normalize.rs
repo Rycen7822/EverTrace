@@ -288,7 +288,8 @@ impl PhysicalNormalizer {
                 source_local_pairing: logical_pairing,
                 operation_id,
                 host_occurrence_id: occurrence.host_occurrence_id,
-                execution_lane_id: None,
+                execution_lane_id: previous_operation
+                    .and_then(|operation| operation.execution_lane_id),
                 operation_kind,
                 input_source_observation_refs: inputs,
                 result_source_observation_refs: results,

@@ -424,6 +424,40 @@ impl HostProbeReport {
             },
             &ProbeEvidence::empty(),
             true,
+            &[],
+        )
+    }
+
+    /// Intrinsic local execution events, not evidence of capture closure or a runtime grant.
+    pub fn execution_source_contract(
+        adapter_revision: &str,
+        eligible_events: &str,
+        host_version: &str,
+    ) -> Result<Self, ProbeError> {
+        Self::evaluate_execution_source(
+            &ProbeContext {
+                adapter_kind: AdapterKind::Other,
+                adapter_revision: adapter_revision.into(),
+                observed_host_version_range: host_version.into(),
+                eligible_event_manifest_ref: eligible_events.into(),
+                evidence_source: EvidenceSourceKind::NoHostEvidence,
+            },
+            &ProbeEvidence::empty(),
+        )
+    }
+
+    pub fn evaluate_execution_source(
+        context: &ProbeContext,
+        evidence: &ProbeEvidence,
+    ) -> Result<Self, ProbeError> {
+        Self::evaluate_with_native_identity(
+            context,
+            evidence,
+            true,
+            &[
+                ObservableCapability::ChildToolCall,
+                ObservableCapability::ChildToolResult,
+            ],
         )
     }
 
@@ -593,15 +627,16 @@ impl HostProbeReport {
     }
 
     pub fn evaluate(context: &ProbeContext, evidence: &ProbeEvidence) -> Result<Self, ProbeError> {
-        Self::evaluate_with_native_identity(context, evidence, false)
+        Self::evaluate_with_native_identity(context, evidence, false, &[])
     }
 
     fn evaluate_with_native_identity(
         context: &ProbeContext,
         evidence: &ProbeEvidence,
         native_identity: bool,
+        intrinsic_observable: &[ObservableCapability],
     ) -> Result<Self, ProbeError> {
-        let manifest = compile_manifest(context, evidence, native_identity)?;
+        let manifest = compile_manifest(context, evidence, native_identity, intrinsic_observable)?;
         let hook = evaluate_hook(evidence.hook.as_ref());
         let mcp = evidence
             .mcp
@@ -659,6 +694,7 @@ fn compile_manifest(
     context: &ProbeContext,
     evidence: &ProbeEvidence,
     native_identity: bool,
+    intrinsic_observable: &[ObservableCapability],
 ) -> Result<AdapterCapabilityManifest, ProbeError> {
     let observable = evidence
         .capture
@@ -677,6 +713,12 @@ fn compile_manifest(
                 .collect::<Vec<_>>()
         })
         .unwrap_or_default();
+    let observable = observable
+        .into_iter()
+        .chain(intrinsic_observable.iter().copied())
+        .collect::<BTreeSet<_>>()
+        .into_iter()
+        .collect::<Vec<_>>();
     let observable_set = observable.iter().copied().collect::<BTreeSet<_>>();
     let has_required = REQUIRED_FOR_FULL
         .iter()

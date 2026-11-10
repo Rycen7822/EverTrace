@@ -700,11 +700,11 @@ impl EvidenceIngestor {
                         .map_err(map_writer_error)?,
                 };
                 if let Some(committed_command) = committed_command {
-                    if verified.body.source_revision.as_str()
-                        == evertrace_capture::execution_source::SOURCE_REVISION
-                        && verified.body.parser_revision
-                            == evertrace_capture::execution_source::QUALIFIED_REVISION
-                    {
+                    if evertrace_capture::execution_source::is_source_revision(
+                        verified.body.source_revision.as_str(),
+                    ) && evertrace_capture::execution_source::is_qualified_revision(
+                        verified.body.parser_revision,
+                    ) {
                         if let Some(original) =
                             committed_command
                                 .payloads
@@ -787,11 +787,11 @@ impl EvidenceIngestor {
                     progress.projected_surfaces += surface_count;
                     continue;
                 }
-                if verified.body.source_revision.as_str()
-                    == evertrace_capture::execution_source::SOURCE_REVISION
-                    && verified.body.parser_revision
-                        == evertrace_capture::execution_source::QUALIFIED_REVISION
-                {
+                if evertrace_capture::execution_source::is_source_revision(
+                    verified.body.source_revision.as_str(),
+                ) && evertrace_capture::execution_source::is_qualified_revision(
+                    verified.body.parser_revision,
+                ) {
                     if let Some(report) = self
                         .execution_canary
                         .as_ref()

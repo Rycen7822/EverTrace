@@ -1460,7 +1460,7 @@ fn reconciliation_artifact_item(
                 receipt.source_observation_id,
             )?)?;
         }
-        let (_, has_current_lane_receipt) =
+        let (_, has_current_lane_receipt, _) =
             collect_capture_dependencies(snapshot, receipt, &mut dependencies)?;
         affected_cohort |= has_current_lane_receipt;
         dependencies.insert(source_receipt_dependency(
@@ -1553,6 +1553,7 @@ fn reconciliation_item(
     let mut dependencies = DependencyCollector::default();
     dependencies.insert(observation)?;
     dependencies.insert(source_receipt.clone())?;
+    let mut source_event_seq = dirty_row.source_event_seq;
     let active = match target.target_kind {
         crate::command::DirtyTargetKind::PhysicalNormalization => {
             let watermark = format!("runtime:watermark:normalization:{}", target.target_id);
@@ -1568,15 +1569,18 @@ fn reconciliation_item(
             }
         }
         crate::command::DirtyTargetKind::CaptureReconciliation => {
-            collect_capture_dependencies(
+            let (import_watermark, _, pending_operation) = collect_capture_dependencies(
                 snapshot,
                 match &source_receipt.payload {
                     JournalPayload::SourceReceiptRecorded(receipt) => receipt,
                     _ => return Err(StoreError::StoreCorrupt),
                 },
                 &mut dependencies,
-            )?
-            .0 < dirty_row.source_event_seq
+            )?;
+            if let Some(sequence) = pending_operation {
+                source_event_seq = source_event_seq.max(sequence);
+            }
+            import_watermark < dirty_row.source_event_seq || pending_operation.is_some()
         }
         _ => false,
     };
@@ -1587,7 +1591,7 @@ fn reconciliation_item(
         row_id: dirty_row.row_id,
         target_kind: target.target_kind,
         target_id: target.target_id,
-        source_event_seq: dirty_row.source_event_seq,
+        source_event_seq,
         dependencies: dependencies.into_dependencies(),
     }))
 }
@@ -1916,6 +1920,9 @@ fn collect_observation_relations(
             snapshot,
             observation.source_receipt_ref,
         )?)?;
+        if let Some(row) = snapshot.other_row(&format!("runtime:watermark:normalization:{id}")) {
+            dependencies.insert(current_payload(row)?)?;
+        }
     }
     let observation_needles = observation_ids
         .iter()
@@ -1971,9 +1978,9 @@ fn collect_capture_dependencies(
     snapshot: &CurrentFacts,
     selected: &SourceReceipt,
     dependencies: &mut DependencyCollector,
-) -> Result<(u64, bool), StoreError> {
+) -> Result<(u64, bool, Option<u64>), StoreError> {
     let Some(lifecycle) = selected.lifecycle.as_ref() else {
-        return Ok((0, false));
+        return Ok((0, false, None));
     };
     let incarnation_ref = source_incarnation_ref(selected).ok_or(StoreError::StoreCorrupt)?;
     let mut cohort_observation_ids = BTreeSet::from([selected.source_observation_id]);
@@ -2002,7 +2009,9 @@ fn collect_capture_dependencies(
     }
     collect_observation_relations(snapshot, &cohort_observation_ids, dependencies)?;
     let mut import_watermark = 0;
+    let mut receipt_event_seq = 0;
     let mut has_current_lane_receipt = false;
+    let mut current_lane = None;
     let lane_needles = [
         json_field_fragment("host_session_id", &lifecycle.host_session_id)?,
         json_field_fragment("agent_id", &lifecycle.agent_id)?,
@@ -2027,6 +2036,16 @@ fn collect_capture_dependencies(
         {
             continue;
         }
+        if current_lane
+            .as_ref()
+            .is_none_or(|(_, revision, _)| *revision < lane.lane_revision)
+        {
+            current_lane = Some((
+                lane.execution_lane_id,
+                lane.lane_revision,
+                lane.operation_ids.iter().copied().collect::<BTreeSet<_>>(),
+            ));
+        }
         let receipt_row_id = format!("object:evidence:capture_receipt:{}", lane.execution_lane_id);
         if let Some(row) = snapshot.other_row(&receipt_row_id) {
             let receipt_dependency = current_payload(row)?;
@@ -2036,12 +2055,50 @@ fn collect_capture_dependencies(
             };
             import_watermark = import_watermark.max(receipt.import_watermark);
             has_current_lane_receipt = true;
+            receipt_event_seq = receipt_event_seq.max(receipt_dependency.source_event_seq);
             collect_receipt_references(snapshot, receipt, dependencies)?;
             dependencies.insert(receipt_dependency)?;
         }
         dependencies.insert(lane_dependency)?;
     }
-    Ok((import_watermark, has_current_lane_receipt))
+    // Source import can precede physical normalization. Materialized or unlinked
+    // operations must wake this target without another source event.
+    let mut operations = BTreeMap::new();
+    for dependency in dependencies.by_row_id.values() {
+        let JournalPayload::OperationDerived(operation) = &dependency.payload else {
+            continue;
+        };
+        if !operation
+            .input_source_observation_refs
+            .iter()
+            .chain(&operation.result_source_observation_refs)
+            .all(|id| cohort_observation_ids.contains(id))
+        {
+            continue;
+        }
+        let candidate = (
+            operation.operation_revision,
+            dependency.source_event_seq,
+            operation.execution_lane_id,
+        );
+        let current = operations
+            .entry(operation.operation_id)
+            .or_insert(candidate);
+        if current.0 < candidate.0 {
+            *current = candidate;
+        }
+    }
+    let pending = operations
+        .iter()
+        .filter(|(id, (_, sequence, lane))| {
+            *sequence > receipt_event_seq
+                || current_lane.as_ref().is_none_or(|(current_id, _, ids)| {
+                    *lane != Some(*current_id) || !ids.contains(id)
+                })
+        })
+        .map(|(_, (_, sequence, _))| *sequence)
+        .max();
+    Ok((import_watermark, has_current_lane_receipt, pending))
 }
 
 fn source_incarnation_ref(receipt: &SourceReceipt) -> Option<String> {

@@ -68,7 +68,8 @@ impl HostCanaryService {
         let report = current.report.as_ref()?;
         (matches!(identity.wiring, CanaryWiring::ExecutionSource)
             && identity.valid()
-            && report.manifest().adapter_version == execution_source::QUALIFIED_ADAPTER_VERSION
+            && execution_source::Profile::from_adapter_version(&report.manifest().adapter_version)
+                .is_some_and(execution_source::Profile::native_identity)
             && report.strong_normalization().result() == GateResult::Enabled)
             .then(|| report.clone())
     }
@@ -132,14 +133,28 @@ impl HostCanaryService {
             child: None,
             completed: false,
         };
-        let contract = match HostProbeReport::unobserved_source_contract(
-            execution_source::ADAPTER_VERSION,
-            execution_source::ELIGIBLE_EVENTS,
-        ) {
-            Ok(value) => value,
-            Err(_) => return unavailable(),
+        let manifests = [
+            execution_source::Profile::ProcessNative,
+            execution_source::Profile::Context,
+        ]
+        .into_iter()
+        .map(|profile| {
+            let contract = if profile == execution_source::Profile::Context {
+                HostProbeReport::execution_source_contract
+            } else {
+                HostProbeReport::native_source_contract
+            };
+            contract(
+                profile.adapter_version(),
+                profile.eligible_events(),
+                "0.166.0",
+            )
+            .map(|report| (profile, report.manifest().adapter_manifest_id.clone()))
+        })
+        .collect::<Result<Vec<_>, _>>();
+        let Ok(manifests) = manifests else {
+            return unavailable();
         };
-        let manifest = contract.manifest().adapter_manifest_id.clone();
         let deadline = Instant::now() + Duration::from_secs(30);
         let collected = tokio::task::spawn_blocking(move || {
             execution_source::canary::collect(
@@ -147,7 +162,7 @@ impl HostCanaryService {
                 &request.source_endpoint,
                 &request.source_executable,
                 &directory,
-                &manifest,
+                &manifests,
                 deadline,
             )
         })
@@ -175,7 +190,7 @@ impl HostCanaryService {
             references.insert(reference.clone());
         }
         let retry = self
-            .execution_retry_evidence(&mut observations, &mut references)
+            .execution_retry_evidence(facts.profile, &mut observations, &mut references)
             .await;
         let mut evidence = ProbeEvidence::empty();
         evidence.normalization = Some(NormalizationEvidence {
@@ -194,12 +209,17 @@ impl HostCanaryService {
             },
             protected_digest: facts.protected_digest,
         });
-        let report = HostProbeReport::evaluate(
+        let evaluate = if facts.profile == execution_source::Profile::Context {
+            HostProbeReport::evaluate_execution_source
+        } else {
+            HostProbeReport::evaluate
+        };
+        let report = evaluate(
             &ProbeContext {
                 adapter_kind: AdapterKind::Other,
-                adapter_revision: execution_source::QUALIFIED_ADAPTER_VERSION.into(),
+                adapter_revision: facts.profile.adapter_version().into(),
                 observed_host_version_range: "0.166.0".into(),
-                eligible_event_manifest_ref: execution_source::ELIGIBLE_EVENTS.into(),
+                eligible_event_manifest_ref: facts.profile.eligible_events().into(),
                 evidence_source: EvidenceSourceKind::ObservedHostCanary,
             },
             &evidence,
@@ -236,6 +256,7 @@ impl HostCanaryService {
     // A different logical call is not a retry canary. Reuse protected, admitted real traffic when present.
     async fn execution_retry_evidence(
         &self,
+        profile: execution_source::Profile,
         observations: &mut Vec<OccurrenceEvidence>,
         refs: &mut BTreeSet<String>,
     ) -> bool {
@@ -253,11 +274,8 @@ impl HostCanaryService {
         for (receipt, _) in snapshot
             .source_receipts()
             .filter(|(receipt, _)| {
-                receipt.source_revision.as_str() == execution_source::SOURCE_REVISION
-                    && matches!(
-                        receipt.parser_revision,
-                        execution_source::REVISION | execution_source::QUALIFIED_REVISION
-                    )
+                receipt.source_revision.as_str() == profile.source_revision()
+                    && execution_source::Profile::from_revision(receipt.parser_revision).is_some()
             })
             .take(65)
         {

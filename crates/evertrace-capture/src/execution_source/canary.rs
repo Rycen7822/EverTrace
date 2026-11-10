@@ -21,6 +21,7 @@ pub struct CanaryError;
 
 /// Only a verified live source can construct these measurements. No runtime gate is changed here.
 pub struct CanaryFacts {
+    pub profile: super::Profile,
     pub measurements: Vec<(String, HostCorrelationEvidence)>,
     pub protected_digest: String,
     pub fork_isolated: bool,
@@ -42,6 +43,7 @@ struct Capture {
 }
 
 struct Client {
+    profile: super::Profile,
     socket: WebSocket<UnixStream>,
     publisher: goal_source::Publisher,
     instance: String,
@@ -53,15 +55,11 @@ struct Client {
 }
 
 impl Client {
-    fn open(
-        endpoint: &Path,
-        executable: &Path,
-        deadline: Instant,
-        capture: &mut Capture,
-    ) -> Result<Self> {
+    fn open(endpoint: &Path, executable: &Path, deadline: Instant) -> Result<Self> {
         let (stream, publisher) =
             goal_source::connect_publisher(endpoint, deadline).map_err(|_| CanaryError)?;
-        if !publisher.execution_receipts() || !publisher.matches_executable(executable) {
+        let profile = publisher.execution_profile().ok_or(CanaryError)?;
+        if !publisher.matches_executable(executable) {
             return Err(CanaryError);
         }
         let instance = format!(
@@ -76,7 +74,8 @@ impl Client {
             .max_frame_size(Some(1 << 20));
         let (socket, _) =
             client_with_config("ws://localhost/", stream, Some(config)).map_err(|_| CanaryError)?;
-        let mut client = Self {
+        Ok(Self {
+            profile,
             socket,
             publisher,
             instance,
@@ -85,15 +84,17 @@ impl Client {
             received: vec![],
             deadline,
             remaining: 8 << 20,
-        };
-        client.call(
+        })
+    }
+
+    fn initialize(&mut self, capture: &mut Capture) -> Result<()> {
+        self.call(
             "initialize",
             json!({"clientInfo":{"name":"evertrace-source-canary","version":"1"},
             "capabilities":{"experimentalApi":true}}),
             capture,
         )?;
-        client.send(json!({"method":"initialized","params":{}}))?;
-        Ok(client)
+        self.send(json!({"method":"initialized","params":{}}))
     }
 
     fn send(&mut self, value: Value) -> Result<()> {
@@ -137,14 +138,20 @@ impl Client {
                 if event.params.origin != "user_shell" || !super::uuid(&event.params.call_id) {
                     return Err(CanaryError);
                 }
-                let input = super::input(&text, &self.instance, self.sequence, &capture.manifest)
-                    .ok_or(CanaryError)?;
+                let input = super::input_revision(
+                    &text,
+                    &self.instance,
+                    self.sequence,
+                    &capture.manifest,
+                    self.profile.revision(),
+                )
+                .ok_or(CanaryError)?;
                 let observation = host_events::execution_observation(
                     &text,
                     &self.instance,
                     self.sequence,
                     &capture.manifest,
-                    super::REVISION,
+                    self.profile.revision(),
                 )
                 .ok_or(CanaryError)?;
                 let outcome = capture
@@ -223,10 +230,20 @@ impl Client {
             "executionOrdinal",
             "processPid",
             "processStartTicks",
+            "executionContextId",
+            "workingDirectory",
         ] {
             if before[field] != after[field] {
                 return Err(CanaryError);
             }
+        }
+        if self.profile == super::Profile::Context
+            && after["laneSequence"]
+                .as_u64()
+                .zip(before["laneSequence"].as_u64())
+                .is_none_or(|(after, before)| after <= before)
+        {
+            return Err(CanaryError);
         }
         if before["phase"] != "started"
             || after["phase"] != "exited"
@@ -270,7 +287,7 @@ pub fn collect(
     endpoint: &Path,
     executable: &Path,
     directory: &Path,
-    manifest: &str,
+    manifests: &[(super::Profile, String)],
     deadline: Instant,
 ) -> Result<CanaryFacts> {
     crate::ConfinedRoot::open_owned_private(directory).map_err(|_| CanaryError)?;
@@ -286,7 +303,14 @@ pub fn collect(
         .ok_or(CanaryError)?;
     let cas = CasStore::open_existing(&snapshot.cas_dir).map_err(|_| CanaryError)?;
     let runtime = CaptureRuntime::open_for_admission(snapshot).map_err(|_| CanaryError)?;
+    let mut first = Client::open(endpoint, executable, work_deadline)?;
+    let profile = first.profile;
+    let (_, manifest) = manifests
+        .iter()
+        .find(|(value, _)| *value == profile)
+        .ok_or(CanaryError)?;
     let facts = CanaryFacts {
+        profile,
         measurements: vec![],
         protected_digest: String::new(),
         fork_isolated: false,
@@ -300,10 +324,10 @@ pub fn collect(
     let mut capture = Capture {
         runtime,
         cas,
-        manifest: manifest.into(),
+        manifest: manifest.clone(),
         facts,
     };
-    let mut first = Client::open(endpoint, executable, work_deadline, &mut capture)?;
+    first.initialize(&mut capture)?;
     let mut second = None;
     let mut owned_threads = vec![];
     let outcome = (|| {
@@ -319,13 +343,12 @@ pub fn collect(
             .ok_or(CanaryError)?;
         owned_threads.push(parent.to_owned());
         first.shell(parent, &mut capture)?;
-        second = Some(Client::open(
-            endpoint,
-            executable,
-            work_deadline,
-            &mut capture,
-        )?);
+        second = Some(Client::open(endpoint, executable, work_deadline)?);
         let other = second.as_mut().ok_or(CanaryError)?;
+        if other.profile != profile {
+            return Err(CanaryError);
+        }
+        other.initialize(&mut capture)?;
         let resumed = other.call(
             "thread/resume",
             json!({"threadId":parent,"excludeTurns":true}),
@@ -391,6 +414,20 @@ pub fn collect(
             && starts[..3]
                 .iter()
                 .all(|value| value["turnId"] != starts[3]["turnId"]);
+        if profile == super::Profile::Context {
+            capture.facts.fork_isolated &=
+                starts[0]["executionContextId"] != starts[2]["executionContextId"];
+            capture.facts.resume_isolated &= starts[0]["executionContextId"]
+                == starts[1]["executionContextId"]
+                && starts[0]["executionContextId"] != starts[3]["executionContextId"]
+                && starts[3]["laneSequence"] == 1;
+            if starts
+                .iter()
+                .any(|event| event["workingDirectory"] != directory.to_str().unwrap_or(""))
+            {
+                return Err(CanaryError);
+            }
+        }
         capture.facts.nonidentity_similarity_not_merged = starts[0]["executionOrdinal"]
             != starts[1]["executionOrdinal"]
             && starts[0]["turnId"] != starts[1]["turnId"];

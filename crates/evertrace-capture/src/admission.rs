@@ -330,7 +330,7 @@ impl CaptureRuntime {
         }
         let key = DeviceKeyStore::new(self.snapshot.device_key_dir.clone()).load()?;
         let protected = protect(&input.raw_payload, &key)?;
-        if input.source_revision == crate::execution_source::SOURCE_REVISION
+        if crate::execution_source::is_source_revision(&input.source_revision)
             && let Some(correlation) =
                 crate::execution_source::protected_correlation(&input, protected.protected_bytes())
         {
@@ -619,7 +619,7 @@ fn reject_caller_source(input: &CaptureRecordInput) -> Result<(), CaptureError> 
     if crate::goal_source::is_source_revision(&input.source_revision)
         || input.source_revision == crate::process_source::KERNEL_SOURCE_REVISION
         || input.source_revision == crate::host_events::SOURCE_REVISION
-        || input.source_revision == crate::execution_source::SOURCE_REVISION
+        || crate::execution_source::is_source_revision(&input.source_revision)
     {
         return Err(CaptureError::InvalidInput);
     }

@@ -36,7 +36,9 @@ pub struct GoalSourceError;
 type Result<T> = std::result::Result<T, GoalSourceError>;
 
 pub fn is_source_revision(revision: &str) -> bool {
-    revision == SOURCE_REVISION || revision == publisher_revision(true)
+    revision == SOURCE_REVISION
+        || revision == publisher_revision(EXECUTION_BINARY_SHA256)
+        || revision == publisher_revision(CONTEXT_BINARY_SHA256)
 }
 
 pub fn adapter_version(revision: &str) -> Result<String> {
@@ -46,13 +48,9 @@ pub fn adapter_version(revision: &str) -> Result<String> {
     Ok(format!("{revision}:capture-{ADAPTER_REVISION}"))
 }
 
-fn publisher_revision(standalone: bool) -> String {
-    if standalone {
-        let (abi, _) = SOURCE_REVISION.rsplit_once(':').expect("fixed goal ABI");
-        format!("{abi}:{EXECUTION_BINARY_SHA256}")
-    } else {
-        SOURCE_REVISION.into()
-    }
+fn publisher_revision(fingerprint: &str) -> String {
+    let (abi, _) = SOURCE_REVISION.rsplit_once(':').expect("fixed goal ABI");
+    format!("{abi}:{fingerprint}")
 }
 
 #[derive(Deserialize)]
@@ -230,9 +228,11 @@ pub struct Observation {
     revision: String,
 }
 
-// One canonical fingerprint for the authorized source extension, including its whole stripped ELF.
+// Canonical whole-ELF fingerprints for the real source formats, including the retained upgrade producer.
 const EXECUTION_BINARY_SHA256: &str =
     "87b73337e44523eba731eb9326c96dbcc8a565657cb7de3ee3e36667c258498e";
+const CONTEXT_BINARY_SHA256: &str =
+    "aa2927a32b6b724d7eb951c2e671ecdbd7ef30d1a34ac5f9d535b694aa73c707";
 
 #[derive(Eq, PartialEq)]
 struct Peer {
@@ -316,7 +316,7 @@ impl Peer {
     }
 }
 
-fn verified_publisher(stream: &UnixStream, deadline: Instant) -> Result<Peer> {
+fn verified_publisher(stream: &UnixStream, deadline: Instant) -> Result<(Peer, &'static str)> {
     let credentials = rustix::net::sockopt::socket_peercred(stream).map_err(|_| GoalSourceError)?;
     if credentials.uid.as_raw()
         != fs::metadata("/proc/self")
@@ -343,19 +343,25 @@ fn verified_publisher(stream: &UnixStream, deadline: Instant) -> Result<Peer> {
         }
         digest.update(&buffer[..count]);
     }
+    let actual = format!("{digest:x}", digest = digest.finalize());
     let expected = if before.standalone {
-        EXECUTION_BINARY_SHA256
+        [EXECUTION_BINARY_SHA256, CONTEXT_BINARY_SHA256]
+            .into_iter()
+            .find(|expected| *expected == actual)
+            .ok_or(GoalSourceError)?
     } else {
-        SOURCE_REVISION.rsplit(':').next().ok_or(GoalSourceError)?
+        let expected = SOURCE_REVISION.rsplit(':').next().ok_or(GoalSourceError)?;
+        if actual != expected {
+            return Err(GoalSourceError);
+        }
+        expected
     };
-    if format!("{digest:x}", digest = digest.finalize()) != expected {
-        return Err(GoalSourceError);
-    }
-    Ok(before)
+    Ok((before, expected))
 }
 
 pub(crate) struct Publisher {
     peer: Peer,
+    fingerprint: &'static str,
     locator: std::path::PathBuf,
     confined: ConfinedRoot,
     locator_identity: (u64, u64),
@@ -365,8 +371,13 @@ pub(crate) struct Publisher {
 }
 
 impl Publisher {
-    pub(crate) fn execution_receipts(&self) -> bool {
-        self.peer.standalone
+    pub(crate) fn execution_profile(&self) -> Option<crate::execution_source::Profile> {
+        use crate::execution_source::Profile;
+        match self.fingerprint {
+            EXECUTION_BINARY_SHA256 => Some(Profile::ProcessNative),
+            CONTEXT_BINARY_SHA256 => Some(Profile::Context),
+            _ => None,
+        }
     }
 
     pub(crate) fn matches_executable(&self, path: &Path) -> bool {
@@ -433,8 +444,10 @@ pub(crate) fn connect_publisher(path: &Path, deadline: Instant) -> Result<(UnixS
     }
     let stream = UnixStream::connect(&endpoint).map_err(|_| GoalSourceError)?;
     timeout(&stream, deadline)?;
+    let (peer, fingerprint) = verified_publisher(&stream, deadline)?;
     let publisher = Publisher {
-        peer: verified_publisher(&stream, deadline)?,
+        peer,
+        fingerprint,
         locator: path.to_path_buf(),
         confined,
         locator_identity: (locator.dev(), locator.ino()),
@@ -529,7 +542,7 @@ pub fn read(path: &Path, thread: &str) -> Result<Option<Observation>> {
     }
     Ok(Some(Observation {
         raw,
-        revision: publisher_revision(publisher.execution_receipts()),
+        revision: publisher_revision(publisher.fingerprint),
         instance: publisher.instance("host-goal")?,
         reference: goal.root_ref(),
         thread: goal.thread_id,

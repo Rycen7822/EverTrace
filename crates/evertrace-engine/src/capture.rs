@@ -157,33 +157,42 @@ pub(crate) fn verify_capture_frame_presented(
             ),
             evertrace_capture::host_events::ELIGIBLE_EVENTS,
         ))
-    } else if body.source_revision.as_str() == evertrace_capture::execution_source::SOURCE_REVISION
+    } else if evertrace_capture::execution_source::is_source_revision(body.source_revision.as_str())
     {
+        let format =
+            evertrace_capture::execution_source::Profile::from_revision(body.parser_revision)
+                .ok_or(IngestError::InvalidRecord)?;
         Some((
-            evertrace_capture::execution_source::ADAPTER_VERSION.to_owned(),
-            evertrace_capture::execution_source::ELIGIBLE_EVENTS,
+            format.adapter_version().to_owned(),
+            format.eligible_events(),
         ))
     } else {
         None
     };
     if let Some((version, eligible)) = native_contract {
-        let contract = if body.source_revision.as_str()
-            == evertrace_capture::execution_source::SOURCE_REVISION
-            && body.parser_revision == evertrace_capture::execution_source::QUALIFIED_REVISION
-        {
-            evertrace_codex::probe::HostProbeReport::native_source_contract(
-                evertrace_capture::execution_source::QUALIFIED_ADAPTER_VERSION,
-                evertrace_capture::execution_source::ELIGIBLE_EVENTS,
-                "0.166.0",
-            )
+        let contract = if evertrace_capture::execution_source::is_source_revision(
+            body.source_revision.as_str(),
+        ) && evertrace_capture::execution_source::is_qualified_revision(
+            body.parser_revision,
+        ) {
+            use evertrace_codex::probe::HostProbeReport;
+            let contract = if evertrace_capture::execution_source::Profile::from_revision(
+                body.parser_revision,
+            ) == Some(evertrace_capture::execution_source::Profile::Context)
+            {
+                HostProbeReport::execution_source_contract
+            } else {
+                HostProbeReport::native_source_contract
+            };
+            contract(&version, eligible, "0.166.0")
         } else {
             evertrace_codex::probe::HostProbeReport::unobserved_source_contract(&version, eligible)
         }
         .map_err(|_| IngestError::InvalidRecord)?;
         let manifest = &contract.manifest().adapter_manifest_id;
-        let valid = if body.source_revision.as_str()
-            == evertrace_capture::execution_source::SOURCE_REVISION
-        {
+        let valid = if evertrace_capture::execution_source::is_source_revision(
+            body.source_revision.as_str(),
+        ) {
             evertrace_capture::execution_source::record_matches(&body, &protected, manifest)
         } else {
             evertrace_capture::host_events::record_matches(&body, &protected, manifest)
@@ -922,6 +931,7 @@ async fn reconcile_selected(
     let committed = if payloads.is_empty() {
         None
     } else {
+        close_normalization_payloads(&state, &mut payloads)?;
         let command = reconciliation_command(&input, payloads)?;
         Some(
             writer
@@ -1060,7 +1070,8 @@ struct CurrentCaptureState {
     host_occurrences: Vec<evertrace_domain::evidence::HostOccurrence>,
     operations: Vec<evertrace_domain::evidence::Operation>,
     scope_effects: Vec<evertrace_domain::evidence::ScopeEffect>,
-    normalization_watermarks: BTreeSet<evertrace_domain::ids::SourceObservationId>,
+    normalization_watermarks:
+        BTreeMap<evertrace_domain::ids::SourceObservationId, NormalizationWatermark>,
     execution_lanes: BTreeMap<ExecutionLaneId, ExecutionLane>,
     execution_lane_event_seq: BTreeMap<ExecutionLaneId, u64>,
     capture_receipts: BTreeMap<ExecutionLaneId, CaptureReceipt>,
@@ -1098,7 +1109,26 @@ impl CurrentCaptureState {
                         .source_observations
                         .insert(value.source_observation_id, *value);
                 }
-                JournalPayload::OperationDerived(value) => state.operations.push(*value),
+                JournalPayload::OperationDerived(value) => {
+                    // Dependencies retain immutable revisions. Current state must not depend on row order.
+                    match state
+                        .operations
+                        .iter_mut()
+                        .find(|current| current.operation_id == value.operation_id)
+                    {
+                        Some(current)
+                            if current.operation_revision == value.operation_revision
+                                && current != value.as_ref() =>
+                        {
+                            return Err(ReconcileError::Projection);
+                        }
+                        Some(current) if current.operation_revision < value.operation_revision => {
+                            *current = *value
+                        }
+                        Some(_) => (),
+                        None => state.operations.push(*value),
+                    }
+                }
                 JournalPayload::HostOccurrenceNormalized(value) => {
                     state.host_occurrences.push(*value);
                 }
@@ -1106,7 +1136,7 @@ impl CurrentCaptureState {
                 JournalPayload::NormalizationWatermark(value) => {
                     state
                         .normalization_watermarks
-                        .insert(value.source_observation_id);
+                        .insert(value.source_observation_id, value);
                 }
                 JournalPayload::ExecutionLaneRecorded(value) => {
                     state
@@ -1480,15 +1510,6 @@ fn normalize_selected_dirty(
             .find(|current| current.operation_id == operation.operation_id)
             != Some(operation);
         if changed {
-            if operation.source_local_pairing.is_some()
-                && !payloads.iter().any(|payload| matches!(payload,
-                    JournalPayload::HostOccurrenceNormalized(value) if value.host_occurrence_id == operation.host_occurrence_id)) {
-                // Preserve the existing normalization command's closed physical
-                // support requirement without changing the old occurrence.
-                let anchor = normalized.occurrences.iter().find(|value| value.host_occurrence_id == operation.host_occurrence_id)
-                    .ok_or(ReconcileError::Domain)?;
-                payloads.push(JournalPayload::HostOccurrenceNormalized(Box::new(anchor.clone())));
-            }
             payloads.push(JournalPayload::OperationDerived(Box::new(
                 operation.clone(),
             )));
@@ -1517,13 +1538,12 @@ fn normalize_selected_dirty(
             JournalPayload::HostOccurrenceNormalized(value) if value.host_occurrence_id == occurrence.host_occurrence_id)) {
             payloads.push(JournalPayload::HostOccurrenceNormalized(Box::new(occurrence.clone())));
         }
-        payloads.push(JournalPayload::NormalizationWatermark(
-            NormalizationWatermark {
-                source_observation_id: id,
-                resolver_version: 1,
-            },
-        ));
-        state.normalization_watermarks.insert(id);
+        let watermark = NormalizationWatermark {
+            source_observation_id: id,
+            resolver_version: 1,
+        };
+        state.normalization_watermarks.insert(id, watermark.clone());
+        payloads.push(JournalPayload::NormalizationWatermark(watermark));
     }
     for occurrence in normalized.occurrences {
         state
@@ -1542,6 +1562,58 @@ fn normalize_selected_dirty(
             .scope_effects
             .retain(|current| current.scope_effect_id != effect.scope_effect_id);
         state.scope_effects.push(effect);
+    }
+    Ok(())
+}
+
+// Lane attachment can revise an already normalized operation. Keep the existing
+// command closure without inventing a new occurrence, effect, watermark or revision.
+fn close_normalization_payloads(
+    state: &CurrentCaptureState,
+    payloads: &mut Vec<JournalPayload>,
+) -> Result<(), ReconcileError> {
+    let operations = payloads
+        .iter()
+        .filter_map(|payload| match payload {
+            JournalPayload::OperationDerived(value) => Some(value.clone()),
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+    for operation in operations {
+        let occurrence = state
+            .host_occurrences
+            .iter()
+            .find(|value| value.host_occurrence_id == operation.host_occurrence_id)
+            .ok_or(ReconcileError::Projection)?;
+        if !payloads.iter().any(|payload| matches!(payload,
+            JournalPayload::HostOccurrenceNormalized(value) if value.host_occurrence_id == occurrence.host_occurrence_id)) {
+            payloads.push(JournalPayload::HostOccurrenceNormalized(Box::new(occurrence.clone())));
+        }
+        for id in &operation.scope_effect_ids {
+            if !payloads.iter().any(|payload| {
+                matches!(payload,
+                JournalPayload::ScopeEffectDerived(value) if value.scope_effect_id == *id)
+            }) {
+                let effect = state
+                    .scope_effects
+                    .iter()
+                    .find(|value| value.scope_effect_id == *id)
+                    .ok_or(ReconcileError::Projection)?;
+                payloads.push(JournalPayload::ScopeEffectDerived(Box::new(effect.clone())));
+            }
+        }
+        if !payloads.iter().any(|payload| {
+            matches!(payload,
+            JournalPayload::NormalizationWatermark(value)
+                if occurrence.source_observation_refs.contains(&value.source_observation_id))
+        }) {
+            let watermark = occurrence
+                .source_observation_refs
+                .iter()
+                .find_map(|id| state.normalization_watermarks.get(id))
+                .ok_or(ReconcileError::Projection)?;
+            payloads.push(JournalPayload::NormalizationWatermark(watermark.clone()));
+        }
     }
     Ok(())
 }
