@@ -11,10 +11,12 @@ use evertrace_store::{JournalCommand, JournalEventDraft, JournalPayload};
 
 /// Request-local authority for trust assessment, never a Host capability report.
 /// Retained human reads may use the daemon's native user configuration without
-/// observing a Host/session. Ingest/execution callers retain report-only gating.
+/// observing a Host/session. A verified root goal uses its publisher's configuration
+/// pin; other ingest/execution callers retain report-only gating.
 pub(crate) enum RepositoryReadAuthority<'a> {
     Observed(&'a evertrace_codex::HostProbeReport),
     CurrentConfig(std::path::PathBuf),
+    Source(&'a super::SourcePolicy),
     Unavailable,
 }
 
@@ -62,6 +64,7 @@ impl<'a> RepositoryReadAuthority<'a> {
     ) -> evertrace_codex::policy::RepositoryTrustResult {
         match self {
             Self::Observed(report) => super::read_report_path_trust_before(report, path, deadline),
+            Self::Source(policy) => policy.trust(path, deadline),
             Self::CurrentConfig(root) => {
                 super::session_catalog::read_repository_trust_at(root, path, deadline)
             }

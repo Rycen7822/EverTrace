@@ -1889,15 +1889,25 @@ impl BackgroundScheduler {
                     repositories.insert(id.parse().map_err(|_| BackgroundSchedulerError::Store)?);
                 }
             }
-            if !crate::repository::blocked_repositories(
-                &self.writer,
-                repositories.clone(),
-                report.as_ref(),
-                self.runtime.effective_config_hash,
-            )
-            .await
-            .map_err(|_| BackgroundSchedulerError::Store)?
-            .is_empty()
+            let native_goal = current
+                .source_observation(source)
+                .is_some_and(|(value, _)| {
+                    evertrace_capture::goal_source::is_source_revision(
+                        value.source_revision.as_str(),
+                    )
+                });
+            // A source goal uses its independently verified publisher's policy,
+            // never another installed Host report or the daemon's HOME fallback.
+            if !native_goal
+                && !crate::repository::blocked_repositories(
+                    &self.writer,
+                    repositories.clone(),
+                    report.as_ref(),
+                    self.runtime.effective_config_hash,
+                )
+                .await
+                .map_err(|_| BackgroundSchedulerError::Store)?
+                .is_empty()
             {
                 continue;
             }
@@ -1919,13 +1929,6 @@ impl BackgroundScheduler {
                 effective_config_hash: self.runtime.effective_config_hash,
                 algorithm_revision: "controlled_run_resolver_v1",
             };
-            let native_goal = current
-                .source_observation(source)
-                .is_some_and(|(value, _)| {
-                    evertrace_capture::goal_source::is_source_revision(
-                        value.source_revision.as_str(),
-                    )
-                });
             let resolution = if native_goal {
                 let resolver = resolver.clone();
                 let key_dir = self.runtime.device_key_dir.clone();
@@ -1937,11 +1940,11 @@ impl BackgroundScheduler {
             } else {
                 resolver.resolve_source(&snapshot, source, &context, None)
             };
-            let command = match resolution {
-                Ok(ControlledRunCommand::NoDelta) => continue,
-                Ok(ControlledRunCommand::WorkRoot { command })
-                | Ok(ControlledRunCommand::Declaration { command, .. })
-                | Ok(ControlledRunCommand::Terminal { command, .. }) => command,
+            let (command, policy) = match resolution {
+                Ok((ControlledRunCommand::NoDelta, _)) => continue,
+                Ok((ControlledRunCommand::WorkRoot { command }, policy))
+                | Ok((ControlledRunCommand::Declaration { command, .. }, policy))
+                | Ok((ControlledRunCommand::Terminal { command, .. }, policy)) => (command, policy),
                 Err(AutoresearchError::Store(_)) => return Err(BackgroundSchedulerError::Store),
                 // Absent/contradictory/untrusted evidence is not a write or a fabricated terminal result.
                 Err(_) => continue,
@@ -1959,16 +1962,30 @@ impl BackgroundScheduler {
             {
                 continue;
             }
-            if !crate::repository::blocked_repositories(
+            let authority = if native_goal {
+                policy.as_ref().map_or(
+                    crate::repository::RepositoryReadAuthority::Unavailable,
+                    crate::repository::RepositoryReadAuthority::Source,
+                )
+            } else {
+                crate::repository::RepositoryReadAuthority::observed(report.as_ref())
+            };
+            let (blocked, revoked) = crate::repository::repository_read_assessment(
                 &self.writer,
                 repositories,
-                report.as_ref(),
+                &authority,
+                Instant::now() + Duration::from_millis(250),
+            )
+            .await
+            .map_err(|_| BackgroundSchedulerError::Store)?;
+            crate::repository::record_trust_revocations(
+                &self.writer,
+                revoked,
                 self.runtime.effective_config_hash,
             )
             .await
-            .map_err(|_| BackgroundSchedulerError::Store)?
-            .is_empty()
-            {
+            .map_err(|_| BackgroundSchedulerError::Store)?;
+            if !blocked.is_empty() {
                 continue;
             }
             match self

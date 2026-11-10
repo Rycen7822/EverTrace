@@ -200,26 +200,11 @@ impl ExecutionScopeSource {
         let directory = File::open(child.path("cwd")).ok()?;
         let directory_metadata = directory.metadata().ok()?;
         child.revalidate(&mut budget)?;
-        let command = budget.read(&source.path("cmdline"))?;
-        let args = arguments(&command)?;
-        if !source_selections(&args).1 {
-            return None;
-        }
-        let environment = budget.read(&source.path("environ"))?;
-        let config_root = environment_path(&environment, b"CODEX_HOME=")
-            .or_else(|| environment_path(&environment, b"HOME=").map(|home| home.join(".codex")))?;
-        let file =
-            evertrace_capture::open_regular_nofollow(&config_root.join("config.toml")).ok()?;
-        let metadata = file.metadata().ok()?;
-        if metadata.uid() != current.owner.0 || metadata.mode() & 0o022 != 0 {
-            return None;
-        }
+        let policy = SourcePolicy::observe(source, &mut budget)?;
         let context = ExecutionNamespace {
-            source,
+            policy,
             child,
             image: self.clone(),
-            config_root,
-            config_identity: metadata.into(),
             cwd,
             directory,
             directory_identity: (directory_metadata.dev(), directory_metadata.ino()),
@@ -229,13 +214,90 @@ impl ExecutionScopeSource {
     }
 }
 
-/// This process/file pin lives for one scope observation, never in the journal.
-pub(crate) struct ExecutionNamespace {
+/// The publisher's actual configuration, not a daemon-HOME fallback or Host capability.
+/// Shared by execution-directory observation and the independently verified root goal.
+pub(crate) struct SourcePolicy {
     source: NativeProcess,
-    child: NativeProcess,
-    image: ExecutionScopeSource,
     config_root: PathBuf,
     config_identity: FileIdentity,
+}
+
+impl SourcePolicy {
+    fn observe(source: NativeProcess, budget: &mut ReadBudget) -> Option<Self> {
+        let command = budget.read(&source.path("cmdline"))?;
+        if !source_selections(&arguments(&command)?).1 {
+            return None;
+        }
+        let environment = budget.read(&source.path("environ"))?;
+        let config_root = environment_path(&environment, b"CODEX_HOME=")
+            .or_else(|| environment_path(&environment, b"HOME=").map(|home| home.join(".codex")))?;
+        let file =
+            evertrace_capture::open_regular_nofollow(&config_root.join("config.toml")).ok()?;
+        let metadata = file.metadata().ok()?;
+        if metadata.uid() != source.owner.0 || metadata.mode() & 0o022 != 0 {
+            return None;
+        }
+        let policy = Self {
+            source,
+            config_root,
+            config_identity: metadata.into(),
+        };
+        policy.revalidate(budget)?;
+        Some(policy)
+    }
+
+    pub(crate) fn from_goal(goal: &evertrace_capture::goal_source::RootGoal) -> Option<Self> {
+        let mut budget = ReadBudget::new();
+        let source = NativeProcess::open(goal.publisher_pid(), &mut budget)?;
+        let current = NativeProcess::open(std::process::id(), &mut budget)?;
+        if source.owner != current.owner || source.namespaces != current.namespaces {
+            return None;
+        }
+        let boot = budget.read(Path::new("/proc/sys/kernel/random/boot_id"))?;
+        let namespace = fs::metadata(source.path("ns/pid")).ok()?.ino();
+        let instance = format!(
+            "host-goal:{}:{namespace}:{}:{}",
+            std::str::from_utf8(&boot).ok()?.trim(),
+            source.pid,
+            source.start_time
+        );
+        if !goal.matches_publisher(
+            &instance,
+            (source.executable.device, source.executable.inode),
+        ) {
+            return None;
+        }
+        Self::observe(source, &mut budget)
+    }
+
+    fn revalidate(&self, budget: &mut ReadBudget) -> Option<()> {
+        self.source.revalidate(budget)?;
+        let file =
+            evertrace_capture::open_regular_nofollow(&self.config_root.join("config.toml")).ok()?;
+        (FileIdentity::from(file.metadata().ok()?) == self.config_identity).then_some(())?;
+        budget.check()
+    }
+
+    pub(crate) fn trust(
+        &self,
+        path: Option<&str>,
+        deadline: Instant,
+    ) -> evertrace_codex::policy::RepositoryTrustResult {
+        let mut result =
+            super::session_catalog::read_repository_trust_at(&self.config_root, path, deadline);
+        if self.revalidate(&mut ReadBudget::new()).is_none() || Instant::now() >= deadline {
+            result.state = evertrace_codex::policy::RepositoryTrustState::Unknown;
+            result.evidence_refs.clear();
+        }
+        result
+    }
+}
+
+/// This process/file pin lives for one scope observation, never in the journal.
+pub(crate) struct ExecutionNamespace {
+    policy: SourcePolicy,
+    child: NativeProcess,
+    image: ExecutionScopeSource,
     pub(crate) cwd: String,
     directory: File,
     directory_identity: (u64, u64),
@@ -243,11 +305,9 @@ pub(crate) struct ExecutionNamespace {
 
 impl ExecutionNamespace {
     fn revalidate(&self, budget: &mut ReadBudget) -> Option<()> {
-        self.source.revalidate(budget)?;
+        self.policy.revalidate(budget)?;
         self.child.revalidate(budget)?;
         let image = evertrace_capture::open_regular_nofollow(&self.image.executable).ok()?;
-        let config =
-            evertrace_capture::open_regular_nofollow(&self.config_root.join("config.toml")).ok()?;
         let directory = self.directory.metadata().ok()?;
         let observed = fs::metadata(self.child.path("cwd")).ok()?;
         let current = fs::metadata(&self.cwd).ok()?;
@@ -255,7 +315,6 @@ impl ExecutionNamespace {
             || (observed.dev(), observed.ino()) != self.directory_identity
             || (current.dev(), current.ino()) != self.directory_identity
             || FileIdentity::from(image.metadata().ok()?) != self.image.identity
-            || FileIdentity::from(config.metadata().ok()?) != self.config_identity
         {
             return None;
         }
@@ -269,7 +328,7 @@ impl ExecutionNamespace {
     pub(crate) fn evidence_ref(&self, source: &str) -> String {
         format!(
             "native-execution-directory:{source}:{}:{}:{}",
-            self.source.start_time, self.directory_identity.0, self.directory_identity.1
+            self.policy.source.start_time, self.directory_identity.0, self.directory_identity.1
         )
     }
 
@@ -278,11 +337,7 @@ impl ExecutionNamespace {
         repository_path: &str,
         deadline: Instant,
     ) -> evertrace_codex::policy::RepositoryTrustResult {
-        let mut result = super::session_catalog::read_repository_trust_at(
-            &self.config_root,
-            Some(repository_path),
-            deadline,
-        );
+        let mut result = self.policy.trust(Some(repository_path), deadline);
         if !self.valid() || Instant::now() >= deadline {
             result.state = evertrace_codex::policy::RepositoryTrustState::Unknown;
             result.evidence_refs.clear();

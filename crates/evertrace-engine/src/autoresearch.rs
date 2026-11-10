@@ -1,4 +1,7 @@
-use std::{collections::BTreeSet, str::FromStr};
+use std::{
+    collections::{BTreeMap, BTreeSet},
+    str::FromStr,
+};
 
 use evertrace_capture::{CasDigest, CasStore};
 use evertrace_domain::{
@@ -154,6 +157,9 @@ fn source_resolved(
         let sequence = current
             .source_observation(observation.source_observation_id)
             .map_or(0, |(_, seq)| seq);
+        let Ok(scopes) = root_scope_candidates(current, observation.source_observation_id) else {
+            return false;
+        };
         let deadline = std::time::Instant::now() + std::time::Duration::from_millis(40);
         return current
             .other_data_rows()
@@ -171,11 +177,20 @@ fn source_resolved(
                 };
                 task.identity_confidence == evertrace_domain::work::TaskIdentityConfidence::Explicit
                     && task.request_root_refs.contains(reference)
-                    && (objective
-                        .as_ref()
-                        .is_some_and(|goal| task.canonical_goal == *goal)
-                        || task.source_watermark >= sequence
-                        || task.lifecycle.is_terminal())
+                    && (task.lifecycle.is_terminal()
+                        || (objective
+                            .as_ref()
+                            .map_or(task.source_watermark >= sequence, |goal| {
+                                task.canonical_goal == *goal
+                            })
+                            && scopes.iter().all(|scope| {
+                                task.scope_memberships.iter().any(|membership| {
+                                    membership.repository_instance_id == Some(scope.repository)
+                                        && membership
+                                            .worktree_instance_ids
+                                            .contains(&scope.worktree)
+                                })
+                            })))
             });
     }
     let SourceCandidate::Run(envelope) = envelope else {
@@ -255,6 +270,121 @@ fn source_candidate(
         .map(SourceCandidate::Run)
 }
 
+struct RootScopeCandidate {
+    source: SourceObservationId,
+    operation: OperationId,
+    effect: evertrace_domain::ids::ScopeEffectId,
+    repository: evertrace_domain::ids::RepositoryId,
+    worktree: evertrace_domain::ids::WorktreeId,
+}
+
+/// Stored matches only select a finite candidate closure. The resolver must
+/// revalidate the live RootGoal and each execution/effect before using it.
+fn root_scope_candidates(
+    current: &evertrace_store::CurrentFacts,
+    goal: SourceObservationId,
+) -> Result<Vec<RootScopeCandidate>, AutoresearchError> {
+    let Some((goal_observation, _)) = current.source_observation(goal) else {
+        return Ok(Vec::new());
+    };
+    let Some((goal_receipt, _)) = current.source_receipt(goal_observation.source_receipt_ref)
+    else {
+        return Ok(Vec::new());
+    };
+    let ids = current
+        .source_receipts()
+        .filter_map(|(receipt, _)| {
+            evertrace_capture::goal_source::same_execution_context(goal_receipt, receipt)
+                .then_some(receipt.source_observation_id)
+        })
+        .collect::<BTreeSet<_>>();
+    if ids.is_empty() {
+        return Ok(Vec::new());
+    }
+    let needles = ids.iter().map(ToString::to_string).collect::<Vec<_>>();
+    let deadline = std::time::Instant::now() + std::time::Duration::from_millis(40);
+    let mut operations = BTreeMap::<OperationId, Operation>::new();
+    for row in current
+        .other_data_rows()
+        .filter(|row| row.object_kind.as_deref() == Some("operation"))
+    {
+        if std::time::Instant::now() >= deadline {
+            return Err(AutoresearchError::SelectionDeferred);
+        }
+        let Some(json) = &row.payload_json else {
+            continue;
+        };
+        if !needles.iter().any(|id| json.contains(id)) {
+            continue;
+        }
+        let JournalPayload::OperationDerived(operation) =
+            serde_json::from_str(json).map_err(|_| AutoresearchError::EvidenceIncomplete)?
+        else {
+            continue;
+        };
+        if operations.get(&operation.operation_id).is_some_and(|old| {
+            old.operation_revision == operation.operation_revision && old != operation.as_ref()
+        }) {
+            return Err(AutoresearchError::EvidenceIncomplete);
+        }
+        if operations
+            .get(&operation.operation_id)
+            .is_none_or(|old| old.operation_revision < operation.operation_revision)
+        {
+            operations.insert(operation.operation_id, *operation);
+        }
+    }
+    let mut selected = BTreeMap::new();
+    for row in current
+        .other_data_rows()
+        .filter(|row| row.object_kind.as_deref() == Some("scope_effect"))
+    {
+        if std::time::Instant::now() >= deadline {
+            return Err(AutoresearchError::SelectionDeferred);
+        }
+        let Some(JournalPayload::ScopeEffectDerived(effect)) = row
+            .payload_json
+            .as_deref()
+            .and_then(|json| serde_json::from_str::<JournalPayload>(json).ok())
+        else {
+            continue;
+        };
+        let Some(operation) = operations.get(&effect.operation_id) else {
+            continue;
+        };
+        if !operation.scope_effect_ids.contains(&effect.scope_effect_id) {
+            continue;
+        }
+        let (Some(repository), Some(worktree)) =
+            (effect.repository_instance_id, effect.worktree_instance_id)
+        else {
+            continue;
+        };
+        let Some(source) = operation
+            .input_source_observation_refs
+            .iter()
+            .chain(&operation.result_source_observation_refs)
+            .find(|id| ids.contains(id) && effect.evidence_refs.contains(id))
+            .copied()
+        else {
+            continue;
+        };
+        selected
+            .entry((repository, worktree))
+            .or_insert(RootScopeCandidate {
+                source,
+                operation: operation.operation_id,
+                effect: effect.scope_effect_id,
+                repository,
+                worktree,
+            });
+        if selected.len() > 64 {
+            return Err(AutoresearchError::EvidenceIncomplete);
+        }
+    }
+    Ok(selected.into_values().collect())
+}
+
 /// Select the closed current input closure, never a second Work graph or the complete source snapshot.
 pub(crate) fn controlled_source_snapshot(
     current: &evertrace_store::CurrentFacts,
@@ -295,6 +425,17 @@ pub(crate) fn controlled_source_snapshot(
         }) => {
             refs.insert(run_id.to_string());
             refs.extend(artifact_refs.into_iter().map(|id| id.to_string()));
+        }
+    }
+    if root_ref.is_some() {
+        for scope in root_scope_candidates(current, id)? {
+            refs.extend([
+                scope.source.to_string(),
+                scope.operation.to_string(),
+                scope.effect.to_string(),
+                scope.repository.to_string(),
+                scope.worktree.to_string(),
+            ]);
         }
     }
     let mut selected = BTreeSet::new();
@@ -570,7 +711,13 @@ impl ControlledRunResolver {
         source: SourceObservationId,
         context: &AutoresearchCommandContext,
         goal_key_dir: Option<&std::path::Path>,
-    ) -> Result<ControlledRunCommand, AutoresearchError> {
+    ) -> Result<
+        (
+            ControlledRunCommand,
+            Option<crate::repository::SourcePolicy>,
+        ),
+        AutoresearchError,
+    > {
         let facts = ControlledFacts::from_snapshot(snapshot)?;
         if facts.observations.get(&source).is_some_and(|value| {
             evertrace_capture::goal_source::is_source_revision(value.source_revision.as_str())
@@ -578,7 +725,7 @@ impl ControlledRunResolver {
             return self.resolve_root_goal(snapshot, &facts, source, context, goal_key_dir);
         }
         let Some(surface) = facts.surfaces.get(&source) else {
-            return Ok(ControlledRunCommand::NoDelta);
+            return Ok((ControlledRunCommand::NoDelta, None));
         };
         let envelope =
             ControlledRunSourceEnvelope::decode_canonical(surface.protected_text.as_bytes())
@@ -601,6 +748,7 @@ impl ControlledRunResolver {
                 self.complete(snapshot, run_id, source, context.clone())
             }
         }
+        .map(|command| (command, None))
     }
 
     fn resolve_root_goal(
@@ -610,7 +758,13 @@ impl ControlledRunResolver {
         source: SourceObservationId,
         context: &AutoresearchCommandContext,
         key_dir: Option<&std::path::Path>,
-    ) -> Result<ControlledRunCommand, AutoresearchError> {
+    ) -> Result<
+        (
+            ControlledRunCommand,
+            Option<crate::repository::SourcePolicy>,
+        ),
+        AutoresearchError,
+    > {
         use evertrace_capture::goal_source;
         let receipt = facts.receipt(source)?;
         let observation = facts
@@ -658,6 +812,7 @@ impl ControlledRunResolver {
         .map_err(|_| AutoresearchError::EvidenceIncomplete)?;
         let root = goal_source::revalidate(receipt, observation, &bytes, &key)
             .map_err(|_| AutoresearchError::UntrustedRunEvidence)?;
+        let policy = crate::repository::SourcePolicy::from_goal(&root);
         let source_ref = source.to_string();
         let watermark = snapshot
             .rows
@@ -668,6 +823,61 @@ impl ControlledRunResolver {
             })
             .map(|row| row.source_event_seq)
             .ok_or(AutoresearchError::EvidenceIncomplete)?;
+        let mut memberships = BTreeMap::<_, BTreeSet<_>>::new();
+        let mut scope_watermark = snapshot
+            .data_rows()
+            .filter(|row| row.object_kind.as_deref() == Some("task"))
+            .map(|row| row.source_event_seq)
+            .fold(watermark, u64::max);
+        for (effect, sequence) in facts.scope_effects.values() {
+            let Some(operation) = facts.operations.get(&effect.operation_id) else {
+                continue;
+            };
+            if !operation.scope_effect_ids.contains(&effect.scope_effect_id) {
+                continue;
+            }
+            let linked = operation
+                .input_source_observation_refs
+                .iter()
+                .chain(&operation.result_source_observation_refs)
+                .filter(|id| effect.evidence_refs.contains(id));
+            let mut witnessed = false;
+            for id in linked {
+                let Some(observation) = facts.observations.get(id) else {
+                    continue;
+                };
+                let receipt = facts.receipt(*id)?;
+                witnessed |= root.matches_execution(receipt)
+                    && evertrace_capture::execution_source::is_execution(observation, receipt);
+            }
+            if !witnessed {
+                continue;
+            }
+            let (Some(repository), Some(worktree)) =
+                (effect.repository_instance_id, effect.worktree_instance_id)
+            else {
+                continue;
+            };
+            if effect.effect_role != evertrace_domain::evidence::EffectRole::Observe
+                || facts
+                    .worktrees
+                    .get(&worktree)
+                    .is_none_or(|tree| tree.repository_instance_id != repository)
+            {
+                return Err(AutoresearchError::UntrustedRunEvidence);
+            }
+            memberships.entry(repository).or_default().insert(worktree);
+            scope_watermark = scope_watermark.max(*sequence);
+        }
+        let memberships = memberships
+            .into_iter()
+            .map(
+                |(repository, worktrees)| evertrace_domain::work::TaskScopeMembership {
+                    repository_instance_id: Some(repository),
+                    worktree_instance_ids: worktrees.into_iter().collect(),
+                },
+            )
+            .collect();
         let command = crate::work::binding::source_root_task(
             crate::work::WorkCommandContext {
                 command_id: context.command_id,
@@ -678,12 +888,16 @@ impl ControlledRunResolver {
             &facts.tasks,
             &root,
             source,
-            watermark,
+            memberships,
+            scope_watermark,
         )
         .map_err(|_| AutoresearchError::ImmutableConflict)?;
-        Ok(command.map_or(ControlledRunCommand::NoDelta, |command| {
-            ControlledRunCommand::WorkRoot { command }
-        }))
+        Ok((
+            command.map_or(ControlledRunCommand::NoDelta, |command| {
+                ControlledRunCommand::WorkRoot { command }
+            }),
+            policy,
+        ))
     }
 
     pub fn declare(
@@ -1078,6 +1292,10 @@ struct ControlledFacts {
     observations: std::collections::BTreeMap<SourceObservationId, SourceObservation>,
     surfaces: std::collections::BTreeMap<SourceObservationId, EvidenceSurface>,
     operations: std::collections::BTreeMap<OperationId, Operation>,
+    scope_effects: BTreeMap<
+        evertrace_domain::ids::ScopeEffectId,
+        (evertrace_domain::evidence::ScopeEffect, u64),
+    >,
     bindings: std::collections::BTreeMap<OperationId, WorkBindingRevision>,
 }
 
@@ -1100,10 +1318,10 @@ impl ControlledFacts {
             observations: Default::default(),
             surfaces: Default::default(),
             operations: Default::default(),
+            scope_effects: Default::default(),
             bindings: Default::default(),
         };
         let mut attempt_seq = std::collections::BTreeMap::new();
-        let mut operation_seq = std::collections::BTreeMap::new();
         let mut procedure_seq = std::collections::BTreeMap::new();
         let mut episode_seq = std::collections::BTreeMap::new();
         let mut task_seq = std::collections::BTreeMap::new();
@@ -1128,6 +1346,7 @@ impl ControlledFacts {
                         | "source_observation"
                         | "evidence_surface"
                         | "operation"
+                        | "scope_effect"
                         | "work_binding"
                 )
             )
@@ -1224,13 +1443,28 @@ impl ControlledFacts {
                         .insert(value.source_observation_revision_ref, *value);
                 }
                 JournalPayload::OperationDerived(value) => {
-                    if operation_seq
+                    if facts
+                        .operations
                         .get(&value.operation_id)
-                        .is_none_or(|seq| row.source_event_seq > *seq)
+                        .is_some_and(|current| {
+                            current.operation_revision == value.operation_revision
+                                && current != value.as_ref()
+                        })
                     {
-                        operation_seq.insert(value.operation_id, row.source_event_seq);
+                        return Err(AutoresearchError::EvidenceIncomplete);
+                    }
+                    if facts
+                        .operations
+                        .get(&value.operation_id)
+                        .is_none_or(|current| value.operation_revision > current.operation_revision)
+                    {
                         facts.operations.insert(value.operation_id, *value);
                     }
+                }
+                JournalPayload::ScopeEffectDerived(value) => {
+                    facts
+                        .scope_effects
+                        .insert(value.scope_effect_id, (*value, row.source_event_seq));
                 }
                 JournalPayload::WorkBindingRecorded(value)
                     if facts

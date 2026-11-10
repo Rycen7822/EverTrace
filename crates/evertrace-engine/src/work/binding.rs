@@ -8,7 +8,7 @@ use evertrace_domain::{
     revision::RevisionId,
     work::{
         AssignmentStatus, PrimaryWorkBinding, SecondaryWorkBinding, Task, TaskIdentityConfidence,
-        TaskLifecycle, WorkBindingRevision,
+        TaskLifecycle, TaskScopeMembership, WorkBindingRevision,
     },
 };
 use evertrace_store::{JournalCommand, JournalEventDraft, JournalPayload, WorkIdentityCurrentView};
@@ -23,6 +23,7 @@ pub(crate) fn source_root_task(
     tasks: &std::collections::BTreeMap<TaskId, Task>,
     root: &evertrace_capture::goal_source::RootGoal,
     source: SourceObservationId,
+    scopes: Vec<TaskScopeMembership>,
     watermark: u64,
 ) -> Result<Option<JournalCommand>, WorkIdentityError> {
     let mut matching = tasks.values().filter(|task| {
@@ -40,13 +41,33 @@ pub(crate) fn source_root_task(
         if current.identity_confidence != TaskIdentityConfidence::Explicit {
             return Err(WorkIdentityError::Conflict);
         }
-        if current.canonical_goal == root.objective()
-            || current.lifecycle.is_terminal()
-            || watermark <= current.source_watermark
-        {
+        if current.lifecycle.is_terminal() || watermark <= current.source_watermark {
             return Ok(None);
         }
+        let mut memberships = current.scope_memberships.clone();
+        for scope in scopes {
+            if let Some(member) = memberships
+                .iter_mut()
+                .find(|member| member.repository_instance_id == scope.repository_instance_id)
+            {
+                member
+                    .worktree_instance_ids
+                    .extend(scope.worktree_instance_ids);
+                member.worktree_instance_ids.sort();
+                member.worktree_instance_ids.dedup();
+            } else {
+                memberships.push(scope);
+            }
+        }
+        memberships.sort();
+        if current.canonical_goal == root.objective() && current.scope_memberships == memberships {
+            return Ok(None);
+        }
+        refs.extend(current.request_root_refs.iter().cloned());
+        refs.sort();
+        refs.dedup();
         let mut successor = current.clone();
+        successor.scope_memberships = memberships;
         successor.revision_id = RevisionId::new_v7();
         successor.predecessor_revision_id = Some(current.revision_id);
         successor.canonical_goal = root.objective().to_owned();
@@ -56,7 +77,11 @@ pub(crate) fn source_root_task(
             context,
             current,
             successor,
-            super::TypedTaskChange::Goal,
+            if current.canonical_goal == root.objective() {
+                super::TypedTaskChange::Scope
+            } else {
+                super::TypedTaskChange::Goal
+            },
             &[source.to_string()],
         )
         .map(Some);
@@ -67,7 +92,7 @@ pub(crate) fn source_root_task(
         predecessor_revision_id: None,
         request_root_refs: refs,
         canonical_goal: root.objective().to_owned(),
-        scope_memberships: vec![],
+        scope_memberships: scopes,
         identity_confidence: TaskIdentityConfidence::Explicit,
         lifecycle: TaskLifecycle::Active,
         continuation_of_task_id: None,

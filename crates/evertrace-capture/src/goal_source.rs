@@ -125,6 +125,9 @@ pub fn observed_goal(raw: &[u8]) -> Result<Option<(String, String)>> {
 pub struct RootGoal {
     reference: String,
     objective: String,
+    publisher_instance: String,
+    publisher_executable: (u64, u64),
+    thread: String,
 }
 
 impl RootGoal {
@@ -135,6 +138,53 @@ impl RootGoal {
     pub fn objective(&self) -> &str {
         &self.objective
     }
+
+    pub fn publisher_pid(&self) -> u32 {
+        self.publisher_instance
+            .split(':')
+            .nth(3)
+            .and_then(|value| value.parse().ok())
+            .expect("revalidated publisher instance")
+    }
+
+    pub fn matches_publisher(&self, instance: &str, executable: (u64, u64)) -> bool {
+        self.publisher_instance == instance && self.publisher_executable == executable
+    }
+
+    /// Only an independently revalidated goal can use this locator match as
+    /// part of a Work scope witness. It does not resolve semantic assignment.
+    pub fn matches_execution(&self, receipt: &SourceReceipt) -> bool {
+        execution_peer_matches(&self.publisher_instance, &self.thread, receipt)
+    }
+}
+
+/// Candidate selection only: these stored locators do not authenticate a publisher.
+pub fn same_execution_context(goal: &SourceReceipt, execution: &SourceReceipt) -> bool {
+    is_source_revision(goal.source_revision.as_str())
+        && goal.identity_domain == IDENTITY_DOMAIN
+        && execution_peer_matches(
+            goal.source_instance_id.as_str(),
+            &goal.source_session_ref,
+            execution,
+        )
+}
+
+fn execution_peer_matches(instance: &str, thread: &str, receipt: &SourceReceipt) -> bool {
+    let Some(goal_peer) = instance.strip_prefix("host-goal:") else {
+        return false;
+    };
+    let Some((peer, _)) = receipt
+        .source_instance_id
+        .as_str()
+        .strip_prefix("native-events:")
+        .and_then(|value| value.split_once(":capture:"))
+    else {
+        return false;
+    };
+    peer == goal_peer
+        && receipt.source_session_ref == thread
+        && crate::execution_source::Profile::from_revision(receipt.parser_revision)
+            == Some(crate::execution_source::Profile::Context)
 }
 
 /// Re-read the actual publisher, not a claimed role, profile label or copied historical payload.
@@ -216,6 +266,9 @@ pub fn revalidate(
         reference: goal.root_ref(),
         objective: String::from_utf8(objective.protected_bytes().to_vec())
             .map_err(|_| GoalSourceError)?,
+        publisher_instance: receipt.source_instance_id.as_str().to_owned(),
+        publisher_executable: publisher.executable,
+        thread: receipt.source_session_ref.clone(),
     })
 }
 
