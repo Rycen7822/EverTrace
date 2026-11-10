@@ -1947,27 +1947,50 @@ fn collect_observation_relations(
         .iter()
         .map(ToString::to_string)
         .collect::<Vec<_>>();
-    let mut operation_ids = BTreeSet::new();
+    let mut operations = BTreeMap::<_, NamedCurrentDependency>::new();
     for row in rows_referencing(snapshot, "operation", &occurrence_needles) {
         let dependency = current_payload(row)?;
         let JournalPayload::OperationDerived(value) = &dependency.payload else {
             return Err(StoreError::StoreCorrupt);
         };
-        if occurrence_ids.contains(&value.host_occurrence_id) {
-            operation_ids.insert(value.operation_id);
-            dependencies.insert(dependency)?;
+        if !occurrence_ids.contains(&value.host_occurrence_id) {
+            continue;
+        }
+        let replace = match operations.get(&value.operation_id) {
+            None => true,
+            Some(previous) => {
+                let JournalPayload::OperationDerived(current) = &previous.payload else {
+                    unreachable!()
+                };
+                if current.operation_revision == value.operation_revision && current != value {
+                    return Err(StoreError::StoreCorrupt);
+                }
+                (current.operation_revision, previous.source_event_seq)
+                    < (value.operation_revision, dependency.source_event_seq)
+            }
+        };
+        if replace {
+            operations.insert(value.operation_id, dependency);
         }
     }
-    let operation_needles = operation_ids
-        .iter()
+    let operation_needles = operations
+        .keys()
         .map(ToString::to_string)
         .collect::<Vec<_>>();
+    let mut effect_ids = BTreeSet::new();
+    for dependency in operations.into_values() {
+        let JournalPayload::OperationDerived(value) = &dependency.payload else {
+            unreachable!()
+        };
+        effect_ids.extend(value.scope_effect_ids.iter().copied());
+        dependencies.insert(dependency)?;
+    }
     for row in rows_referencing(snapshot, "scope_effect", &operation_needles) {
         let dependency = current_payload(row)?;
         let JournalPayload::ScopeEffectDerived(value) = &dependency.payload else {
             return Err(StoreError::StoreCorrupt);
         };
-        if operation_ids.contains(&value.operation_id) {
+        if effect_ids.contains(&value.scope_effect_id) {
             dependencies.insert(dependency)?;
         }
     }
@@ -11845,6 +11868,40 @@ impl JournalAdmissionState {
             }
         }
         self.repository_read_context(&ids)
+    }
+
+    /// Only current snapshots are selected. Resolution callers must mark the
+    /// omitted snapshot history incomplete; absence is never continuity proof.
+    pub(crate) fn repository_resolution_context(
+        &self,
+        identity: evertrace_domain::repository::FilesystemIdentity,
+    ) -> Result<
+        (
+            crate::repository::RepositoryCurrentView,
+            BTreeSet<RepositoryId>,
+        ),
+        StoreError,
+    > {
+        let read = self.source_repository_read_context(identity, &BTreeSet::new())?;
+        let mut view = crate::repository::RepositoryCurrentView {
+            frontier: read.frontier,
+            repositories: read.repositories,
+            ..Default::default()
+        };
+        for (id, (worktree, _)) in &self.worktrees {
+            if view
+                .repositories
+                .contains_key(&worktree.repository_instance_id)
+            {
+                view.worktrees.insert(*id, worktree.clone());
+                if let Some(snapshot) = worktree.current_snapshot_id
+                    && let Some((value, _)) = self.worktree_snapshots.get(&snapshot)
+                {
+                    view.snapshots.insert(snapshot, value.clone());
+                }
+            }
+        }
+        Ok((view, read.purged))
     }
 
     pub(crate) fn inventory_context(

@@ -100,7 +100,7 @@ use tokio::sync::{OwnedRwLockReadGuard, RwLock, mpsc, oneshot, watch};
 use crate::procedure::PROCEDURE_USAGE_JOB_KIND;
 use crate::{
     SessionImportBudget, SessionImportWorker, WriterActorError, WriterHandle,
-    capture::{ReconcileError, ReconcileInput, reconcile_observations_once},
+    capture::{ReconcileError, ReconcileInput, reconcile_scoped_observations_once},
     jobs::{JobResultDisposition, SynthesisPlanner, expired_leases, support_closure_result},
     session_import::{SessionCatalogService, session_import_job_budget},
 };
@@ -109,7 +109,7 @@ const TOTAL_LIMIT: usize = 32;
 pub(crate) const PER_LANE_LIMIT: usize = 8;
 const CAPTURE_PROBE_LIMIT: usize = TOTAL_LIMIT + PER_LANE_LIMIT;
 const RETRY_DELAY: Duration = Duration::from_secs(5);
-const CAPTURE_ALGORITHM_REVISION: &str = "capture-reconciliation-v6";
+const CAPTURE_ALGORITHM_REVISION: &str = "capture-reconciliation-v7";
 const PROCEDURE_PROMOTION_JOB_KIND: &str = "procedure_cohort_promotion_v1";
 
 fn procedure_promotion_budget() -> JobBudget {
@@ -1698,6 +1698,7 @@ pub struct BackgroundScheduler {
     catalog: SessionCatalogService,
     import: SessionImportWorker,
     inventory: Option<crate::jobs::InventoryWorker>,
+    execution_canary: Option<crate::HostCanaryService>,
     report: Arc<RwLock<Option<HostProbeReport>>>,
     runtime: RuntimeSnapshot,
     synthesis: SynthesisPlanner,
@@ -1730,6 +1731,7 @@ impl BackgroundScheduler {
             catalog,
             import,
             inventory: None,
+            execution_canary: None,
             report,
             runtime,
             synthesis,
@@ -1756,6 +1758,11 @@ impl BackgroundScheduler {
     pub fn with_inventory(mut self, inventory: crate::jobs::InventoryWorker) -> Self {
         self.synthesis = self.synthesis.with_inventory(Some(inventory.clone()));
         self.inventory = Some(inventory);
+        self
+    }
+
+    pub fn with_execution_canary(mut self, canary: crate::HostCanaryService) -> Self {
+        self.execution_canary = Some(canary);
         self
     }
 
@@ -4106,7 +4113,7 @@ impl BackgroundScheduler {
             resolve_capture_manifests(item, report_guard.as_ref(), &self.runtime)
                 .ok_or(BackgroundSchedulerError::Store)?
         };
-        let reconciliation = reconcile_observations_once(
+        let reconciliation = reconcile_scoped_observations_once(
             ReconcileInput {
                 runtime_snapshot: self.runtime.clone(),
                 adapter_manifests,
@@ -4121,6 +4128,9 @@ impl BackgroundScheduler {
             },
             &self.writer,
             &[observation_id],
+            self.execution_canary
+                .as_ref()
+                .and_then(crate::HostCanaryService::execution_scope_source),
         )
         .await;
         drop(report_guard);

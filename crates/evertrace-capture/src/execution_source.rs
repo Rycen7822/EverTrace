@@ -583,6 +583,28 @@ pub fn record_matches(body: &CaptureRecordBody, protected: &[u8], manifest: &str
         && body.recovery_preflight.is_none()
 }
 
+/// A recorded request locator, not repository identity or filesystem authority.
+/// Canonical acceptance already verified the protected record; bind it again
+/// before a live, separately authorized namespace consumer can use the cwd.
+pub fn execution_directory(
+    observation: &SourceObservation,
+    receipt: &SourceReceipt,
+    protected: &[u8],
+) -> Option<(String, u32, u64)> {
+    if receipt.parser_revision != CONTEXT_REVISION || !is_execution(observation, receipt) {
+        return None;
+    }
+    let event = Event::decode(protected)?;
+    if !event.accepts(Profile::Context) || event.reference() != receipt.source_ref {
+        return None;
+    }
+    Some((
+        event.params.working_directory??,
+        event.params.process_pid?,
+        event.params.process_start_ticks?,
+    ))
+}
+
 /// Canonical observations may retain a namespace admitted by the original ingestion command.
 pub fn is_execution(observation: &SourceObservation, receipt: &SourceReceipt) -> bool {
     let Some(format) = Profile::from_revision(receipt.parser_revision) else {

@@ -74,6 +74,26 @@ impl HostCanaryService {
             .then(|| report.clone())
     }
 
+    pub(crate) fn execution_scope_source(&self) -> Option<crate::repository::ExecutionScopeSource> {
+        let current = self.current.lock().ok()?;
+        let current = current.as_ref()?;
+        let identity = current.identity.as_ref()?;
+        let report = current.report.as_ref()?;
+        if !matches!(identity.wiring, CanaryWiring::ExecutionSource)
+            || !identity.valid()
+            || report.strong_normalization().result() != GateResult::Enabled
+            || execution_source::Profile::from_adapter_version(&report.manifest().adapter_version)
+                != Some(execution_source::Profile::Context)
+        {
+            return None;
+        }
+        let (path, file) = identity.files.first()?;
+        Some(crate::repository::ExecutionScopeSource::measured(
+            path.clone(),
+            *file,
+        ))
+    }
+
     async fn run_execution_inner(&self, request: ExecutionCanaryRequest) -> HostCanaryDiagnostic {
         use std::os::unix::fs::{DirBuilderExt, MetadataExt};
         let unavailable = || canary_diagnostic(HostCanaryStatus::Unavailable);

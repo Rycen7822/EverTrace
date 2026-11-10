@@ -132,6 +132,165 @@ impl NativeProcess {
     }
 }
 
+/// A transient executable pin supplied only by the current measured source canary.
+/// It is not deserializable and a cwd, PID or caller capability label cannot create it.
+#[derive(Clone)]
+pub(crate) struct ExecutionScopeSource {
+    executable: PathBuf,
+    identity: FileIdentity,
+}
+
+impl ExecutionScopeSource {
+    pub(crate) fn measured(executable: PathBuf, identity: [u64; 7]) -> Self {
+        Self {
+            executable,
+            identity: FileIdentity {
+                device: identity[0],
+                inode: identity[1],
+                size: identity[2],
+                modified: (identity[3] as i64, identity[4] as i64),
+                changed: (identity[5] as i64, identity[6] as i64),
+            },
+        }
+    }
+
+    pub(crate) fn observe(
+        &self,
+        observation: &evertrace_domain::evidence::SourceObservation,
+        receipt: &evertrace_domain::evidence::SourceReceipt,
+        protected: &[u8],
+    ) -> Option<ExecutionNamespace> {
+        let (cwd, child_pid, child_start) =
+            evertrace_capture::execution_source::execution_directory(
+                observation,
+                receipt,
+                protected,
+            )?;
+        let mut parts = receipt.source_instance_id.as_str().split(':');
+        if parts.next()? != "native-events" {
+            return None;
+        }
+        let boot = parts.next()?;
+        let namespace = parts.next()?.parse::<u64>().ok()?;
+        let pid = parts.next()?.parse::<u32>().ok()?;
+        let start = parts.next()?.parse::<u64>().ok()?;
+        let mut budget = ReadBudget::new();
+        let source = NativeProcess::open(pid, &mut budget)?;
+        let current = NativeProcess::open(std::process::id(), &mut budget)?;
+        let actual_boot = budget.read(Path::new("/proc/sys/kernel/random/boot_id"))?;
+        if std::str::from_utf8(&actual_boot).ok()?.trim() != boot
+            || source.owner != current.owner
+            || source.start_time != start
+            || source.executable != self.identity
+            || source.namespaces != current.namespaces
+            || fs::metadata("/proc/self/ns/pid").ok()?.ino() != namespace
+        {
+            return None;
+        }
+        let child = NativeProcess::open(child_pid, &mut budget)?;
+        if child.start_time != child_start
+            || child.parent != source.pid
+            || child.owner != source.owner
+            || child.namespaces != source.namespaces
+        {
+            return None;
+        }
+        // Keep the measured child's actual cwd inode alive throughout the Git
+        // observation. The request path is only a locator for that pinned object.
+        let directory = File::open(child.path("cwd")).ok()?;
+        let directory_metadata = directory.metadata().ok()?;
+        child.revalidate(&mut budget)?;
+        let command = budget.read(&source.path("cmdline"))?;
+        let args = arguments(&command)?;
+        if !source_selections(&args).1 {
+            return None;
+        }
+        let environment = budget.read(&source.path("environ"))?;
+        let config_root = environment_path(&environment, b"CODEX_HOME=")
+            .or_else(|| environment_path(&environment, b"HOME=").map(|home| home.join(".codex")))?;
+        let file =
+            evertrace_capture::open_regular_nofollow(&config_root.join("config.toml")).ok()?;
+        let metadata = file.metadata().ok()?;
+        if metadata.uid() != current.owner.0 || metadata.mode() & 0o022 != 0 {
+            return None;
+        }
+        let context = ExecutionNamespace {
+            source,
+            child,
+            image: self.clone(),
+            config_root,
+            config_identity: metadata.into(),
+            cwd,
+            directory,
+            directory_identity: (directory_metadata.dev(), directory_metadata.ino()),
+        };
+        context.revalidate(&mut budget)?;
+        Some(context)
+    }
+}
+
+/// This process/file pin lives for one scope observation, never in the journal.
+pub(crate) struct ExecutionNamespace {
+    source: NativeProcess,
+    child: NativeProcess,
+    image: ExecutionScopeSource,
+    config_root: PathBuf,
+    config_identity: FileIdentity,
+    pub(crate) cwd: String,
+    directory: File,
+    directory_identity: (u64, u64),
+}
+
+impl ExecutionNamespace {
+    fn revalidate(&self, budget: &mut ReadBudget) -> Option<()> {
+        self.source.revalidate(budget)?;
+        self.child.revalidate(budget)?;
+        let image = evertrace_capture::open_regular_nofollow(&self.image.executable).ok()?;
+        let config =
+            evertrace_capture::open_regular_nofollow(&self.config_root.join("config.toml")).ok()?;
+        let directory = self.directory.metadata().ok()?;
+        let observed = fs::metadata(self.child.path("cwd")).ok()?;
+        let current = fs::metadata(&self.cwd).ok()?;
+        if (directory.dev(), directory.ino()) != self.directory_identity
+            || (observed.dev(), observed.ino()) != self.directory_identity
+            || (current.dev(), current.ino()) != self.directory_identity
+            || FileIdentity::from(image.metadata().ok()?) != self.image.identity
+            || FileIdentity::from(config.metadata().ok()?) != self.config_identity
+        {
+            return None;
+        }
+        budget.check()
+    }
+
+    pub(crate) fn valid(&self) -> bool {
+        self.revalidate(&mut ReadBudget::new()).is_some()
+    }
+
+    pub(crate) fn evidence_ref(&self, source: &str) -> String {
+        format!(
+            "native-execution-directory:{source}:{}:{}:{}",
+            self.source.start_time, self.directory_identity.0, self.directory_identity.1
+        )
+    }
+
+    pub(crate) fn trust(
+        &self,
+        repository_path: &str,
+        deadline: Instant,
+    ) -> evertrace_codex::policy::RepositoryTrustResult {
+        let mut result = super::session_catalog::read_repository_trust_at(
+            &self.config_root,
+            Some(repository_path),
+            deadline,
+        );
+        if !self.valid() || Instant::now() >= deadline {
+            result.state = evertrace_codex::policy::RepositoryTrustState::Unknown;
+            result.evidence_refs.clear();
+        }
+        result
+    }
+}
+
 /// Only source-affecting selections survive process inspection. Neither the
 /// command line nor unrelated environment values are retained in this value.
 pub(crate) struct NativeHostContext {

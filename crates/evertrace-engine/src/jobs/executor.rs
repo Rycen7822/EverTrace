@@ -250,6 +250,18 @@ enum WriterRequest {
         filesystem: Option<evertrace_domain::repository::FilesystemIdentity>,
         reply: oneshot::Sender<Result<evertrace_store::RepositoryReadContext, WriterActorError>>,
     },
+    RepositoryResolutionContext {
+        identity: evertrace_domain::repository::FilesystemIdentity,
+        reply: oneshot::Sender<
+            Result<
+                (
+                    evertrace_store::repository::RepositoryCurrentView,
+                    std::collections::BTreeSet<evertrace_domain::ids::RepositoryId>,
+                ),
+                WriterActorError,
+            >,
+        >,
+    },
     InventoryContext {
         context: evertrace_domain::inventory::InventoryContext,
         job_id: Option<evertrace_domain::ids::JobId>,
@@ -530,6 +542,24 @@ impl WriterHandle {
                 filesystem: Some(identity),
                 reply,
             })
+            .await
+            .map_err(|_| WriterActorError::Stopped)?;
+        response.await.map_err(|_| WriterActorError::Stopped)?
+    }
+
+    pub(crate) async fn repository_resolution_context(
+        &self,
+        identity: evertrace_domain::repository::FilesystemIdentity,
+    ) -> Result<
+        (
+            evertrace_store::repository::RepositoryCurrentView,
+            std::collections::BTreeSet<evertrace_domain::ids::RepositoryId>,
+        ),
+        WriterActorError,
+    > {
+        let (reply, response) = oneshot::channel();
+        self.sender
+            .send(WriterRequest::RepositoryResolutionContext { identity, reply })
             .await
             .map_err(|_| WriterActorError::Stopped)?;
         response.await.map_err(|_| WriterActorError::Stopped)?
@@ -2031,6 +2061,14 @@ async fn run_writer(
                         None => writer.repository_read_context(&ids),
                     }
                     .map_err(map_store_error);
+                    let _ = reply.send(result);
+                }
+                WriterRequest::RepositoryResolutionContext { identity, reply } => {
+                    let result = writer
+                        .as_ref()
+                        .ok_or(WriterActorError::Stopped)?
+                        .repository_resolution_context(identity)
+                        .map_err(map_store_error);
                     let _ = reply.send(result);
                 }
                 WriterRequest::InventoryContext {

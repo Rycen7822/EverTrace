@@ -544,13 +544,22 @@ pub async fn reconcile_once(
     input: ReconcileInput,
     writer: &WriterHandle,
 ) -> Result<ReconcileProgress, ReconcileError> {
-    reconcile_selected(input, writer, None, None).await
+    reconcile_selected(input, writer, None, None, None).await
 }
 
 pub async fn reconcile_observations_once(
     input: ReconcileInput,
     writer: &WriterHandle,
     observation_ids: &[SourceObservationId],
+) -> Result<ReconcileProgress, ReconcileError> {
+    reconcile_scoped_observations_once(input, writer, observation_ids, None).await
+}
+
+pub(crate) async fn reconcile_scoped_observations_once(
+    input: ReconcileInput,
+    writer: &WriterHandle,
+    observation_ids: &[SourceObservationId],
+    source: Option<crate::repository::ExecutionScopeSource>,
 ) -> Result<ReconcileProgress, ReconcileError> {
     if observation_ids.is_empty()
         || observation_ids.len() > 16
@@ -563,7 +572,7 @@ pub async fn reconcile_observations_once(
     {
         return Err(ReconcileError::InvalidInput);
     }
-    reconcile_selected(input, writer, Some(observation_ids), None).await
+    reconcile_selected(input, writer, Some(observation_ids), None, source).await
 }
 
 pub(crate) fn pending_capture_artifacts(
@@ -592,7 +601,7 @@ pub(crate) async fn reconcile_artifact_once(
     writer: &WriterHandle,
     artifact: &ReconciliationArtifactDescriptor,
 ) -> Result<ReconcileProgress, ReconcileError> {
-    reconcile_selected(input, writer, None, Some(artifact)).await
+    reconcile_selected(input, writer, None, Some(artifact), None).await
 }
 
 pub(crate) fn capture_artifact_descriptor(
@@ -697,6 +706,7 @@ async fn reconcile_selected(
     writer: &WriterHandle,
     observation_ids: Option<&[SourceObservationId]>,
     artifact: Option<&ReconciliationArtifactDescriptor>,
+    source: Option<crate::repository::ExecutionScopeSource>,
 ) -> Result<ReconcileProgress, ReconcileError> {
     validate_reconcile_input(&input)?;
     let targeted = observation_ids.is_some();
@@ -910,7 +920,23 @@ async fn reconcile_selected(
     let lane_ids = lane_ids_for_groups(&groups, &state)?;
     let mut selected = dirty_rows(&dirty_frontier, remaining);
     remaining = remaining.saturating_sub(selected.len());
-    normalize_selected_dirty(&selected, &mut state, &mut payloads, &mut progress)?;
+    let scopes = observe_execution_scopes(
+        &selected,
+        &state,
+        &input,
+        writer,
+        source.as_ref(),
+        &mut payloads,
+        dirty_frontier.frontier,
+    )
+    .await?;
+    normalize_selected_dirty(
+        &selected,
+        &mut state,
+        &scopes.claims,
+        &mut payloads,
+        &mut progress,
+    )?;
     selected.retain(|dirty| dirty.target_kind == DirtyTargetKind::CaptureReconciliation);
     reconcile_lane_groups(
         LaneReconcileContext {
@@ -929,6 +955,9 @@ async fn reconcile_selected(
         &mut progress,
         &mut remaining,
     )?;
+    if scopes.pins.iter().any(|pin| !pin.valid()) {
+        return Err(ReconcileError::StaleFrontier);
+    }
     let committed = if payloads.is_empty() {
         None
     } else {
@@ -1448,9 +1477,209 @@ fn apply_reconciled_evidence(
     Ok(targets)
 }
 
+#[derive(Default)]
+struct ObservedSourceScopes {
+    claims: BTreeMap<SourceObservationId, evertrace_domain::evidence::ScopeEffectClaim>,
+    pins: Vec<crate::repository::ExecutionNamespace>,
+}
+
+async fn observe_execution_scopes(
+    selected: &[DirtyRow],
+    state: &CurrentCaptureState,
+    input: &ReconcileInput,
+    writer: &WriterHandle,
+    authority: Option<&crate::repository::ExecutionScopeSource>,
+    payloads: &mut Vec<JournalPayload>,
+    frontier: u64,
+) -> Result<ObservedSourceScopes, ReconcileError> {
+    use crate::repository::{
+        HostTrustDecision, ProbeLimits, RepositoryResolveInput, ResolutionKind,
+    };
+    use evertrace_capture::CasDigest;
+    use evertrace_domain::evidence::{EffectRole, ScopeEffectClaim};
+    use std::{
+        path::Path,
+        time::{Duration, Instant},
+    };
+
+    let mut observed = ObservedSourceScopes::default();
+    let Some(authority) = authority else {
+        return Ok(observed);
+    };
+    let cas = CasStore::open_existing(&input.runtime_snapshot.cas_dir)
+        .map_err(|_| ReconcileError::Projection)?;
+    let ids = selected
+        .iter()
+        .filter(|dirty| dirty.target_kind == DirtyTargetKind::PhysicalNormalization)
+        .filter_map(|dirty| SourceObservationId::from_str(&dirty.target_id).ok())
+        .collect::<BTreeSet<_>>();
+    for id in ids {
+        // Scope is witnessed while the actual execution is live. A later path
+        // probe never retroactively supplies a missing historical namespace.
+        if state.normalization_watermarks.contains_key(&id) {
+            continue;
+        }
+        let Some(observation) = state.source_observations.get(&id) else {
+            continue;
+        };
+        let Some(receipt) = state
+            .source_receipts
+            .iter()
+            .find(|value| value.source_observation_id == id)
+        else {
+            continue;
+        };
+        if !evertrace_capture::execution_source::is_execution(observation, receipt) {
+            continue;
+        }
+        let digest = receipt
+            .cas_ref
+            .parse::<CasDigest>()
+            .map_err(|_| ReconcileError::Projection)?;
+        let Ok((protected, _)) = cas.read_bounded(&digest, 128 * 1024, 64 * 1024) else {
+            continue;
+        };
+        let authority = authority.clone();
+        let observation = observation.clone();
+        let receipt = receipt.clone();
+        let located = tokio::task::spawn_blocking(move || {
+            let namespace = authority.observe(&observation, &receipt, &protected)?;
+            let deadline = Instant::now() + Duration::from_millis(500);
+            let location =
+                crate::repository::workspace_git_location(Path::new(&namespace.cwd), deadline)
+                    .ok()??;
+            let trust = namespace.trust(location.worktree_path.to_str()?, deadline);
+            if trust.state != evertrace_codex::policy::RepositoryTrustState::Trusted {
+                return None;
+            }
+            let mut references = vec![receipt.source_ref, namespace.evidence_ref(&id.to_string())];
+            references.extend(trust.evidence_refs);
+            Some((namespace, location, references, deadline))
+        })
+        .await
+        .map_err(|_| ReconcileError::Projection)?;
+        let Some((namespace, location, references, deadline)) = located else {
+            continue;
+        };
+        let (view, purged) = writer
+            .repository_resolution_context(location.common_dir_filesystem)
+            .await
+            .map_err(map_reconcile_writer)?;
+        if view.frontier != frontier {
+            return Err(ReconcileError::StaleFrontier);
+        }
+        if view.repositories.values().any(|repository| {
+            !crate::repository::repository_read_gate(
+                repository,
+                purged.contains(&repository.repository_id),
+            )
+        }) {
+            continue;
+        }
+        let occurred = input.occurred_at_us;
+        let resolved = tokio::task::spawn_blocking(move || {
+            let heads = view
+                .snapshots
+                .values()
+                .filter_map(|snapshot| snapshot.head_oid.as_deref())
+                .collect::<BTreeSet<_>>()
+                .into_iter()
+                .map(crate::repository::GitOid::parse)
+                .collect::<Result<Vec<_>, _>>()
+                .ok()?;
+            let evidence = crate::repository::with_probe_deadline(deadline, || {
+                crate::repository::probe_repository(
+                    Path::new(&namespace.cwd),
+                    HostTrustDecision::Trusted,
+                    &references,
+                    occurred,
+                    &ProbeLimits::default(),
+                    &view.known_admin_paths(),
+                    &heads,
+                )
+            })
+            .ok()?;
+            if evidence.unavailable_reason.is_some()
+                || !namespace.valid()
+                || evidence.common_dir_filesystem != Some(location.common_dir_filesystem)
+                || evidence.git_dir.as_deref().map(Path::new) != Some(location.git_dir.as_path())
+            {
+                return None;
+            }
+            // The narrow reader deliberately omits old snapshots. Never use
+            // their absence to infer unbornness, discontinuity or a new instance.
+            let incomplete = view.repositories.keys().copied().collect();
+            let resolution = RepositoryResolveInput {
+                view: &view,
+                evidence: &evidence,
+                derived_from_hint: None,
+            }
+            .resolve_with_incomplete_history(&incomplete)
+            .ok()?;
+            if !matches!(
+                resolution.kind,
+                Some(ResolutionKind::Create | ResolutionKind::Successor | ResolutionKind::NoDelta)
+            ) {
+                return None;
+            }
+            let payloads = resolution.payloads();
+            let mut view = view;
+            view.repositories.extend(
+                resolution
+                    .repositories
+                    .into_iter()
+                    .map(|value| (value.repository_id, value)),
+            );
+            view.worktrees.extend(
+                resolution
+                    .worktrees
+                    .into_iter()
+                    .map(|value| (value.worktree_instance_id, value)),
+            );
+            let root = evidence.worktree_root.as_deref()?;
+            let mut matches = view.worktrees.values().filter(|worktree| {
+                worktree.current_path.as_deref() == Some(root)
+                    && !worktree.lifecycle.is_terminal()
+                    && view
+                        .repositories
+                        .get(&worktree.repository_instance_id)
+                        .is_some_and(|repository| {
+                            repository.common_dir_filesystem == evidence.common_dir_filesystem
+                                && repository.object_format == evidence.object_format
+                        })
+            });
+            let worktree = matches.next()?;
+            if matches.next().is_some() || !namespace.valid() {
+                return None;
+            }
+            let claim = ScopeEffectClaim {
+                effect_role: EffectRole::Observe,
+                repository_instance_id: Some(worktree.repository_instance_id),
+                worktree_instance_id: Some(worktree.worktree_instance_id),
+                pre_snapshot_id: None,
+                post_snapshot_id: None,
+                experiment_run_ids: Vec::new(),
+                artifact_refs: Vec::new(),
+                evidence_refs: vec![id],
+            };
+            claim.validate().ok()?;
+            Some((namespace, payloads, claim))
+        })
+        .await
+        .map_err(|_| ReconcileError::Projection)?;
+        if let Some((namespace, records, claim)) = resolved {
+            payloads.extend(records);
+            observed.claims.insert(id, claim);
+            observed.pins.push(namespace);
+        }
+    }
+    Ok(observed)
+}
+
 fn normalize_selected_dirty(
     selected: &[DirtyRow],
     state: &mut CurrentCaptureState,
+    source_scopes: &BTreeMap<SourceObservationId, evertrace_domain::evidence::ScopeEffectClaim>,
     payloads: &mut Vec<JournalPayload>,
     progress: &mut ReconcileProgress,
 ) -> Result<(), ReconcileError> {
@@ -1481,6 +1710,38 @@ fn normalize_selected_dirty(
         .values()
         .cloned()
         .collect::<Vec<_>>();
+    for observation in &mut ordered_observations {
+        let native = state.source_receipts.iter().any(|receipt| {
+            receipt.source_observation_id == observation.source_observation_id
+                && evertrace_capture::execution_source::is_execution(observation, receipt)
+        });
+        if let Some(claim) = source_scopes.get(&observation.source_observation_id) {
+            observation.scope_effect_claims.push(claim.clone());
+        }
+        if native {
+            // Preserve exact accepted scope facts after publisher exit/replay;
+            // never re-probe a historical path to reconstruct its namespace.
+            for effect in &previous.scope_effects {
+                if effect
+                    .evidence_refs
+                    .contains(&observation.source_observation_id)
+                {
+                    observation.scope_effect_claims.push(
+                        evertrace_domain::evidence::ScopeEffectClaim {
+                            effect_role: effect.effect_role,
+                            repository_instance_id: effect.repository_instance_id,
+                            worktree_instance_id: effect.worktree_instance_id,
+                            pre_snapshot_id: effect.pre_snapshot_id,
+                            post_snapshot_id: effect.post_snapshot_id,
+                            experiment_run_ids: effect.experiment_run_ids.clone(),
+                            artifact_refs: effect.artifact_refs.clone(),
+                            evidence_refs: effect.evidence_refs.clone(),
+                        },
+                    );
+                }
+            }
+        }
+    }
     ordered_observations.sort_by_key(|value| {
         normalization_state.observation_event_seq[&value.source_observation_id]
     });

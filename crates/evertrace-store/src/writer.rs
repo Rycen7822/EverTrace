@@ -759,6 +759,19 @@ impl JournalWriter {
             .source_repository_read_context(identity, retained_ids)
     }
 
+    pub fn repository_resolution_context(
+        &self,
+        identity: evertrace_domain::repository::FilesystemIdentity,
+    ) -> Result<
+        (
+            crate::repository::RepositoryCurrentView,
+            std::collections::BTreeSet<evertrace_domain::ids::RepositoryId>,
+        ),
+        StoreError,
+    > {
+        self.admission_state.repository_resolution_context(identity)
+    }
+
     pub async fn source_observation_authority_context(
         &self,
         selector: &crate::session_import::SourceObservationRepositorySelector,

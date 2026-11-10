@@ -294,6 +294,7 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
             engine.synthesis_planner(),
             engine.effective_config().config().dreaming.clone(),
         )
+        .with_execution_canary(host_canary.clone())
         .with_dispatch(Arc::clone(&dispatch_gate))
         .with_backup_requests(backup_request_tx)
         .with_inventory(evertrace_engine::jobs::InventoryWorker::new(
