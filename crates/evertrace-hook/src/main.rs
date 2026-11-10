@@ -69,9 +69,10 @@ fn run() -> Result<(), ()> {
             evertrace_capture::host_events::ELIGIBLE_EVENTS,
         )
         .map_err(|_| ())?;
-        let execution = evertrace_codex::probe::HostProbeReport::unobserved_source_contract(
-            evertrace_capture::execution_source::ADAPTER_VERSION,
+        let execution = evertrace_codex::probe::HostProbeReport::native_source_contract(
+            evertrace_capture::execution_source::QUALIFIED_ADAPTER_VERSION,
             evertrace_capture::execution_source::ELIGIBLE_EVENTS,
+            "0.166.0",
         )
         .map_err(|_| ())?;
         let snapshot = RuntimeSnapshot::load(Path::new(&path)).map_err(|_| ())?;

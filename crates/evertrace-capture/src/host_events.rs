@@ -380,6 +380,17 @@ fn blocked(error: &WireError) -> bool {
     matches!(error, WireError::Io(error) if error.kind() == io::ErrorKind::WouldBlock)
 }
 
+pub(crate) fn execution_observation(
+    raw: &str,
+    instance: &str,
+    sequence: u64,
+    manifest: &str,
+    revision: u32,
+) -> Option<Observation> {
+    crate::execution_source::input_revision(raw, instance, sequence, manifest, revision)
+        .map(Observation)
+}
+
 /// Explicit source connection only. Never start a host, send hidden requests or poll work state.
 /// Native JSONRPC text is forwarded unchanged, with stdio's newline framing.
 pub fn relay(
@@ -454,15 +465,15 @@ pub fn relay(
                     let execution = publisher
                         .execution_receipts()
                         .then(|| {
-                            crate::execution_source::input(
+                            execution_observation(
                                 &text,
                                 &instance,
                                 sequence,
                                 execution_manifest,
+                                crate::execution_source::QUALIFIED_REVISION,
                             )
                         })
-                        .flatten()
-                        .map(Observation);
+                        .flatten();
                     if let Some(observed) =
                         execution.or_else(|| observation(&text, &instance, sequence, manifest))
                     {

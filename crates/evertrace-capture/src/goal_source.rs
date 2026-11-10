@@ -364,6 +364,14 @@ impl Publisher {
         self.peer.standalone
     }
 
+    pub(crate) fn matches_executable(&self, path: &Path) -> bool {
+        fs::symlink_metadata(path).is_ok_and(|metadata| {
+            metadata.is_file()
+                && (metadata.dev(), metadata.ino()) == self.peer.executable
+                && self.revalidate().is_ok()
+        })
+    }
+
     pub(crate) fn instance(&self, prefix: &str) -> Result<String> {
         self.peer.instance(prefix)
     }

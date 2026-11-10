@@ -167,9 +167,19 @@ pub(crate) fn verify_capture_frame_presented(
         None
     };
     if let Some((version, eligible)) = native_contract {
-        let contract =
+        let contract = if body.source_revision.as_str()
+            == evertrace_capture::execution_source::SOURCE_REVISION
+            && body.parser_revision == evertrace_capture::execution_source::QUALIFIED_REVISION
+        {
+            evertrace_codex::probe::HostProbeReport::native_source_contract(
+                evertrace_capture::execution_source::QUALIFIED_ADAPTER_VERSION,
+                evertrace_capture::execution_source::ELIGIBLE_EVENTS,
+                "0.166.0",
+            )
+        } else {
             evertrace_codex::probe::HostProbeReport::unobserved_source_contract(&version, eligible)
-                .map_err(|_| IngestError::InvalidRecord)?;
+        }
+        .map_err(|_| IngestError::InvalidRecord)?;
         let manifest = &contract.manifest().adapter_manifest_id;
         let valid = if body.source_revision.as_str()
             == evertrace_capture::execution_source::SOURCE_REVISION

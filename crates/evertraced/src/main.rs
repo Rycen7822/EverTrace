@@ -341,6 +341,7 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
             "ordinary-hook-ingest-v1",
         )?
         .with_config(Arc::clone(&config_reload))
+        .with_execution_canary(host_canary.clone())
         .with_scheduler_wakeup(session_import_wakeup_tx.clone());
         Ok::<_, Box<dyn std::error::Error>>((
             config_reload,
@@ -522,6 +523,14 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
                         Ok(Response::HostCanary(map_host_canary(host_canary.run(evertrace_engine::HostCanaryRequest {
                             host_executable: request.host_executable, host_config: request.host_config,
                         }).await)))
+                    }
+                    ProtocolCommand::RunExecutionCanary(request) => {
+                        if context.client_kind != ClientKind::Cli { return Err(ErrorCode::Untrusted); }
+                        let request = evertrace_engine::ExecutionCanaryRequest {
+                            source_endpoint: request.source_endpoint.into(),
+                            source_executable: request.source_executable.into(),
+                        };
+                        Ok(Response::HostCanary(map_host_canary(host_canary.run_execution_source(request).await)))
                     }
                     ProtocolCommand::Health => {
                         let snapshot = handler_engine.health().map_err(|error| match error {

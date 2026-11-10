@@ -1,4 +1,6 @@
 //! Source-owned local spawn/exit receipts. Measurements do not grant namespace or Work authority.
+pub mod canary;
+
 use evertrace_domain::evidence::{
     CanonicalEventFamily, CaptureCompleteness, ContentTrust, CorrelationAdmission,
     CorrelationField, CorrelationFieldClaim, EvidenceByteRange, EvidenceSourceKind,
@@ -11,8 +13,10 @@ use crate::{CaptureRecordBody, CaptureRecordInput, host_events};
 
 pub const SOURCE_REVISION: &str = "native-local-execution-0.166.0-v1";
 pub const ADAPTER_VERSION: &str = "native-local-execution-0.166.0-v1:capture-6";
+pub const QUALIFIED_ADAPTER_VERSION: &str = "native-local-execution-0.166.0-v1:capture-7";
 pub const ELIGIBLE_EVENTS: &str = "native-local-execution-events-v1";
 pub const REVISION: u32 = 6;
+pub const QUALIFIED_REVISION: u32 = 7;
 
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -101,6 +105,7 @@ fn evidence(
     manifest: &str,
     role: ObservationRole,
     request: Option<&str>,
+    revision: u32,
 ) -> Option<HostCorrelationEvidence> {
     let peer = host_events::peer_instance(instance)?;
     let fields: Vec<_> = reference
@@ -153,7 +158,7 @@ fn evidence(
         pairing_role: role,
         field_provenance: claims,
         adapter_manifest_ref: manifest.into(),
-        adapter_revision: REVISION,
+        adapter_revision: revision,
         strong_gate_receipt_ref: None,
         admission: CorrelationAdmission::Unavailable,
         partial_correlation_ref: None,
@@ -177,6 +182,19 @@ pub(crate) fn input(
     sequence: u64,
     manifest: &str,
 ) -> Option<CaptureRecordInput> {
+    input_revision(raw, instance, sequence, manifest, REVISION)
+}
+
+pub(crate) fn input_revision(
+    raw: &str,
+    instance: &str,
+    sequence: u64,
+    manifest: &str,
+    revision: u32,
+) -> Option<CaptureRecordInput> {
+    if !matches!(revision, REVISION | QUALIFIED_REVISION) {
+        return None;
+    }
     let event = Event::decode(raw.as_bytes())?;
     Some(CaptureRecordInput {
         spool_record_id: None,
@@ -204,7 +222,14 @@ pub(crate) fn input(
         previous_source_revision: None,
         close_watermark: None,
         observation_role: event.role(),
-        correlation: evidence(instance, &event.reference(), manifest, event.role(), None)?,
+        correlation: evidence(
+            instance,
+            &event.reference(),
+            manifest,
+            event.role(),
+            None,
+            revision,
+        )?,
         scope_effect_claims: vec![],
         source_local_evidence: None,
         lifecycle: None,
@@ -213,10 +238,10 @@ pub(crate) fn input(
         content_trust: ContentTrust::Observed,
         capture_completeness: CaptureCompleteness::Partial,
         surface_eligible: false,
-        adapter_revision: REVISION,
+        adapter_revision: revision,
         adapter_manifest_ref: manifest.into(),
         eligible_event_manifest_ref: ELIGIBLE_EVENTS.into(),
-        parser_revision: REVISION,
+        parser_revision: revision,
         canonicalization_revision: 1,
         event_time_us: None,
         event_time_provenance: None,
@@ -240,18 +265,43 @@ pub(crate) fn protected_correlation(
         &input.adapter_manifest_ref,
         input.observation_role,
         request_id(&event.params.call_id),
+        input.adapter_revision,
     )
+}
+
+/// Decode measurements only; this does not admit a source or enable a correlation gate.
+pub fn protected_measurement(
+    protected: &[u8],
+    instance: &str,
+    manifest: &str,
+    revision: u32,
+) -> Option<(String, HostCorrelationEvidence)> {
+    if !matches!(revision, REVISION | QUALIFIED_REVISION) {
+        return None;
+    }
+    let event = Event::decode(protected)?;
+    let reference = event.reference();
+    let correlation = evidence(
+        instance,
+        &reference,
+        manifest,
+        event.role(),
+        request_id(&event.params.call_id),
+        revision,
+    )?;
+    Some((reference, correlation))
 }
 
 pub fn record_matches(body: &CaptureRecordBody, protected: &[u8], manifest: &str) -> bool {
     let Some(raw) = std::str::from_utf8(protected).ok() else {
         return false;
     };
-    let Some(expected) = input(
+    let Some(expected) = input_revision(
         raw,
         body.source_instance_id.as_str(),
         body.source_sequence,
         manifest,
+        body.parser_revision,
     ) else {
         return false;
     };
@@ -265,8 +315,8 @@ pub fn record_matches(body: &CaptureRecordBody, protected: &[u8], manifest: &str
         && body.source_session_ref == expected.session_ref
         && body.observation_role == expected.observation_role
         && protected_correlation(&expected, protected).as_ref() == Some(&body.correlation)
-        && body.adapter_revision == REVISION
-        && body.parser_revision == REVISION
+        && body.adapter_revision == expected.adapter_revision
+        && body.parser_revision == expected.parser_revision
         && body.canonicalization_revision == 1
         && body.adapter_manifest_ref == manifest
         && body.eligible_event_manifest_ref == ELIGIBLE_EVENTS
@@ -294,12 +344,23 @@ pub fn record_matches(body: &CaptureRecordBody, protected: &[u8], manifest: &str
         && body.recovery_preflight.is_none()
 }
 
-pub fn is_unqualified_execution(observation: &SourceObservation, receipt: &SourceReceipt) -> bool {
+/// Canonical observations may retain a namespace admitted by the original ingestion command.
+pub fn is_execution(observation: &SourceObservation, receipt: &SourceReceipt) -> bool {
+    let mut correlation = observation.correlation.clone();
+    if receipt.parser_revision == QUALIFIED_REVISION
+        && correlation.admission == CorrelationAdmission::ExactCapable
+    {
+        if correlation.exact_key().is_none() || correlation.validate().is_err() {
+            return false;
+        }
+        correlation.admission = CorrelationAdmission::Unavailable;
+        correlation.strong_gate_receipt_ref = None;
+    }
     receipt.source_revision.as_str() == SOURCE_REVISION
         && receipt.identity_domain == SOURCE_REVISION
         && receipt.source_kind == EvidenceSourceKind::Other
-        && receipt.parser_revision == REVISION
-        && receipt.adapter_revision == REVISION
+        && matches!(receipt.parser_revision, REVISION | QUALIFIED_REVISION)
+        && receipt.adapter_revision == receipt.parser_revision
         && receipt.canonicalization_revision == 1
         && receipt.eligible_event_manifest_ref == ELIGIBLE_EVENTS
         && observation.source_receipt_ref == receipt.source_receipt_id
@@ -308,8 +369,8 @@ pub fn is_unqualified_execution(observation: &SourceObservation, receipt: &Sourc
         && observation.source_revision == receipt.source_revision
         && observation.source_record_identity == receipt.source_record_identity
         && observation.observation_role == receipt.observation_role
-        && observation.adapter_revision == REVISION
-        && observation.parser_revision == REVISION
+        && observation.adapter_revision == receipt.parser_revision
+        && observation.parser_revision == receipt.parser_revision
         && observation.canonicalization_revision == 1
         && observation.source_role == SourceRole::Host
         && observation.content_trust == ContentTrust::Observed
@@ -320,9 +381,10 @@ pub fn is_unqualified_execution(observation: &SourceObservation, receipt: &Sourc
             &receipt.adapter_manifest_ref,
             receipt.observation_role,
             observation.correlation.native_request_id.as_deref(),
+            receipt.parser_revision,
         )
         .as_ref()
-            == Some(&observation.correlation)
+            == Some(&correlation)
         && observation.scope_effect_claims.is_empty()
         && observation.source_local_evidence.is_none()
         && receipt.lifecycle.is_none()

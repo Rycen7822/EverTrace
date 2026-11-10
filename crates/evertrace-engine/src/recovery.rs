@@ -1,4 +1,6 @@
 //! Deterministic destructive classification, capture, and supervised recovery.
+mod execution;
+pub use execution::ExecutionCanaryRequest;
 
 use evertrace_domain::repository::{RecoveryOmission, WorktreeSnapshot};
 use evertrace_store::StoreError;
@@ -243,6 +245,7 @@ enum CanaryWiring {
         host: std::path::PathBuf,
     },
     Candidate([String; 7]),
+    ExecutionSource,
 }
 
 fn canary_file_identity(path: &std::path::Path) -> Option<[u64; 7]> {
@@ -365,6 +368,7 @@ impl CanaryIdentity {
                 CanaryWiring::Candidate(arguments) => {
                     evertrace_codex::install::candidate_wiring_hash(arguments) == self.wiring_hash
                 }
+                CanaryWiring::ExecutionSource => true,
             }
             && self.valid()
     }
@@ -805,7 +809,16 @@ impl HostCanaryService {
         }
         let command = format!("cat {filename}");
         let prompt = format!(
-            "EverTrace read-only installation diagnostic. In this disposable workspace only, run exactly this shell command once: {command}. Then call the evertrace MCP tool with action search, workspace {workspace}, input {nonce}, and empty refs. Do not change files, configuration, trust, permissions or repository. Do not use other tools or delegate. Finish after these calls."
+            concat!(
+                "EverTrace read-only installation diagnostic. In this disposable workspace only, ",
+                "run exactly this shell command once: {command}. Then call the evertrace MCP tool ",
+                "with action search, workspace {workspace}, input {nonce}, and empty refs. ",
+                "Do not change files, configuration, trust, permissions or repository. ",
+                "Do not use other tools or delegate. Finish after these calls."
+            ),
+            command = command,
+            workspace = workspace,
+            nonce = nonce,
         );
         let Ok((mut output, child_output)) = std::os::unix::net::UnixStream::pair() else {
             return canary_diagnostic(Status::Unavailable);

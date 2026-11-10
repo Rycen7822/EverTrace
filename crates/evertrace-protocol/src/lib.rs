@@ -143,6 +143,7 @@ impl LocalServer {
                 Command::IssueMcpBinding(_)
                 | Command::ObserveSessionSource(_)
                 | Command::RunHostCanary(_)
+                | Command::RunExecutionCanary(_)
                 | Command::ConfigReload
                 | Command::ConfigRead
                 | Command::ConfigWrite(_)

@@ -407,9 +407,27 @@ pub struct GateQualification {
 }
 
 impl HostProbeReport {
-    /// A content-bound contract, not evidence of any observed host capability.
-    /// Both the source producer and its weak-normalization consumer compile this
-    /// same manifest. This never enables capture, correlation, policy or recovery.
+    /// A content-bound contract for a source with intrinsic native IDs.
+    /// Stable IDs alone never enable capture, normalization, policy or recovery.
+    pub fn native_source_contract(
+        adapter_revision: &str,
+        eligible_events: &str,
+        host_version: &str,
+    ) -> Result<Self, ProbeError> {
+        Self::evaluate_with_native_identity(
+            &ProbeContext {
+                adapter_kind: AdapterKind::Other,
+                adapter_revision: adapter_revision.into(),
+                observed_host_version_range: host_version.into(),
+                eligible_event_manifest_ref: eligible_events.into(),
+                evidence_source: EvidenceSourceKind::NoHostEvidence,
+            },
+            &ProbeEvidence::empty(),
+            true,
+        )
+    }
+
+    /// A weak source contract, not evidence of any observed host capability.
     pub fn unobserved_source_contract(
         adapter_revision: &str,
         eligible_event_manifest_ref: &str,
@@ -575,7 +593,15 @@ impl HostProbeReport {
     }
 
     pub fn evaluate(context: &ProbeContext, evidence: &ProbeEvidence) -> Result<Self, ProbeError> {
-        let manifest = compile_manifest(context, evidence)?;
+        Self::evaluate_with_native_identity(context, evidence, false)
+    }
+
+    fn evaluate_with_native_identity(
+        context: &ProbeContext,
+        evidence: &ProbeEvidence,
+        native_identity: bool,
+    ) -> Result<Self, ProbeError> {
+        let manifest = compile_manifest(context, evidence, native_identity)?;
         let hook = evaluate_hook(evidence.hook.as_ref());
         let mcp = evidence
             .mcp
@@ -632,6 +658,7 @@ pub enum ProbeError {
 fn compile_manifest(
     context: &ProbeContext,
     evidence: &ProbeEvidence,
+    native_identity: bool,
 ) -> Result<AdapterCapabilityManifest, ProbeError> {
     let observable = evidence
         .capture
@@ -684,12 +711,13 @@ fn compile_manifest(
                     AdmissionFailureObservability::BestEffort
                 }
             });
-    let event_identity = if evidence
-        .normalization
-        .as_ref()
-        .is_some_and(|normalization| {
-            normalization.fork_resume_retry_unique && normalization.replay_rejected
-        }) {
+    let event_identity = if native_identity
+        || evidence
+            .normalization
+            .as_ref()
+            .is_some_and(|normalization| {
+                normalization.fork_resume_retry_unique && normalization.replay_rejected
+            }) {
         EventIdentity::StableNative
     } else if evidence.capture.as_ref().is_some_and(|capture| {
         !capture.source_identity.is_empty() && !capture.source_revision_refs.is_empty()

@@ -2525,7 +2525,7 @@ impl BackgroundScheduler {
                         && (evertrace_capture::host_events::is_unqualified_execution(
                             observation,
                             receipt,
-                        ) || evertrace_capture::execution_source::is_unqualified_execution(
+                        ) || evertrace_capture::execution_source::is_execution(
                             observation,
                             receipt,
                         ));
@@ -5195,12 +5195,22 @@ fn resolve_capture_report(
                 JournalPayload::SourceReceiptRecorded(receipt)
                     if receipt.source_revision.as_str()
                         == evertrace_capture::execution_source::SOURCE_REVISION
-                        && receipt.parser_revision
-                            == evertrace_capture::execution_source::REVISION
+                        && matches!(
+                            receipt.parser_revision,
+                            evertrace_capture::execution_source::REVISION
+                                | evertrace_capture::execution_source::QUALIFIED_REVISION
+                        )
                         && receipt.adapter_revision == receipt.parser_revision =>
                 {
                     Some((
-                        evertrace_capture::execution_source::ADAPTER_VERSION.to_owned(),
+                        if receipt.parser_revision
+                            == evertrace_capture::execution_source::QUALIFIED_REVISION
+                        {
+                            evertrace_capture::execution_source::QUALIFIED_ADAPTER_VERSION
+                                .to_owned()
+                        } else {
+                            evertrace_capture::execution_source::ADAPTER_VERSION.to_owned()
+                        },
                         evertrace_capture::execution_source::ELIGIBLE_EVENTS,
                     ))
                 }
@@ -5229,10 +5239,7 @@ fn resolve_capture_report(
                         _ => None,
                     })?;
             if !evertrace_capture::host_events::is_unqualified_execution(observation, receipt)
-                && !evertrace_capture::execution_source::is_unqualified_execution(
-                    observation,
-                    receipt,
-                )
+                && !evertrace_capture::execution_source::is_execution(observation, receipt)
             {
                 return None;
             }
@@ -5241,7 +5248,16 @@ fn resolve_capture_report(
         if !observed {
             return None;
         }
-        let report = HostProbeReport::unobserved_source_contract(&version, eligible).ok()?;
+        let report = if version == evertrace_capture::execution_source::QUALIFIED_ADAPTER_VERSION {
+            HostProbeReport::native_source_contract(
+                evertrace_capture::execution_source::QUALIFIED_ADAPTER_VERSION,
+                evertrace_capture::execution_source::ELIGIBLE_EVENTS,
+                "0.166.0",
+            )
+        } else {
+            HostProbeReport::unobserved_source_contract(&version, eligible)
+        }
+        .ok()?;
         return capture_item_manifest_matches(item, &report).then_some(report);
     }
     if item.dependencies.iter().any(|dependency| {

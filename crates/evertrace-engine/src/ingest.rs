@@ -44,9 +44,15 @@ pub struct EvidenceIngestor {
     config: Option<std::sync::Arc<crate::ConfigReloadService>>,
     operation_config: Option<std::sync::Arc<evertrace_domain::config::EffectiveConfig>>,
     scheduler_wakeup: Option<tokio::sync::watch::Sender<u64>>,
+    execution_canary: Option<crate::HostCanaryService>,
 }
 
 impl EvidenceIngestor {
+    pub fn with_execution_canary(mut self, canary: crate::HostCanaryService) -> Self {
+        self.execution_canary = Some(canary);
+        self
+    }
+
     pub fn with_scheduler_wakeup(mut self, wakeup: tokio::sync::watch::Sender<u64>) -> Self {
         self.scheduler_wakeup = Some(wakeup);
         self
@@ -207,6 +213,7 @@ impl EvidenceIngestor {
             config: None,
             operation_config: None,
             scheduler_wakeup: None,
+            execution_canary: None,
         })
     }
 
@@ -693,6 +700,40 @@ impl EvidenceIngestor {
                         .map_err(map_writer_error)?,
                 };
                 if let Some(committed_command) = committed_command {
+                    if verified.body.source_revision.as_str()
+                        == evertrace_capture::execution_source::SOURCE_REVISION
+                        && verified.body.parser_revision
+                            == evertrace_capture::execution_source::QUALIFIED_REVISION
+                    {
+                        if let Some(original) =
+                            committed_command
+                                .payloads
+                                .iter()
+                                .find_map(|payload| match payload {
+                                    JournalPayload::SourceObservationRecorded(value)
+                                        if value.source_observation_id
+                                            == verified.observation.source_observation_id =>
+                                    {
+                                        Some(value.as_ref())
+                                    }
+                                    _ => None,
+                                })
+                        {
+                            // Lost-ack replay preserves first admission, even after qualification or restart.
+                            let mut weak = original.clone();
+                            weak.correlation.admission =
+                                evertrace_domain::evidence::CorrelationAdmission::Unavailable;
+                            weak.correlation.strong_gate_receipt_ref = None;
+                            if weak == verified.observation
+                                && evertrace_capture::execution_source::is_execution(
+                                    original,
+                                    &verified.receipt,
+                                )
+                            {
+                                verified.observation.correlation = original.correlation.clone();
+                            }
+                        }
+                    }
                     let receipt = committed_command
                         .payloads
                         .iter()
@@ -745,6 +786,33 @@ impl EvidenceIngestor {
                     progress.replayed_frames += 1;
                     progress.projected_surfaces += surface_count;
                     continue;
+                }
+                if verified.body.source_revision.as_str()
+                    == evertrace_capture::execution_source::SOURCE_REVISION
+                    && verified.body.parser_revision
+                        == evertrace_capture::execution_source::QUALIFIED_REVISION
+                {
+                    if let Some(report) = self
+                        .execution_canary
+                        .as_ref()
+                        .and_then(|canary| canary.execution_source_report())
+                    {
+                        let correlation = &mut verified.observation.correlation;
+                        if report.manifest().adapter_manifest_id
+                            == verified.receipt.adapter_manifest_ref
+                            && correlation.native_request_id.is_some()
+                        {
+                            let weak = correlation.clone();
+                            correlation.admission =
+                                evertrace_domain::evidence::CorrelationAdmission::ExactCapable;
+                            correlation.strong_gate_receipt_ref =
+                                Some(report.strong_normalization().protected_digest().into());
+                            if correlation.validate().is_err() || correlation.exact_key().is_none()
+                            {
+                                *correlation = weak;
+                            }
+                        }
+                    }
                 }
                 self.verify_namespace_support(&verified, &cas, &mut remaining)
                     .await?;

@@ -1908,6 +1908,15 @@ fn collect_observation_relations(
     observation_ids: &BTreeSet<SourceObservationId>,
     dependencies: &mut DependencyCollector,
 ) -> Result<(), StoreError> {
+    for id in observation_ids {
+        let (observation, _) = snapshot
+            .source_observation(*id)
+            .ok_or(StoreError::StoreCorrupt)?;
+        dependencies.insert(source_receipt_dependency(
+            snapshot,
+            observation.source_receipt_ref,
+        )?)?;
+    }
     let observation_needles = observation_ids
         .iter()
         .map(ToString::to_string)
