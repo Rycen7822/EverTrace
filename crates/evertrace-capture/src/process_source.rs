@@ -127,7 +127,8 @@ pub fn source_launch(input: &[u8], snapshot: &Path, caller_pid: u32) -> Result<S
             return Err(ProcessSourceError);
         }
     }
-    peer_at(&header, &caller_image, snapshot, caller_pid)?;
+    let script = peer_at(&header, &caller_image, snapshot, caller_pid)?;
+    published_record(input, &header, &script)?;
     physical_scope(&header)?;
     let directory = fs::read_link(format!("/proc/{}/cwd", header.controller.pid))
         .map_err(|_| ProcessSourceError)?;
