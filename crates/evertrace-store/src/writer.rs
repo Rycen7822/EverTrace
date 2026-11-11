@@ -2843,6 +2843,15 @@ impl JournalWriter {
         result
     }
 
+    pub async fn physical_normalization_context(
+        &self,
+        observation_id: evertrace_domain::ids::SourceObservationId,
+    ) -> Result<ReconciliationFrontier, StoreError> {
+        self.project_current(false)
+            .await?
+            .physical_normalization_context(observation_id)
+    }
+
     pub async fn reconciliation_frontier(
         &self,
         limit: usize,

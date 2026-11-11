@@ -293,6 +293,10 @@ enum WriterRequest {
         request: SessionImportPrefixRequest,
         reply: oneshot::Sender<Result<SessionImportPrefixPage, WriterActorError>>,
     },
+    PhysicalNormalizationContext {
+        observation_id: evertrace_domain::ids::SourceObservationId,
+        reply: oneshot::Sender<Result<ReconciliationFrontier, WriterActorError>>,
+    },
     ReconciliationFrontier {
         limit: usize,
         reply: oneshot::Sender<Result<ReconciliationFrontier, WriterActorError>>,
@@ -318,6 +322,7 @@ enum WriterCommitCondition {
     Frontier(u64),
     SourceObservation(Box<SourceObservationGuard>),
     SourceSnapshot(Box<crate::ingest::SourceSnapshotGuard>),
+    LiveNormalization(Box<crate::capture::LiveNormalizationGuard>),
 }
 
 #[derive(Clone)]
@@ -1102,6 +1107,21 @@ impl WriterHandle {
         response.await.map_err(|_| WriterActorError::Stopped)?
     }
 
+    pub(crate) async fn physical_normalization_context(
+        &self,
+        observation_id: evertrace_domain::ids::SourceObservationId,
+    ) -> Result<ReconciliationFrontier, WriterActorError> {
+        let (reply, response) = oneshot::channel();
+        self.sender
+            .send(WriterRequest::PhysicalNormalizationContext {
+                observation_id,
+                reply,
+            })
+            .await
+            .map_err(|_| WriterActorError::Stopped)?;
+        response.await.map_err(|_| WriterActorError::Stopped)?
+    }
+
     pub async fn reconciliation_frontier(
         &self,
         limit: usize,
@@ -1169,6 +1189,20 @@ impl WriterHandle {
             command,
             ingested_at_us,
             WriterCommitCondition::SourceSnapshot(Box::new(guard)),
+        )
+        .await
+    }
+
+    pub(crate) async fn commit_live_normalization(
+        &self,
+        command: JournalCommand,
+        ingested_at_us: i64,
+        guard: crate::capture::LiveNormalizationGuard,
+    ) -> Result<CommitOutcome, WriterActorError> {
+        self.commit_with_condition(
+            command,
+            ingested_at_us,
+            WriterCommitCondition::LiveNormalization(Box::new(guard)),
         )
         .await
     }
@@ -1478,6 +1512,41 @@ async fn run_writer(
                             writer
                                 .commit_source_observation(&command, ingested_at_us, *guard)
                                 .await
+                        }
+                        WriterCommitCondition::LiveNormalization(guard) => {
+                            async {
+                                if writer
+                                    .committed_command(command.command_id())
+                                    .await?
+                                    .is_some()
+                                {
+                                    return Err(StoreError::StaleFrontier);
+                                }
+                                let source = writer
+                                    .capture_current_context(
+                                        None,
+                                        Some(&guard.observation_id().to_string()),
+                                        1,
+                                    )
+                                    .await?;
+                                if source.items.first().is_none_or(|item| item.suppressed) {
+                                    return Err(StoreError::StaleFrontier);
+                                }
+                                let current = writer
+                                    .physical_normalization_context(guard.observation_id())
+                                    .await?;
+                                guard.validate(&current)?;
+                                for repository in guard.repositories() {
+                                    let (view, purged) = writer
+                                        .repository_resolution_context(repository.identity())?;
+                                    repository
+                                        .validate(view, &purged)
+                                        .map_err(|_| StoreError::StaleFrontier)?;
+                                }
+                                guard.validate(&current)?;
+                                writer.commit(&command, ingested_at_us).await
+                            }
+                            .await
                         }
                         WriterCommitCondition::SourceSnapshot(guard) => {
                             async {
@@ -2139,6 +2208,18 @@ async fn run_writer(
                         .as_ref()
                         .ok_or(WriterActorError::Stopped)?
                         .session_import_prefix_page(&request)
+                        .map_err(map_store_error);
+                    let _ = reply.send(result);
+                }
+                WriterRequest::PhysicalNormalizationContext {
+                    observation_id,
+                    reply,
+                } => {
+                    let result = writer
+                        .as_ref()
+                        .ok_or(WriterActorError::Stopped)?
+                        .physical_normalization_context(observation_id)
+                        .await
                         .map_err(map_store_error);
                     let _ = reply.send(result);
                 }

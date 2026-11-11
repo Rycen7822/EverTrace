@@ -41,10 +41,7 @@ pub(crate) struct SourceSnapshotGuard {
     observation_id: SourceObservationId,
     observation_payload: String,
     receipt_payload: String,
-    identity: evertrace_domain::repository::FilesystemIdentity,
-    view: evertrace_store::repository::RepositoryCurrentView,
-    purged: BTreeSet<RepositoryId>,
-    namespace: crate::repository::ExecutionNamespace,
+    repository: crate::repository::RepositoryObservationGuard,
     raw: Vec<u8>,
     path: std::path::PathBuf,
     caller_pid: u32,
@@ -56,13 +53,13 @@ impl SourceSnapshotGuard {
     }
 
     pub(crate) fn identity(&self) -> evertrace_domain::repository::FilesystemIdentity {
-        self.identity
+        self.repository.identity()
     }
 
     pub(crate) fn validate(
         &self,
         source: &evertrace_store::CaptureCurrentContext,
-        mut view: evertrace_store::repository::RepositoryCurrentView,
+        view: evertrace_store::repository::RepositoryCurrentView,
         purged: &BTreeSet<RepositoryId>,
     ) -> Result<(), evertrace_store::StoreError> {
         let current = source.items.first().filter(|item| !item.suppressed);
@@ -75,16 +72,8 @@ impl SourceSnapshotGuard {
         }) {
             return Err(evertrace_store::StoreError::InvalidInput);
         }
-        view.frontier = self.view.frontier;
-        if view != self.view || purged != &self.purged {
-            return Err(evertrace_store::StoreError::StaleFrontier);
-        }
-        if !self.namespace.valid()
-            || evertrace_capture::process_source::source_launch(
-                &self.raw,
-                &self.path,
-                self.caller_pid,
-            )
+        self.repository.validate(view, purged)?;
+        if evertrace_capture::process_source::source_launch(&self.raw, &self.path, self.caller_pid)
             .is_err()
         {
             return Err(evertrace_store::StoreError::InvalidInput);
@@ -722,10 +711,9 @@ impl EvidenceIngestor {
                     .as_deref()
                     .map(str::to_owned)
                     .ok_or(IngestError::InvalidRecord)?,
-                identity,
-                view,
-                purged,
-                namespace,
+                repository: crate::repository::RepositoryObservationGuard::new(
+                    namespace, identity, view, purged,
+                ),
                 raw,
                 path,
                 caller_pid,

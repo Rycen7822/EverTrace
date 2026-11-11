@@ -803,25 +803,51 @@ async fn reconcile_selected(
     } else {
         None
     };
-    let current = writer
-        .project_current(false)
-        .await
-        .map_err(map_reconcile_writer)?;
-    let dirty_frontier = if let Some(context) = &selected_artifact_context {
+    let current = if pass == ReconcilePass::Physical {
+        None
+    } else {
+        Some(
+            writer
+                .project_current(false)
+                .await
+                .map_err(map_reconcile_writer)?,
+        )
+    };
+    let live_observation = if pass == ReconcilePass::Physical {
+        let [id] = observation_ids.ok_or(ReconcileError::InvalidInput)? else {
+            return Err(ReconcileError::InvalidInput);
+        };
+        Some(*id)
+    } else {
+        None
+    };
+    let dirty_frontier = if let Some(id) = live_observation {
+        writer
+            .physical_normalization_context(id)
+            .await
+            .map_err(map_reconcile_writer)?
+    } else if let Some(context) = &selected_artifact_context {
         evertrace_store::ReconciliationFrontier {
             frontier: context.frontier,
             items: Vec::new(),
         }
     } else if let Some(observation_ids) = observation_ids {
         current
+            .as_ref()
+            .ok_or(ReconcileError::InvalidInput)?
             .reconciliation_frontier_for_observations(observation_ids)
             .map_err(|_| ReconcileError::Projection)?
     } else {
         current
+            .as_ref()
+            .ok_or(ReconcileError::InvalidInput)?
             .reconciliation_frontier(input.max_items)
             .map_err(|_| ReconcileError::Projection)?
     };
-    if current.frontier() != dirty_frontier.frontier {
+    if current
+        .as_ref()
+        .is_some_and(|value| value.frontier() != dirty_frontier.frontier)
+    {
         return Err(ReconcileError::StaleFrontier);
     }
     let quarantine_start = dirty_frontier.frontier.wrapping_add(
@@ -979,7 +1005,9 @@ async fn reconcile_selected(
         writer,
         source.as_ref(),
         &mut payloads,
-        dirty_frontier.frontier,
+        live_observation
+            .is_none()
+            .then_some(dirty_frontier.frontier),
     )
     .await?;
     if pass == ReconcilePass::Physical && scopes.claims.is_empty() {
@@ -1003,6 +1031,8 @@ async fn reconcile_selected(
             .map(|receipt| receipt.source_observation_id)
             .collect();
         for dependency in current
+            .as_ref()
+            .ok_or(ReconcileError::InvalidInput)?
             .capture_reconciliation_inputs(observations)
             .map_err(|_| ReconcileError::Projection)?
         {
@@ -1031,7 +1061,7 @@ async fn reconcile_selected(
             &mut remaining,
         )?;
     }
-    if scopes.pins.iter().any(|pin| !pin.valid()) {
+    if scopes.repositories.iter().any(|pin| !pin.valid()) {
         return Err(ReconcileError::StaleFrontier);
     }
     let committed = if payloads.is_empty() {
@@ -1039,14 +1069,28 @@ async fn reconcile_selected(
     } else {
         close_normalization_payloads(&state, &mut payloads)?;
         let command = reconciliation_command(&input, payloads)?;
-        Some(
+        let outcome = if let Some(observation_id) = live_observation {
+            let guard = LiveNormalizationGuard {
+                observation_id,
+                expected: dirty_frontier.items,
+                repositories: scopes.repositories,
+            };
+            writer
+                .commit_live_normalization(command, input.occurred_at_us, guard)
+                .await
+        } else {
             writer
                 .commit_if_frontier(command, input.occurred_at_us, dirty_frontier.frontier)
                 .await
-                .map_err(map_reconcile_writer)?,
-        )
+        };
+        Some(outcome.map_err(map_reconcile_writer)?)
     };
-    let after_dirty = if artifact.is_some() {
+    let after_dirty = if let Some(id) = live_observation {
+        writer
+            .physical_normalization_context(id)
+            .await
+            .map_err(map_reconcile_writer)?
+    } else if artifact.is_some() {
         evertrace_store::ReconciliationFrontier {
             frontier: dirty_frontier.frontier,
             items: Vec::new(),
@@ -1585,10 +1629,36 @@ fn apply_reconciled_evidence(
     Ok(targets)
 }
 
+pub(crate) struct LiveNormalizationGuard {
+    observation_id: SourceObservationId,
+    expected: Vec<evertrace_store::ReconciliationWorkItem>,
+    repositories: Vec<crate::repository::RepositoryObservationGuard>,
+}
+
+impl LiveNormalizationGuard {
+    pub(crate) fn observation_id(&self) -> SourceObservationId {
+        self.observation_id
+    }
+
+    pub(crate) fn repositories(&self) -> &[crate::repository::RepositoryObservationGuard] {
+        &self.repositories
+    }
+
+    pub(crate) fn validate(
+        &self,
+        current: &ReconciliationFrontier,
+    ) -> Result<(), evertrace_store::StoreError> {
+        if current.items != self.expected || self.repositories.iter().any(|pin| !pin.valid()) {
+            return Err(evertrace_store::StoreError::StaleFrontier);
+        }
+        Ok(())
+    }
+}
+
 #[derive(Default)]
 struct ObservedSourceScopes {
     claims: BTreeMap<SourceObservationId, evertrace_domain::evidence::ScopeEffectClaim>,
-    pins: Vec<crate::repository::ExecutionNamespace>,
+    repositories: Vec<crate::repository::RepositoryObservationGuard>,
 }
 
 async fn observe_execution_scopes(
@@ -1598,7 +1668,7 @@ async fn observe_execution_scopes(
     writer: &WriterHandle,
     authority: Option<&crate::repository::ExecutionScopeSource>,
     payloads: &mut Vec<JournalPayload>,
-    frontier: u64,
+    frontier: Option<u64>,
 ) -> Result<ObservedSourceScopes, ReconcileError> {
     use crate::repository::{
         HostTrustDecision, ProbeLimits, RepositoryResolveInput, ResolutionKind,
@@ -1624,7 +1694,7 @@ async fn observe_execution_scopes(
     for id in ids {
         // Scope is witnessed while the actual execution is live. A later path
         // probe never retroactively supplies a missing historical namespace.
-        if state.normalization_watermarks.contains_key(&id) {
+        if frontier.is_some() && state.normalization_watermarks.contains_key(&id) {
             continue;
         }
         let Some(observation) = state.source_observations.get(&id) else {
@@ -1673,7 +1743,7 @@ async fn observe_execution_scopes(
             .repository_resolution_context(location.common_dir_filesystem)
             .await
             .map_err(map_reconcile_writer)?;
-        if view.frontier != frontier {
+        if frontier.is_some_and(|expected| view.frontier != expected) {
             return Err(ReconcileError::StaleFrontier);
         }
         if view.repositories.values().any(|repository| {
@@ -1685,6 +1755,8 @@ async fn observe_execution_scopes(
             continue;
         }
         let occurred = input.occurred_at_us;
+        let expected_view = view.clone();
+        let identity = location.common_dir_filesystem;
         let resolved = tokio::task::spawn_blocking(move || {
             let heads = view
                 .snapshots
@@ -1778,7 +1850,14 @@ async fn observe_execution_scopes(
         if let Some((namespace, records, claim)) = resolved {
             payloads.extend(records);
             observed.claims.insert(id, claim);
-            observed.pins.push(namespace);
+            observed
+                .repositories
+                .push(crate::repository::RepositoryObservationGuard::new(
+                    namespace,
+                    identity,
+                    expected_view,
+                    purged,
+                ));
         }
     }
     Ok(observed)

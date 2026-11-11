@@ -1541,6 +1541,7 @@ fn reconciliation_item(
     snapshot: &CurrentFacts,
     dirty_row: NamedCurrentDependency,
     target: DirtyTarget,
+    live_physical: bool,
 ) -> Result<Option<ReconciliationWorkItem>, StoreError> {
     let observation_id = target
         .target_id
@@ -1560,7 +1561,7 @@ fn reconciliation_item(
     let active = match target.target_kind {
         crate::command::DirtyTargetKind::PhysicalNormalization => {
             let watermark = format!("runtime:watermark:normalization:{}", target.target_id);
-            if snapshot.other_row(&watermark).is_some() {
+            if !live_physical && snapshot.other_row(&watermark).is_some() {
                 false
             } else {
                 collect_normalization_dependencies(
@@ -2356,7 +2357,7 @@ impl CurrentFacts {
             ) {
                 continue;
             }
-            if let Some(item) = reconciliation_item(self, payload, target)? {
+            if let Some(item) = reconciliation_item(self, payload, target, false)? {
                 items.push(item);
                 if items.len() == limit {
                     break;
@@ -2372,6 +2373,23 @@ impl CurrentFacts {
     pub fn reconciliation_frontier_for_observations(
         &self,
         observation_ids: &[SourceObservationId],
+    ) -> Result<ReconciliationFrontier, StoreError> {
+        self.selected_reconciliation_frontier(observation_ids, false)
+    }
+
+    /// Request-local live evidence may enrich an already normalized occurrence.
+    /// This selector is never used by the background dirty/watermark scheduler.
+    pub fn physical_normalization_context(
+        &self,
+        observation_id: SourceObservationId,
+    ) -> Result<ReconciliationFrontier, StoreError> {
+        self.selected_reconciliation_frontier(&[observation_id], true)
+    }
+
+    fn selected_reconciliation_frontier(
+        &self,
+        observation_ids: &[SourceObservationId],
+        live_physical: bool,
     ) -> Result<ReconciliationFrontier, StoreError> {
         if observation_ids.is_empty()
             || observation_ids.len() > 16
@@ -2399,12 +2417,11 @@ impl CurrentFacts {
             };
             let target = target.clone();
             if selected.contains(&target.target_id)
-                && matches!(
-                    target.target_kind,
-                    crate::command::DirtyTargetKind::PhysicalNormalization
-                        | crate::command::DirtyTargetKind::CaptureReconciliation
-                )
-                && let Some(item) = reconciliation_item(self, payload, target)?
+                && (target.target_kind == crate::command::DirtyTargetKind::PhysicalNormalization
+                    || !live_physical
+                        && target.target_kind
+                            == crate::command::DirtyTargetKind::CaptureReconciliation)
+                && let Some(item) = reconciliation_item(self, payload, target, live_physical)?
             {
                 items.push(item);
             }

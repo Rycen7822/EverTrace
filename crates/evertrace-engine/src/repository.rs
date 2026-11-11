@@ -26,7 +26,7 @@ pub(crate) use access::{
 };
 pub(crate) use host_context::NativeHostContext;
 pub use host_context::NativeHostPeer;
-pub(crate) use host_context::{ExecutionNamespace, ExecutionScopeSource, SourcePolicy};
+pub(crate) use host_context::{ExecutionScopeSource, RepositoryObservationGuard, SourcePolicy};
 pub(crate) use session_catalog::{
     SESSION_ROOT_PROBE_BUDGET, freeze_native_namespace, read_report_path_trust_before,
     read_report_worktree_trust_before,

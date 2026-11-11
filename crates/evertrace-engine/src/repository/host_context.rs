@@ -244,6 +244,54 @@ impl ExecutionScopeSource {
     }
 }
 
+/// One live observation's repository compare set, shared by source snapshots
+/// and Native physical normalization. It is neither serialized nor retained.
+pub(crate) struct RepositoryObservationGuard {
+    namespace: ExecutionNamespace,
+    identity: evertrace_domain::repository::FilesystemIdentity,
+    view: evertrace_store::repository::RepositoryCurrentView,
+    purged: std::collections::BTreeSet<evertrace_domain::ids::RepositoryId>,
+}
+
+impl RepositoryObservationGuard {
+    pub(crate) fn new(
+        namespace: ExecutionNamespace,
+        identity: evertrace_domain::repository::FilesystemIdentity,
+        view: evertrace_store::repository::RepositoryCurrentView,
+        purged: std::collections::BTreeSet<evertrace_domain::ids::RepositoryId>,
+    ) -> Self {
+        Self {
+            namespace,
+            identity,
+            view,
+            purged,
+        }
+    }
+
+    pub(crate) fn identity(&self) -> evertrace_domain::repository::FilesystemIdentity {
+        self.identity
+    }
+
+    pub(crate) fn valid(&self) -> bool {
+        self.namespace.valid()
+    }
+
+    pub(crate) fn validate(
+        &self,
+        mut view: evertrace_store::repository::RepositoryCurrentView,
+        purged: &std::collections::BTreeSet<evertrace_domain::ids::RepositoryId>,
+    ) -> Result<(), evertrace_store::StoreError> {
+        view.frontier = self.view.frontier;
+        if view != self.view || purged != &self.purged {
+            return Err(evertrace_store::StoreError::StaleFrontier);
+        }
+        if !self.valid() {
+            return Err(evertrace_store::StoreError::InvalidInput);
+        }
+        Ok(())
+    }
+}
+
 /// The publisher's actual configuration, not a daemon-HOME fallback or Host capability.
 /// Shared by execution-directory observation and the independently verified root goal.
 pub(crate) struct SourcePolicy {
