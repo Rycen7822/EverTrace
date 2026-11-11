@@ -1,5 +1,5 @@
 use evertrace_domain::{
-    ids::{RecoveryBundleId, RecoveryCaptureRequestId, RequestId, WorktreeId},
+    ids::{RecoveryBundleId, RecoveryCaptureRequestId, RequestId, SourceObservationId, WorktreeId},
     recall::{PresentationAttemptState, RecallCueSnapshot},
     repository::RecoveryApplicationKind,
     revision::RevisionId,
@@ -30,6 +30,10 @@ pub enum Command {
     RequestRecovery(RequestRecoveryCommand),
     IssueMcpBinding(McpBindingIssueCommand),
     ObserveSessionSource(ObserveSessionSourceCommand),
+    /// Hook-only locator; the daemon observes state, never accepts snapshot facts.
+    ObserveProcessSource {
+        source_observation_id: SourceObservationId,
+    },
     McpCall(McpCallCommand),
     /// Internal stdio transport receipt, not a public MCP action.
     McpReturned {

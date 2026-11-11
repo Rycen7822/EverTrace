@@ -26,6 +26,7 @@ pub enum Response {
     RecoveryAction(RecoveryActionResponse),
     McpBindingIssued(McpBindingIssuedResponse),
     SessionSourceObserved(SessionSourceObservedResponse),
+    ProcessSourceObserved(ProcessSourceObservedResponse),
     McpResult(Box<McpResultEnvelope>),
     McpReturned,
     RecallCue(RecallCueResponse),
@@ -78,6 +79,12 @@ pub struct McpBindingIssuedResponse {
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct SessionSourceObservedResponse {
+    pub changed: bool,
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct ProcessSourceObservedResponse {
     pub changed: bool,
 }
 

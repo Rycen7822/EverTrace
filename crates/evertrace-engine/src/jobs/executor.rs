@@ -317,6 +317,7 @@ enum WriterCommitCondition {
     None,
     Frontier(u64),
     SourceObservation(Box<SourceObservationGuard>),
+    SourceSnapshot(Box<crate::ingest::SourceSnapshotGuard>),
 }
 
 #[derive(Clone)]
@@ -633,17 +634,8 @@ impl WriterHandle {
         command: JournalCommand,
         ingested_at_us: i64,
     ) -> Result<CommitOutcome, WriterActorError> {
-        let (reply, response) = oneshot::channel();
-        self.sender
-            .send(WriterRequest::Commit {
-                command,
-                ingested_at_us,
-                condition: WriterCommitCondition::None,
-                reply,
-            })
+        self.commit_with_condition(command, ingested_at_us, WriterCommitCondition::None)
             .await
-            .map_err(|_| WriterActorError::Stopped)?;
-        response.await.map_err(|_| WriterActorError::Stopped)?
     }
 
     pub(crate) async fn confirm_procedure_return(
@@ -1145,17 +1137,12 @@ impl WriterHandle {
         ingested_at_us: i64,
         expected_frontier: u64,
     ) -> Result<CommitOutcome, WriterActorError> {
-        let (reply, response) = oneshot::channel();
-        self.sender
-            .send(WriterRequest::Commit {
-                command,
-                ingested_at_us,
-                condition: WriterCommitCondition::Frontier(expected_frontier),
-                reply,
-            })
-            .await
-            .map_err(|_| WriterActorError::Stopped)?;
-        response.await.map_err(|_| WriterActorError::Stopped)?
+        self.commit_with_condition(
+            command,
+            ingested_at_us,
+            WriterCommitCondition::Frontier(expected_frontier),
+        )
+        .await
     }
 
     pub async fn commit_source_observation(
@@ -1164,12 +1151,40 @@ impl WriterHandle {
         ingested_at_us: i64,
         guard: SourceObservationGuard,
     ) -> Result<CommitOutcome, WriterActorError> {
+        self.commit_with_condition(
+            command,
+            ingested_at_us,
+            WriterCommitCondition::SourceObservation(Box::new(guard)),
+        )
+        .await
+    }
+
+    pub(crate) async fn commit_source_snapshot(
+        &self,
+        command: JournalCommand,
+        ingested_at_us: i64,
+        guard: crate::ingest::SourceSnapshotGuard,
+    ) -> Result<CommitOutcome, WriterActorError> {
+        self.commit_with_condition(
+            command,
+            ingested_at_us,
+            WriterCommitCondition::SourceSnapshot(Box::new(guard)),
+        )
+        .await
+    }
+
+    async fn commit_with_condition(
+        &self,
+        command: JournalCommand,
+        ingested_at_us: i64,
+        condition: WriterCommitCondition,
+    ) -> Result<CommitOutcome, WriterActorError> {
         let (reply, response) = oneshot::channel();
         self.sender
             .send(WriterRequest::Commit {
                 command,
                 ingested_at_us,
-                condition: WriterCommitCondition::SourceObservation(Box::new(guard)),
+                condition,
                 reply,
             })
             .await
@@ -1463,6 +1478,30 @@ async fn run_writer(
                             writer
                                 .commit_source_observation(&command, ingested_at_us, *guard)
                                 .await
+                        }
+                        WriterCommitCondition::SourceSnapshot(guard) => {
+                            async {
+                                // A concurrent accepted replay must never re-open its old namespace.
+                                if writer
+                                    .committed_command(command.command_id())
+                                    .await?
+                                    .is_some()
+                                {
+                                    return Err(StoreError::StaleFrontier);
+                                }
+                                let source = writer
+                                    .capture_current_context(
+                                        None,
+                                        Some(&guard.observation_id().to_string()),
+                                        1,
+                                    )
+                                    .await?;
+                                let (view, purged) =
+                                    writer.repository_resolution_context(guard.identity())?;
+                                guard.validate(&source, view, &purged)?;
+                                writer.commit(&command, ingested_at_us).await
+                            }
+                            .await
                         }
                     }
                     .map_err(map_store_error);

@@ -409,6 +409,7 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
     ));
     let (shutdown_tx, shutdown_rx) = watch::channel(false);
     let maintenance_active = Arc::new(AtomicBool::new(false));
+    let handler_ingestor = ingestor.clone();
     let mut ingest_task = Some(tokio::spawn(ingestor.run(
         Arc::clone(&dispatch_gate),
         session_import_shutdown_tx.subscribe(),
@@ -443,6 +444,8 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
             let session_catalog = handler_session_catalog.clone();
             let session_import_admin = handler_session_import_admin.clone();
             let writer = handler_writer.clone();
+            let source_ingestor = matches!(&command, ProtocolCommand::ObserveProcessSource { .. })
+                .then(|| handler_ingestor.clone());
             let runtime_snapshot = Arc::clone(&handler_runtime_snapshot);
             let session_import_wakeup = handler_session_import_wakeup.clone();
             let maintenance_active = Arc::clone(&handler_maintenance_active);
@@ -455,6 +458,12 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
                         ProtocolCommand::Health | ProtocolCommand::HumanGovernance(HumanGovernanceRequest::Read { .. })))
                 { return Err(ErrorCode::Untrusted); }
                 let observation_deadline = match &command {
+                    ProtocolCommand::ObserveProcessSource { .. } => {
+                        if context.client_kind != ClientKind::Hook || context.peer_credentials.is_none() {
+                            return Err(ErrorCode::Untrusted);
+                        }
+                        Some(Instant::now() + Duration::from_secs(2))
+                    }
                     ProtocolCommand::ObserveSessionSource(observation) => {
                         if context.client_kind != ClientKind::Hook || !observation.validate() {
                             return Err(ErrorCode::Untrusted);
@@ -628,6 +637,17 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
                             bound_workspace: grant.bound_workspace,
                             expires_at_us: grant.expires_at_us,
                         }))
+                    }
+                    ProtocolCommand::ObserveProcessSource { source_observation_id } => {
+                        let deadline = observation_deadline.ok_or(ErrorCode::Internal)?;
+                        let peer = context.peer_credentials.ok_or(ErrorCode::Untrusted)?;
+                        let ingestor = source_ingestor.ok_or(ErrorCode::Internal)?;
+                        let changed = tokio::time::timeout_at(tokio::time::Instant::from_std(deadline),
+                            ingestor.observe_process_source(source_observation_id, peer.pid))
+                            .await.map_err(|_| ErrorCode::Untrusted)?
+                            .map_err(|_| ErrorCode::Internal)?;
+                        Ok(Response::ProcessSourceObserved(
+                            evertrace_protocol::response::ProcessSourceObservedResponse { changed }))
                     }
                     ProtocolCommand::ObserveSessionSource(observation) => {
                         let deadline = observation_deadline.ok_or(ErrorCode::Internal)?;

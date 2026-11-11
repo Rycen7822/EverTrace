@@ -10,7 +10,7 @@ use evertrace_capture::{
 use evertrace_domain::{
     canonical::{CanonicalValue, sha256},
     evidence::{SourceInstanceId, SourceRevision, SourceRevisionMode, SourceRole, hex},
-    ids::{RepositoryId, SourceObservationId},
+    ids::{CommandId, RepositoryId, SourceObservationId},
 };
 use evertrace_store::{
     DirtyTarget, DirtyTargetKind, EventScope, JournalCommand, JournalEventDraft, JournalPayload,
@@ -33,6 +33,64 @@ pub struct DrainProgress {
     pub replayed_frames: usize,
     pub projected_surfaces: usize,
     pub synced_frontier: Option<u64>,
+}
+
+// This witness is created only from the sealed L0 row and a live, policy-checked
+// Native descendant. The writer rechecks its read set without fencing unrelated L0.
+pub(crate) struct SourceSnapshotGuard {
+    observation_id: SourceObservationId,
+    observation_payload: String,
+    receipt_payload: String,
+    identity: evertrace_domain::repository::FilesystemIdentity,
+    view: evertrace_store::repository::RepositoryCurrentView,
+    purged: BTreeSet<RepositoryId>,
+    namespace: crate::repository::ExecutionNamespace,
+    raw: Vec<u8>,
+    path: std::path::PathBuf,
+    caller_pid: u32,
+}
+
+impl SourceSnapshotGuard {
+    pub(crate) fn observation_id(&self) -> SourceObservationId {
+        self.observation_id
+    }
+
+    pub(crate) fn identity(&self) -> evertrace_domain::repository::FilesystemIdentity {
+        self.identity
+    }
+
+    pub(crate) fn validate(
+        &self,
+        source: &evertrace_store::CaptureCurrentContext,
+        mut view: evertrace_store::repository::RepositoryCurrentView,
+        purged: &BTreeSet<RepositoryId>,
+    ) -> Result<(), evertrace_store::StoreError> {
+        let current = source.items.first().filter(|item| !item.suppressed);
+        if !current.is_some_and(|item| {
+            item.selected.payload_json.as_deref() == Some(self.observation_payload.as_str())
+                && item.source_rows.iter().any(|row| {
+                    row.object_kind.as_deref() == Some("source_receipt")
+                        && row.payload_json.as_deref() == Some(self.receipt_payload.as_str())
+                })
+        }) {
+            return Err(evertrace_store::StoreError::InvalidInput);
+        }
+        view.frontier = self.view.frontier;
+        if view != self.view || purged != &self.purged {
+            return Err(evertrace_store::StoreError::StaleFrontier);
+        }
+        if !self.namespace.valid()
+            || evertrace_capture::process_source::source_launch(
+                &self.raw,
+                &self.path,
+                self.caller_pid,
+            )
+            .is_err()
+        {
+            return Err(evertrace_store::StoreError::InvalidInput);
+        }
+        Ok(())
+    }
 }
 
 #[derive(Clone)]
@@ -436,6 +494,254 @@ impl EvidenceIngestor {
             .capture(input)
             .map_err(|_| IngestError::InvalidRecord)?;
         Ok(())
+    }
+
+    /// Observe a held source trial through the actual Hook connection, not caller facts.
+    pub async fn observe_process_source(
+        &self,
+        observation_id: SourceObservationId,
+        caller_pid: u32,
+    ) -> Result<bool, IngestError> {
+        use crate::repository::{
+            GitOid, HostTrustDecision, ProbeLimits, RepositoryResolveInput, ResolutionKind,
+        };
+        use evertrace_capture::process_source;
+        use std::{
+            path::Path,
+            time::{Duration, Instant},
+        };
+        let Some(authority) = self
+            .execution_canary
+            .as_ref()
+            .and_then(|value| value.execution_scope_source())
+        else {
+            return Ok(false);
+        };
+        self.drain_observations_once(&[observation_id]).await?;
+        let cas = CasStore::open_existing(&self.snapshot.cas_dir).map_err(|_| IngestError::Cas)?;
+        let snapshot_path = RuntimeSnapshot::snapshot_path(
+            self.snapshot
+                .data_dir()
+                .map_err(|_| IngestError::Snapshot)?,
+        );
+        for _ in 0..3 {
+            let selected = self
+                .writer
+                .capture_current_context(None, Some(observation_id.to_string()), 1)
+                .await
+                .map_err(map_writer_error)?;
+            let Some(item) = selected.items.first().filter(|item| !item.suppressed) else {
+                return Ok(false);
+            };
+            let JournalPayload::SourceObservationRecorded(observation) = serde_json::from_str(
+                item.selected
+                    .payload_json
+                    .as_deref()
+                    .ok_or(IngestError::InvalidRecord)?,
+            )
+            .map_err(|_| IngestError::InvalidRecord)?
+            else {
+                return Err(IngestError::InvalidRecord);
+            };
+            let Some(row) = item
+                .source_rows
+                .iter()
+                .find(|row| row.object_kind.as_deref() == Some("source_receipt"))
+            else {
+                return Ok(false);
+            };
+            let JournalPayload::SourceReceiptRecorded(receipt) = serde_json::from_str(
+                row.payload_json
+                    .as_deref()
+                    .ok_or(IngestError::InvalidRecord)?,
+            )
+            .map_err(|_| IngestError::InvalidRecord)?
+            else {
+                return Err(IngestError::InvalidRecord);
+            };
+            if receipt.source_revision.as_str() != process_source::SOURCE_REVISION
+                || receipt.source_observation_id != observation_id
+                || observation.source_observation_id != observation_id
+            {
+                return Ok(false);
+            }
+            let command_id = source_snapshot_command_id(observation_id, receipt.recorded_at_us)?;
+            if self
+                .writer
+                .committed_command(command_id)
+                .await
+                .map_err(map_writer_error)?
+                .is_some()
+            {
+                return Ok(false);
+            }
+            let digest = CasDigest::from_str(&receipt.cas_ref).map_err(|_| IngestError::Cas)?;
+            let (raw, _) = cas
+                .read_bounded(&digest, 128 * 1024, 65_536)
+                .map_err(|_| IngestError::Cas)?;
+            let authority = authority.clone();
+            let path = snapshot_path.clone();
+            let located = tokio::task::spawn_blocking(move || {
+                let launch = process_source::source_launch(&raw, &path, caller_pid).ok()?;
+                let (pid, start) = launch.controller();
+                let namespace = authority.observe_controller(pid, start)?;
+                if Path::new(&namespace.cwd) != launch.directory() {
+                    return None;
+                }
+                let deadline = Instant::now() + Duration::from_millis(500);
+                let location =
+                    crate::repository::workspace_git_location(Path::new(&namespace.cwd), deadline)
+                        .ok()??;
+                let trust = namespace.trust(location.worktree_path.to_str()?, deadline);
+                if trust.state != evertrace_codex::policy::RepositoryTrustState::Trusted {
+                    return None;
+                }
+                let mut references = vec![
+                    receipt.source_ref,
+                    namespace.evidence_ref(&observation_id.to_string()),
+                ];
+                references.extend(trust.evidence_refs);
+                Some((launch, namespace, location, references, deadline, raw, path))
+            })
+            .await
+            .map_err(|_| IngestError::Store)?;
+            let Some((launch, namespace, location, references, deadline, raw, path)) = located
+            else {
+                return Ok(false);
+            };
+            let (view, purged) = self
+                .writer
+                .repository_resolution_context(location.common_dir_filesystem)
+                .await
+                .map_err(map_writer_error)?;
+            if view.repositories.values().any(|row| {
+                !crate::repository::repository_read_gate(row, purged.contains(&row.repository_id))
+            }) {
+                return Ok(false);
+            }
+            let now = i64::try_from(
+                std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .map_err(|_| IngestError::InvalidRecord)?
+                    .as_micros(),
+            )
+            .map_err(|_| IngestError::InvalidRecord)?;
+            let identity = location.common_dir_filesystem;
+            let resolved = tokio::task::spawn_blocking(move || {
+                let heads = view
+                    .snapshots
+                    .values()
+                    .filter_map(|row| row.head_oid.as_deref())
+                    .map(GitOid::parse)
+                    .collect::<Result<Vec<_>, _>>()
+                    .ok()?;
+                let evidence = crate::repository::with_probe_deadline(deadline, || {
+                    crate::repository::probe_repository(
+                        Path::new(&namespace.cwd),
+                        HostTrustDecision::Trusted,
+                        &references,
+                        now,
+                        &ProbeLimits::default(),
+                        &view.known_admin_paths(),
+                        &heads,
+                    )
+                })
+                .ok()?;
+                let (commit, tree) = launch.anchor();
+                if evidence.unavailable_reason.is_some()
+                    || !namespace.valid()
+                    || evidence.head_oid.as_ref().map(GitOid::as_str) != Some(commit)
+                    || evidence.tree_oid.as_ref().map(GitOid::as_str) != Some(tree)
+                    || evidence.common_dir_filesystem != Some(location.common_dir_filesystem)
+                    || evidence.git_dir.as_deref().map(Path::new)
+                        != Some(location.git_dir.as_path())
+                {
+                    return None;
+                }
+                let incomplete = view.repositories.keys().copied().collect();
+                let resolution = RepositoryResolveInput {
+                    view: &view,
+                    evidence: &evidence,
+                    derived_from_hint: None,
+                }
+                .resolve_with_incomplete_history(&incomplete)
+                .ok()?;
+                if !matches!(
+                    resolution.kind,
+                    Some(
+                        ResolutionKind::Create
+                            | ResolutionKind::Successor
+                            | ResolutionKind::NoDelta
+                    )
+                ) {
+                    return None;
+                }
+                if !namespace.valid()
+                    || process_source::source_launch(&raw, &path, caller_pid).is_err()
+                {
+                    return None;
+                }
+                Some((resolution.payloads(), namespace, view, raw, path))
+            })
+            .await
+            .map_err(|_| IngestError::Store)?;
+            let Some((payloads, namespace, view, raw, path)) = resolved else {
+                return Ok(false);
+            };
+            if payloads.is_empty() {
+                return Ok(false);
+            }
+            let events = payloads
+                .into_iter()
+                .map(|payload| {
+                    let mut event = JournalEventDraft::runtime(
+                        now,
+                        self.snapshot.effective_config_hash,
+                        "process-source-snapshot-v1",
+                        payload,
+                    );
+                    event.causation_id = Some(observation_id.to_string());
+                    event
+                })
+                .collect();
+            if !namespace.valid() {
+                return Ok(false);
+            }
+            let command =
+                JournalCommand::new(command_id, events).map_err(|_| IngestError::InvalidRecord)?;
+            let guard = SourceSnapshotGuard {
+                observation_id,
+                observation_payload: item
+                    .selected
+                    .payload_json
+                    .as_deref()
+                    .map(str::to_owned)
+                    .ok_or(IngestError::InvalidRecord)?,
+                receipt_payload: row
+                    .payload_json
+                    .as_deref()
+                    .map(str::to_owned)
+                    .ok_or(IngestError::InvalidRecord)?,
+                identity,
+                view,
+                purged,
+                namespace,
+                raw,
+                path,
+                caller_pid,
+            };
+            match self
+                .writer
+                .commit_source_snapshot(command, now, guard)
+                .await
+            {
+                Ok(outcome) => return Ok(!outcome.replayed),
+                Err(WriterActorError::StaleFrontier) => continue,
+                Err(WriterActorError::InvalidInput) => return Ok(false),
+                Err(error) => return Err(map_writer_error(error)),
+            }
+        }
+        Ok(false)
     }
 
     async fn normalize_live_native(
@@ -1467,6 +1773,39 @@ pub(crate) fn confirmed_prefix_digest(
     )
     .map_err(|_| IngestError::InvalidRecord)?;
     Ok(hex(&digest))
+}
+
+// Reuse the sealed observation's existing canonical digest as UUIDv7 entropy.
+// The timestamp is its actual recorded time; no second digest or registry is stored.
+fn source_snapshot_command_id(
+    id: SourceObservationId,
+    recorded_at_us: i64,
+) -> Result<CommandId, IngestError> {
+    let timestamp = u64::try_from(recorded_at_us / 1000).map_err(|_| IngestError::InvalidRecord)?;
+    let identity = id.to_string();
+    let digest = identity
+        .strip_prefix("obs:")
+        .ok_or(IngestError::InvalidRecord)?;
+    let mut bytes = [0u8; 16];
+    bytes[..6].copy_from_slice(&timestamp.to_be_bytes()[2..]);
+    for (index, byte) in bytes[6..].iter_mut().enumerate() {
+        *byte = u8::from_str_radix(&digest[index * 2..index * 2 + 2], 16)
+            .map_err(|_| IngestError::InvalidRecord)?;
+    }
+    bytes[6] = bytes[6] & 0x0f | 0x70;
+    bytes[8] = bytes[8] & 0x3f | 0x80;
+    bytes[15] ^= 0x53;
+    let value = bytes.map(|byte| format!("{byte:02x}")).concat();
+    format!(
+        "{}-{}-{}-{}-{}",
+        &value[..8],
+        &value[8..12],
+        &value[12..16],
+        &value[16..20],
+        &value[20..]
+    )
+    .parse()
+    .map_err(|_| IngestError::InvalidRecord)
 }
 
 fn map_writer_error(error: WriterActorError) -> IngestError {

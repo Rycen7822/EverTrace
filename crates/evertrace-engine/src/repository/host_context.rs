@@ -188,8 +188,38 @@ impl ExecutionScopeSource {
             return None;
         }
         let child = NativeProcess::open(child_pid, &mut budget)?;
-        if child.start_time != child_start
-            || child.parent != source.pid
+        if child.start_time != child_start {
+            return None;
+        }
+        self.namespace(source, child, cwd, &mut budget)
+    }
+
+    pub(crate) fn observe_controller(&self, pid: u32, start: u64) -> Option<ExecutionNamespace> {
+        let mut budget = ReadBudget::new();
+        let child = NativeProcess::open(pid, &mut budget)?;
+        if child.start_time != start {
+            return None;
+        }
+        let source = NativeProcess::open(child.parent, &mut budget)?;
+        let current = NativeProcess::open(std::process::id(), &mut budget)?;
+        if source.executable != self.identity
+            || source.owner != current.owner
+            || source.namespaces != current.namespaces
+        {
+            return None;
+        }
+        let cwd = fs::read_link(child.path("cwd")).ok()?.to_str()?.to_owned();
+        self.namespace(source, child, cwd, &mut budget)
+    }
+
+    fn namespace(
+        &self,
+        source: NativeProcess,
+        child: NativeProcess,
+        cwd: String,
+        budget: &mut ReadBudget,
+    ) -> Option<ExecutionNamespace> {
+        if child.parent != source.pid
             || child.owner != source.owner
             || child.namespaces != source.namespaces
         {
@@ -199,8 +229,8 @@ impl ExecutionScopeSource {
         // observation. The request path is only a locator for that pinned object.
         let directory = File::open(child.path("cwd")).ok()?;
         let directory_metadata = directory.metadata().ok()?;
-        child.revalidate(&mut budget)?;
-        let policy = SourcePolicy::observe(source, &mut budget)?;
+        child.revalidate(budget)?;
+        let policy = SourcePolicy::observe(source, budget)?;
         let context = ExecutionNamespace {
             policy,
             child,
@@ -209,7 +239,7 @@ impl ExecutionScopeSource {
             directory,
             directory_identity: (directory_metadata.dev(), directory_metadata.ino()),
         };
-        context.revalidate(&mut budget)?;
+        context.revalidate(budget)?;
         Some(context)
     }
 }

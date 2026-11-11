@@ -18,6 +18,7 @@ use evertrace_domain::evidence::{
     HostCorrelationEvidence, IdentityStrength, ObservationRole, SourceInstanceId,
     SourceRecordIdentity, SourceRevision, SourceRevisionMode, SourceRole, source_observation_id,
 };
+use evertrace_domain::ids::SourceObservationId;
 use serde::Deserialize;
 use serde_json::Value;
 use sha2::{Digest, Sha256};
@@ -59,6 +60,107 @@ impl Observation {
     pub(crate) fn into_record(self) -> CaptureRecordInput {
         self.0
     }
+
+    pub fn launch_locator(&self) -> Result<Option<SourceObservationId>> {
+        if self.0.observation_role != ObservationRole::Intent {
+            return Ok(None);
+        }
+        source_observation_id(
+            &SourceInstanceId::parse(&self.0.source_instance_id).map_err(|_| ProcessSourceError)?,
+            &SourceRevision::parse(&self.0.source_revision).map_err(|_| ProcessSourceError)?,
+            &SourceRecordIdentity::parse(
+                self.0
+                    .source_record_identity
+                    .as_deref()
+                    .ok_or(ProcessSourceError)?,
+            )
+            .map_err(|_| ProcessSourceError)?,
+        )
+        .map(Some)
+        .map_err(|_| ProcessSourceError)
+    }
+}
+
+/// A live producer/caller relationship, not authority for the record's claims.
+pub struct SourceLaunch {
+    controller_pid: u32,
+    controller_start: u64,
+    directory: PathBuf,
+    commit: String,
+    tree: String,
+}
+
+impl SourceLaunch {
+    pub fn controller(&self) -> (u32, u64) {
+        (self.controller_pid, self.controller_start)
+    }
+    pub fn directory(&self) -> &Path {
+        &self.directory
+    }
+    pub fn anchor(&self) -> (&str, &str) {
+        (&self.commit, &self.tree)
+    }
+}
+
+/// Recheck only while the actual Hook child and its held trial are still alive.
+pub fn source_launch(input: &[u8], snapshot: &Path, caller_pid: u32) -> Result<SourceLaunch> {
+    let (header, _) = decode(input)?;
+    if header.event != "trial_launch" {
+        return Err(ProcessSourceError);
+    }
+    let caller_image =
+        fs::read_link(format!("/proc/{caller_pid}/exe")).map_err(|_| ProcessSourceError)?;
+    let caller = fs::metadata(format!("/proc/{caller_pid}")).map_err(|_| ProcessSourceError)?;
+    if caller.uid()
+        != fs::metadata("/proc/self")
+            .map_err(|_| ProcessSourceError)?
+            .uid()
+    {
+        return Err(ProcessSourceError);
+    }
+    for kind in ["pid", "user", "mnt"] {
+        let own = fs::read_link(format!("/proc/{caller_pid}/ns/{kind}"))
+            .map_err(|_| ProcessSourceError)?;
+        let parent = fs::read_link(format!("/proc/{}/ns/{kind}", header.controller.pid))
+            .map_err(|_| ProcessSourceError)?;
+        if own != parent {
+            return Err(ProcessSourceError);
+        }
+    }
+    peer_at(&header, &caller_image, snapshot, caller_pid)?;
+    physical_scope(&header)?;
+    let directory = fs::read_link(format!("/proc/{}/cwd", header.controller.pid))
+        .map_err(|_| ProcessSourceError)?;
+    let process = header.process.as_ref().ok_or(ProcessSourceError)?;
+    let root = fs::metadata(&directory).map_err(|_| ProcessSourceError)?;
+    let child =
+        fs::metadata(format!("/proc/{}/cwd", process.pid)).map_err(|_| ProcessSourceError)?;
+    if (root.dev(), root.ino()) != (child.dev(), child.ino()) {
+        return Err(ProcessSourceError);
+    }
+    let value: Value = serde_json::from_slice(input).map_err(|_| ProcessSourceError)?;
+    let anchor = value.get("source_anchor").ok_or(ProcessSourceError)?;
+    let commit = anchor
+        .get("commit")
+        .and_then(Value::as_str)
+        .ok_or(ProcessSourceError)?;
+    let tree = anchor
+        .get("tree")
+        .and_then(Value::as_str)
+        .ok_or(ProcessSourceError)?;
+    if [commit, tree]
+        .iter()
+        .any(|value| value.len() != 40 || !value.bytes().all(|byte| byte.is_ascii_hexdigit()))
+    {
+        return Err(ProcessSourceError);
+    }
+    Ok(SourceLaunch {
+        controller_pid: header.controller.pid,
+        controller_start: header.controller.start_ticks,
+        directory,
+        commit: commit.into(),
+        tree: tree.into(),
+    })
 }
 
 pub fn kernel_adapter_version() -> String {
@@ -153,7 +255,16 @@ fn uuid(value: &str) -> bool {
 }
 
 fn peer(header: &Header, executable: &Path, snapshot: &Path) -> Result<PathBuf> {
-    let parent = stat("self")?.parent;
+    peer_at(header, executable, snapshot, std::process::id())
+}
+
+fn peer_at(
+    header: &Header,
+    executable: &Path,
+    snapshot: &Path,
+    caller_pid: u32,
+) -> Result<PathBuf> {
+    let parent = stat(&caller_pid.to_string())?.parent;
     let root = Path::new("/proc").join(parent.to_string());
     let own_uid = fs::metadata("/proc/self")
         .map_err(|_| ProcessSourceError)?

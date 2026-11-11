@@ -135,10 +135,12 @@ fn run() -> Result<(), ()> {
                 .map_err(|_| ())?
                 .into_iter();
                 let record = records.next().ok_or(())?;
+                let source_locator = record.launch_locator().map_err(|_| ())?;
                 let closed = evertrace_capture::process_source::closed_records(&record, path);
                 let snapshot = RuntimeSnapshot::load(path).map_err(|_| ())?;
+                let socket = snapshot.recovery_socket_path.clone();
                 let mut runtime = CaptureRuntime::open_for_admission(snapshot).map_err(|_| ())?;
-                runtime
+                let outcome = runtime
                     .capture_process_observation(record)
                     .map_err(|_| ())?;
                 for record in records {
@@ -150,6 +152,19 @@ fn run() -> Result<(), ()> {
                     runtime
                         .capture_process_observation(record)
                         .map_err(|_| ())?;
+                }
+                drop(runtime);
+                if matches!(outcome, CaptureOutcome::Durable { .. })
+                    && let Some(locator) = source_locator
+                {
+                    // Durable source acceptance does not depend on live metadata availability.
+                    // The producer's existing wait keeps this trial held during observation.
+                    let _ = evertrace_protocol::request_process_source_observation_sync(
+                        &socket,
+                        env!("CARGO_PKG_VERSION"),
+                        locator,
+                        Duration::from_secs(2),
+                    );
                 }
                 Ok(())
             } else {
