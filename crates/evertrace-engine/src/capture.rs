@@ -487,6 +487,8 @@ pub struct IndependentSourceReconciliation {
     pub evidence_refs: Vec<String>,
 }
 
+pub(crate) const CAPTURE_ALGORITHM_REVISION: &str = "capture-reconciliation-v8";
+
 #[derive(Clone)]
 pub struct ReconcileInput {
     pub runtime_snapshot: RuntimeSnapshot,
@@ -544,7 +546,7 @@ pub async fn reconcile_once(
     input: ReconcileInput,
     writer: &WriterHandle,
 ) -> Result<ReconcileProgress, ReconcileError> {
-    reconcile_selected(input, writer, None, None, None).await
+    reconcile_selected(input, writer, None, None, None, ReconcilePass::Complete).await
 }
 
 pub async fn reconcile_observations_once(
@@ -572,7 +574,43 @@ pub(crate) async fn reconcile_scoped_observations_once(
     {
         return Err(ReconcileError::InvalidInput);
     }
-    reconcile_selected(input, writer, Some(observation_ids), None, source).await
+    reconcile_selected(
+        input,
+        writer,
+        Some(observation_ids),
+        None,
+        source,
+        ReconcilePass::Complete,
+    )
+    .await
+}
+
+/// Preserve a measured Native directory while its process carrier is still alive.
+/// L0 is already accepted; lane/receipt reconciliation remains background work.
+pub(crate) async fn normalize_live_observation_once(
+    input: ReconcileInput,
+    writer: &WriterHandle,
+    observation_id: SourceObservationId,
+    source: crate::repository::ExecutionScopeSource,
+) -> Result<ReconcileProgress, ReconcileError> {
+    // Unrelated background appends can advance the single-writer frontier.
+    // Retry now, not after the short-lived process carrier has disappeared.
+    let mut retries = 2;
+    loop {
+        let outcome = reconcile_selected(
+            input.clone(),
+            writer,
+            Some(&[observation_id]),
+            None,
+            Some(source.clone()),
+            ReconcilePass::Physical,
+        )
+        .await;
+        match outcome {
+            Err(ReconcileError::StaleFrontier) if retries != 0 => retries -= 1,
+            outcome => return outcome,
+        }
+    }
 }
 
 pub(crate) fn pending_capture_artifacts(
@@ -601,7 +639,15 @@ pub(crate) async fn reconcile_artifact_once(
     writer: &WriterHandle,
     artifact: &ReconciliationArtifactDescriptor,
 ) -> Result<ReconcileProgress, ReconcileError> {
-    reconcile_selected(input, writer, None, Some(artifact), None).await
+    reconcile_selected(
+        input,
+        writer,
+        None,
+        Some(artifact),
+        None,
+        ReconcilePass::Complete,
+    )
+    .await
 }
 
 pub(crate) fn capture_artifact_descriptor(
@@ -701,12 +747,19 @@ fn quarantine_for_target(
         .collect())
 }
 
+#[derive(Clone, Copy, Eq, PartialEq)]
+enum ReconcilePass {
+    Physical,
+    Complete,
+}
+
 async fn reconcile_selected(
     input: ReconcileInput,
     writer: &WriterHandle,
     observation_ids: Option<&[SourceObservationId]>,
     artifact: Option<&ReconciliationArtifactDescriptor>,
     source: Option<crate::repository::ExecutionScopeSource>,
+    pass: ReconcilePass,
 ) -> Result<ReconcileProgress, ReconcileError> {
     validate_reconcile_input(&input)?;
     let targeted = observation_ids.is_some();
@@ -929,6 +982,13 @@ async fn reconcile_selected(
         dirty_frontier.frontier,
     )
     .await?;
+    if pass == ReconcilePass::Physical && scopes.claims.is_empty() {
+        return Ok(ReconcileProgress {
+            no_delta: true,
+            frontier: dirty_frontier.frontier,
+            ..Default::default()
+        });
+    }
     normalize_selected_dirty(
         &selected,
         &mut state,
@@ -936,39 +996,41 @@ async fn reconcile_selected(
         &mut payloads,
         &mut progress,
     )?;
-    let observations = state
-        .source_receipts
-        .iter()
-        .map(|receipt| receipt.source_observation_id)
-        .collect();
-    for dependency in current
-        .capture_reconciliation_inputs(observations)
-        .map_err(|_| ReconcileError::Projection)?
-    {
-        state.absorb_dependency(dependency.map_err(|_| ReconcileError::Projection)?)?;
+    if pass == ReconcilePass::Complete {
+        let observations = state
+            .source_receipts
+            .iter()
+            .map(|receipt| receipt.source_observation_id)
+            .collect();
+        for dependency in current
+            .capture_reconciliation_inputs(observations)
+            .map_err(|_| ReconcileError::Projection)?
+        {
+            state.absorb_dependency(dependency.map_err(|_| ReconcileError::Projection)?)?;
+        }
+        progress.inspected_source_receipts = state.source_receipts.len();
+        let source_receipts = state.source_receipts.clone();
+        let groups = lane_groups(&source_receipts)?;
+        let lane_ids = lane_ids_for_groups(&groups, &state)?;
+        selected.retain(|dirty| dirty.target_kind == DirtyTargetKind::CaptureReconciliation);
+        reconcile_lane_groups(
+            LaneReconcileContext {
+                input: &input,
+                manifests: &manifests,
+                groups: &groups,
+                lane_ids: &lane_ids,
+                selected_dirty: &selected,
+                explicit_targets: &explicit_targets,
+                pending_marker_ids: &pending_marker_ids,
+                pending_quarantine_ids: &pending_quarantine_ids,
+                retain_unobserved: artifact.is_some(),
+            },
+            &mut state,
+            &mut payloads,
+            &mut progress,
+            &mut remaining,
+        )?;
     }
-    progress.inspected_source_receipts = state.source_receipts.len();
-    let source_receipts = state.source_receipts.clone();
-    let groups = lane_groups(&source_receipts)?;
-    let lane_ids = lane_ids_for_groups(&groups, &state)?;
-    selected.retain(|dirty| dirty.target_kind == DirtyTargetKind::CaptureReconciliation);
-    reconcile_lane_groups(
-        LaneReconcileContext {
-            input: &input,
-            manifests: &manifests,
-            groups: &groups,
-            lane_ids: &lane_ids,
-            selected_dirty: &selected,
-            explicit_targets: &explicit_targets,
-            pending_marker_ids: &pending_marker_ids,
-            pending_quarantine_ids: &pending_quarantine_ids,
-            retain_unobserved: artifact.is_some(),
-        },
-        &mut state,
-        &mut payloads,
-        &mut progress,
-        &mut remaining,
-    )?;
     if scopes.pins.iter().any(|pin| !pin.valid()) {
         return Err(ReconcileError::StaleFrontier);
     }

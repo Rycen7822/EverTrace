@@ -100,7 +100,10 @@ use tokio::sync::{OwnedRwLockReadGuard, RwLock, mpsc, oneshot, watch};
 use crate::procedure::PROCEDURE_USAGE_JOB_KIND;
 use crate::{
     SessionImportBudget, SessionImportWorker, WriterActorError, WriterHandle,
-    capture::{ReconcileError, ReconcileInput, reconcile_scoped_observations_once},
+    capture::{
+        CAPTURE_ALGORITHM_REVISION, ReconcileError, ReconcileInput,
+        reconcile_scoped_observations_once,
+    },
     jobs::{JobResultDisposition, SynthesisPlanner, expired_leases, support_closure_result},
     session_import::{SessionCatalogService, session_import_job_budget},
 };
@@ -109,7 +112,6 @@ const TOTAL_LIMIT: usize = 32;
 pub(crate) const PER_LANE_LIMIT: usize = 8;
 const CAPTURE_PROBE_LIMIT: usize = TOTAL_LIMIT + PER_LANE_LIMIT;
 const RETRY_DELAY: Duration = Duration::from_secs(5);
-const CAPTURE_ALGORITHM_REVISION: &str = "capture-reconciliation-v8";
 const PROCEDURE_PROMOTION_JOB_KIND: &str = "procedure_cohort_promotion_v1";
 
 fn procedure_promotion_budget() -> JobBudget {
@@ -6138,6 +6140,7 @@ fn now_us() -> Result<i64, BackgroundSchedulerError> {
 }
 
 fn map_writer(error: WriterActorError) -> BackgroundSchedulerError {
+    tracing::error!(target: "evertrace_lifecycle", reason = %error, "background writer operation failed");
     match error {
         WriterActorError::Stopped => BackgroundSchedulerError::Writer,
         _ => BackgroundSchedulerError::Store,

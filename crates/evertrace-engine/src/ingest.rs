@@ -438,6 +438,67 @@ impl EvidenceIngestor {
         Ok(())
     }
 
+    async fn normalize_live_native(
+        &self,
+        verified: &crate::capture::VerifiedCapture,
+        spool: &DurableSpool,
+        occurred_at_us: i64,
+    ) -> Result<(), IngestError> {
+        use crate::capture::{
+            CAPTURE_ALGORITHM_REVISION, ReconcileError, ReconcileInput,
+            normalize_live_observation_once,
+        };
+        use evertrace_capture::execution_source::{Profile, is_execution};
+        if Profile::from_revision(verified.receipt.parser_revision) != Some(Profile::Context)
+            || !is_execution(&verified.observation, &verified.receipt)
+            || !spool.pending_gap_markers().map_err(map_spool)?.is_empty()
+            || std::fs::read_dir(self.snapshot.spool_dir.join("quarantine"))
+                .map_err(|_| IngestError::Spool)?
+                .next()
+                .is_some()
+        {
+            return Ok(());
+        }
+        let Some(canary) = &self.execution_canary else {
+            return Ok(());
+        };
+        let Some(source) = canary.execution_scope_source() else {
+            return Ok(());
+        };
+        let Some(report) = canary.execution_source_report() else {
+            return Ok(());
+        };
+        let input = ReconcileInput {
+            runtime_snapshot: self.snapshot.clone(),
+            adapter_manifests: vec![report.manifest().clone()],
+            liveness: Vec::new(),
+            reconciled_gaps: Vec::new(),
+            reconciled_outages: Vec::new(),
+            independent_source_reconciliations: Vec::new(),
+            effective_config_hash: self.snapshot.effective_config_hash,
+            algorithm_revision: CAPTURE_ALGORITHM_REVISION.to_owned(),
+            occurred_at_us,
+            max_items: 3,
+        };
+        match normalize_live_observation_once(
+            input,
+            &self.writer,
+            verified.observation.source_observation_id,
+            source,
+        )
+        .await
+        {
+            Ok(_)
+            | Err(
+                ReconcileError::Busy
+                | ReconcileError::StaleFrontier
+                | ReconcileError::Spool
+                | ReconcileError::Manifest,
+            ) => Ok(()),
+            Err(_) => Err(IngestError::Store),
+        }
+    }
+
     async fn drain_segments(
         &self,
         spool: &DurableSpool,
@@ -853,6 +914,12 @@ impl EvidenceIngestor {
                     .commit(command, recorded_at_us)
                     .await
                     .map_err(map_writer_error)?;
+                if !outcome.replayed {
+                    // L0 is accepted first. A measured live directory gets one bounded
+                    // physical pass; replay never probes a historical process/path.
+                    self.normalize_live_native(&verified, &spool, recorded_at_us)
+                        .await?;
+                }
                 committed += 1;
                 progress.committed_frames += 1;
                 progress.replayed_frames += usize::from(outcome.replayed);
