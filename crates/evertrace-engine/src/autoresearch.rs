@@ -311,7 +311,7 @@ impl ProcessWorkDeclaration {
             "process:{}:{}:{}:{}",
             controller.boot_id, controller.pid_namespace, controller.pid, controller.start_ticks
         );
-        (value.format == "process-trial-source-v3"
+        (value.format == evertrace_capture::process_source::FORMAT
             && value.event == "study_opened"
             && value.study_key == value.definition.study_key
             && !value.source_epoch.is_empty()
@@ -333,6 +333,7 @@ struct ProcessTrialDeclaration {
     sequence: u64,
     controller: ProcessController,
     execution_key: String,
+    request_key: String,
     execution_ordinal: u32,
     config: serde_json::Value,
     source_anchor: ProcessTrialAnchor,
@@ -355,15 +356,14 @@ impl ProcessTrialDeclaration {
             value.controller.pid,
             value.controller.start_ticks
         );
-        (value.format == "process-trial-source-v3"
+        (value.format == evertrace_capture::process_source::FORMAT
             && value.event == "trial_launch"
             && value.sequence == receipt.source_sequence
             && source.source_instance_id.as_str() == instance
             && receipt.source_record_identity.as_str() == value.event_key
             && source.correlation.host_trace_lineage_id.as_deref()
                 == Some(value.source_epoch.as_str())
-            && source.correlation.native_request_id.as_deref()
-                == Some(value.execution_key.as_str())
+            && source.correlation.native_request_id.as_deref() == Some(value.request_key.as_str())
             && source.correlation.physical_execution_ordinal == Some(value.execution_ordinal)
             && value.execution_ordinal != 0)
             .then_some(value)
@@ -1206,7 +1206,7 @@ impl ControlledRunResolver {
             || receipt.adapter_revision != process_source::ADAPTER_REVISION
             || receipt.adapter_manifest_ref != manifest.manifest().adapter_manifest_id
             || receipt.eligible_event_manifest_ref != process_source::ELIGIBLE_EVENTS
-            || receipt.parser_revision != 5
+            || receipt.parser_revision != process_source::PARSER_REVISION
             || receipt.capture_completeness != CaptureCompleteness::Partial
             || observation.capture_completeness != CaptureCompleteness::Partial
             || observation.source_role != SourceRole::Tool
@@ -1466,7 +1466,7 @@ impl ControlledRunResolver {
         };
         let external_key = format!("{}/{}", trial.source_epoch, trial.execution_key);
         if facts.runs.runs.values().any(|run| {
-            run.external_system_id.as_deref() == Some("process-trial-source-v3")
+            run.external_system_id.as_deref() == Some(evertrace_capture::process_source::FORMAT)
                 && run.external_run_key.as_deref() == Some(external_key.as_str())
         }) {
             return Ok(ControlledRunCommand::NoDelta);
@@ -1478,7 +1478,7 @@ impl ControlledRunResolver {
         ];
         let mut run = create_experiment_run(attempt, input)?;
         run.origin = RunOrigin::External;
-        run.external_system_id = Some("process-trial-source-v3".into());
+        run.external_system_id = Some(evertrace_capture::process_source::FORMAT.into());
         run.external_run_key = Some(external_key);
         run.validate()
             .map_err(|_| AutoresearchError::InvalidInput)?;

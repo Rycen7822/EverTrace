@@ -6,8 +6,8 @@
 use std::{
     collections::BTreeSet,
     fs,
-    io::Read,
-    os::unix::fs::MetadataExt,
+    io::{Read, Write},
+    os::unix::{fs::MetadataExt, net::UnixStream},
     path::{Path, PathBuf},
     time::{Duration, Instant},
 };
@@ -26,12 +26,13 @@ use uuid::Uuid;
 
 use crate::{CaptureRecordInput, ConfinedFile, ConfinedReadLimits, ConfinedRoot};
 
-const PREFIX: &[u8] = b"{\"format\":\"process-trial-source-v3\",";
-const FORMAT: &str = "process-trial-source-v3";
+const PREFIX: &[u8] = b"{\"format\":\"process-trial-source-v4\",";
+pub const FORMAT: &str = "process-trial-source-v4";
 pub const SOURCE_REVISION: &str =
-    "process-trial-source-v3:34f3ac803868e39a12ec71b7c5cfb0c0415108a06f7883a72ae887c808507b63";
-pub const ADAPTER_REVISION: u32 = 8;
-pub const ELIGIBLE_EVENTS: &str = "process-trial-source-events-v3";
+    "process-trial-source-v4:84e413385043c92b6723c629b7c0b0481539671827b539dc2f910cf01d432d1d";
+pub const ADAPTER_REVISION: u32 = 9;
+pub const PARSER_REVISION: u32 = 6;
+pub const ELIGIBLE_EVENTS: &str = "process-trial-source-events-v4";
 pub const KERNEL_SOURCE_REVISION: &str = "linux-proc-stat-v1";
 pub const KERNEL_ADAPTER_REVISION: u32 = 1;
 pub const KERNEL_ELIGIBLE_EVENTS: &str = "linux-proc-state-snapshot-v1";
@@ -222,6 +223,9 @@ struct Header {
     controller: ProcessIdentity,
     process: Option<ProcessIdentity>,
     execution_key: Option<String>,
+    request_key: Option<String>,
+    lane_thread_id: u32,
+    probe_endpoint: String,
     execution_ordinal: Option<u32>,
     launch_event: Option<String>,
     argv: Option<Vec<String>>,
@@ -466,6 +470,11 @@ fn decode(raw: &[u8]) -> Result<(Header, ObservationRole)> {
                 | "returncode"
                 | "scorer"
                 | "outcomes"
+                | "request_key"
+                | "lane_thread_id"
+                | "probe_endpoint"
+                | "generation_parent"
+                | "retry_of_execution"
         )
     }) {
         return Err(ProcessSourceError);
@@ -479,6 +488,8 @@ fn decode(raw: &[u8]) -> Result<(Header, ObservationRole)> {
         _ => return Err(ProcessSourceError),
     };
     if header.format != FORMAT
+        || header.lane_thread_id != header.controller.pid
+        || header.probe_endpoint != format!(".trial-probe-{}.sock", header.source_epoch)
         || !uuid(&header.event_key)
         || !uuid(&header.source_epoch)
         || !uuid(&header.study_key)
@@ -546,7 +557,8 @@ pub fn records(
     // populate this candidate axis. Its own gate is still unavailable; never use a cursor.
     let mut kernel = None;
     if let Some(ordinal) = native_ordinal
-        && let Ok((scope, stat)) = physical_scope(&header)
+        && header.request_key.as_deref().is_some_and(uuid)
+        && let Ok((_, stat)) = physical_scope(&header)
     {
         kernel = Some(stat);
         let evidence = source_observation_id(
@@ -557,9 +569,12 @@ pub fn records(
         .map_err(|_| ProcessSourceError)?;
         correlation.host_instance_id = Some(source_instance_id.clone());
         correlation.host_trace_lineage_id = Some(header.source_epoch.clone());
-        correlation.host_lane_key = Some(scope);
+        correlation.host_lane_key = Some(format!(
+            "{source_instance_id}:thread:{}",
+            header.lane_thread_id
+        ));
         correlation.canonical_event_family = Some(CanonicalEventFamily::Verify);
-        correlation.native_request_id = header.execution_key.clone();
+        correlation.native_request_id = header.request_key.clone();
         correlation.physical_execution_ordinal = Some(ordinal);
         correlation.field_provenance = [
             CorrelationField::HostInstanceId,
@@ -627,7 +642,7 @@ pub fn records(
         adapter_revision: ADAPTER_REVISION,
         adapter_manifest_ref: manifest_ref.into(),
         eligible_event_manifest_ref: ELIGIBLE_EVENTS.into(),
-        parser_revision: 5,
+        parser_revision: PARSER_REVISION,
         canonicalization_revision: 1,
         // The original clock value remains in raw bytes; its uncertainty is not qualified.
         event_time_us: None,
@@ -995,7 +1010,7 @@ fn published_file(
         .map(|index| args.get(index + 1).ok_or(ProcessSourceError))
         .transpose()?
         .copied()
-        .unwrap_or(b"recording-v2");
+        .unwrap_or(b"recording-v4");
     if series.is_empty()
         || series.len() > 48
         || !series
@@ -1041,6 +1056,118 @@ fn published_file(
     Ok((path, file))
 }
 
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ProbeSnapshot {
+    format: String,
+    nonce: String,
+    controller: ProcessIdentity,
+    source_epoch: String,
+    source_event_bytes: Vec<String>,
+    parent_event_bytes: Vec<String>,
+}
+
+fn probe_read(socket: &mut UnixStream, mut output: &mut [u8], deadline: Instant) -> Result<()> {
+    while !output.is_empty() {
+        let remaining = deadline
+            .checked_duration_since(Instant::now())
+            .filter(|duration| !duration.is_zero())
+            .ok_or(ProcessSourceError)?;
+        socket
+            .set_read_timeout(Some(remaining))
+            .map_err(|_| ProcessSourceError)?;
+        let length = socket.read(output).map_err(|_| ProcessSourceError)?;
+        if length == 0 {
+            return Err(ProcessSourceError);
+        }
+        output = &mut output[length..];
+    }
+    Ok(())
+}
+
+// A live, nonce-bound export from the actual code-pinned controller, not a caller's
+// view or a qualification grant. The original file below remains the canonical byte range.
+fn source_probe(header: &Header, deadline: Instant) -> Result<Vec<u8>> {
+    use rustix::net::{AddressFamily, SocketAddrUnix, SocketFlags, SocketType};
+    let path = Path::new("/proc")
+        .join(header.controller.pid.to_string())
+        .join("cwd")
+        .join(&header.probe_endpoint);
+    let before = fs::symlink_metadata(&path).map_err(|_| ProcessSourceError)?;
+    let own_uid = fs::metadata("/proc/self")
+        .map_err(|_| ProcessSourceError)?
+        .uid();
+    if !std::os::unix::fs::FileTypeExt::is_socket(&before.file_type())
+        || before.uid() != own_uid
+        || before.mode() & 0o777 != 0o600
+    {
+        return Err(ProcessSourceError);
+    }
+    let fd = rustix::net::socket_with(
+        AddressFamily::UNIX,
+        SocketType::STREAM,
+        SocketFlags::CLOEXEC | SocketFlags::NONBLOCK,
+        None,
+    )
+    .map_err(|_| ProcessSourceError)?;
+    let address = SocketAddrUnix::new(&path).map_err(|_| ProcessSourceError)?;
+    rustix::net::connect(&fd, &address).map_err(|_| ProcessSourceError)?;
+    let credential = rustix::net::sockopt::socket_peercred(&fd).map_err(|_| ProcessSourceError)?;
+    if credential.pid.as_raw_nonzero().get() as u32 != header.controller.pid
+        || credential.uid.as_raw() != own_uid
+    {
+        return Err(ProcessSourceError);
+    }
+    let mut socket = UnixStream::from(fd);
+    socket
+        .set_nonblocking(false)
+        .map_err(|_| ProcessSourceError)?;
+    socket
+        .set_write_timeout(Some(deadline.saturating_duration_since(Instant::now())))
+        .map_err(|_| ProcessSourceError)?;
+    let nonce = Uuid::new_v4().to_string();
+    let mut request = serde_json::to_vec(&serde_json::json!({
+        "format":"process-trial-probe-v1", "nonce":nonce
+    }))
+    .map_err(|_| ProcessSourceError)?;
+    request.push(b'\n');
+    socket.write_all(&request).map_err(|_| ProcessSourceError)?;
+    let mut length = [0_u8; 4];
+    probe_read(&mut socket, &mut length, deadline)?;
+    let length = u32::from_be_bytes(length) as usize;
+    if length == 0 || length > 1024 * 1024 {
+        return Err(ProcessSourceError);
+    }
+    let mut raw = vec![0; length];
+    probe_read(&mut socket, &mut raw, deadline)?;
+    let snapshot: ProbeSnapshot = serde_json::from_slice(&raw).map_err(|_| ProcessSourceError)?;
+    let after = fs::symlink_metadata(&path).map_err(|_| ProcessSourceError)?;
+    if snapshot.format != "process-trial-probe-v1"
+        || snapshot.nonce != nonce
+        || snapshot.controller != header.controller
+        || snapshot.source_epoch != header.source_epoch
+        || (before.dev(), before.ino(), before.uid()) != (after.dev(), after.ino(), after.uid())
+        || snapshot.source_event_bytes.len() > SOURCE_RECORDS as usize
+        || snapshot.parent_event_bytes.len() > SOURCE_RECORDS as usize
+        || snapshot
+            .source_event_bytes
+            .iter()
+            .map(String::len)
+            .sum::<usize>()
+            > SOURCE_BYTES as usize
+        || snapshot
+            .parent_event_bytes
+            .iter()
+            .map(String::len)
+            .sum::<usize>()
+            > SOURCE_BYTES as usize
+        || Instant::now() >= deadline
+    {
+        return Err(ProcessSourceError);
+    }
+    Ok(snapshot.source_event_bytes.concat().into_bytes())
+}
+
 fn published_record(
     raw: &[u8],
     selected: &Header,
@@ -1048,6 +1175,9 @@ fn published_record(
 ) -> Result<(EvidenceByteRange, Option<u32>)> {
     let deadline = Instant::now() + Duration::from_millis(50);
     let (_, file) = published_file(script, &selected.controller, deadline)?;
+    if source_probe(selected, deadline)? != file.bytes {
+        return Err(ProcessSourceError);
+    }
     let mut keys = BTreeSet::new();
     let mut offset = 0;
     let mut found = None;
@@ -1090,6 +1220,8 @@ fn published_record(
         .filter(|launch| {
             launch.sequence <= selected.sequence
                 && launch.process == selected.process
+                && launch.request_key == selected.request_key
+                && launch.lane_thread_id == selected.lane_thread_id
                 && launch.execution_ordinal == selected.execution_ordinal
                 && if selected.event == "trial_launch" {
                     selected.event_key == launch.event_key
