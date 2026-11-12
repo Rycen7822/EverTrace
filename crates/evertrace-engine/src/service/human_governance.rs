@@ -5,7 +5,6 @@ pub use crate::semantic::human_acceptance::{
     HumanActionOutcome, HumanGovernanceError, HumanProposalDecision,
 };
 
-mod compiled;
 mod diagnostics;
 mod export;
 mod presentation;

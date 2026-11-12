@@ -942,6 +942,20 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
                                 MetadataReadOutcome::TooLarge => return Err(ErrorCode::ResourceExhausted),
                             }));
                         }
+                        if let HumanGovernanceRequest::Read {
+                            request: HumanReadRequest::CompiledProjections { query, expected_frontier, after, limit },
+                        } = &command {
+                            let result = evertrace_engine::CompiledProjectionReader::new(
+                                writer.clone(), config_snapshot.hash(), Arc::clone(&session_catalog_report),
+                                runtime_snapshot.cas_dir.clone(),
+                            ).read(query.clone(), *expected_frontier, after.as_deref(), *limit).await?;
+                            return Ok(Response::HumanGovernance(match result {
+                                Ok(page) => HumanGovernanceResponse::CompiledProjections { page: Box::new(page) },
+                                Err(current_frontier) => HumanGovernanceResponse::Conflict {
+                                    current_revision_ref: None, current_frontier,
+                                },
+                            }));
+                        }
                         let human_governance = HumanGovernanceService::with_acceptance(
                             writer,
                             runtime_snapshot.effective_config_hash,
@@ -981,22 +995,11 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
                                 HumanReadRequest::State | HumanReadRequest::Jobs { .. }
                                     | HumanReadRequest::ReadBatch { .. } | HumanReadRequest::ReadExact { .. }
                                     | HumanReadRequest::ReadRevisionPair { .. }
+                                    | HumanReadRequest::CompiledProjections { .. }
                                         => return Err(ErrorCode::Internal),
                                 HumanReadRequest::Search {query} => {
                                     let page = human_governance.search(query).await.map_err(map_human_error)?;
                                     HumanGovernanceResponse::Search {page: Box::new(page)}
-                                }
-                                HumanReadRequest::CompiledProjections { query, expected_frontier, after, limit } => {
-                                    let result = human_governance.compiled_projections(query, expected_frontier, after.as_deref(), limit)
-                                        .await.map_err(map_human_error)?;
-                                    match result {
-                                        Ok(page) => HumanGovernanceResponse::CompiledProjections {
-                                            page: Box::new(page),
-                                        },
-                                        Err(current_frontier) => HumanGovernanceResponse::Conflict {
-                                            current_revision_ref: None, current_frontier,
-                                        },
-                                    }
                                 }
                                 HumanReadRequest::BrowseMemories {
                                     query,

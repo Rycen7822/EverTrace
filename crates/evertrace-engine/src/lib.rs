@@ -39,11 +39,11 @@ pub use normalize::{NormalizationSnapshot, NormalizeError, PhysicalNormalizer};
 pub use recall::{RecallCueError, RecallCueOutcome, RecallCueService};
 pub use recovery::*;
 pub use service::{
-    ConfigReloadAudit, ConfigReloadOutcome, ConfigReloadSource, EngineError, EngineService,
-    HealthDispatchError, HealthSnapshot, HumanActionOutcome, HumanBackupSummary,
-    HumanBackupTableState, HumanBackupValidationResult, HumanCompetingDetail, HumanContentState,
-    HumanDegradedReason, HumanDiagnosticCheck, HumanDiagnosticState, HumanDiagnostics,
-    HumanExecutionIntegrityDetail, HumanExplorerListSelection, HumanExportResult,
+    CompiledProjectionReader, ConfigReloadAudit, ConfigReloadOutcome, ConfigReloadSource,
+    EngineError, EngineService, HealthDispatchError, HealthSnapshot, HumanActionOutcome,
+    HumanBackupSummary, HumanBackupTableState, HumanBackupValidationResult, HumanCompetingDetail,
+    HumanContentState, HumanDegradedReason, HumanDiagnosticCheck, HumanDiagnosticState,
+    HumanDiagnostics, HumanExecutionIntegrityDetail, HumanExplorerListSelection, HumanExportResult,
     HumanExportSelection, HumanExportStatus, HumanForgetPreview, HumanGovernanceError,
     HumanGovernanceService, HumanItemCategory, HumanJobBudget, HumanJobDetail, HumanJobState,
     HumanJobTerminalReason, HumanMemoryBrowsePage, HumanMemoryPreview,

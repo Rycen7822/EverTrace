@@ -11,6 +11,7 @@ mod scope;
 pub use actions::*;
 pub use binding::*;
 pub use human_governance::*;
+pub use object_read::CompiledProjectionReader;
 pub use scope::McpQueryAnchor;
 pub(crate) use scope::active_worktree_repository;
 
