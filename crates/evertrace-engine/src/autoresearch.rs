@@ -240,6 +240,17 @@ fn source_resolved(
                                 })))
             });
     }
+    if matches!(envelope, SourceCandidate::Trial(_)) {
+        return current.other_data_rows().any(|row| {
+            row.payload_json
+                .as_deref()
+                .and_then(|json| serde_json::from_str::<JournalPayload>(json).ok())
+                .is_some_and(|payload| {
+                    matches!(payload, JournalPayload::ExperimentRunRecorded(run)
+                if run.source_receipt_refs.contains(&observation.source_receipt_ref))
+                })
+        });
+    }
     let SourceCandidate::Run(envelope) = envelope else {
         return false;
     };
@@ -286,6 +297,7 @@ struct ProcessController {
 struct ProcessWorkDeclaration {
     format: String,
     event: String,
+    source_epoch: String,
     study_key: String,
     controller: ProcessController,
     definition: ProcessWorkPlan,
@@ -302,6 +314,7 @@ impl ProcessWorkDeclaration {
         (value.format == "process-trial-source-v3"
             && value.event == "study_opened"
             && value.study_key == value.definition.study_key
+            && !value.source_epoch.is_empty()
             && receipt.source_sequence == 1
             && receipt.source_instance_id.as_str() == instance
             && value.definition.phase.validate().is_ok()
@@ -310,8 +323,56 @@ impl ProcessWorkDeclaration {
     }
 }
 
+#[derive(Deserialize)]
+struct ProcessTrialDeclaration {
+    format: String,
+    event: String,
+    source_epoch: String,
+    event_key: String,
+    study_key: String,
+    sequence: u64,
+    controller: ProcessController,
+    execution_key: String,
+    execution_ordinal: u32,
+    config: serde_json::Value,
+    source_anchor: ProcessTrialAnchor,
+}
+
+#[derive(Deserialize)]
+struct ProcessTrialAnchor {
+    commit: String,
+    tree: String,
+    scorer_blob: String,
+}
+
+impl ProcessTrialDeclaration {
+    fn decode(raw: &[u8], source: &SourceObservation, receipt: &SourceReceipt) -> Option<Self> {
+        let value: Self = serde_json::from_slice(raw).ok()?;
+        let instance = format!(
+            "process:{}:{}:{}:{}",
+            value.controller.boot_id,
+            value.controller.pid_namespace,
+            value.controller.pid,
+            value.controller.start_ticks
+        );
+        (value.format == "process-trial-source-v3"
+            && value.event == "trial_launch"
+            && value.sequence == receipt.source_sequence
+            && source.source_instance_id.as_str() == instance
+            && receipt.source_record_identity.as_str() == value.event_key
+            && source.correlation.host_trace_lineage_id.as_deref()
+                == Some(value.source_epoch.as_str())
+            && source.correlation.native_request_id.as_deref()
+                == Some(value.execution_key.as_str())
+            && source.correlation.physical_execution_ordinal == Some(value.execution_ordinal)
+            && value.execution_ordinal != 0)
+            .then_some(value)
+    }
+}
+
 enum SourceCandidate {
     WorkPlan(Box<ProcessWorkDeclaration>),
+    Trial(Box<ProcessTrialDeclaration>),
     Run(ControlledRunSourceEnvelope),
     RootGoal {
         reference: String,
@@ -332,7 +393,15 @@ fn source_candidate(
         let (receipt, _) = current.source_receipt(observation.source_receipt_ref)?;
         let (surface, _) = current.evidence_surface(id)?;
         return ProcessWorkDeclaration::decode(surface.protected_text.as_bytes(), receipt)
-            .map(|declaration| SourceCandidate::WorkPlan(Box::new(declaration)));
+            .map(|declaration| SourceCandidate::WorkPlan(Box::new(declaration)))
+            .or_else(|| {
+                ProcessTrialDeclaration::decode(
+                    surface.protected_text.as_bytes(),
+                    observation,
+                    receipt,
+                )
+                .map(|value| SourceCandidate::Trial(Box::new(value)))
+            });
     }
     if observation.content_trust != ContentTrust::Observed
         || !matches!(observation.source_role, SourceRole::Host | SourceRole::Tool)
@@ -573,6 +642,42 @@ fn process_work_refs(
     Ok(refs)
 }
 
+fn process_opening(
+    current: &evertrace_store::CurrentFacts,
+    source: SourceObservationId,
+) -> Result<Option<(SourceObservationId, Box<ProcessWorkDeclaration>)>, AutoresearchError> {
+    let Some((observation, _)) = current.source_observation(source) else {
+        return Ok(None);
+    };
+    let deadline = std::time::Instant::now() + std::time::Duration::from_millis(40);
+    let mut found = None;
+    for (receipt, _) in current.source_receipts() {
+        if std::time::Instant::now() >= deadline {
+            return Err(AutoresearchError::SelectionDeferred);
+        }
+        if receipt.source_instance_id != observation.source_instance_id
+            || receipt.source_revision != observation.source_revision
+            || receipt.source_sequence != 1
+        {
+            continue;
+        }
+        if let Some(SourceCandidate::WorkPlan(plan)) =
+            source_candidate(current, receipt.source_observation_id)
+        {
+            if Some(plan.source_epoch.as_str())
+                != observation.correlation.host_trace_lineage_id.as_deref()
+            {
+                continue;
+            }
+            if found.is_some() {
+                return Err(AutoresearchError::EvidenceIncomplete);
+            }
+            found = Some((receipt.source_observation_id, plan));
+        }
+    }
+    Ok(found)
+}
+
 /// Select the closed current input closure, never a second Work graph or the complete source snapshot.
 pub(crate) fn controlled_source_snapshot(
     current: &evertrace_store::CurrentFacts,
@@ -581,10 +686,40 @@ pub(crate) fn controlled_source_snapshot(
     let Some(envelope) = source_candidate(current, id) else {
         return Ok(None);
     };
-    let process_refs = if let SourceCandidate::WorkPlan(declaration) = &envelope {
-        process_work_refs(current, id, declaration)?
-    } else {
-        BTreeSet::new()
+    let process_refs = match &envelope {
+        SourceCandidate::WorkPlan(declaration) => process_work_refs(current, id, declaration)?,
+        SourceCandidate::Trial(trial) => {
+            let Some((opening, declaration)) = process_opening(current, id)? else {
+                return Ok(None);
+            };
+            if trial.study_key != declaration.study_key {
+                return Ok(None);
+            }
+            let mut refs = process_work_refs(current, opening, &declaration)?;
+            refs.insert(opening.to_string());
+            let deadline = std::time::Instant::now() + std::time::Duration::from_millis(40);
+            for row in current.other_data_rows() {
+                if std::time::Instant::now() >= deadline {
+                    return Err(AutoresearchError::SelectionDeferred);
+                }
+                if row.object_kind.as_deref() != Some("workstream") {
+                    continue;
+                }
+                if let Some(JournalPayload::WorkstreamRecorded(stream)) = row
+                    .payload_json
+                    .as_deref()
+                    .and_then(|json| serde_json::from_str(json).ok())
+                    && stream.worktree_lineage_refs.contains(&opening.to_string())
+                {
+                    refs.insert(stream.workstream_id.to_string());
+                    if let Some(episode) = stream.active_episode_id {
+                        refs.insert(episode.to_string());
+                    }
+                }
+            }
+            refs
+        }
+        _ => BTreeSet::new(),
     };
     let mut root_refs = process_refs
         .iter()
@@ -594,11 +729,14 @@ pub(crate) fn controlled_source_snapshot(
     if let SourceCandidate::RootGoal { reference, .. } = &envelope {
         root_refs.insert(reference.clone());
     }
-    let is_work_plan = matches!(&envelope, SourceCandidate::WorkPlan(_));
+    let is_work_plan = matches!(
+        &envelope,
+        SourceCandidate::WorkPlan(_) | SourceCandidate::Trial(_)
+    );
     let mut refs = BTreeSet::from([id.to_string()]);
     refs.extend(process_refs);
     match envelope {
-        SourceCandidate::WorkPlan(_) => {}
+        SourceCandidate::WorkPlan(_) | SourceCandidate::Trial(_) => {}
         SourceCandidate::RootGoal { reference, .. } => {
             refs.insert(reference);
         }
@@ -881,10 +1019,15 @@ pub fn run_command(
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub struct ControlledRunRequest {
-    pub attempt_id: AttemptId,
-    pub procedure_revision_id: RevisionId,
-    pub source_observation_id: SourceObservationId,
+pub enum RunSourceRequest {
+    Controlled {
+        attempt_id: AttemptId,
+        procedure_revision_id: RevisionId,
+        source_observation_id: SourceObservationId,
+    },
+    SourceBound {
+        source_observation_id: SourceObservationId,
+    },
 }
 
 #[derive(Debug)]
@@ -934,6 +1077,19 @@ impl ControlledRunResolver {
         if facts.observations.get(&source).is_some_and(|value| {
             value.source_revision.as_str() == evertrace_capture::process_source::SOURCE_REVISION
         }) {
+            let observation = facts
+                .observations
+                .get(&source)
+                .ok_or(AutoresearchError::EvidenceIncomplete)?;
+            if ProcessTrialDeclaration::decode(
+                &self.protected_source(&facts, source)?,
+                observation,
+                facts.receipt(source)?,
+            )
+            .is_some()
+            {
+                return self.resolve_process_trial(snapshot, &facts, source, context, goal_key_dir);
+            }
             return self.resolve_process_work(snapshot, &facts, source, context, goal_key_dir);
         }
         if facts.observations.get(&source).is_some_and(|value| {
@@ -954,7 +1110,7 @@ impl ControlledRunResolver {
                 ..
             } => self.declare(
                 snapshot,
-                ControlledRunRequest {
+                RunSourceRequest::Controlled {
                     attempt_id,
                     procedure_revision_id,
                     source_observation_id: source,
@@ -1245,6 +1401,96 @@ impl ControlledRunResolver {
         ))
     }
 
+    fn resolve_process_trial(
+        &self,
+        snapshot: &ProjectionSnapshot,
+        facts: &ControlledFacts,
+        source: SourceObservationId,
+        context: &AutoresearchCommandContext,
+        key_dir: Option<&std::path::Path>,
+    ) -> Result<
+        (
+            ControlledRunCommand,
+            Option<crate::repository::SourcePolicy>,
+        ),
+        AutoresearchError,
+    > {
+        let opening = facts.process_opening(source)?;
+        let (command, policy) = self.resolve_process_work(
+            snapshot,
+            facts,
+            opening.source_observation_id,
+            context,
+            key_dir,
+        )?;
+        if !matches!(command, ControlledRunCommand::NoDelta) || policy.is_none() {
+            return Ok((command, policy));
+        }
+        self.declare(
+            snapshot,
+            RunSourceRequest::SourceBound {
+                source_observation_id: source,
+            },
+            context.clone(),
+        )
+        .map(|command| (command, policy))
+    }
+
+    fn declare_process_trial(
+        &self,
+        snapshot: &ProjectionSnapshot,
+        source: SourceObservationId,
+        context: &AutoresearchCommandContext,
+    ) -> Result<ControlledRunCommand, AutoresearchError> {
+        let facts = ControlledFacts::from_snapshot(snapshot)?;
+        let observation = facts
+            .observations
+            .get(&source)
+            .ok_or(AutoresearchError::EvidenceIncomplete)?;
+        let opening_source = facts.process_opening(source)?.source_observation_id;
+        let trial = ProcessTrialDeclaration::decode(
+            &self.protected_source(&facts, source)?,
+            observation,
+            facts.receipt(source)?,
+        )
+        .ok_or(AutoresearchError::EvidenceIncomplete)?;
+        let plan = ProcessWorkDeclaration::decode(
+            &self.protected_source(&facts, opening_source)?,
+            facts.receipt(opening_source)?,
+        )
+        .ok_or(AutoresearchError::EvidenceIncomplete)?;
+        let Some((attempt, anchor)) =
+            process_trial_target(&facts, &trial, &plan, source, opening_source)?
+        else {
+            return Ok(ControlledRunCommand::NoDelta);
+        };
+        let external_key = format!("{}/{}", trial.source_epoch, trial.execution_key);
+        if facts.runs.runs.values().any(|run| {
+            run.external_system_id.as_deref() == Some("process-trial-source-v3")
+                && run.external_run_key.as_deref() == Some(external_key.as_str())
+        }) {
+            return Ok(ControlledRunCommand::NoDelta);
+        }
+        let mut input = process_trial_input(&trial, attempt, anchor, context.occurred_at_us)?;
+        input.source_receipt_refs = vec![
+            facts.receipt(source)?.source_receipt_id,
+            facts.receipt(opening_source)?.source_receipt_id,
+        ];
+        let mut run = create_experiment_run(attempt, input)?;
+        run.origin = RunOrigin::External;
+        run.external_system_id = Some("process-trial-source-v3".into());
+        run.external_run_key = Some(external_key);
+        run.validate()
+            .map_err(|_| AutoresearchError::InvalidInput)?;
+        let command = run_command(context.clone(), &run)?;
+        Ok(ControlledRunCommand::Declaration {
+            run: Box::new(run),
+            bindings: Vec::new(),
+            attempt: None,
+            command,
+        })
+    }
+
     fn resolve_root_goal(
         &self,
         snapshot: &ProjectionSnapshot,
@@ -1397,16 +1643,26 @@ impl ControlledRunResolver {
     pub fn declare(
         &self,
         snapshot: &ProjectionSnapshot,
-        request: ControlledRunRequest,
+        request: RunSourceRequest,
         context: AutoresearchCommandContext,
     ) -> Result<ControlledRunCommand, AutoresearchError> {
+        let (requested_attempt, requested_procedure, source_observation_id) = match request {
+            RunSourceRequest::Controlled {
+                attempt_id,
+                procedure_revision_id,
+                source_observation_id,
+            } => (attempt_id, procedure_revision_id, source_observation_id),
+            RunSourceRequest::SourceBound {
+                source_observation_id,
+            } => return self.declare_process_trial(snapshot, source_observation_id, &context),
+        };
         let facts = ControlledFacts::from_snapshot(snapshot)?;
-        let Some(attempt) = facts.attempts.get(&request.attempt_id) else {
+        let Some(attempt) = facts.attempts.get(&requested_attempt) else {
             return Ok(ControlledRunCommand::NoDelta);
         };
         if facts
             .procedures
-            .get(&request.procedure_revision_id)
+            .get(&requested_procedure)
             .is_none_or(|procedure| {
                 facts.current_procedures.get(&procedure.procedure_id)
                     != Some(&procedure.revision_id)
@@ -1414,7 +1670,7 @@ impl ControlledRunResolver {
         {
             return Ok(ControlledRunCommand::NoDelta);
         }
-        let envelope = match self.witness(&facts, request.source_observation_id) {
+        let envelope = match self.witness(&facts, source_observation_id) {
             Ok(value) => value,
             Err(AutoresearchError::EvidenceIncomplete | AutoresearchError::Cas) => {
                 return Ok(ControlledRunCommand::NoDelta);
@@ -1442,8 +1698,8 @@ impl ControlledRunResolver {
         else {
             return Err(AutoresearchError::UntrustedRunEvidence);
         };
-        if attempt_id != request.attempt_id
-            || procedure_revision_id != request.procedure_revision_id
+        if attempt_id != requested_attempt
+            || procedure_revision_id != requested_procedure
             || attempt.strategy_contract.search_policy_ref.as_deref()
                 != Some(procedure_revision_id.to_string()).as_deref()
             || binding
@@ -1457,11 +1713,7 @@ impl ControlledRunResolver {
         {
             return Err(AutoresearchError::ImmutableConflict);
         }
-        match facts.validate_declaration_anchor(
-            request.procedure_revision_id,
-            attempt,
-            code_snapshot_id,
-        ) {
+        match facts.validate_declaration_anchor(requested_procedure, attempt, code_snapshot_id) {
             Ok(()) => {}
             Err(AutoresearchError::EvidenceIncomplete) => {
                 return Ok(ControlledRunCommand::NoDelta);
@@ -1470,7 +1722,7 @@ impl ControlledRunResolver {
         }
         let (run_id, binding_successors) = match exact_bound_run(
             &facts,
-            request.source_observation_id,
+            source_observation_id,
             attempt.attempt_id,
             attempt.workstream_id,
         ) {
@@ -1482,19 +1734,14 @@ impl ControlledRunResolver {
         };
         if let Some(existing) = facts.runs.runs.get(&run_id) {
             return if existing.source_receipt_refs
-                == vec![
-                    facts
-                        .receipt(request.source_observation_id)?
-                        .source_receipt_id,
-                ] {
+                == vec![facts.receipt(source_observation_id)?.source_receipt_id]
+            {
                 Ok(ControlledRunCommand::NoDelta)
             } else {
                 Err(AutoresearchError::ImmutableConflict)
             };
         }
-        let receipt_id = facts
-            .receipt(request.source_observation_id)?
-            .source_receipt_id;
+        let receipt_id = facts.receipt(source_observation_id)?.source_receipt_id;
         let mut run = ExperimentRun {
             run_id,
             revision_id: RevisionId::new_v7(),
@@ -1768,6 +2015,186 @@ impl ControlledRunResolver {
     }
 }
 
+fn process_trial_target<'a>(
+    facts: &'a ControlledFacts,
+    trial: &ProcessTrialDeclaration,
+    plan: &ProcessWorkDeclaration,
+    source: SourceObservationId,
+    opening: SourceObservationId,
+) -> Result<Option<(&'a Attempt, &'a WorktreeSnapshot)>, AutoresearchError> {
+    if trial.study_key != plan.study_key || trial.source_epoch != plan.source_epoch {
+        return Err(AutoresearchError::UntrustedRunEvidence);
+    }
+    let reference = opening.to_string();
+    let mut streams = facts
+        .workstreams
+        .values()
+        .filter(|value| value.worktree_lineage_refs.contains(&reference));
+    let Some(stream) = streams.next() else {
+        return Ok(None);
+    };
+    if streams.next().is_some() {
+        return Err(AutoresearchError::EvidenceIncomplete);
+    }
+    if stream.status != evertrace_domain::work::workstream::WorkstreamStatus::Active
+        || stream.phase_contract != plan.definition.phase
+    {
+        return Ok(None);
+    }
+    let Some(episode) = stream
+        .active_episode_id
+        .and_then(|id| facts.current_episodes.get(&id))
+        .and_then(|revision| facts.episodes.get(revision))
+    else {
+        return Ok(None);
+    };
+    if episode.workstream_id != stream.workstream_id
+        || episode.phase_contract != plan.definition.phase
+    {
+        return Err(AutoresearchError::ImmutableConflict);
+    }
+    let roots = facts
+        .bindings
+        .values()
+        .filter(|binding| {
+            binding.assignment_status == AssignmentStatus::Resolved
+                && binding.primary_binding.workstream_id == Some(stream.workstream_id)
+                && binding.primary_binding.task_id == Some(stream.task_id)
+                && binding.evidence_refs.contains(&reference)
+        })
+        .collect::<Vec<_>>();
+    if roots.is_empty() {
+        return Ok(None);
+    }
+    let mut attempts = facts.attempts.values().filter(|attempt| {
+        attempt.workstream_id == stream.workstream_id
+            && attempt.episode_id == Some(episode.episode_id)
+            && episode.attempt_ids.contains(&attempt.attempt_id)
+            && attempt.strategy_contract == plan.definition.strategy
+    });
+    let Some(attempt) = attempts.next() else {
+        return Ok(None);
+    };
+    if attempts.next().is_some() {
+        return Err(AutoresearchError::EvidenceIncomplete);
+    }
+    let mut prefixes = vec![format!("native-execution-directory:{source}:")];
+    for binding in roots {
+        prefixes.extend(
+            binding
+                .evidence_refs
+                .iter()
+                .map(|value| format!("native-execution-directory:{value}:")),
+        );
+    }
+    let mut snapshots = facts.snapshots.values().filter(|snapshot| {
+        snapshot.capture_status == evertrace_domain::repository::SnapshotCaptureStatus::Complete
+            && snapshot
+                .evidence_refs
+                .iter()
+                .any(|value| prefixes.iter().any(|prefix| value.starts_with(prefix)))
+            && snapshot.head_oid.as_deref() == Some(trial.source_anchor.commit.as_str())
+            && snapshot.tree_oid.as_deref() == Some(trial.source_anchor.tree.as_str())
+            && facts
+                .worktrees
+                .get(&snapshot.worktree_instance_id)
+                .is_some_and(|worktree| {
+                    Some(worktree.repository_instance_id) == stream.repository_instance_id
+                        && stream
+                            .worktree_instance_ids
+                            .contains(&worktree.worktree_instance_id)
+                })
+    });
+    let Some(snapshot) = snapshots.next() else {
+        return Ok(None);
+    };
+    if snapshots.next().is_some() {
+        return Err(AutoresearchError::EvidenceIncomplete);
+    }
+    Ok(Some((attempt, snapshot)))
+}
+
+fn process_trial_input(
+    trial: &ProcessTrialDeclaration,
+    attempt: &Attempt,
+    snapshot: &WorktreeSnapshot,
+    created_at_us: i64,
+) -> Result<RunCreateInput, AutoresearchError> {
+    let value = &trial.config;
+    let text = |name| {
+        value
+            .get(name)
+            .and_then(serde_json::Value::as_str)
+            .filter(|value| !value.is_empty())
+            .ok_or(AutoresearchError::EvidenceIncomplete)
+    };
+    let selected = text("selected")?;
+    let implementation = text("implementation")?;
+    let framework = text("framework")?;
+    let framework_version = text("framework_version")?;
+    let python = text("python")?;
+    let environment = value
+        .get("environment")
+        .and_then(serde_json::Value::as_object)
+        .ok_or(AutoresearchError::EvidenceIncomplete)?;
+    let timeout = value
+        .get("timeout_seconds")
+        .and_then(serde_json::Value::as_u64)
+        .filter(|value| *value > 0)
+        .ok_or(AutoresearchError::EvidenceIncomplete)?;
+    if selected != "fixed_scorer.py::TestTaskEval"
+        || framework != "pytest"
+        || value.get("uses_model") != Some(&serde_json::Value::Bool(false))
+        || value.get("uses_randomness") != Some(&serde_json::Value::Bool(false))
+        || environment.len() != 5
+        || trial.source_anchor.scorer_blob.len() != 40
+        || !trial
+            .source_anchor
+            .scorer_blob
+            .bytes()
+            .all(|value| value.is_ascii_hexdigit())
+    {
+        return Err(AutoresearchError::EvidenceIncomplete);
+    }
+    // These are the source's declared conditions, not an immutable runtime qualification.
+    let environment_fingerprint = serde_json::to_string(&serde_json::json!({"environment":environment,
+        "framework":framework,"framework_version":framework_version,"python":python,"uses_model":false}))
+        .map_err(|_| AutoresearchError::InvalidInput)?;
+    Ok(RunCreateInput {
+        workstream_id: attempt.workstream_id,
+        source_receipt_refs: Vec::new(),
+        code_snapshot_id: snapshot.worktree_snapshot_id,
+        data_fingerprint: format!("declared-git-blob:{}", trial.source_anchor.scorer_blob),
+        normalized_config: vec![
+            ContractField {
+                name: "selected".into(),
+                value: selected.into(),
+            },
+            ContractField {
+                name: "implementation".into(),
+                value: implementation.into(),
+            },
+            ContractField {
+                name: "timeout_seconds".into(),
+                value: timeout.to_string(),
+            },
+        ],
+        variable_declaration: VariableDeclaration {
+            varied: vec!["implementation".into()],
+            fixed: vec!["selected".into(), "timeout_seconds".into()],
+            uncontrolled: Vec::new(),
+        },
+        seed_policy: SeedPolicy::Unspecified,
+        seed_values: Vec::new(),
+        nondeterministic: false,
+        metric_definition: "TestTaskEval passed tests".into(),
+        metric_extractor_version: "pytest-junit-xunit2".into(),
+        multi_cas_metric_policy: MultiCasMetricPolicy::RejectMultipleParsed,
+        environment_fingerprint,
+        created_at_us,
+    })
+}
+
 struct ProcessWorkAnchor<'a> {
     repository: evertrace_domain::ids::RepositoryId,
     snapshot: &'a WorktreeSnapshot,
@@ -1941,6 +2368,32 @@ struct ControlledFacts {
 }
 
 impl ControlledFacts {
+    fn process_opening(
+        &self,
+        source: SourceObservationId,
+    ) -> Result<&SourceObservation, AutoresearchError> {
+        let observation = self
+            .observations
+            .get(&source)
+            .ok_or(AutoresearchError::EvidenceIncomplete)?;
+        let mut openings = self
+            .receipts
+            .values()
+            .filter(|receipt| {
+                receipt.source_instance_id == observation.source_instance_id
+                    && receipt.source_revision == observation.source_revision
+                    && receipt.source_sequence == 1
+            })
+            .filter_map(|receipt| self.observations.get(&receipt.source_observation_id));
+        let opening = openings
+            .next()
+            .ok_or(AutoresearchError::EvidenceIncomplete)?;
+        if openings.next().is_some() {
+            return Err(AutoresearchError::EvidenceIncomplete);
+        }
+        Ok(opening)
+    }
+
     fn from_snapshot(snapshot: &ProjectionSnapshot) -> Result<Self, AutoresearchError> {
         let mut facts = Self {
             runs: AutoresearchCurrentView::from_snapshot(snapshot)

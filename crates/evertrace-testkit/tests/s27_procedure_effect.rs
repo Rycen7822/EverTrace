@@ -260,8 +260,8 @@ mod controlled_projection_proof {
     use evertrace_engine::{
         EvidenceIngestor, HumanActionOutcome, HumanGovernanceService, HumanSurface,
         autoresearch::{
-            AutoresearchCommandContext, ControlledRunCommand, ControlledRunRequest,
-            ControlledRunResolver, RunCreateInput, create_experiment_run,
+            AutoresearchCommandContext, ControlledRunCommand, ControlledRunResolver,
+            RunCreateInput, RunSourceRequest, create_experiment_run,
         },
         normalize::PhysicalNormalizer,
         procedure::{
@@ -880,7 +880,7 @@ mod controlled_projection_proof {
         let ControlledRunCommand::Declaration { run, command, .. } = resolver
             .declare(
                 &writer.project().await.unwrap(),
-                ControlledRunRequest {
+                RunSourceRequest::Controlled {
                     attempt_id,
                     procedure_revision_id,
                     source_observation_id: intent_id,
@@ -937,7 +937,7 @@ mod controlled_projection_proof {
             resolver
                 .declare(
                     &writer.project().await.unwrap(),
-                    ControlledRunRequest {
+                    RunSourceRequest::Controlled {
                         attempt_id,
                         procedure_revision_id,
                         source_observation_id: observation_id,
@@ -2613,7 +2613,7 @@ mod controlled_projection_proof {
             resolver
                 .declare(
                     &writer.project().await.unwrap(),
-                    ControlledRunRequest {
+                    RunSourceRequest::Controlled {
                         attempt_id: attempts[0].attempt_id,
                         procedure_revision_id: procedure.revision_id,
                         source_observation_id: late_launch_observation_id,
