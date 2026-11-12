@@ -37,11 +37,13 @@ pub const KERNEL_ADAPTER_REVISION: u32 = 1;
 pub const KERNEL_ELIGIBLE_EVENTS: &str = "linux-proc-state-snapshot-v1";
 pub const INPUT_SOURCE_REVISION: &str = "linux-proc-inputs-v1";
 pub const INPUT_ELIGIBLE_EVENTS: &str = "linux-proc-inputs-snapshot-v1";
+pub const OUTPUT_SOURCE_REVISION: &str = "junit-xunit2-output-v1";
+pub const OUTPUT_ELIGIBLE_EVENTS: &str = "junit-xunit2-output-snapshot-v1";
 
 pub fn is_owned_revision(revision: &str) -> bool {
     matches!(
         revision,
-        SOURCE_REVISION | KERNEL_SOURCE_REVISION | INPUT_SOURCE_REVISION
+        SOURCE_REVISION | KERNEL_SOURCE_REVISION | INPUT_SOURCE_REVISION | OUTPUT_SOURCE_REVISION
     )
 }
 const LIMIT: usize = 65_536;
@@ -173,6 +175,10 @@ pub fn source_launch(input: &[u8], snapshot: &Path, caller_pid: u32) -> Result<S
     })
 }
 
+pub fn output_adapter_version() -> String {
+    format!("{OUTPUT_SOURCE_REVISION}:capture-{KERNEL_ADAPTER_REVISION}")
+}
+
 pub fn input_adapter_version() -> String {
     format!("{INPUT_SOURCE_REVISION}:capture-{KERNEL_ADAPTER_REVISION}")
 }
@@ -206,6 +212,7 @@ struct Header {
     launch_event: Option<String>,
     argv: Option<Vec<String>>,
     config: Option<Value>,
+    scorer: Option<Value>,
     returncode: Option<i32>,
 }
 
@@ -460,10 +467,16 @@ pub fn records(
     manifest_ref: &str,
     kernel_manifest: &str,
     input_manifest: &str,
+    output_manifest: &str,
 ) -> Result<Vec<Observation>> {
-    if [manifest_ref, kernel_manifest, input_manifest]
-        .iter()
-        .any(|value| value.len() != 64 || !value.bytes().all(|byte| byte.is_ascii_hexdigit()))
+    if [
+        manifest_ref,
+        kernel_manifest,
+        input_manifest,
+        output_manifest,
+    ]
+    .iter()
+    .any(|value| value.len() != 64 || !value.bytes().all(|byte| byte.is_ascii_hexdigit()))
     {
         return Err(ProcessSourceError);
     }
@@ -534,6 +547,11 @@ pub fn records(
     } else {
         vec![]
     };
+    let output = if kernel.is_some() && header.event == "trial_finished" {
+        execution_output(&header, &script).ok()
+    } else {
+        None
+    };
     let primary = CaptureRecordInput {
         spool_record_id: Some(header.event_key.clone()),
         source_observation_id_hint: None,
@@ -596,6 +614,16 @@ pub fn records(
             );
             input.eligible_event_manifest_ref = INPUT_ELIGIBLE_EVENTS.into();
             observations.push(Observation(input));
+        }
+        if let Some((raw, reference)) = output
+            && let Ok(Observation(mut artifact)) = kernel_observation(raw, process, output_manifest)
+        {
+            artifact.source_instance_id.push_str(":junit");
+            artifact.source_revision = OUTPUT_SOURCE_REVISION.into();
+            artifact.identity_domain = OUTPUT_SOURCE_REVISION.into();
+            artifact.source_ref = reference;
+            artifact.eligible_event_manifest_ref = OUTPUT_ELIGIBLE_EVENTS.into();
+            observations.push(Observation(artifact));
         }
     }
     Ok(observations)
@@ -821,6 +849,46 @@ pub fn closed_records(primary: &Observation, snapshot: &Path) -> Result<Vec<Obse
         return Err(ProcessSourceError);
     }
     Ok(records)
+}
+
+/// Read the native output at the fixed source format's execution-key path.
+fn execution_output(header: &Header, script: &Path) -> Result<(Vec<u8>, String)> {
+    let execution = header.execution_key.as_deref().ok_or(ProcessSourceError)?;
+    if !uuid(execution) {
+        return Err(ProcessSourceError);
+    }
+    let scorer = header.scorer.as_ref().ok_or(ProcessSourceError)?;
+    if scorer.get("format").and_then(Value::as_str) != Some("pytest-junit-xunit2") {
+        return Err(ProcessSourceError);
+    }
+    let directory = script.parent().ok_or(ProcessSourceError)?;
+    let relative = format!("trial-{execution}.xml");
+    let root = ConfinedRoot::open_external_source(directory).map_err(|_| ProcessSourceError)?;
+    let file = root
+        .read(
+            Path::new(&relative),
+            ConfinedReadLimits {
+                single_file_remaining: SOURCE_BYTES as u64,
+                untracked_total_remaining: SOURCE_BYTES as u64,
+                bundle_remaining: SOURCE_BYTES as u64,
+                deadline: Instant::now() + Duration::from_millis(50),
+            },
+        )
+        .map_err(|_| ProcessSourceError)?;
+    if scorer
+        .get("original_xml")
+        .and_then(Value::as_str)
+        .map(str::as_bytes)
+        != Some(file.bytes.as_slice())
+    {
+        return Err(ProcessSourceError);
+    }
+    physical_scope(header)?;
+    let reference = format!(
+        "file-native:{}:{}:{relative}",
+        file.identity.device, file.identity.inode
+    );
+    Ok((file.bytes, reference))
 }
 
 /// Read only the live verified publisher's owned output, never a caller-supplied locator.
