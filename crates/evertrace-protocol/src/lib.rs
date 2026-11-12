@@ -145,6 +145,7 @@ impl LocalServer {
                 | Command::ObserveProcessSource { .. }
                 | Command::RunHostCanary(_)
                 | Command::RunExecutionCanary(_)
+                | Command::RunProcessCanary(_)
                 | Command::ConfigReload
                 | Command::ConfigRead
                 | Command::ConfigWrite(_)

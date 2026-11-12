@@ -204,6 +204,11 @@ enum WriterRequest {
         limit: usize,
         reply: oneshot::Sender<Result<evertrace_store::MemoryBrowseContext, WriterActorError>>,
     },
+    SourceCanaryCurrent {
+        seeds: [evertrace_domain::ids::SourceObservationId; 3],
+        revision: String,
+        reply: oneshot::Sender<Result<evertrace_store::CaptureCurrentContext, WriterActorError>>,
+    },
     CaptureCurrent {
         after: Option<String>,
         exact: Option<String>,
@@ -1026,6 +1031,23 @@ impl WriterHandle {
         response.await.map_err(|_| WriterActorError::Stopped)?
     }
 
+    pub(crate) async fn source_canary_context(
+        &self,
+        seeds: [evertrace_domain::ids::SourceObservationId; 3],
+        revision: String,
+    ) -> Result<evertrace_store::CaptureCurrentContext, WriterActorError> {
+        let (reply, response) = oneshot::channel();
+        self.sender
+            .send(WriterRequest::SourceCanaryCurrent {
+                seeds,
+                revision,
+                reply,
+            })
+            .await
+            .map_err(|_| WriterActorError::Stopped)?;
+        response.await.map_err(|_| WriterActorError::Stopped)?
+    }
+
     pub(crate) async fn project_objects(&self) -> Result<ProjectionSnapshot, WriterActorError> {
         let (reply, response) = oneshot::channel();
         self.sender
@@ -1712,6 +1734,28 @@ async fn run_writer(
                         .await
                         .map_err(map_store_error);
                     let fatal = result.is_err();
+                    let _ = reply.send(result);
+                    if fatal {
+                        return Err(WriterActorError::Store);
+                    }
+                }
+                WriterRequest::SourceCanaryCurrent {
+                    seeds,
+                    revision,
+                    reply,
+                } => {
+                    if reply.is_closed() {
+                        continue;
+                    }
+                    let result = writer
+                        .as_ref()
+                        .ok_or(WriterActorError::Stopped)?
+                        .source_canary_context(&seeds, &revision)
+                        .await
+                        .map_err(map_store_error);
+                    let fatal = result
+                        .as_ref()
+                        .is_err_and(|error| *error != WriterActorError::InvalidInput);
                     let _ = reply.send(result);
                     if fatal {
                         return Err(WriterActorError::Store);

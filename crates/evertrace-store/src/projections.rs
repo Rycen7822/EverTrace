@@ -8411,6 +8411,64 @@ impl JournalAdmissionState {
         })
     }
 
+    pub(crate) fn source_canary_context(
+        &self,
+        seeds: &[SourceObservationId; 3],
+        source_revision: &str,
+        has_failed_job: bool,
+    ) -> Result<CaptureCurrentContext, StoreError> {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_millis(40);
+        let instances = seeds
+            .iter()
+            .map(|id| {
+                self.source_observations
+                    .get(id)
+                    .filter(|(value, _)| value.source_revision.as_str() == source_revision)
+                    .map(|(value, _)| value.source_instance_id.clone())
+                    .ok_or(StoreError::InvalidInput)
+            })
+            .collect::<Result<BTreeSet<_>, _>>()?;
+        if instances.len() != 3 {
+            return Err(StoreError::InvalidInput);
+        }
+        let mut selected = Vec::new();
+        let mut bytes = 0;
+        for (id, (value, seq)) in self.source_observations.iter() {
+            if std::time::Instant::now() >= deadline {
+                return Err(StoreError::InvalidInput);
+            }
+            if value.source_revision.as_str() != source_revision
+                || value.source_role != evertrace_domain::evidence::SourceRole::Tool
+                || !instances.contains(&value.source_instance_id)
+            {
+                continue;
+            }
+            let mut visible =
+                self.capture_product_rows(vec![source_observation_row(value.as_ref(), *seq)?])?;
+            let row = visible.pop().ok_or(StoreError::InvalidInput)?;
+            bytes += row.payload_json.as_ref().map_or(0, |payload| payload.len());
+            if selected.len() == 64 || bytes > 2 * 1024 * 1024 {
+                return Err(StoreError::InvalidInput);
+            }
+            selected.push((row, *id));
+        }
+        let items = self.capture_selected_items(selected, false)?;
+        let size: usize = items
+            .iter()
+            .flat_map(|item| item.source_rows.iter().chain(&item.scope_rows))
+            .map(|row| row.payload_json.as_ref().map_or(0, |payload| payload.len()))
+            .sum();
+        if size > 2 * 1024 * 1024 || std::time::Instant::now() >= deadline {
+            return Err(StoreError::InvalidInput);
+        }
+        Ok(CaptureCurrentContext {
+            frontier: self.frontier,
+            has_failed_job,
+            items,
+            next_cursor: None,
+        })
+    }
+
     fn capture_selected_items(
         &self,
         selected: Vec<(ObjectRow, SourceObservationId)>,

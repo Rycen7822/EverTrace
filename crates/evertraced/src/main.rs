@@ -542,6 +542,17 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
                         };
                         Ok(Response::HostCanary(map_host_canary(host_canary.run_execution_source(request).await)))
                     }
+                    ProtocolCommand::RunProcessCanary(request) => {
+                        if context.client_kind != ClientKind::Cli { return Err(ErrorCode::Untrusted); }
+                        let request = evertrace_engine::ProcessCanaryRequest {
+                            sources: [
+                                request.root_source.parse().map_err(|_| ErrorCode::InvalidInput)?,
+                                request.resumed_source.parse().map_err(|_| ErrorCode::InvalidInput)?,
+                                request.forked_source.parse().map_err(|_| ErrorCode::InvalidInput)?,
+                            ],
+                        };
+                        Ok(Response::HostCanary(map_host_canary(host_canary.run_process_source(request).await)))
+                    }
                     ProtocolCommand::Health => {
                         let snapshot = handler_engine.health().map_err(|error| match error {
                             HealthDispatchError::MaintenanceMode => ErrorCode::MaintenanceMode,

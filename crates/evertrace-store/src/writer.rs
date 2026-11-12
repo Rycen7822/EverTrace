@@ -2235,6 +2235,18 @@ impl JournalWriter {
         .await
     }
 
+    /// Explicit source qualification reads only these three producer generations.
+    pub async fn source_canary_context(
+        &self,
+        seeds: &[evertrace_domain::ids::SourceObservationId; 3],
+        source_revision: &str,
+    ) -> Result<crate::projections::CaptureCurrentContext, StoreError> {
+        self.validated_current_read(|state, stamp| {
+            state.source_canary_context(seeds, source_revision, stamp.has_failed_job)
+        })
+        .await
+    }
+
     pub async fn scope_current_context(
         &self,
         request: &crate::projections::ScopeCurrentRequest,

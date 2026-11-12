@@ -26,6 +26,7 @@ pub enum Command {
     ConfigWrite(ConfigWriteCommand),
     RunHostCanary(RunHostCanaryCommand),
     RunExecutionCanary(RunExecutionCanaryCommand),
+    RunProcessCanary(RunProcessCanaryCommand),
     RecoveryBarrier(RecoveryBarrierLocator),
     RequestRecovery(RequestRecoveryCommand),
     IssueMcpBinding(McpBindingIssueCommand),
@@ -63,6 +64,14 @@ pub struct RunHostCanaryCommand {
 pub struct RunExecutionCanaryCommand {
     pub source_endpoint: String,
     pub source_executable: String,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct RunProcessCanaryCommand {
+    pub root_source: String,
+    pub resumed_source: String,
+    pub forked_source: String,
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]

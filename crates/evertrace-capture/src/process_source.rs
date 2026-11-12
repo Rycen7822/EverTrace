@@ -30,8 +30,8 @@ const PREFIX: &[u8] = b"{\"format\":\"process-trial-source-v4\",";
 pub const FORMAT: &str = "process-trial-source-v4";
 pub const SOURCE_REVISION: &str =
     "process-trial-source-v4:84e413385043c92b6723c629b7c0b0481539671827b539dc2f910cf01d432d1d";
-pub const ADAPTER_REVISION: u32 = 9;
-pub const PARSER_REVISION: u32 = 6;
+pub const ADAPTER_REVISION: u32 = 10;
+pub const PARSER_REVISION: u32 = 7;
 pub const ELIGIBLE_EVENTS: &str = "process-trial-source-events-v4";
 pub const KERNEL_SOURCE_REVISION: &str = "linux-proc-stat-v1";
 pub const KERNEL_ADAPTER_REVISION: u32 = 1;
@@ -304,7 +304,14 @@ fn peer_at(
     snapshot: &Path,
     caller_pid: u32,
 ) -> Result<PathBuf> {
-    let parent = stat(&caller_pid.to_string())?.parent;
+    if stat(&caller_pid.to_string())?.parent != header.controller.pid {
+        return Err(ProcessSourceError);
+    }
+    controller_peer(header, Some(executable), snapshot)
+}
+
+fn controller_peer(header: &Header, executable: Option<&Path>, snapshot: &Path) -> Result<PathBuf> {
+    let parent = header.controller.pid;
     let root = Path::new("/proc").join(parent.to_string());
     let own_uid = fs::metadata("/proc/self")
         .map_err(|_| ProcessSourceError)?
@@ -348,7 +355,7 @@ fn peer_at(
     }
     for (flag, expected) in [
         (b"--native-hook".as_slice(), executable),
-        (b"--runtime-snapshot".as_slice(), snapshot),
+        (b"--runtime-snapshot".as_slice(), Some(snapshot)),
     ] {
         let index = args
             .iter()
@@ -356,10 +363,17 @@ fn peer_at(
             .ok_or(ProcessSourceError)?;
         let value = std::str::from_utf8(args.get(index + 1).ok_or(ProcessSourceError)?)
             .map_err(|_| ProcessSourceError)?;
-        if fs::canonicalize(value).map_err(|_| ProcessSourceError)?
-            != fs::canonicalize(expected).map_err(|_| ProcessSourceError)?
-        {
-            return Err(ProcessSourceError);
+        if let Some(expected) = expected {
+            if fs::canonicalize(value).map_err(|_| ProcessSourceError)?
+                != fs::canonicalize(expected).map_err(|_| ProcessSourceError)?
+            {
+                return Err(ProcessSourceError);
+            }
+        } else {
+            let file = fs::symlink_metadata(value).map_err(|_| ProcessSourceError)?;
+            if !file.is_file() || file.uid() != own_uid || file.mode() & 0o022 != 0 {
+                return Err(ProcessSourceError);
+            }
         }
     }
     fs::canonicalize(script).map_err(|_| ProcessSourceError)
@@ -1166,6 +1180,161 @@ fn source_probe(header: &Header, deadline: Instant) -> Result<Vec<u8>> {
         return Err(ProcessSourceError);
     }
     Ok(snapshot.source_event_bytes.concat().into_bytes())
+}
+
+/// Reparse the native axes only. This never grants an admission or constructs an Observation.
+pub fn native_correlation_matches(raw: &[u8], value: &HostCorrelationEvidence) -> bool {
+    let Ok((header, role)) = decode(raw) else {
+        return false;
+    };
+    let instance = format!(
+        "process:{}:{}:{}:{}",
+        header.controller.boot_id,
+        header.controller.pid_namespace,
+        header.controller.pid,
+        header.controller.start_ticks
+    );
+    let lane = format!("{instance}:thread:{}", header.lane_thread_id);
+    matches!(
+        header.event.as_str(),
+        "trial_launch" | "trial_started" | "trial_finished"
+    ) && header.execution_key.as_deref().is_some_and(uuid)
+        && header.request_key.as_deref().is_some_and(uuid)
+        && header.execution_ordinal.is_some_and(|ordinal| ordinal > 0)
+        && header
+            .config
+            .as_ref()
+            .and_then(|config| config.get("probe_case"))
+            .is_none()
+        && value.host_instance_id.as_deref() == Some(instance.as_str())
+        && value.host_trace_lineage_id.as_deref() == Some(header.source_epoch.as_str())
+        && value.host_lane_key.as_deref() == Some(lane.as_str())
+        && value.native_request_id == header.request_key
+        && value.physical_execution_ordinal == header.execution_ordinal
+        && value.canonical_event_family == Some(CanonicalEventFamily::Verify)
+        && value.pairing_role == role
+}
+
+/// Verify frozen metadata against original protected bytes without re-reading a live process.
+pub fn record_matches(raw: &[u8], body: &crate::CaptureRecordBody) -> bool {
+    let Ok((header, role)) = decode(raw) else {
+        return false;
+    };
+    let instance = format!(
+        "process:{}:{}:{}:{}",
+        header.controller.boot_id,
+        header.controller.pid_namespace,
+        header.controller.pid,
+        header.controller.start_ticks
+    );
+    let known_profile = (body.adapter_revision, body.parser_revision)
+        == (ADAPTER_REVISION, PARSER_REVISION)
+        || (body.adapter_revision, body.parser_revision) == (9, 6);
+    let file_view = body
+        .source_instance_id
+        .as_str()
+        .strip_prefix(&format!("{instance}:file:"))
+        .and_then(|suffix| suffix.split_once(':'))
+        .is_some_and(|(device, inode)| {
+            device.parse::<u64>().is_ok() && inode.parse::<u64>().is_ok_and(|value| value > 0)
+        })
+        && body
+            .source_ref
+            .strip_prefix("file:")
+            .is_some_and(|path| Path::new(path).is_absolute())
+        && body.correlation.host_instance_id.is_none()
+        && body.correlation.host_trace_lineage_id.is_none()
+        && body.correlation.host_lane_key.is_none()
+        && body.correlation.canonical_event_family.is_none()
+        && body.correlation.native_request_id.is_none()
+        && body.correlation.physical_execution_ordinal.is_none()
+        && body.correlation.field_provenance.is_empty();
+    body.source_kind == EvidenceSourceKind::Other
+        && body.source_revision.as_str() == SOURCE_REVISION
+        && known_profile
+        && body.correlation.adapter_revision == body.adapter_revision
+        && body.correlation.admission == CorrelationAdmission::Unavailable
+        && body.correlation.strong_gate_receipt_ref.is_none()
+        && (body.source_instance_id.as_str() == instance || file_view)
+        && body.source_record_identity.as_str() == header.event_key
+        && body.source_sequence == header.sequence
+        && body.source_role == SourceRole::Tool
+        && body.content_trust == ContentTrust::UntrustedSourceContent
+        && body.capture_completeness == CaptureCompleteness::Partial
+        && body.correlation.pairing_role == role
+        && (body.correlation.host_instance_id.is_none()
+            || native_correlation_matches(raw, &body.correlation))
+}
+
+/// Unforgeable live probe result. Only the real code-pinned controller can produce one.
+pub struct CanaryWitness {
+    script: PathBuf,
+    executable: PathBuf,
+    replayed_record: Vec<u8>,
+    opening_record: Vec<u8>,
+}
+
+impl CanaryWitness {
+    pub fn script(&self) -> &Path {
+        &self.script
+    }
+
+    pub fn executable(&self) -> &Path {
+        &self.executable
+    }
+
+    pub fn replayed_record(&self) -> &[u8] {
+        &self.replayed_record
+    }
+
+    pub fn opening_record(&self) -> &[u8] {
+        &self.opening_record
+    }
+}
+
+pub fn canary_witness(raw: &[u8], snapshot: &Path) -> Result<CanaryWitness> {
+    let (header, _) = decode(raw)?;
+    let script = controller_peer(&header, None, snapshot)?;
+    let deadline = Instant::now() + Duration::from_millis(150);
+    let first = source_probe(&header, deadline)?;
+    let second = source_probe(&header, deadline)?;
+    let (_, file) = published_file(&script, &header.controller, deadline)?;
+    if !file.bytes.starts_with(&first)
+        || !file.bytes.starts_with(&second)
+        || !first
+            .split_inclusive(|byte| *byte == b'\n')
+            .any(|line| line == raw)
+        || !second
+            .split_inclusive(|byte| *byte == b'\n')
+            .any(|line| line == raw)
+    {
+        return Err(ProcessSourceError);
+    }
+    let mut keys = BTreeSet::new();
+    let mut opening_record = None;
+    for (index, line) in first.split_inclusive(|byte| *byte == b'\n').enumerate() {
+        let (entry, _) = decode(line)?;
+        if entry.sequence != index as u64 + 1
+            || entry.controller != header.controller
+            || entry.source_epoch != header.source_epoch
+            || entry.study_key != header.study_key
+            || !keys.insert(entry.event_key)
+        {
+            return Err(ProcessSourceError);
+        }
+        if index == 0 {
+            if entry.event != "study_opened" {
+                return Err(ProcessSourceError);
+            }
+            opening_record = Some(line.to_vec());
+        }
+    }
+    Ok(CanaryWitness {
+        script,
+        executable: header.controller.executable.into(),
+        replayed_record: raw.to_vec(),
+        opening_record: opening_record.ok_or(ProcessSourceError)?,
+    })
 }
 
 fn published_record(

@@ -446,6 +446,14 @@ impl HostProbeReport {
         )
     }
 
+    /// Native identity without borrowing execution-directory/project-policy authority.
+    pub fn evaluate_native_source(
+        context: &ProbeContext,
+        evidence: &ProbeEvidence,
+    ) -> Result<Self, ProbeError> {
+        Self::evaluate_with_native_identity(context, evidence, true, &[])
+    }
+
     pub fn evaluate_execution_source(
         context: &ProbeContext,
         evidence: &ProbeEvidence,

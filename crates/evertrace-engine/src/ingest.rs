@@ -1043,6 +1043,18 @@ impl EvidenceIngestor {
                     } else {
                         (None, None)
                     };
+                let process_profile = verified.body.source_revision.as_str()
+                    == evertrace_capture::process_source::SOURCE_REVISION
+                    && verified.body.adapter_revision
+                        == evertrace_capture::process_source::ADAPTER_REVISION
+                    && verified.body.parser_revision
+                        == evertrace_capture::process_source::PARSER_REVISION;
+                let native_profile = process_profile
+                    || (evertrace_capture::execution_source::is_source_revision(
+                        verified.body.source_revision.as_str(),
+                    ) && evertrace_capture::execution_source::is_qualified_revision(
+                        verified.body.parser_revision,
+                    ));
                 // The journal validates the original whole command before
                 // returning it. Preserve its first presentation across lost ack
                 // and reload; verify every payload against this same frame/CAS.
@@ -1055,11 +1067,7 @@ impl EvidenceIngestor {
                         .map_err(map_writer_error)?,
                 };
                 if let Some(committed_command) = committed_command {
-                    if evertrace_capture::execution_source::is_source_revision(
-                        verified.body.source_revision.as_str(),
-                    ) && evertrace_capture::execution_source::is_qualified_revision(
-                        verified.body.parser_revision,
-                    ) {
+                    if native_profile {
                         if let Some(original) =
                             committed_command
                                 .payloads
@@ -1080,10 +1088,11 @@ impl EvidenceIngestor {
                                 evertrace_domain::evidence::CorrelationAdmission::Unavailable;
                             weak.correlation.strong_gate_receipt_ref = None;
                             if weak == verified.observation
-                                && evertrace_capture::execution_source::is_execution(
-                                    original,
-                                    &verified.receipt,
-                                )
+                                && (process_profile
+                                    || evertrace_capture::execution_source::is_execution(
+                                        original,
+                                        &verified.receipt,
+                                    ))
                             {
                                 verified.observation.correlation = original.correlation.clone();
                             }
@@ -1103,6 +1112,12 @@ impl EvidenceIngestor {
                         .receipt
                         .protected_presentation
                         .clone_from(&receipt.protected_presentation);
+                    // Transport replay can relocate the same frame. Retain its first L0 receipt,
+                    // not the retry segment's offset; all source/CAS/payload fields must still match.
+                    verified
+                        .receipt
+                        .spool_byte_range
+                        .clone_from(&receipt.spool_byte_range);
                     let original_algorithm = committed_command
                         .payloads
                         .iter()
@@ -1142,16 +1157,14 @@ impl EvidenceIngestor {
                     progress.projected_surfaces += surface_count;
                     continue;
                 }
-                if evertrace_capture::execution_source::is_source_revision(
-                    verified.body.source_revision.as_str(),
-                ) && evertrace_capture::execution_source::is_qualified_revision(
-                    verified.body.parser_revision,
-                ) {
-                    if let Some(report) = self
-                        .execution_canary
-                        .as_ref()
-                        .and_then(|canary| canary.execution_source_report())
-                    {
+                if native_profile {
+                    if let Some(report) = self.execution_canary.as_ref().and_then(|canary| {
+                        if process_profile {
+                            canary.process_source_report()
+                        } else {
+                            canary.execution_source_report()
+                        }
+                    }) {
                         let correlation = &mut verified.observation.correlation;
                         if report.manifest().adapter_manifest_id
                             == verified.receipt.adapter_manifest_ref

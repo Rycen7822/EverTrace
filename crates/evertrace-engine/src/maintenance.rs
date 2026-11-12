@@ -2548,8 +2548,7 @@ impl BackgroundScheduler {
                         dirty.target_kind,
                         &dirty.target_id,
                     );
-                    let weak_process =
-                        physical && is_unqualified_process_source(observation, receipt);
+                    let process_profile = physical && is_process_source(observation, receipt);
                     let weak_live = (physical
                         && evertrace_capture::host_events::is_unqualified_execution(
                             observation,
@@ -2566,7 +2565,7 @@ impl BackgroundScheduler {
                                 .get_or_insert_with(&load_retained_manifests)
                                 .is_empty())
                         && !weak_import
-                        && !weak_process
+                        && !process_profile
                         && !weak_live
                     {
                         return Ok(None);
@@ -2575,7 +2574,7 @@ impl BackgroundScheduler {
                     // the complete dependency manifest check below remains authoritative.
                     let manifest = receipt.adapter_manifest_ref.as_str();
                     Ok((weak_import
-                        || weak_process
+                        || process_profile
                         || weak_live
                         || current_manifest == Some(manifest)
                         || (physical
@@ -5171,9 +5170,9 @@ fn is_verified_importer_weak_normalization(
         && receipt.lifecycle.is_none()
 }
 
-// This ABI has no host authority. A matching source version must not rescue a
-// forged Exact, adopted scope or trusted-role claim through a weak contract.
-fn is_unqualified_process_source(
+// This profile grants no scope or content authority. Correlation is frozen at first admission;
+// its manifest cannot manufacture a gate or rescue adopted scope/trusted-role claims.
+fn is_process_source(
     observation: &evertrace_domain::evidence::SourceObservation,
     receipt: &evertrace_domain::evidence::SourceReceipt,
 ) -> bool {
@@ -5196,8 +5195,11 @@ fn is_unqualified_process_source(
         && observation.content_trust == ContentTrust::UntrustedSourceContent
         && observation.capture_completeness == CaptureCompleteness::Partial
         && receipt.capture_completeness == CaptureCompleteness::Partial
-        && observation.correlation.admission == CorrelationAdmission::Unavailable
-        && observation.correlation.strong_gate_receipt_ref.is_none()
+        && ((observation.correlation.admission == CorrelationAdmission::Unavailable
+            && observation.correlation.strong_gate_receipt_ref.is_none())
+            || (observation.correlation.admission == CorrelationAdmission::ExactCapable
+                && observation.correlation.strong_gate_receipt_ref.is_some()
+                && observation.correlation.exact_key().is_some()))
         && observation.correlation.partial_correlation_ref.is_none()
         && observation
             .correlation
@@ -5400,7 +5402,7 @@ fn resolve_capture_report(
                     if receipt.source_receipt_id == observation.source_receipt_ref => Some(receipt),
                 _ => None,
             })?;
-            if !is_unqualified_process_source(observation, receipt) {
+            if !is_process_source(observation, receipt) {
                 return None;
             }
             observed = true;
@@ -5408,9 +5410,10 @@ fn resolve_capture_report(
         if !observed {
             return None;
         }
-        let report = HostProbeReport::unobserved_source_contract(
+        let report = HostProbeReport::native_source_contract(
             &evertrace_capture::process_source::adapter_version(),
             evertrace_capture::process_source::ELIGIBLE_EVENTS,
+            evertrace_capture::process_source::FORMAT,
         )
         .ok()?;
         return capture_item_manifest_matches(item, &report).then_some(report);

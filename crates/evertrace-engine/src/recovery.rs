@@ -1,6 +1,8 @@
 //! Deterministic destructive classification, capture, and supervised recovery.
 mod execution;
+mod process;
 pub use execution::ExecutionCanaryRequest;
+pub use process::ProcessCanaryRequest;
 
 use evertrace_domain::repository::{RecoveryOmission, WorktreeSnapshot};
 use evertrace_store::StoreError;
@@ -65,6 +67,7 @@ pub struct HostCanaryService {
     bindings: crate::McpBindingAuthority,
     running: std::sync::Arc<tokio::sync::Mutex<()>>,
     current: std::sync::Arc<std::sync::Mutex<Option<CurrentCanary>>>,
+    process_current: std::sync::Arc<std::sync::Mutex<Option<CurrentCanary>>>,
 }
 
 struct CurrentCanary {
@@ -246,6 +249,7 @@ enum CanaryWiring {
     },
     Candidate([String; 7]),
     ExecutionSource,
+    ProcessSource,
 }
 
 fn canary_file_identity(path: &std::path::Path) -> Option<[u64; 7]> {
@@ -368,7 +372,7 @@ impl CanaryIdentity {
                 CanaryWiring::Candidate(arguments) => {
                     evertrace_codex::install::candidate_wiring_hash(arguments) == self.wiring_hash
                 }
-                CanaryWiring::ExecutionSource => true,
+                CanaryWiring::ExecutionSource | CanaryWiring::ProcessSource => true,
             }
             && self.valid()
     }
@@ -520,6 +524,7 @@ impl HostCanaryService {
             bindings,
             running: Default::default(),
             current: Default::default(),
+            process_current: Default::default(),
         }
     }
 

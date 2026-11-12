@@ -1194,9 +1194,10 @@ impl ControlledRunResolver {
         let bytes = self.protected_source(facts, source)?;
         let declaration = ProcessWorkDeclaration::decode(&bytes, receipt)
             .ok_or(AutoresearchError::EvidenceIncomplete)?;
-        let manifest = evertrace_codex::probe::HostProbeReport::unobserved_source_contract(
+        let manifest = evertrace_codex::probe::HostProbeReport::native_source_contract(
             &process_source::adapter_version(),
             process_source::ELIGIBLE_EVENTS,
+            process_source::FORMAT,
         )
         .map_err(|_| AutoresearchError::UntrustedRunEvidence)?;
         if receipt.identity_domain != declaration.format

@@ -202,6 +202,35 @@ pub(crate) fn verify_capture_frame_presented(
             return Err(IngestError::InvalidRecord);
         }
     }
+    if body.source_revision.as_str() == evertrace_capture::process_source::SOURCE_REVISION {
+        use evertrace_capture::process_source;
+        use evertrace_codex::probe::HostProbeReport;
+        let contract = if (body.adapter_revision, body.parser_revision)
+            == (
+                process_source::ADAPTER_REVISION,
+                process_source::PARSER_REVISION,
+            ) {
+            HostProbeReport::native_source_contract(
+                &process_source::adapter_version(),
+                process_source::ELIGIBLE_EVENTS,
+                process_source::FORMAT,
+            )
+        } else if (body.adapter_revision, body.parser_revision) == (9, 6) {
+            // Frozen v4 history verifies its own weak contract; it cannot acquire today's grant.
+            HostProbeReport::unobserved_source_contract(
+                &format!("{}:capture-9", process_source::SOURCE_REVISION),
+                process_source::ELIGIBLE_EVENTS,
+            )
+        } else {
+            return Err(IngestError::InvalidRecord);
+        }
+        .map_err(|_| IngestError::InvalidRecord)?;
+        if body.adapter_manifest_ref != contract.manifest().adapter_manifest_id
+            || !process_source::record_matches(&protected, &body)
+        {
+            return Err(IngestError::InvalidRecord);
+        }
+    }
     if matches!(
         body.event_time_provenance,
         Some(evertrace_domain::evidence::EventTimeProvenance::SourceTimestamp { .. })
