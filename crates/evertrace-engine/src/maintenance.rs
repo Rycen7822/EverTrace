@@ -1855,7 +1855,7 @@ impl BackgroundScheduler {
             .map_err(|_| BackgroundSchedulerError::Store)?;
         let resolver = ControlledRunResolver::new(cas);
         for source in sources {
-            let snapshot = match controlled_source_snapshot(current, source) {
+            let snapshot = match controlled_source_snapshot(current, source, &resolver) {
                 Ok(Some(snapshot)) => snapshot,
                 Ok(None) | Err(AutoresearchError::EvidenceIncomplete) => continue,
                 Err(AutoresearchError::SelectionDeferred) => {

@@ -46,6 +46,7 @@ pub(crate) use git_probe::{
     WorkspaceGitLocation, probe_repository_identity, workspace_git_location,
 };
 pub use integration::{IntegrationEvidence, resolve_integration};
+pub(crate) use resolver::complete_repository_source_start;
 pub use resolver::{
     PathHint, RepositoryResolution, RepositoryResolveError, RepositoryResolveInput, ResolutionKind,
     correct_transition, resolve_repository, resolve_repository_source_start,

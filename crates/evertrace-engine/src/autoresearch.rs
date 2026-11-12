@@ -162,7 +162,8 @@ fn source_resolved(
         let sequence = current
             .source_observation(observation.source_observation_id)
             .map_or(0, |(_, seq)| seq);
-        let Ok(scopes) = root_scope_candidates(current, observation.source_observation_id) else {
+        let Ok(scopes) = root_scope_candidates(current, observation.source_observation_id, None)
+        else {
             return false;
         };
         let deadline = std::time::Instant::now() + std::time::Duration::from_millis(40);
@@ -454,6 +455,7 @@ struct RootScopeCandidate {
 fn root_scope_candidates(
     current: &evertrace_store::CurrentFacts,
     goal: SourceObservationId,
+    expected_directory: Option<(&CasStore, &str, u32, u64)>,
 ) -> Result<Vec<RootScopeCandidate>, AutoresearchError> {
     let Some((goal_observation, _)) = current.source_observation(goal) else {
         return Ok(Vec::new());
@@ -462,18 +464,43 @@ fn root_scope_candidates(
     else {
         return Ok(Vec::new());
     };
-    let ids = current
-        .source_receipts()
-        .filter_map(|(receipt, _)| {
-            evertrace_capture::goal_source::same_execution_context(goal_receipt, receipt)
-                .then_some(receipt.source_observation_id)
-        })
-        .collect::<BTreeSet<_>>();
+    let deadline = std::time::Instant::now() + std::time::Duration::from_millis(40);
+    let mut ids = BTreeSet::new();
+    for (receipt, _) in current.source_receipts() {
+        if std::time::Instant::now() >= deadline {
+            return Err(AutoresearchError::SelectionDeferred);
+        }
+        if !evertrace_capture::goal_source::same_execution_context(goal_receipt, receipt) {
+            continue;
+        }
+        if let Some((cas, path, pid, start)) = expected_directory {
+            let Some((native, _)) = current.source_observation(receipt.source_observation_id)
+            else {
+                continue;
+            };
+            let digest =
+                CasDigest::from_str(&receipt.cas_ref).map_err(|_| AutoresearchError::Cas)?;
+            // Native execution deliberately has no presentation surface. Read its bounded L0 CAS
+            // only to select candidates; the resolver still authenticates every source/effect.
+            let (raw, _) = cas
+                .read_bounded(&digest, 128 * 1024, 65536)
+                .map_err(|_| AutoresearchError::Cas)?;
+            let directory =
+                evertrace_capture::execution_source::execution_directory(native, receipt, &raw);
+            if directory
+                .as_ref()
+                .map(|(path, pid, start)| (path.as_str(), *pid, *start))
+                != Some((path, pid, start))
+            {
+                continue;
+            }
+        }
+        ids.insert(receipt.source_observation_id);
+    }
     if ids.is_empty() {
         return Ok(Vec::new());
     }
     let needles = ids.iter().map(ToString::to_string).collect::<Vec<_>>();
-    let deadline = std::time::Instant::now() + std::time::Duration::from_millis(40);
     let mut operations = BTreeMap::<OperationId, Operation>::new();
     for row in current
         .other_data_rows()
@@ -541,7 +568,11 @@ fn root_scope_candidates(
             continue;
         };
         selected
-            .entry((repository, worktree))
+            .entry((
+                repository,
+                worktree,
+                expected_directory.map(|_| (operation.operation_id, effect.scope_effect_id)),
+            ))
             .or_insert(RootScopeCandidate {
                 source,
                 operation: operation.operation_id,
@@ -562,6 +593,7 @@ fn process_work_refs(
     current: &evertrace_store::CurrentFacts,
     source: SourceObservationId,
     declaration: &ProcessWorkDeclaration,
+    cas: &CasStore,
 ) -> Result<BTreeSet<String>, AutoresearchError> {
     let (observation, _) = current
         .source_observation(source)
@@ -598,7 +630,13 @@ fn process_work_refs(
             continue;
         }
         refs.extend([receipt.source_observation_id.to_string(), reference]);
-        for scope in root_scope_candidates(current, receipt.source_observation_id)? {
+        let directory = Some((
+            cas,
+            declaration.definition.scope.as_str(),
+            declaration.controller.pid,
+            declaration.controller.start_ticks,
+        ));
+        for scope in root_scope_candidates(current, receipt.source_observation_id, directory)? {
             causal.insert(scope.source);
             refs.extend([
                 scope.source.to_string(),
@@ -682,12 +720,15 @@ fn process_opening(
 pub(crate) fn controlled_source_snapshot(
     current: &evertrace_store::CurrentFacts,
     id: SourceObservationId,
+    resolver: &ControlledRunResolver,
 ) -> Result<Option<ProjectionSnapshot>, AutoresearchError> {
     let Some(envelope) = source_candidate(current, id) else {
         return Ok(None);
     };
     let process_refs = match &envelope {
-        SourceCandidate::WorkPlan(declaration) => process_work_refs(current, id, declaration)?,
+        SourceCandidate::WorkPlan(declaration) => {
+            process_work_refs(current, id, declaration, &resolver.cas)?
+        }
         SourceCandidate::Trial(trial) => {
             let Some((opening, declaration)) = process_opening(current, id)? else {
                 return Ok(None);
@@ -695,7 +736,7 @@ pub(crate) fn controlled_source_snapshot(
             if trial.study_key != declaration.study_key {
                 return Ok(None);
             }
-            let mut refs = process_work_refs(current, opening, &declaration)?;
+            let mut refs = process_work_refs(current, opening, &declaration, &resolver.cas)?;
             refs.insert(opening.to_string());
             let deadline = std::time::Instant::now() + std::time::Duration::from_millis(40);
             for row in current.other_data_rows() {
@@ -769,7 +810,7 @@ pub(crate) fn controlled_source_snapshot(
         source_candidate(current, id),
         Some(SourceCandidate::RootGoal { .. })
     ) {
-        for scope in root_scope_candidates(current, id)? {
+        for scope in root_scope_candidates(current, id, None)? {
             refs.extend([
                 scope.source.to_string(),
                 scope.operation.to_string(),
@@ -2088,28 +2129,44 @@ fn process_trial_target<'a>(
                 .map(|value| format!("native-execution-directory:{value}:")),
         );
     }
-    let mut snapshots = facts.snapshots.values().filter(|snapshot| {
-        snapshot.capture_status == evertrace_domain::repository::SnapshotCaptureStatus::Complete
-            && snapshot
+    let snapshots = facts
+        .snapshots
+        .values()
+        .filter(|snapshot| {
+            snapshot.capture_status == evertrace_domain::repository::SnapshotCaptureStatus::Complete
+                && snapshot
+                    .evidence_refs
+                    .iter()
+                    .any(|value| prefixes.iter().any(|prefix| value.starts_with(prefix)))
+                && snapshot.head_oid.as_deref() == Some(trial.source_anchor.commit.as_str())
+                && snapshot.tree_oid.as_deref() == Some(trial.source_anchor.tree.as_str())
+                && facts
+                    .worktrees
+                    .get(&snapshot.worktree_instance_id)
+                    .is_some_and(|worktree| {
+                        Some(worktree.repository_instance_id) == stream.repository_instance_id
+                            && stream
+                                .worktree_instance_ids
+                                .contains(&worktree.worktree_instance_id)
+                    })
+        })
+        .collect::<Vec<_>>();
+    let direct = format!("native-execution-directory:{source}:");
+    let exact = snapshots
+        .iter()
+        .copied()
+        .filter(|snapshot| {
+            snapshot
                 .evidence_refs
                 .iter()
-                .any(|value| prefixes.iter().any(|prefix| value.starts_with(prefix)))
-            && snapshot.head_oid.as_deref() == Some(trial.source_anchor.commit.as_str())
-            && snapshot.tree_oid.as_deref() == Some(trial.source_anchor.tree.as_str())
-            && facts
-                .worktrees
-                .get(&snapshot.worktree_instance_id)
-                .is_some_and(|worktree| {
-                    Some(worktree.repository_instance_id) == stream.repository_instance_id
-                        && stream
-                            .worktree_instance_ids
-                            .contains(&worktree.worktree_instance_id)
-                })
-    });
-    let Some(snapshot) = snapshots.next() else {
+                .any(|reference| reference.starts_with(&direct))
+        })
+        .collect::<Vec<_>>();
+    let candidates = if exact.is_empty() { &snapshots } else { &exact };
+    let Some(snapshot) = candidates.first().copied() else {
         return Ok(None);
     };
-    if snapshots.next().is_some() {
+    if candidates.len() != 1 {
         return Err(AutoresearchError::EvidenceIncomplete);
     }
     Ok(Some((attempt, snapshot)))

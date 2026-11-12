@@ -648,12 +648,16 @@ impl EvidenceIngestor {
                     return None;
                 }
                 let incomplete = view.repositories.keys().copied().collect();
-                let resolution = RepositoryResolveInput {
+                let input = RepositoryResolveInput {
                     view: &view,
                     evidence: &evidence,
                     derived_from_hint: None,
-                }
-                .resolve_with_incomplete_history(&incomplete)
+                };
+                let resolution = input.resolve_with_incomplete_history(&incomplete).ok()?;
+                let reference = namespace.evidence_ref(&observation_id.to_string());
+                let resolution = crate::repository::complete_repository_source_start(
+                    &input, &reference, resolution,
+                )
                 .ok()?;
                 if !matches!(
                     resolution.kind,

@@ -224,6 +224,14 @@ pub fn resolve_repository_source_start(
     input: &RepositoryResolveInput<'_>,
     source_reference: &str,
 ) -> Result<RepositoryResolution, RepositoryResolveError> {
+    complete_repository_source_start(input, source_reference, resolve_repository(input)?)
+}
+
+pub(crate) fn complete_repository_source_start(
+    input: &RepositoryResolveInput<'_>,
+    source_reference: &str,
+    mut resolution: RepositoryResolution,
+) -> Result<RepositoryResolution, RepositoryResolveError> {
     let evidence = input.evidence;
     if source_reference.is_empty()
         || !evidence
@@ -236,7 +244,6 @@ pub fn resolve_repository_source_start(
     if evidence.unavailable_reason.is_some() {
         return Err(RepositoryResolveError::InsufficientEvidence);
     }
-    let mut resolution = resolve_repository(input)?;
     if !matches!(
         resolution.kind,
         Some(ResolutionKind::Create | ResolutionKind::Successor | ResolutionKind::NoDelta)
