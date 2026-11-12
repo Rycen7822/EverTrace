@@ -35,6 +35,15 @@ pub const ELIGIBLE_EVENTS: &str = "process-trial-source-events-v3";
 pub const KERNEL_SOURCE_REVISION: &str = "linux-proc-stat-v1";
 pub const KERNEL_ADAPTER_REVISION: u32 = 1;
 pub const KERNEL_ELIGIBLE_EVENTS: &str = "linux-proc-state-snapshot-v1";
+pub const INPUT_SOURCE_REVISION: &str = "linux-proc-inputs-v1";
+pub const INPUT_ELIGIBLE_EVENTS: &str = "linux-proc-inputs-snapshot-v1";
+
+pub fn is_owned_revision(revision: &str) -> bool {
+    matches!(
+        revision,
+        SOURCE_REVISION | KERNEL_SOURCE_REVISION | INPUT_SOURCE_REVISION
+    )
+}
 const LIMIT: usize = 65_536;
 const SOURCE_BYTES: u64 = 262_144;
 const SOURCE_RECORDS: u64 = 64;
@@ -164,6 +173,10 @@ pub fn source_launch(input: &[u8], snapshot: &Path, caller_pid: u32) -> Result<S
     })
 }
 
+pub fn input_adapter_version() -> String {
+    format!("{INPUT_SOURCE_REVISION}:capture-{KERNEL_ADAPTER_REVISION}")
+}
+
 pub fn kernel_adapter_version() -> String {
     format!("{KERNEL_SOURCE_REVISION}:capture-{KERNEL_ADAPTER_REVISION}")
 }
@@ -192,6 +205,7 @@ struct Header {
     execution_key: Option<String>,
     launch_event: Option<String>,
     argv: Option<Vec<String>>,
+    config: Option<Value>,
     returncode: Option<i32>,
 }
 
@@ -445,8 +459,9 @@ pub fn records(
     snapshot: &Path,
     manifest_ref: &str,
     kernel_manifest: &str,
+    input_manifest: &str,
 ) -> Result<Vec<Observation>> {
-    if [manifest_ref, kernel_manifest]
+    if [manifest_ref, kernel_manifest, input_manifest]
         .iter()
         .any(|value| value.len() != 64 || !value.bytes().all(|byte| byte.is_ascii_hexdigit()))
     {
@@ -514,6 +529,11 @@ pub fn records(
         })
         .collect();
     }
+    let inputs = if kernel.is_some() && header.event == "trial_launch" {
+        execution_inputs(&header).unwrap_or_default()
+    } else {
+        vec![]
+    };
     let primary = CaptureRecordInput {
         spool_record_id: Some(header.event_key.clone()),
         source_observation_id_hint: None,
@@ -561,8 +581,93 @@ pub fn records(
         && let Ok(probe) = kernel_observation(raw, process, kernel_manifest)
     {
         observations.push(probe);
+        for (endpoint, raw) in inputs {
+            let Ok(Observation(mut input)) = kernel_observation(raw, process, input_manifest)
+            else {
+                continue;
+            };
+            input.source_instance_id.push(':');
+            input.source_instance_id.push_str(endpoint);
+            input.source_revision = INPUT_SOURCE_REVISION.into();
+            input.identity_domain = INPUT_SOURCE_REVISION.into();
+            input.source_ref = format!(
+                "procfs:/proc/{}/{endpoint}@{}",
+                process.pid, process.start_ticks
+            );
+            input.eligible_event_manifest_ref = INPUT_ELIGIBLE_EVENTS.into();
+            observations.push(Observation(input));
+        }
     }
     Ok(observations)
+}
+
+// Preserve the original NUL-delimited procfs bytes. Unknown environment keys,
+// missing fields or disagreement with the declared bounded input are not archived.
+fn accepted_environment(raw: &[u8], config: Option<&Value>) -> bool {
+    let Some(declared) = config
+        .and_then(|value| value.get("environment"))
+        .and_then(Value::as_object)
+    else {
+        return false;
+    };
+    let keys = [
+        "HOME",
+        "LANG",
+        "PATH",
+        "PYTEST_DISABLE_PLUGIN_AUTOLOAD",
+        "PYTHONDONTWRITEBYTECODE",
+    ];
+    if declared.len() != keys.len()
+        || keys
+            .iter()
+            .any(|key| declared.get(*key).and_then(Value::as_str).is_none())
+        || !raw.ends_with(&[0])
+    {
+        return false;
+    }
+    let mut seen = BTreeSet::new();
+    for entry in raw[..raw.len() - 1].split(|byte| *byte == 0) {
+        let Ok(entry) = std::str::from_utf8(entry) else {
+            return false;
+        };
+        let Some((key, value)) = entry.split_once('=') else {
+            return false;
+        };
+        if !seen.insert(key) || declared.get(key).and_then(Value::as_str) != Some(value) {
+            return false;
+        }
+    }
+    seen.len() == keys.len()
+}
+
+fn execution_inputs(header: &Header) -> Result<Vec<(&'static str, Vec<u8>)>> {
+    let identity = header.process.as_ref().ok_or(ProcessSourceError)?;
+    let root = Path::new("/proc").join(identity.pid.to_string());
+    let command = bytes(&root.join("cmdline"))?;
+    let args = header.argv.as_ref().ok_or(ProcessSourceError)?;
+    let declared = args
+        .iter()
+        .flat_map(|arg| arg.bytes().chain(std::iter::once(0)))
+        .collect::<Vec<_>>();
+    if command.is_empty() || command != declared {
+        return Err(ProcessSourceError);
+    }
+    let mut inputs = vec![("cmdline", command)];
+    if let Ok(environment) = bytes(&root.join("environ"))
+        && accepted_environment(&environment, header.config.as_ref())
+    {
+        inputs.push(("environ", environment));
+    }
+    // This is the exact child already checked by physical_scope, not a source
+    // locator. Recheck birth/parent after reads, before admitting either snapshot.
+    let observed = stat(&identity.pid.to_string())?;
+    if observed.start != identity.start_ticks
+        || observed.parent != header.controller.pid
+        || observed.state == "Z"
+    {
+        return Err(ProcessSourceError);
+    }
+    Ok(inputs)
 }
 
 fn kernel_observation(

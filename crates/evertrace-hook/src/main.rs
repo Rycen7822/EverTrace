@@ -126,11 +126,18 @@ fn run() -> Result<(), ()> {
                         evertrace_capture::process_source::KERNEL_ELIGIBLE_EVENTS,
                     )
                     .map_err(|_| ())?;
+                let input_contract =
+                    evertrace_codex::probe::HostProbeReport::unobserved_source_contract(
+                        &evertrace_capture::process_source::input_adapter_version(),
+                        evertrace_capture::process_source::INPUT_ELIGIBLE_EVENTS,
+                    )
+                    .map_err(|_| ())?;
                 let mut records = evertrace_capture::process_source::records(
                     &bytes,
                     path,
                     &contract.manifest().adapter_manifest_id,
                     &kernel_contract.manifest().adapter_manifest_id,
+                    &input_contract.manifest().adapter_manifest_id,
                 )
                 .map_err(|_| ())?
                 .into_iter();
