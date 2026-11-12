@@ -26,11 +26,11 @@ use uuid::Uuid;
 
 use crate::{CaptureRecordInput, ConfinedFile, ConfinedReadLimits, ConfinedRoot};
 
-const PREFIX: &[u8] = b"{\"format\":\"process-trial-source-v2\",";
-const FORMAT: &str = "process-trial-source-v2";
+const PREFIX: &[u8] = b"{\"format\":\"process-trial-source-v3\",";
+const FORMAT: &str = "process-trial-source-v3";
 pub const SOURCE_REVISION: &str =
-    "process-trial-source-v2:79ba882813eea69af109ace6016462953d63b7c97677392d6673c96bebeee9d6";
-pub const ADAPTER_REVISION: u32 = 7;
+    "process-trial-source-v3:34f3ac803868e39a12ec71b7c5cfb0c0415108a06f7883a72ae887c808507b63";
+pub const ADAPTER_REVISION: u32 = 8;
 pub const ELIGIBLE_EVENTS: &str = "process-trial-source-events-v3";
 pub const KERNEL_SOURCE_REVISION: &str = "linux-proc-stat-v1";
 pub const KERNEL_ADAPTER_REVISION: u32 = 1;
@@ -40,11 +40,18 @@ pub const INPUT_ELIGIBLE_EVENTS: &str = "linux-proc-inputs-snapshot-v1";
 pub const OUTPUT_SOURCE_REVISION: &str = "junit-xunit2-output-v1";
 pub const OUTPUT_ELIGIBLE_EVENTS: &str = "junit-xunit2-output-snapshot-v1";
 
+pub const CONDITIONS_SOURCE_REVISION: &str = "python-execution-conditions-v1";
+pub const CONDITIONS_ELIGIBLE_EVENTS: &str = "python-execution-conditions-snapshot-v1";
+
 pub fn is_owned_revision(revision: &str) -> bool {
-    matches!(
-        revision,
-        SOURCE_REVISION | KERNEL_SOURCE_REVISION | INPUT_SOURCE_REVISION | OUTPUT_SOURCE_REVISION
-    )
+    revision.starts_with("process-trial-source-v")
+        || matches!(
+            revision,
+            KERNEL_SOURCE_REVISION
+                | INPUT_SOURCE_REVISION
+                | OUTPUT_SOURCE_REVISION
+                | CONDITIONS_SOURCE_REVISION
+        )
 }
 const LIMIT: usize = 65_536;
 const SOURCE_BYTES: u64 = 262_144;
@@ -139,7 +146,9 @@ pub fn source_launch(input: &[u8], snapshot: &Path, caller_pid: u32) -> Result<S
         }
     }
     let script = peer_at(&header, &caller_image, snapshot, caller_pid)?;
-    published_record(input, &header, &script)?;
+    if published_record(input, &header, &script)?.1.is_none() {
+        return Err(ProcessSourceError);
+    }
     physical_scope(&header)?;
     let directory = fs::read_link(format!("/proc/{}/cwd", header.controller.pid))
         .map_err(|_| ProcessSourceError)?;
@@ -179,6 +188,10 @@ pub fn output_adapter_version() -> String {
     format!("{OUTPUT_SOURCE_REVISION}:capture-{KERNEL_ADAPTER_REVISION}")
 }
 
+pub fn conditions_adapter_version() -> String {
+    format!("{CONDITIONS_SOURCE_REVISION}:capture-{KERNEL_ADAPTER_REVISION}")
+}
+
 pub fn input_adapter_version() -> String {
     format!("{INPUT_SOURCE_REVISION}:capture-{KERNEL_ADAPTER_REVISION}")
 }
@@ -209,6 +222,7 @@ struct Header {
     controller: ProcessIdentity,
     process: Option<ProcessIdentity>,
     execution_key: Option<String>,
+    execution_ordinal: Option<u32>,
     launch_event: Option<String>,
     argv: Option<Vec<String>>,
     config: Option<Value>,
@@ -388,6 +402,22 @@ fn physical_scope(header: &Header) -> Result<(String, Vec<u8>)> {
         }
         if header.event == "trial_launch" {
             let args = header.argv.as_ref().ok_or(ProcessSourceError)?;
+            let names = args
+                .iter()
+                .filter_map(|arg| arg.strip_prefix("--junitxml="))
+                .collect::<Vec<_>>();
+            let expected = format!(
+                "trial-{}.xml",
+                header.execution_key.as_deref().ok_or(ProcessSourceError)?
+            );
+            if names.len() != 1
+                || Path::new(names[0])
+                    .file_name()
+                    .and_then(|name| name.to_str())
+                    != Some(expected.as_str())
+            {
+                return Err(ProcessSourceError);
+            }
             let mut command = Vec::new();
             for arg in args {
                 command.extend_from_slice(arg.as_bytes());
@@ -432,6 +462,7 @@ fn decode(raw: &[u8]) -> Result<(Header, ObservationRole)> {
                 | "launch_event"
                 | "process"
                 | "execution_key"
+                | "execution_ordinal"
                 | "returncode"
                 | "scorer"
                 | "outcomes"
@@ -468,12 +499,14 @@ pub fn records(
     kernel_manifest: &str,
     input_manifest: &str,
     output_manifest: &str,
+    conditions_manifest: &str,
 ) -> Result<Vec<Observation>> {
     if [
         manifest_ref,
         kernel_manifest,
         input_manifest,
         output_manifest,
+        conditions_manifest,
     ]
     .iter()
     .any(|value| value.len() != 64 || !value.bytes().all(|byte| byte.is_ascii_hexdigit()))
@@ -483,7 +516,7 @@ pub fn records(
     let (header, role) = decode(raw)?;
     let executable = std::env::current_exe().map_err(|_| ProcessSourceError)?;
     let script = peer(&header, &executable, snapshot)?;
-    let (source_range, has_launch) = published_record(raw, &header, &script)?;
+    let (source_range, native_ordinal) = published_record(raw, &header, &script)?;
     let source_instance_id = format!(
         "process:{}:{}:{}:{}",
         header.controller.boot_id,
@@ -509,10 +542,12 @@ pub fn records(
         partial_correlation_ref: None,
         possible_duplicate_group_id: None,
     };
-    // A matched launch and kernel identity do not prove a physical execution counter.
-    // Keep that axis unknown: the source's publication cursor is not a retry discriminator.
+    // Only v3's actual successful Popen counter, linked to the original launch, may
+    // populate this candidate axis. Its own gate is still unavailable; never use a cursor.
     let mut kernel = None;
-    if has_launch && let Ok((scope, stat)) = physical_scope(&header) {
+    if let Some(ordinal) = native_ordinal
+        && let Ok((scope, stat)) = physical_scope(&header)
+    {
         kernel = Some(stat);
         let evidence = source_observation_id(
             &SourceInstanceId::parse(&source_instance_id).map_err(|_| ProcessSourceError)?,
@@ -525,12 +560,14 @@ pub fn records(
         correlation.host_lane_key = Some(scope);
         correlation.canonical_event_family = Some(CanonicalEventFamily::Verify);
         correlation.native_request_id = header.execution_key.clone();
+        correlation.physical_execution_ordinal = Some(ordinal);
         correlation.field_provenance = [
             CorrelationField::HostInstanceId,
             CorrelationField::HostTraceLineageId,
             CorrelationField::HostLaneKey,
             CorrelationField::CanonicalEventFamily,
             CorrelationField::NativeRequestId,
+            CorrelationField::PhysicalExecutionOrdinal,
         ]
         .into_iter()
         .map(|field| CorrelationFieldClaim {
@@ -547,6 +584,11 @@ pub fn records(
     };
     let output = if kernel.is_some() && header.event == "trial_finished" {
         execution_output(&header, &script).ok()
+    } else {
+        None
+    };
+    let conditions = if inputs.len() == 2 {
+        execution_conditions(&header, &script).ok()
     } else {
         None
     };
@@ -585,7 +627,7 @@ pub fn records(
         adapter_revision: ADAPTER_REVISION,
         adapter_manifest_ref: manifest_ref.into(),
         eligible_event_manifest_ref: ELIGIBLE_EVENTS.into(),
-        parser_revision: 4,
+        parser_revision: 5,
         canonicalization_revision: 1,
         // The original clock value remains in raw bytes; its uncertainty is not qualified.
         event_time_us: None,
@@ -613,15 +655,32 @@ pub fn records(
             input.eligible_event_manifest_ref = INPUT_ELIGIBLE_EVENTS.into();
             observations.push(Observation(input));
         }
-        if let Some((raw, reference)) = output
-            && let Ok(Observation(mut artifact)) = kernel_observation(raw, process, output_manifest)
-        {
-            artifact.source_instance_id.push_str(":junit");
-            artifact.source_revision = OUTPUT_SOURCE_REVISION.into();
-            artifact.identity_domain = OUTPUT_SOURCE_REVISION.into();
-            artifact.source_ref = reference;
-            artifact.eligible_event_manifest_ref = OUTPUT_ELIGIBLE_EVENTS.into();
-            observations.push(Observation(artifact));
+        for (file, manifest, revision, events, suffix) in [
+            (
+                output,
+                output_manifest,
+                OUTPUT_SOURCE_REVISION,
+                OUTPUT_ELIGIBLE_EVENTS,
+                ":junit",
+            ),
+            (
+                conditions,
+                conditions_manifest,
+                CONDITIONS_SOURCE_REVISION,
+                CONDITIONS_ELIGIBLE_EVENTS,
+                ":runtime",
+            ),
+        ] {
+            if let Some((raw, reference)) = file
+                && let Ok(Observation(mut artifact)) = kernel_observation(raw, process, manifest)
+            {
+                artifact.source_instance_id.push_str(suffix);
+                artifact.source_revision = revision.into();
+                artifact.identity_domain = revision.into();
+                artifact.source_ref = reference;
+                artifact.eligible_event_manifest_ref = events.into();
+                observations.push(Observation(artifact));
+            }
         }
     }
     Ok(observations)
@@ -849,18 +908,14 @@ pub fn closed_records(primary: &Observation, snapshot: &Path) -> Result<Vec<Obse
     Ok(records)
 }
 
-/// Read the native output at the fixed source format's execution-key path.
-fn execution_output(header: &Header, script: &Path) -> Result<(Vec<u8>, String)> {
+/// Read only fixed source-native execution filenames, never the declared locator.
+fn execution_file(header: &Header, script: &Path, suffix: &str) -> Result<(Vec<u8>, String)> {
     let execution = header.execution_key.as_deref().ok_or(ProcessSourceError)?;
     if !uuid(execution) {
         return Err(ProcessSourceError);
     }
-    let scorer = header.scorer.as_ref().ok_or(ProcessSourceError)?;
-    if scorer.get("format").and_then(Value::as_str) != Some("pytest-junit-xunit2") {
-        return Err(ProcessSourceError);
-    }
     let directory = script.parent().ok_or(ProcessSourceError)?;
-    let relative = format!("trial-{execution}.xml");
+    let relative = format!("trial-{execution}.{suffix}");
     let root = ConfinedRoot::open_external_source(directory).map_err(|_| ProcessSourceError)?;
     let file = root
         .read(
@@ -873,20 +928,49 @@ fn execution_output(header: &Header, script: &Path) -> Result<(Vec<u8>, String)>
             },
         )
         .map_err(|_| ProcessSourceError)?;
-    if scorer
-        .get("original_xml")
-        .and_then(Value::as_str)
-        .map(str::as_bytes)
-        != Some(file.bytes.as_slice())
-    {
-        return Err(ProcessSourceError);
-    }
     physical_scope(header)?;
     let reference = format!(
         "file-native:{}:{}:{relative}",
         file.identity.device, file.identity.inode
     );
     Ok((file.bytes, reference))
+}
+
+fn execution_output(header: &Header, script: &Path) -> Result<(Vec<u8>, String)> {
+    let scorer = header.scorer.as_ref().ok_or(ProcessSourceError)?;
+    if scorer.get("format").and_then(Value::as_str) != Some("pytest-junit-xunit2") {
+        return Err(ProcessSourceError);
+    }
+    let (raw, reference) = execution_file(header, script, "xml")?;
+    if scorer
+        .get("original_xml")
+        .and_then(Value::as_str)
+        .map(str::as_bytes)
+        != Some(raw.as_slice())
+    {
+        return Err(ProcessSourceError);
+    }
+    Ok((raw, reference))
+}
+
+fn execution_conditions(header: &Header, script: &Path) -> Result<(Vec<u8>, String)> {
+    let (raw, reference) = execution_file(header, script, "conditions.json")?;
+    let value: Value = serde_json::from_slice(&raw).map_err(|_| ProcessSourceError)?;
+    let process: ProcessIdentity =
+        serde_json::from_value(value.get("process").ok_or(ProcessSourceError)?.clone())
+            .map_err(|_| ProcessSourceError)?;
+    let declared = header
+        .config
+        .as_ref()
+        .and_then(|config| config.get("environment"));
+    if value.get("format").and_then(Value::as_str) != Some(CONDITIONS_SOURCE_REVISION)
+        || Some(&process) != header.process.as_ref()
+        || declared.is_none()
+        || value.get("environment") != declared
+    {
+        return Err(ProcessSourceError);
+    }
+    Ok((raw, reference))
 }
 
 /// Read only the live verified publisher's owned output, never a caller-supplied locator.
@@ -961,13 +1045,13 @@ fn published_record(
     raw: &[u8],
     selected: &Header,
     script: &Path,
-) -> Result<(EvidenceByteRange, bool)> {
+) -> Result<(EvidenceByteRange, Option<u32>)> {
     let deadline = Instant::now() + Duration::from_millis(50);
     let (_, file) = published_file(script, &selected.controller, deadline)?;
     let mut keys = BTreeSet::new();
     let mut offset = 0;
     let mut found = None;
-    let mut has_launch = false;
+    let mut launch = None;
     let mut count = 0;
     for line in file.bytes.split_inclusive(|byte| *byte == b'\n') {
         let (header, _) = decode(line)?;
@@ -992,24 +1076,28 @@ fn published_record(
                 end: offset + line.len() as u64,
             });
         }
-        if header.event == "trial_launch"
-            && (header.event_key == selected.event_key
-                || selected.launch_event.as_deref() == Some(header.event_key.as_str()))
+        if launch.is_none()
+            && header.event == "trial_launch"
+            && header.execution_key.is_some()
+            && header.execution_key == selected.execution_key
         {
-            if has_launch
-                || header.execution_key != selected.execution_key
-                || header.process != selected.process
-                || header.sequence > selected.sequence
-            {
-                return Err(ProcessSourceError);
-            }
-            has_launch = true;
+            launch = Some(header);
         }
         offset += line.len() as u64;
     }
     let range = found.ok_or(ProcessSourceError)?;
-    if matches!(selected.event.as_str(), "trial_started" | "trial_finished") && !has_launch {
-        return Err(ProcessSourceError);
-    }
-    Ok((range, has_launch))
+    let ordinal = launch
+        .filter(|launch| {
+            launch.sequence <= selected.sequence
+                && launch.process == selected.process
+                && launch.execution_ordinal == selected.execution_ordinal
+                && if selected.event == "trial_launch" {
+                    selected.event_key == launch.event_key
+                } else {
+                    selected.launch_event.as_deref() == Some(launch.event_key.as_str())
+                }
+        })
+        .and_then(|launch| launch.execution_ordinal)
+        .filter(|ordinal| *ordinal != 0);
+    Ok((range, ordinal))
 }

@@ -299,7 +299,7 @@ impl ProcessWorkDeclaration {
             "process:{}:{}:{}:{}",
             controller.boot_id, controller.pid_namespace, controller.pid, controller.start_ticks
         );
-        (value.format == "process-trial-source-v2"
+        (value.format == "process-trial-source-v3"
             && value.event == "study_opened"
             && value.study_key == value.definition.study_key
             && receipt.source_sequence == 1
@@ -1050,7 +1050,7 @@ impl ControlledRunResolver {
             || receipt.adapter_revision != process_source::ADAPTER_REVISION
             || receipt.adapter_manifest_ref != manifest.manifest().adapter_manifest_id
             || receipt.eligible_event_manifest_ref != process_source::ELIGIBLE_EVENTS
-            || receipt.parser_revision != 4
+            || receipt.parser_revision != 5
             || receipt.capture_completeness != CaptureCompleteness::Partial
             || observation.capture_completeness != CaptureCompleteness::Partial
             || observation.source_role != SourceRole::Tool
