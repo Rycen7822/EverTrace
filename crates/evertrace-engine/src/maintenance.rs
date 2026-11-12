@@ -1891,16 +1891,18 @@ impl BackgroundScheduler {
                     repositories.insert(id.parse().map_err(|_| BackgroundSchedulerError::Store)?);
                 }
             }
-            let native_goal = current
-                .source_observation(source)
-                .is_some_and(|(value, _)| {
-                    evertrace_capture::goal_source::is_source_revision(
-                        value.source_revision.as_str(),
-                    )
-                });
-            // A source goal uses its independently verified publisher's policy,
-            // never another installed Host report or the daemon's HOME fallback.
-            if !native_goal
+            let source_owned_policy =
+                current
+                    .source_observation(source)
+                    .is_some_and(|(value, _)| {
+                        evertrace_capture::goal_source::is_source_revision(
+                            value.source_revision.as_str(),
+                        ) || value.source_revision.as_str()
+                            == evertrace_capture::process_source::SOURCE_REVISION
+                    });
+            // Source Work uses its independently verified RootGoal publisher's
+            // policy, never another installed Host or the daemon's HOME fallback.
+            if !source_owned_policy
                 && !crate::repository::blocked_repositories(
                     &self.writer,
                     repositories.clone(),
@@ -1931,7 +1933,7 @@ impl BackgroundScheduler {
                 effective_config_hash: self.runtime.effective_config_hash,
                 algorithm_revision: "controlled_run_resolver_v1",
             };
-            let resolution = if native_goal {
+            let resolution = if source_owned_policy {
                 let resolver = resolver.clone();
                 let key_dir = self.runtime.device_key_dir.clone();
                 tokio::task::spawn_blocking(move || {
@@ -1964,7 +1966,7 @@ impl BackgroundScheduler {
             {
                 continue;
             }
-            let authority = if native_goal {
+            let authority = if source_owned_policy {
                 policy.as_ref().map_or(
                     crate::repository::RepositoryReadAuthority::Unavailable,
                     crate::repository::RepositoryReadAuthority::Source,

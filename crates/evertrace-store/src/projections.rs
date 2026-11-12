@@ -3849,7 +3849,11 @@ pub fn read_dependencies_for(row: &ObjectRow, payload: &JournalPayload) -> BTree
                     .map(ToString::to_string),
             );
         }
+        JournalPayload::WorkstreamRecorded(value) => {
+            refs.extend(value.worktree_lineage_refs.iter().cloned());
+        }
         JournalPayload::WorkEpisodeRecorded(value) => {
+            refs.insert(value.workstream_id.to_string());
             refs.extend(
                 value
                     .capture_receipt_revision_ids
@@ -3869,6 +3873,7 @@ pub fn read_dependencies_for(row: &ObjectRow, payload: &JournalPayload) -> BTree
             );
         }
         JournalPayload::AttemptRecorded(value) => {
+            refs.insert(value.workstream_id.to_string());
             refs.extend(
                 value
                     .local_outcome_refs
