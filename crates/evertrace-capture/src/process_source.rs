@@ -30,7 +30,7 @@ const PREFIX: &[u8] = b"{\"format\":\"process-trial-source-v2\",";
 const FORMAT: &str = "process-trial-source-v2";
 pub const SOURCE_REVISION: &str =
     "process-trial-source-v2:79ba882813eea69af109ace6016462953d63b7c97677392d6673c96bebeee9d6";
-pub const ADAPTER_REVISION: u32 = 6;
+pub const ADAPTER_REVISION: u32 = 7;
 pub const ELIGIBLE_EVENTS: &str = "process-trial-source-events-v3";
 pub const KERNEL_SOURCE_REVISION: &str = "linux-proc-stat-v1";
 pub const KERNEL_ADAPTER_REVISION: u32 = 1;
@@ -483,7 +483,7 @@ pub fn records(
     let (header, role) = decode(raw)?;
     let executable = std::env::current_exe().map_err(|_| ProcessSourceError)?;
     let script = peer(&header, &executable, snapshot)?;
-    let (source_range, ordinal) = published_record(raw, &header, &script)?;
+    let (source_range, has_launch) = published_record(raw, &header, &script)?;
     let source_instance_id = format!(
         "process:{}:{}:{}:{}",
         header.controller.boot_id,
@@ -509,10 +509,10 @@ pub fn records(
         partial_correlation_ref: None,
         possible_duplicate_group_id: None,
     };
-    // Failed/missing kernel evidence remains an original untrusted/partial record with no
-    // physical claims. Even verified fields cannot form an Exact key without a qualified gate.
+    // A matched launch and kernel identity do not prove a physical execution counter.
+    // Keep that axis unknown: the source's publication cursor is not a retry discriminator.
     let mut kernel = None;
-    if let (Ok((scope, stat)), Some(ordinal)) = (physical_scope(&header), ordinal) {
+    if has_launch && let Ok((scope, stat)) = physical_scope(&header) {
         kernel = Some(stat);
         let evidence = source_observation_id(
             &SourceInstanceId::parse(&source_instance_id).map_err(|_| ProcessSourceError)?,
@@ -525,14 +525,12 @@ pub fn records(
         correlation.host_lane_key = Some(scope);
         correlation.canonical_event_family = Some(CanonicalEventFamily::Verify);
         correlation.native_request_id = header.execution_key.clone();
-        correlation.physical_execution_ordinal = Some(ordinal);
         correlation.field_provenance = [
             CorrelationField::HostInstanceId,
             CorrelationField::HostTraceLineageId,
             CorrelationField::HostLaneKey,
             CorrelationField::CanonicalEventFamily,
             CorrelationField::NativeRequestId,
-            CorrelationField::PhysicalExecutionOrdinal,
         ]
         .into_iter()
         .map(|field| CorrelationFieldClaim {
@@ -963,13 +961,13 @@ fn published_record(
     raw: &[u8],
     selected: &Header,
     script: &Path,
-) -> Result<(EvidenceByteRange, Option<u32>)> {
+) -> Result<(EvidenceByteRange, bool)> {
     let deadline = Instant::now() + Duration::from_millis(50);
     let (_, file) = published_file(script, &selected.controller, deadline)?;
     let mut keys = BTreeSet::new();
     let mut offset = 0;
     let mut found = None;
-    let mut launch = None;
+    let mut has_launch = false;
     let mut count = 0;
     for line in file.bytes.split_inclusive(|byte| *byte == b'\n') {
         let (header, _) = decode(line)?;
@@ -998,21 +996,20 @@ fn published_record(
             && (header.event_key == selected.event_key
                 || selected.launch_event.as_deref() == Some(header.event_key.as_str()))
         {
-            if launch.is_some()
+            if has_launch
                 || header.execution_key != selected.execution_key
                 || header.process != selected.process
                 || header.sequence > selected.sequence
             {
                 return Err(ProcessSourceError);
             }
-            // Use the publisher's actual launch cursor, not an invented retry count.
-            launch = Some(u32::try_from(header.sequence).map_err(|_| ProcessSourceError)?);
+            has_launch = true;
         }
         offset += line.len() as u64;
     }
     let range = found.ok_or(ProcessSourceError)?;
-    if matches!(selected.event.as_str(), "trial_started" | "trial_finished") && launch.is_none() {
+    if matches!(selected.event.as_str(), "trial_started" | "trial_finished") && !has_launch {
         return Err(ProcessSourceError);
     }
-    Ok((range, launch))
+    Ok((range, has_launch))
 }
