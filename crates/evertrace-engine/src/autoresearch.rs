@@ -200,20 +200,45 @@ fn source_resolved(
     }
     if matches!(envelope, SourceCandidate::WorkPlan(_)) {
         let reference = observation.source_observation_id.to_string();
-        return current.other_data_rows().any(|row| {
-            if row.object_kind.as_deref() != Some("workstream") {
-                return false;
-            }
-            let Some(JournalPayload::WorkstreamRecorded(value)) = row
-                .payload_json
-                .as_deref()
-                .and_then(|json| serde_json::from_str::<JournalPayload>(json).ok())
-            else {
-                return false;
-            };
-            value.worktree_lineage_refs.contains(&reference)
-                && (value.active_episode_id.is_some() || value.status.is_terminal())
-        });
+        let deadline = std::time::Instant::now() + std::time::Duration::from_millis(40);
+        return current
+            .other_data_rows()
+            .take_while(|_| std::time::Instant::now() < deadline)
+            .any(|row| {
+                if row.object_kind.as_deref() != Some("workstream") {
+                    return false;
+                }
+                let Some(JournalPayload::WorkstreamRecorded(value)) = row
+                    .payload_json
+                    .as_deref()
+                    .and_then(|json| serde_json::from_str::<JournalPayload>(json).ok())
+                else {
+                    return false;
+                };
+                value.worktree_lineage_refs.contains(&reference)
+                    && (value.status.is_terminal()
+                        || (value.active_episode_id.is_some()
+                            && current
+                                .other_data_rows()
+                                .take_while(|_| std::time::Instant::now() < deadline)
+                                .any(|row| {
+                                    if row.object_kind.as_deref() != Some("work_binding") {
+                                        return false;
+                                    }
+                                    let Some(JournalPayload::WorkBindingRecorded(binding)) =
+                                        row.payload_json.as_deref().and_then(|json| {
+                                            serde_json::from_str::<JournalPayload>(json).ok()
+                                        })
+                                    else {
+                                        return false;
+                                    };
+                                    binding.assignment_status == AssignmentStatus::Resolved
+                                        && binding.primary_binding.task_id == Some(value.task_id)
+                                        && binding.primary_binding.workstream_id
+                                            == Some(value.workstream_id)
+                                        && binding.evidence_refs.contains(&reference)
+                                })))
+            });
     }
     let SourceCandidate::Run(envelope) = envelope else {
         return false;
@@ -1199,6 +1224,9 @@ impl ControlledRunResolver {
                 .get(&anchor)
                 .ok_or(AutoresearchError::EvidenceIncomplete)?,
             session: &facts.receipt(native)?.source_session_ref,
+            effect,
+            root_source: native,
+            goal_source: goal,
         };
         let command = process_work_command(
             snapshot,
@@ -1744,6 +1772,9 @@ struct ProcessWorkAnchor<'a> {
     repository: evertrace_domain::ids::RepositoryId,
     snapshot: &'a WorktreeSnapshot,
     session: &'a str,
+    effect: &'a evertrace_domain::evidence::ScopeEffect,
+    root_source: SourceObservationId,
+    goal_source: SourceObservationId,
 }
 
 fn process_work_command(
@@ -1779,8 +1810,31 @@ fn process_work_command(
         {
             return Err(AutoresearchError::ImmutableConflict);
         }
-        if stream.active_episode_id.is_some() || stream.status.is_terminal() {
+        if stream.status.is_terminal() {
             return Ok(None);
+        }
+        if stream.active_episode_id.is_some() {
+            let view = evertrace_store::WorkIdentityCurrentView::from_snapshot(snapshot)?;
+            let sources = vec![
+                source.to_string(),
+                anchor.root_source.to_string(),
+                anchor.goal_source.to_string(),
+            ];
+            let binding = crate::work::binding::source_root_workstream(
+                &view,
+                stream,
+                anchor.effect.operation_id,
+                anchor.effect.scope_effect_id,
+                facts.bindings.get(&anchor.effect.operation_id),
+                &sources,
+            )
+            .map_err(map_error)?
+            .into_revision();
+            return binding
+                .map(|binding| {
+                    crate::work::binding::record_binding(context, binding).map_err(map_error)
+                })
+                .transpose();
         }
         let attempts = facts
             .attempts

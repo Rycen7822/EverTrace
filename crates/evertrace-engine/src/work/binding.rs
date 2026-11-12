@@ -107,6 +107,85 @@ pub(crate) fn source_root_task(
     super::task::create_task(context, task).map(Some)
 }
 
+/// The source resolver has independently verified the publisher, controller and
+/// declared Work provenance. This establishes Root Task/Workstream ownership,
+/// not an Episode boundary, strategy execution, verifier or ExperimentRun.
+pub(crate) fn source_root_workstream(
+    view: &WorkIdentityCurrentView,
+    stream: &evertrace_domain::work::Workstream,
+    operation: OperationId,
+    scope: ScopeEffectId,
+    current: Option<&WorkBindingRevision>,
+    sources: &[String],
+) -> Result<BindingResolution, WorkIdentityError> {
+    if let Some(current) = current {
+        current
+            .validate()
+            .map_err(|_| WorkIdentityError::InvalidInput)?;
+        if current.operation_id != operation {
+            return Err(WorkIdentityError::InvalidInput);
+        }
+        let primary = &current.primary_binding;
+        if current.assignment_status == AssignmentStatus::Conflicted
+            || (current.assignment_status == AssignmentStatus::Resolved
+                && (primary.task_id != Some(stream.task_id)
+                    || primary.workstream_id != Some(stream.workstream_id)))
+            || (current.assignment_status != AssignmentStatus::Resolved
+                && (primary.episode_id.is_some()
+                    || primary.attempt_id.is_some()
+                    || primary.experiment_run_id.is_some()
+                    || primary.competing_group_id.is_some()))
+        {
+            return Ok(BindingResolution::NoDelta);
+        }
+        if current.assignment_status == AssignmentStatus::Resolved {
+            let mut next = current.clone();
+            next.evidence_refs.extend_from_slice(sources);
+            next.evidence_refs.sort();
+            next.evidence_refs.dedup();
+            next.scope_effect_refs.push(scope);
+            next.scope_effect_refs.sort();
+            next.scope_effect_refs.dedup();
+            if next.evidence_refs == current.evidence_refs
+                && next.scope_effect_refs == current.scope_effect_refs
+            {
+                return Ok(BindingResolution::NoDelta);
+            }
+            next.work_binding_revision_id = WorkBindingRevisionId::new_v7();
+            next.revision_generation = current
+                .revision_generation
+                .checked_add(1)
+                .ok_or(WorkIdentityError::InvalidInput)?;
+            next.predecessor_revision_id = Some(current.work_binding_revision_id);
+            current
+                .validate_successor(&next)
+                .map_err(|_| WorkIdentityError::InvalidInput)?;
+            return Ok(BindingResolution::Revision(Box::new(next)));
+        }
+    }
+    let mut scopes = current.map_or_else(Vec::new, |value| value.scope_effect_refs.clone());
+    scopes.push(scope);
+    scopes.sort();
+    scopes.dedup();
+    let evidence = sources
+        .iter()
+        .map(|source| BindingEvidence {
+            strength: BindingEvidenceStrength::Strong,
+            evidence_ref: source.clone(),
+            task_id: stream.task_id,
+            workstream_id: stream.workstream_id,
+        })
+        .collect::<Vec<_>>();
+    resolve_binding(
+        view,
+        operation,
+        current,
+        scopes,
+        current.map_or_else(Vec::new, |value| value.secondary_bindings.clone()),
+        &evidence,
+    )
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum BindingResolution {
     NoDelta,
