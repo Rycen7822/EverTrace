@@ -9685,10 +9685,12 @@ fn derive_repository_scope_purge_preview(
             .then_some(effect)
         })
         .collect::<Vec<_>>();
+    // Retained L0 operations must not lose their declared scope effects.
     if target_scope_effects.iter().any(|effect| {
-        effect
-            .repository_instance_id
-            .is_some_and(|id| id != repository_id)
+        !target_operation_ids.contains(&effect.operation_id)
+            || effect
+                .repository_instance_id
+                .is_some_and(|id| id != repository_id)
             || effect
                 .worktree_instance_id
                 .is_some_and(|id| !worktree_ids.contains(&id))
