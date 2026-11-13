@@ -3,8 +3,7 @@ import asyncio
 import json
 
 from . import BackendError
-from .backend import _decode
-from .content import read_record_detail
+from .content import _decode_cursor, read_record_detail
 from .sources import read_source_links
 
 SUPPORT_DETAIL_KINDS = {"global_support_contract", "global_support_validation"}
@@ -27,9 +26,7 @@ async def _read_recall_trace(backend, reference, revision, request_id, after):
         raise BackendError("invalid_input")
     cursor = None
     if after is not None:
-        if not isinstance(after, str) or not 0 < len(after.encode()) <= 4096:
-            raise BackendError("invalid_input")
-        cursor = _decode(after.encode())
+        cursor = _decode_cursor(after)
         keys = {"algorithm", "reference", "revision", "request_id", "frontier", "data_identity", "after"}
         if (not isinstance(cursor, dict) or set(cursor) != keys or cursor["algorithm"] != "recall-ledger-1"
             or cursor["reference"] != reference or cursor["revision"] != revision or cursor["request_id"] != request_id

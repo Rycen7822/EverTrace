@@ -19,15 +19,20 @@ def _cursor(reference, revision, identity, source, offset, backwards):
     return encoded
 
 
+def _decode_cursor(after):
+    try:
+        raw = after.encode() if isinstance(after, str) else b""
+        if not 0 < len(raw) <= 4096:
+            raise BackendError("invalid_input")
+        return _decode(raw)
+    except (ValueError, RecursionError, BackendError) as error:
+        raise BackendError("invalid_input") from error
+
+
 def _selection(after, reference, revision):
     if after is None:
         return 0, False, None, None
-    if not isinstance(after, str) or not 0 < len(after.encode()) <= 4096:
-        raise BackendError("invalid_input")
-    try:
-        cursor = _decode(after.encode())
-    except (ValueError, UnicodeError, BackendError) as error:
-        raise BackendError("invalid_input") from error
+    cursor = _decode_cursor(after)
     if (not isinstance(cursor, dict) or set(cursor) != _CURSOR_KEYS or cursor["algorithm"] != _ALGORITHM
         or cursor["reference"] != reference or cursor["revision"] != revision
         or type(cursor["offset"]) is not int or not 0 <= cursor["offset"] < 2**64 - 8193
@@ -219,12 +224,7 @@ def _record_cursor(reference, revision, representation, identity, selection, off
 def _record_selection(after, reference, revision, representation):
     if after is None:
         return 0, False, None, None
-    if not isinstance(after, str) or not 0 < len(after.encode()) <= 4096:
-        raise BackendError("invalid_input")
-    try:
-        cursor = _decode(after.encode())
-    except (ValueError, UnicodeError, BackendError) as error:
-        raise BackendError("invalid_input") from error
+    cursor = _decode_cursor(after)
     if (not isinstance(cursor, dict) or set(cursor) != _RECORD_KEYS or cursor["algorithm"] != _RECORD_ALGORITHM
         or (cursor["reference"], cursor["revision"], cursor["representation"]) != (reference, revision, representation)
         or type(cursor["offset"]) is not int or not 0 <= cursor["offset"] < 2**64 - 8193
