@@ -9,13 +9,53 @@
   <p>这里只列选中 Need 的原有账本事实，不是全量请求日志。展示或发送成功不表示 agent 看过。</p>
   {% if page.request_id %}<p>请求筛选只用于原有 request ID 的检索结果。
   Need 与呈现尝试是 Need 级事实，没有据此归属到该请求。</p>{% endif %}
-  {% if page.history_state == 'not_recorded' %}<p>not_recorded：可核对范围内未记录该请求的检索结果。</p>
-  {% elif not page.events %}<p>本页没有匹配事实；扫描未完成或前页可能有记录，不能据此判断请求未发生。</p>{% endif %}
+  <p data-recall-history="{{ page.history_state }}">
+    {% if page.history_state == 'not_recorded' %}not_recorded：可核对范围内未记录该请求的检索结果。
+    {% elif page.history_state == 'unknown' %}unknown：扫描未完成，或前页可能有记录；本页不足以判断请求是否有历史记录。
+    {% else %}recorded：本页有已存账本事实，不表示 agent 看过或采用。{% endif %}
+  </p>
   {% for event in page.events %}
-  <article class="memory-item">
-    <h3>{{ {'need_recorded':'Need 状态记录', 'presentation_attempt':'呈现尝试', 'retrieval_outcome':'检索结果'}[event.kind] }}</h3>
+  <article class="memory-item" data-recall-event="{{ event.kind }}" data-recall-seq="{{ event.source_event_seq }}">
+    <h3>{{ {'need_recorded':'Need 状态记录', 'presentation_attempt':'呈现尝试', 'retrieval_outcome':'检索状态记录'}[event.kind] }}</h3>
     <p>原账本序列 {{ event.source_event_seq }}</p>
-    <pre class="memory-prose">{{ event|pretty }}</pre>
+    {% if event.kind == 'need_recorded' %}
+      {% set fields = [
+        ('recall_need_id', 'Need', event.recall_need_id),
+        ('revision_id', '计划修订', event.revision_id),
+        ('trigger_family', '触发族', event.trigger_family),
+        ('source_watermark', '来源水位', event.source_watermark),
+        ('delivery_state', '投递状态', event.delivery_state),
+        ('agent_response', 'Agent 响应记录', event.agent_response),
+        ('obligation_state', '义务状态', event.obligation_state),
+        ('at_time_us', 'Need 创建时间（Unix 微秒）', event.at_time_us)
+      ] %}
+    {% else %}
+      {% set fact = event.attempt if event.kind == 'presentation_attempt' else event.outcome %}
+      {% set fields = [
+        ('recall_need_id', 'Need', fact.recall_need_id),
+        ('state', '已存状态', fact.state),
+        ('occurred_at_us', '发生时间（Unix 微秒）', fact.occurred_at_us)
+      ] %}
+      {% if event.kind == 'presentation_attempt' %}
+        {% set fields = fields + [
+          ('presentation_attempt_id', '呈现尝试', fact.presentation_attempt_id),
+          ('boundary_event_ref', '边界事件', fact.boundary_event_ref)
+        ] %}
+      {% else %}
+        {% set fields = fields + [('request_id', '检索请求', fact.request_id)] %}
+      {% endif %}
+    {% endif %}
+    <dl>
+      {% for key, label, value in fields %}
+      <dt>{{ label }}</dt><dd class="memory-prose" data-recall-field="{{ key }}">{{ value }}</dd>
+      {% endfor %}
+      {% if event.kind != 'need_recorded' %}
+      <dt>已有 Need hash（十六进制）</dt>
+      <dd class="memory-prose" data-recall-field="recall_need_hash"><code>
+        {%- for byte in fact.recall_need_hash -%}{{ '%02x'|format(byte) }}{%- endfor -%}
+      </code></dd>
+      {% endif %}
+    </dl>
   </article>
   {% endfor %}
   {% if page.next_cursor %}<button class="button" type="button" data-content-nav="next">继续读取账本</button>{% endif %}
