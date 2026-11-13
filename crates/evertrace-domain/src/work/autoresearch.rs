@@ -163,6 +163,119 @@ impl ControlledRunSourceEnvelope {
 
 /// The original source event and embedded xUnit2 bytes, not a generated metric envelope.
 pub const NATIVE_TEST_RESULT_PARSER_VERSION: &str = "evertrace.native_test_result.v1";
+pub const NATIVE_TEST_CONTRACT_PARSER_VERSION: &str = "evertrace.native_test_result.v2";
+
+pub fn is_native_test_parser(version: &str) -> bool {
+    matches!(
+        version,
+        NATIVE_TEST_RESULT_PARSER_VERSION | NATIVE_TEST_CONTRACT_PARSER_VERSION
+    )
+}
+
+/// Transient compilation of the fixed original launch, never a second persisted contract.
+#[derive(Debug)]
+pub struct NativeTestContract {
+    pub started_at_us: i64,
+    pub data_fingerprint: String,
+    pub normalized_config: Vec<ContractField>,
+    pub variable_declaration: VariableDeclaration,
+}
+
+impl NativeTestContract {
+    pub fn decode(
+        raw: &[u8],
+        snapshot: &crate::repository::WorktreeSnapshot,
+        source: SourceObservationId,
+        harness_revision: &str,
+    ) -> Option<Self> {
+        let value: serde_json::Value = serde_json::from_slice(raw).ok()?;
+        let config = &value["config"];
+        let implementation = config["implementation"].as_str()?;
+        // These are the audited original external code trees, not inferred model/seed claims.
+        let tree = match implementation {
+            "baseline" => "976e7817799add9e524e38c3c95b19ac8bdf0062",
+            "biased" => "35ebe319ad4ead97d4d3b5a4115d503fb16d5116",
+            "equivalent" => "4f696277f28ed6c5721f38dc9ae2b65184201dc6",
+            _ => return None,
+        };
+        let clean = crate::evidence::hex(
+            &sha256(
+                crate::repository::TRACKED_DIFF_DIGEST_TAG,
+                1,
+                &CanonicalValue::Bytes(Vec::new()),
+            )
+            .ok()?,
+        );
+        let started_at_us = value["time_us"].as_i64()?;
+        let anchor = &value["source_anchor"];
+        let prefix = format!("native-execution-directory:{source}:");
+        if value["format"] != "process-trial-source-v4"
+            || value["event"] != "trial_launch"
+            || started_at_us < 0
+            || config["selected"] != "fixed_scorer.py::TestTaskEval"
+            || config["timeout_seconds"] != 30
+            || config["framework"] != "pytest"
+            || config["framework_version"] != "9.0.2"
+            || config["uses_model"] != false
+            || config["uses_randomness"] != false
+            || anchor["scorer_blob"] != "3472c5a70052b6b7c4c8969679fb0556a60793a9"
+            || anchor["tree"] != tree
+            || snapshot.tree_oid.as_deref() != Some(tree)
+            || snapshot.head_oid.as_deref() != anchor["commit"].as_str()
+            || snapshot.capture_status != crate::repository::SnapshotCaptureStatus::Complete
+            || snapshot.tracked_diff_digest.as_deref() != Some(clean.as_str())
+            || !snapshot
+                .evidence_refs
+                .iter()
+                .any(|reference| reference.starts_with(&prefix))
+        {
+            return None;
+        }
+        let fields = [
+            ("budget_unit", "wall_seconds_after_gate"),
+            ("harness_revision", harness_revision),
+            ("implementation", implementation),
+            ("model_use", "not_used"),
+            ("randomness", "not_used"),
+            ("selected", "fixed_scorer.py::TestTaskEval"),
+            ("timeout_seconds", "30"),
+        ];
+        let normalized_config = fields
+            .into_iter()
+            .map(|(name, value)| ContractField {
+                name: name.into(),
+                value: value.into(),
+            })
+            .collect::<Vec<_>>();
+        Some(Self {
+            started_at_us,
+            data_fingerprint: "git-blob:3472c5a70052b6b7c4c8969679fb0556a60793a9".into(),
+            variable_declaration: VariableDeclaration {
+                varied: vec!["implementation".into()],
+                fixed: normalized_config
+                    .iter()
+                    .filter(|field| field.name != "implementation")
+                    .map(|field| field.name.clone())
+                    .collect(),
+                uncontrolled: Vec::new(),
+            },
+            normalized_config,
+        })
+    }
+
+    pub fn matches_run(&self, run: &ExperimentRun) -> bool {
+        run.data_fingerprint == self.data_fingerprint
+            && run.normalized_config == self.normalized_config
+            && run.variable_declaration == self.variable_declaration
+            && run.seed_policy == SeedPolicy::Unspecified
+            && run.seed_values.is_empty()
+            && !run.nondeterministic
+            && run.metric_definition == "TestTaskEval passed tests"
+            && run.metric_extractor_version == NATIVE_TEST_CONTRACT_PARSER_VERSION
+            && run.multi_cas_metric_policy == MultiCasMetricPolicy::RejectMultipleParsed
+            && run.created_at_us <= self.started_at_us
+    }
+}
 
 #[derive(Debug, Deserialize)]
 pub struct NativeTestResult {

@@ -24,7 +24,7 @@ use evertrace_domain::{
     evidence::hex,
     repository::{
         FilesystemIdentity, GitObjectFormat, GitOperation, ProbeUnavailableReason,
-        REMOTE_FINGERPRINT_PREFIX, SnapshotField, UntrackedCaptureScope,
+        REMOTE_FINGERPRINT_PREFIX, SnapshotField, TRACKED_DIFF_DIGEST_TAG, UntrackedCaptureScope,
     },
 };
 use thiserror::Error;
@@ -32,7 +32,6 @@ use thiserror::Error;
 pub const GIT_PROBE_SCHEMA_VERSION: u32 = 1;
 
 const REMOTE_FINGERPRINT_TAG: &str = "s11_remote_fingerprint_v1";
-const TRACKED_DIFF_DIGEST_TAG: &str = "worktree_tracked_diff_v1";
 const INDEX_DIGEST_TAG: &str = "worktree_index_v1";
 const UNTRACKED_DIGEST_TAG: &str = "worktree_untracked_manifest_v1";
 const PATCH_EQUIVALENCE_TAG: &str = "worktree_patch_equivalence_v1";

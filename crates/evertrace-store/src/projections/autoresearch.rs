@@ -57,8 +57,7 @@ pub(crate) fn validate_controlled_command<'a>(
     let payloads = payloads.into_iter().collect::<Vec<_>>();
     for payload in &payloads {
         if let JournalPayload::ResultEvidenceRecorded(result) = payload
-            && result.parser_receipt.parser_version
-                == evertrace_domain::work::NATIVE_TEST_RESULT_PARSER_VERSION
+            && evertrace_domain::work::is_native_test_parser(&result.parser_receipt.parser_version)
         {
             validate_native_test_result(&view, result, &payloads, error)?;
         }
@@ -71,8 +70,13 @@ pub(crate) fn validate_controlled_command<'a>(
         })
         .collect::<Vec<_>>();
     for run in &runs {
+        if run.metric_extractor_version
+            == evertrace_domain::work::NATIVE_TEST_CONTRACT_PARSER_VERSION
+        {
+            validate_native_contract(&view, run, error)?;
+        }
         if run.comparison_execution_binding.is_none() && !run.is_declaration_only() {
-            return Err(error);
+            validate_native_terminal_cohort(&view, run, &payloads, error)?;
         }
     }
     if !runs
@@ -446,6 +450,275 @@ fn launch_matches(
         && run.started_at_us == Some(*started_at_us)
 }
 
+fn native_source_bytes<'a>(
+    view: &'a ControlledRunAdmissionView<'_>,
+    id: SourceReceiptId,
+    role: evertrace_domain::evidence::ObservationRole,
+    complete: bool,
+    error: StoreError,
+) -> Result<
+    (
+        &'a SourceReceipt,
+        &'a evertrace_domain::evidence::SourceObservation,
+        &'a [u8],
+    ),
+    StoreError,
+> {
+    let receipt = &view.receipts.get(&id).ok_or(error)?.0;
+    let observation = &view
+        .observations
+        .get(&receipt.source_observation_id)
+        .ok_or(error)?
+        .0;
+    let surface = &view
+        .surfaces
+        .get(&receipt.source_observation_id)
+        .ok_or(error)?
+        .0;
+    surface.validate().map_err(|_| error)?;
+    let raw = surface.protected_text.as_bytes();
+    if observation.source_receipt_ref != id
+        || observation.observation_role != role
+        || observation.source_instance_id != receipt.source_instance_id
+        || observation.source_revision != receipt.source_revision
+        || observation.source_record_identity != receipt.source_record_identity
+        // Intent supplies the admitted namespace; image3 separately authenticates its entire raw body.
+        || role != evertrace_domain::evidence::ObservationRole::Intent
+            && observation.content_trust != ContentTrust::Observed
+        || observation.source_role != SourceRole::Tool
+        || surface.source_role != observation.source_role
+        || surface.content_trust != observation.content_trust
+        || surface.source_observation_revision_ref != observation.source_observation_id
+        || surface.canonicalization_version != receipt.canonicalization_revision
+        || observation.canonicalization_revision != receipt.canonicalization_revision
+        || surface.capture_completeness != receipt.capture_completeness
+        || observation.capture_completeness != receipt.capture_completeness
+        || complete && receipt.capture_completeness != CaptureCompleteness::Complete
+        || receipt.archive_mode != SourceArchiveMode::Exact
+        || receipt.unsupported_record_classification.is_some()
+        || receipt.protected_secret_digest.is_some()
+        || !receipt.redaction_spans.is_empty()
+        || receipt.protected_length != raw.len() as u64
+        || CasDigest::for_protected_bytes(raw).to_string() != receipt.cas_ref
+        || observation.payload_fingerprint
+            != hex(
+                &payload_fingerprint(receipt.canonicalization_revision, raw, None)
+                    .map_err(|_| error)?,
+            )
+    {
+        return Err(error);
+    }
+    Ok((receipt, observation, raw))
+}
+
+fn validate_native_contract(
+    view: &ControlledRunAdmissionView<'_>,
+    run: &ExperimentRun,
+    error: StoreError,
+) -> Result<evertrace_domain::work::NativeTestContract, StoreError> {
+    use evertrace_capture::process_source;
+    use evertrace_domain::evidence::ObservationRole;
+    let launches = run
+        .source_receipt_refs
+        .iter()
+        .filter_map(|id| view.receipts.get(id))
+        .filter(|(receipt, _)| receipt.source_revision.as_str() == process_source::SOURCE_REVISION)
+        .filter(|(receipt, _)| {
+            view.observations
+                .get(&receipt.source_observation_id)
+                .is_some_and(|(observation, _)| {
+                    observation.observation_role == ObservationRole::Intent
+                })
+        })
+        .map(|(receipt, _)| receipt.source_receipt_id)
+        .collect::<Vec<_>>();
+    let [launch_id] = launches.as_slice() else {
+        return Err(error);
+    };
+    let (receipt, launch, raw) =
+        native_source_bytes(view, *launch_id, ObservationRole::Intent, false, error)?;
+    let anchor = &view.snapshots.get(&run.code_snapshot_id).ok_or(error)?.0;
+    let contract = evertrace_domain::work::NativeTestContract::decode(
+        raw,
+        anchor,
+        launch.source_observation_id,
+        receipt.source_revision.as_str(),
+    )
+    .ok_or(error)?;
+    let value: serde_json::Value = serde_json::from_slice(raw).map_err(|_| error)?;
+    let process = &value["process"];
+    let instance = format!(
+        "native-runtime:{}:{}:{}:{}",
+        process["boot_id"].as_str().ok_or(error)?,
+        process["pid_namespace"].as_u64().ok_or(error)?,
+        process["pid"].as_u64().ok_or(error)?,
+        process["start_ticks"].as_u64().ok_or(error)?
+    );
+    let reference = format!(
+        "runtime:{}:{}@{}",
+        value["source_epoch"].as_str().ok_or(error)?,
+        value["execution_key"].as_str().ok_or(error)?,
+        process["start_ticks"].as_u64().ok_or(error)?
+    );
+    let images = run
+        .source_receipt_refs
+        .iter()
+        .filter_map(|id| view.receipts.get(id))
+        .filter(|(receipt, _)| {
+            receipt.source_revision.as_str() == process_source::IMAGE_SOURCE_REVISION
+        })
+        .map(|(receipt, _)| receipt.source_receipt_id)
+        .collect::<Vec<_>>();
+    let [image_id] = images.as_slice() else {
+        return Err(error);
+    };
+    let (image, _, image_raw) =
+        native_source_bytes(view, *image_id, ObservationRole::StateProbe, true, error)?;
+    let attempt = &view
+        .attempts
+        .get(&run.attempt_id.ok_or(error)?)
+        .ok_or(error)?
+        .0;
+    let stream = &view.workstreams.get(&run.workstream_id).ok_or(error)?.0;
+    let episode = &view
+        .episodes
+        .get(&attempt.episode_id.ok_or(error)?)
+        .ok_or(error)?
+        .0;
+    let tree = &view
+        .worktrees
+        .get(&anchor.worktree_instance_id)
+        .ok_or(error)?
+        .0;
+    if !contract.matches_run(run)
+        || run.comparison_execution_binding.is_some()
+        || run.origin != evertrace_domain::work::RunOrigin::External
+        || run.external_system_id.as_deref() != Some(process_source::FORMAT)
+        || run.external_run_key.as_deref()
+            != Some(
+                format!(
+                    "{}/{}",
+                    value["source_epoch"].as_str().ok_or(error)?,
+                    value["execution_key"].as_str().ok_or(error)?
+                )
+                .as_str(),
+            )
+        || launch.correlation.exact_key().is_none()
+        || (receipt.adapter_revision, receipt.parser_revision)
+            != (
+                process_source::ADAPTER_REVISION,
+                process_source::PARSER_REVISION,
+            )
+        || image_raw != raw
+        || (image.adapter_revision, image.parser_revision) != (3, 3)
+        || image.source_instance_id.as_str() != instance
+        || image.source_ref != reference
+        || image.source_record_identity.as_str() != run.environment_fingerprint
+        || image.identity_domain != process_source::IMAGE_SOURCE_REVISION
+        || image.identity_strength != evertrace_domain::evidence::IdentityStrength::StableNative
+        || run.attempt_binding_status != AttemptBindingStatus::Resolved
+        || attempt.workstream_id != stream.workstream_id
+        || attempt.task_id != stream.task_id
+        || attempt.strategy_contract_fingerprint != run.strategy_contract_fingerprint
+        || stream.active_episode_id != Some(episode.episode_id)
+        || !episode.attempt_ids.contains(&attempt.attempt_id)
+        || episode.workstream_id != stream.workstream_id
+        || episode.task_id != stream.task_id
+        || episode.worktree_instance_id != Some(tree.worktree_instance_id)
+        || attempt.repository_instance_id != Some(tree.repository_instance_id)
+        || stream.repository_instance_id != Some(tree.repository_instance_id)
+        || !attempt
+            .worktree_instance_ids
+            .contains(&tree.worktree_instance_id)
+        || !stream
+            .worktree_instance_ids
+            .contains(&tree.worktree_instance_id)
+    {
+        return Err(error);
+    }
+    Ok(contract)
+}
+
+fn validate_native_terminal_cohort(
+    view: &ControlledRunAdmissionView<'_>,
+    run: &ExperimentRun,
+    payloads: &[&JournalPayload],
+    error: StoreError,
+) -> Result<(), StoreError> {
+    use evertrace_domain::semantic::{EvidenceCompleteness, ParserStatus, ResultScope};
+    if run.metric_extractor_version != evertrace_domain::work::NATIVE_TEST_CONTRACT_PARSER_VERSION {
+        return Err(error);
+    }
+    let current = &view.runs.get(&run.run_id).ok_or(error)?.0;
+    let contract = validate_native_contract(view, run, error)?;
+    current.validate_successor(run).map_err(|_| error)?;
+    let results = payloads
+        .iter()
+        .filter_map(|payload| match payload {
+            JournalPayload::ResultEvidenceRecorded(result)
+                if result.experiment_run_id == run.run_id =>
+            {
+                Some(result.as_ref())
+            }
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+    let [result] = results.as_slice() else {
+        return Err(error);
+    };
+    let [terminal] = run.terminal_evidence_refs.as_slice() else {
+        return Err(error);
+    };
+    let (_, _, raw) = native_source_bytes(
+        view,
+        *terminal,
+        evertrace_domain::evidence::ObservationRole::Result,
+        true,
+        error,
+    )?;
+    let event = evertrace_domain::work::NativeTestResult::decode(raw).ok_or(error)?;
+    let ended_at = serde_json::from_slice::<serde_json::Value>(raw).map_err(|_| error)?["time_us"]
+        .as_i64()
+        .ok_or(error)?;
+    let digest = hex(&result.raw_cas_refs.first().ok_or(error)?.as_digest());
+    let mut artifacts = current.work_artifact_refs.clone();
+    artifacts.extend(&result.raw_artifact_refs);
+    artifacts.sort();
+    artifacts.dedup();
+    if !current.is_declaration_only()
+        || run.parent_revision_id != Some(current.revision_id)
+        || current.metric_extractor_version != run.metric_extractor_version
+        || run.source_receipt_refs != current.source_receipt_refs
+        || run.created_at_us != current.created_at_us
+        || run.attempt_id != current.attempt_id
+        || run.attempt_binding_status != current.attempt_binding_status
+        || run.observability != RunObservability::Full
+        || run.execution_status != RunExecutionStatus::Completed
+        || run.contract_validity != RunContractValidity::Valid
+        || run.started_at_us != Some(contract.started_at_us)
+        || run.ended_at_us != Some(ended_at)
+        || run
+            .ended_at_us
+            .is_none_or(|ended| ended < contract.started_at_us)
+        || result.experiment_run_revision_id != run.revision_id
+        || result.result_scope != ResultScope::Complete
+        || result.completeness != EvidenceCompleteness::Complete
+        || result.parser_receipt.status != ParserStatus::Parsed
+        || event.metric().is_none()
+        || result.parsed_metric != event.metric()
+        || result.failure.is_some()
+        || run.work_artifact_refs != artifacts
+        || result.raw_cas_refs.len() != 1
+        || view
+            .receipts
+            .get(terminal)
+            .is_none_or(|(receipt, _)| receipt.cas_ref != digest)
+    {
+        return Err(error);
+    }
+    Ok(())
+}
+
 fn validate_native_test_result(
     view: &ControlledRunAdmissionView<'_>,
     result: &ResultEvidence,
@@ -453,18 +726,44 @@ fn validate_native_test_result(
     error: StoreError,
 ) -> Result<(), StoreError> {
     use evertrace_domain::{
+        semantic::VerifierStatus,
         semantic::{EvidenceCompleteness, ParserFailureCode, ParserStatus, ResultScope},
-        work::{NATIVE_TEST_RESULT_PARSER_VERSION, NativeTestResult},
+        work::{NativeTestResult, is_native_test_parser},
     };
-    let run = &view.runs.get(&result.experiment_run_id).ok_or(error)?.0;
+    let command_run = payloads.iter().find_map(|payload| match payload {
+        JournalPayload::ExperimentRunRecorded(run) if run.run_id == result.experiment_run_id => {
+            Some(run.as_ref())
+        }
+        _ => None,
+    });
+    let run = command_run
+        .or_else(|| view.runs.get(&result.experiment_run_id).map(|(run, _)| run))
+        .ok_or(error)?;
+    let full = run.metric_extractor_version
+        == evertrace_domain::work::NATIVE_TEST_CONTRACT_PARSER_VERSION
+        && result.result_scope == ResultScope::Complete;
     if result.experiment_run_revision_id != run.revision_id
-        || !run.is_declaration_only()
-        || run.metric_extractor_version != NATIVE_TEST_RESULT_PARSER_VERSION
+        || !is_native_test_parser(&run.metric_extractor_version)
+        || result.parser_receipt.parser_version != run.metric_extractor_version
+        || if full {
+            command_run.is_none()
+                || run.observability != RunObservability::Full
+                || run.execution_status != RunExecutionStatus::Completed
+                || run.contract_validity != RunContractValidity::Valid
+                || result.completeness != EvidenceCompleteness::Complete
+                || result.verifier_receipt.as_ref().is_none_or(|receipt| {
+                    receipt.status != VerifierStatus::Passed
+                        || receipt.verifier_version != "evertrace.result_reparse.v1"
+                        || receipt.failure_code.is_some()
+                })
+        } else {
+            !run.is_declaration_only()
+                || result.result_scope != ResultScope::Partial
+                || result.completeness != EvidenceCompleteness::Incomplete
+                || result.verifier_receipt.is_some()
+        }
         || run.attempt_binding_status != AttemptBindingStatus::Resolved
         || result.parent_revision_id.is_some()
-        || result.result_scope != ResultScope::Partial
-        || result.completeness != EvidenceCompleteness::Incomplete
-        || result.verifier_receipt.is_some()
         || result.raw_artifact_refs.len() != 1
         || result.parser_receipt.input_artifact_refs != result.raw_artifact_refs
         || result.raw_cas_refs.len() != 1
@@ -524,37 +823,14 @@ fn validate_native_test_result(
     {
         return Err(error);
     }
-    let observation = &view.observations.get(&id).ok_or(error)?.0;
-    let surface = &view.surfaces.get(&id).ok_or(error)?.0;
-    surface.validate().map_err(|_| error)?;
-    let raw = surface.protected_text.as_bytes();
-    if surface.source_observation_revision_ref != id
-        || surface.canonicalization_version != receipt.canonicalization_revision
-        || observation.canonicalization_revision != receipt.canonicalization_revision
-        || observation.source_record_identity != receipt.source_record_identity
-        || observation.observation_role != evertrace_domain::evidence::ObservationRole::Result
-        || receipt.identity_domain != evertrace_capture::process_source::FORMAT
-        || receipt.unsupported_record_classification.is_some()
-        || observation.source_role != SourceRole::Tool
-        || observation.content_trust != ContentTrust::Observed
-        || observation.capture_completeness != CaptureCompleteness::Complete
-        || observation.source_receipt_ref != receipt.source_receipt_id
-        || observation.source_instance_id != receipt.source_instance_id
-        || observation.source_revision != receipt.source_revision
-        || surface.source_role != observation.source_role
-        || surface.content_trust != observation.content_trust
-        || surface.capture_completeness != CaptureCompleteness::Complete
-        || receipt.archive_mode != SourceArchiveMode::Exact
-        || receipt.protected_secret_digest.is_some()
-        || !receipt.redaction_spans.is_empty()
-        || receipt.protected_length != raw.len() as u64
-        || CasDigest::for_protected_bytes(raw).to_string() != receipt.cas_ref
-        || observation.payload_fingerprint
-            != hex(
-                &payload_fingerprint(receipt.canonicalization_revision, raw, None)
-                    .map_err(|_| error)?,
-            )
-    {
+    let (_, observation, raw) = native_source_bytes(
+        view,
+        receipt.source_receipt_id,
+        evertrace_domain::evidence::ObservationRole::Result,
+        true,
+        error,
+    )?;
+    if receipt.identity_domain != evertrace_capture::process_source::FORMAT {
         return Err(error);
     }
     let event = NativeTestResult::decode(raw).ok_or(error)?;
@@ -593,6 +869,10 @@ fn validate_native_test_result(
     if operations.is_empty()
         || operations.iter().any(|operation| {
             operation.pairing_state != PairingState::Paired
+                || full
+                    && !operation
+                        .input_source_observation_refs
+                        .contains(&launch.source_observation_id)
                 || bindings.get(&operation.operation_id).is_none_or(|binding| {
                     binding.assignment_status != AssignmentStatus::Resolved
                         || binding.primary_binding.experiment_run_id != Some(run.run_id)
@@ -690,6 +970,7 @@ pub(crate) fn validate_relations(input: AutoresearchRelationInputs<'_>) -> Resul
                 result.parser_receipt.parser_version.as_str(),
                 "evertrace.result_metric.v1"
                     | evertrace_domain::work::NATIVE_TEST_RESULT_PARSER_VERSION
+                    | evertrace_domain::work::NATIVE_TEST_CONTRACT_PARSER_VERSION
             )
             || result
                 .verifier_receipt
@@ -1199,7 +1480,9 @@ pub(crate) fn record_run(
 fn allowed_run_shape(value: &ExperimentRun) -> bool {
     value.is_declaration_only()
         || value.is_controlled_declaration()
-        || value.comparison_execution_binding.is_some()
+        || (value.comparison_execution_binding.is_some()
+            || value.metric_extractor_version
+                == evertrace_domain::work::NATIVE_TEST_CONTRACT_PARSER_VERSION)
             && value.observability == RunObservability::Full
             && value.execution_status == RunExecutionStatus::Completed
             && value.contract_validity == RunContractValidity::Valid

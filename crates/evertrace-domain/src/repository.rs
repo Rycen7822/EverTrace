@@ -12,6 +12,8 @@ mod recovery;
 pub use recovery::*;
 
 pub const REPOSITORY_RESOLVER_VERSION: u32 = 1;
+/// Canonical porcelain-v2 bytes; shared by the probe and independent contract admission.
+pub const TRACKED_DIFF_DIGEST_TAG: &str = "worktree_tracked_diff_v1";
 
 const MAX_LOCATOR_BYTES: usize = 4096;
 const MAX_REF_BYTES: usize = 256;

@@ -48,7 +48,7 @@ pub const CONDITIONS_ELIGIBLE_EVENTS: &str = "python-execution-conditions-snapsh
 pub const IMAGE_SOURCE_REVISION: &str = "python-native-runtime-v1";
 pub const IMAGE_ELIGIBLE_EVENTS: &str = "python-native-runtime-measurement-v1";
 
-pub const IMAGE_ADAPTER_REVISION: u32 = 2;
+pub const IMAGE_ADAPTER_REVISION: u32 = 3;
 
 pub fn image_adapter_version(revision: u32) -> String {
     format!("{IMAGE_SOURCE_REVISION}:capture-{revision}")
@@ -1265,7 +1265,7 @@ pub fn verify_native_terminal(raw: &[u8], snapshot: &Path) -> Result<()> {
 
 /// The same canonical environment identity is measured by the reader and again at first L0 admission.
 pub fn verify_runtime_image(raw: &[u8], snapshot: &Path, revision: u32) -> Result<String> {
-    if !matches!(revision, 1 | IMAGE_ADAPTER_REVISION) {
+    if !matches!(revision, 1 | 2 | IMAGE_ADAPTER_REVISION) {
         return Err(ProcessSourceError);
     }
     let (header, role) = decode(raw)?;
@@ -1283,11 +1283,11 @@ pub fn verify_runtime_image(raw: &[u8], snapshot: &Path, revision: u32) -> Resul
         return Err(ProcessSourceError);
     }
     let (conditions, _) = execution_conditions(&header, &script)?;
-    if revision == IMAGE_ADAPTER_REVISION {
+    if revision >= 2 {
         image::verify_source_namespace(&script)?;
     }
-    let fingerprint = image::fingerprint(&header, &conditions)?;
-    if revision == IMAGE_ADAPTER_REVISION {
+    let fingerprint = image::fingerprint(&header, &conditions, revision >= 3)?;
+    if revision >= 2 {
         image::verify_source_namespace(&script)?;
     }
     if inputs != execution_inputs(&header)? {
@@ -1379,7 +1379,7 @@ pub fn image_record_matches(raw: &[u8], body: &crate::CaptureRecordBody) -> bool
         && body.close_watermark == Some(0)
         && matches!(
             (body.adapter_revision, body.parser_revision),
-            (1, 1) | (2, 2)
+            (1, 1) | (2, 2) | (3, 3)
         )
         && body.canonicalization_revision == 1
         && body.eligible_event_manifest_ref == IMAGE_ELIGIBLE_EVENTS

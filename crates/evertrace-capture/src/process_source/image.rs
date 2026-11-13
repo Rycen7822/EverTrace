@@ -132,7 +132,7 @@ fn add(files: &mut BTreeMap<PathBuf, Stamp>, path: &Path, deadline: Instant) -> 
     Ok(())
 }
 
-fn standard_library(
+fn add_directory_files(
     files: &mut BTreeMap<PathBuf, Stamp>,
     directory: &Path,
     prefix: &Path,
@@ -177,12 +177,13 @@ fn files(
     prefix: &Path,
     purelib: &Path,
     deadline: Instant,
+    package_namespace: bool,
 ) -> Result<BTreeMap<PathBuf, Stamp>> {
     let process = header.process.as_ref().ok_or(ProcessSourceError)?;
     let mut files = BTreeMap::new();
     let executable = PathBuf::from(format!("/proc/{}/exe", process.pid));
     add(&mut files, &executable, deadline)?;
-    standard_library(
+    add_directory_files(
         &mut files,
         purelib.parent().ok_or(ProcessSourceError)?,
         prefix,
@@ -193,6 +194,7 @@ fn files(
         .as_array()
         .ok_or(ProcessSourceError)?;
     let mut names = std::collections::BTreeSet::new();
+    let mut roots = std::collections::BTreeSet::new();
     for package in packages {
         let name = package["name"].as_str().ok_or(ProcessSourceError)?;
         names.insert(name);
@@ -206,6 +208,18 @@ fn files(
             let fields = line.split(',').collect::<Vec<_>>();
             if fields.len() != 3 || fields[0].is_empty() || Path::new(fields[0]).is_absolute() {
                 return Err(ProcessSourceError);
+            }
+            if package_namespace
+                && let Some(std::path::Component::Normal(root)) =
+                    Path::new(fields[0]).components().next()
+            {
+                let path = purelib.join(root);
+                if fs::symlink_metadata(&path)
+                    .map_err(|_| ProcessSourceError)?
+                    .is_dir()
+                {
+                    roots.insert(path);
+                }
             }
             let path = fs::canonicalize(purelib.join(fields[0])).map_err(|_| ProcessSourceError)?;
             if !path.starts_with(prefix) {
@@ -225,6 +239,10 @@ fn files(
             ])
     {
         return Err(ProcessSourceError);
+    }
+    // RECORD is not a namespace boundary: unlisted cache/extension/module bytes can execute too.
+    for root in roots {
+        add_directory_files(&mut files, &root, prefix, purelib, deadline)?;
     }
     // These are kernel-selected mapped files, not caller-supplied library locators.
     let maps = super::text(Path::new(&format!("/proc/{}/maps", process.pid)))?;
@@ -251,7 +269,11 @@ fn files(
 }
 
 /// Measure while the source holds its exact live child; no cached or declared file hash is adopted.
-pub(super) fn fingerprint(header: &Header, conditions: &[u8]) -> Result<String> {
+pub(super) fn fingerprint(
+    header: &Header,
+    conditions: &[u8],
+    package_namespace: bool,
+) -> Result<String> {
     let deadline = Instant::now() + Duration::from_secs(2);
     let conditions: serde_json::Value =
         serde_json::from_slice(conditions).map_err(|_| ProcessSourceError)?;
@@ -270,7 +292,14 @@ pub(super) fn fingerprint(header: &Header, conditions: &[u8]) -> Result<String> 
     if !purelib.starts_with(prefix) || measured != *process {
         return Err(ProcessSourceError);
     }
-    let before = files(header, &conditions, prefix, &purelib, deadline)?;
+    let before = files(
+        header,
+        &conditions,
+        prefix,
+        &purelib,
+        deadline,
+        package_namespace,
+    )?;
     let mut hash = Sha256::new();
     field(&mut hash, b"evertrace.native_execution_environment.v1");
     for name in ["python", "framework", "environment", "packages"] {
@@ -323,7 +352,15 @@ pub(super) fn fingerprint(header: &Header, conditions: &[u8]) -> Result<String> 
             return Err(ProcessSourceError);
         }
     }
-    if files(header, &conditions, prefix, &purelib, deadline)? != before {
+    if files(
+        header,
+        &conditions,
+        prefix,
+        &purelib,
+        deadline,
+        package_namespace,
+    )? != before
+    {
         return Err(ProcessSourceError);
     }
     Ok(format!("measured-runtime-v1:{:x}", hash.finalize()))
