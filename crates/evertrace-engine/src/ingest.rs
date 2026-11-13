@@ -818,9 +818,10 @@ impl EvidenceIngestor {
                 .map_err(|_| IngestError::Snapshot)?,
         );
         let identity = body.source_record_identity.as_str().to_owned();
+        let revision = body.adapter_revision;
         let observed = tokio::task::spawn_blocking(move || {
             if image {
-                process_source::verify_runtime_image(&raw, &snapshot)
+                process_source::verify_runtime_image(&raw, &snapshot, revision)
                     .is_ok_and(|value| value == identity)
             } else {
                 process_source::verify_native_terminal(&raw, &snapshot).is_ok()

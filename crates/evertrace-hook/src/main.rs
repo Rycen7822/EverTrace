@@ -185,7 +185,9 @@ fn run() -> Result<(), ()> {
                     }
                     let contract =
                         evertrace_codex::probe::HostProbeReport::unobserved_source_contract(
-                            &evertrace_capture::process_source::image_adapter_version(),
+                            &evertrace_capture::process_source::image_adapter_version(
+                                evertrace_capture::process_source::IMAGE_ADAPTER_REVISION,
+                            ),
                             evertrace_capture::process_source::IMAGE_ELIGIBLE_EVENTS,
                         )
                         .map_err(|_| ())?;

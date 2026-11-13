@@ -40,6 +40,82 @@ fn stamp(value: &Metadata) -> Result<Stamp> {
     })
 }
 
+fn empty_cache(path: &Path) -> Result<()> {
+    match fs::symlink_metadata(path) {
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Ok(value) if value.is_dir() => {
+            if fs::read_dir(path)
+                .map_err(|_| ProcessSourceError)?
+                .next()
+                .is_none()
+            {
+                Ok(())
+            } else {
+                Err(ProcessSourceError)
+            }
+        }
+        _ => Err(ProcessSourceError),
+    }
+}
+
+/// Close the fixed source profile's import namespace, including ignored Python bytecode.
+/// Git/tree validation still belongs to the repository and Run contract owners.
+pub(super) fn verify_source_namespace(script: &Path) -> Result<()> {
+    let root = script.parent().ok_or(ProcessSourceError)?;
+    // External-format paths, not an internal domain registry or a second file manifest.
+    let expected = [
+        "raven/__init__.py",
+        "raven/evolver/__init__.py",
+        "raven/evolver/analysis/__init__.py",
+        "raven/evolver/analysis/stability_bucket.py",
+        "raven/evolver/orchestrator/__init__.py",
+        "raven/evolver/orchestrator/scoring.py",
+        "raven/evolver/scheduler/__init__.py",
+        "raven/evolver/scheduler/anchor_selection.py",
+    ];
+    let deadline = Instant::now() + Duration::from_millis(40);
+    let mut pending = vec![root.join("raven")];
+    let mut seen = std::collections::BTreeSet::new();
+    let mut entries = 0;
+    while let Some(directory) = pending.pop() {
+        if Instant::now() >= deadline
+            || !fs::symlink_metadata(&directory).is_ok_and(|value| value.is_dir())
+        {
+            return Err(ProcessSourceError);
+        }
+        for entry in fs::read_dir(&directory).map_err(|_| ProcessSourceError)? {
+            entries += 1;
+            if entries > 64 || Instant::now() >= deadline {
+                return Err(ProcessSourceError);
+            }
+            let entry = entry.map_err(|_| ProcessSourceError)?;
+            let path = entry.path();
+            let relative = path.strip_prefix(root).map_err(|_| ProcessSourceError)?;
+            let name = relative.to_str().ok_or(ProcessSourceError)?;
+            let kind = entry.file_type().map_err(|_| ProcessSourceError)?;
+            if kind.is_dir() && entry.file_name() == "__pycache__" {
+                empty_cache(&path)?;
+            } else if kind.is_dir()
+                && expected
+                    .iter()
+                    .any(|value| Path::new(value).starts_with(relative))
+            {
+                pending.push(path);
+            } else if kind.is_file() && expected.contains(&name) {
+                seen.insert(name.to_owned());
+            } else {
+                return Err(ProcessSourceError);
+            }
+        }
+    }
+    if seen.len() != expected.len()
+        || !fs::symlink_metadata(root.join("fixed_scorer.py")).is_ok_and(|value| value.is_file())
+    {
+        return Err(ProcessSourceError);
+    }
+    empty_cache(&root.join("__pycache__"))
+}
+
 fn field(hash: &mut Sha256, bytes: &[u8]) {
     hash.update((bytes.len() as u64).to_be_bytes());
     hash.update(bytes);

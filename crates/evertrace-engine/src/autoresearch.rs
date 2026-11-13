@@ -2213,10 +2213,11 @@ impl ControlledRunResolver {
             let raw: ProcessTrialDeclaration =
                 serde_json::from_slice(&self.protected_source(facts, id)?)
                     .map_err(|_| AutoresearchError::UntrustedRunEvidence)?;
-            if receipt.adapter_revision != 1
-                || receipt.parser_revision != 1
-                || observation.observation_role
-                    != evertrace_domain::evidence::ObservationRole::StateProbe
+            if !matches!(
+                (receipt.adapter_revision, receipt.parser_revision),
+                (1, 1) | (2, 2)
+            ) || observation.observation_role
+                != evertrace_domain::evidence::ObservationRole::StateProbe
                 || observation.source_role != SourceRole::Tool
                 || receipt.identity_domain != process_source::IMAGE_SOURCE_REVISION
                 || receipt.identity_strength

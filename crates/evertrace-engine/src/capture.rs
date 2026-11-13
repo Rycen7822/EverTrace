@@ -205,7 +205,7 @@ pub(crate) fn verify_capture_frame_presented(
     if body.source_revision.as_str() == evertrace_capture::process_source::IMAGE_SOURCE_REVISION {
         use evertrace_capture::process_source;
         let contract = evertrace_codex::probe::HostProbeReport::unobserved_source_contract(
-            &process_source::image_adapter_version(),
+            &process_source::image_adapter_version(body.adapter_revision),
             process_source::IMAGE_ELIGIBLE_EVENTS,
         )
         .map_err(|_| IngestError::InvalidRecord)?;

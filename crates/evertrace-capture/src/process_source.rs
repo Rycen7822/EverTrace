@@ -48,8 +48,10 @@ pub const CONDITIONS_ELIGIBLE_EVENTS: &str = "python-execution-conditions-snapsh
 pub const IMAGE_SOURCE_REVISION: &str = "python-native-runtime-v1";
 pub const IMAGE_ELIGIBLE_EVENTS: &str = "python-native-runtime-measurement-v1";
 
-pub fn image_adapter_version() -> String {
-    format!("{IMAGE_SOURCE_REVISION}:capture-1")
+pub const IMAGE_ADAPTER_REVISION: u32 = 2;
+
+pub fn image_adapter_version(revision: u32) -> String {
+    format!("{IMAGE_SOURCE_REVISION}:capture-{revision}")
 }
 
 pub fn is_owned_revision(revision: &str) -> bool {
@@ -1262,7 +1264,10 @@ pub fn verify_native_terminal(raw: &[u8], snapshot: &Path) -> Result<()> {
 }
 
 /// The same canonical environment identity is measured by the reader and again at first L0 admission.
-pub fn verify_runtime_image(raw: &[u8], snapshot: &Path) -> Result<String> {
+pub fn verify_runtime_image(raw: &[u8], snapshot: &Path, revision: u32) -> Result<String> {
+    if !matches!(revision, 1 | IMAGE_ADAPTER_REVISION) {
+        return Err(ProcessSourceError);
+    }
     let (header, role) = decode(raw)?;
     if role != ObservationRole::Intent {
         return Err(ProcessSourceError);
@@ -1278,7 +1283,13 @@ pub fn verify_runtime_image(raw: &[u8], snapshot: &Path) -> Result<String> {
         return Err(ProcessSourceError);
     }
     let (conditions, _) = execution_conditions(&header, &script)?;
+    if revision == IMAGE_ADAPTER_REVISION {
+        image::verify_source_namespace(&script)?;
+    }
     let fingerprint = image::fingerprint(&header, &conditions)?;
+    if revision == IMAGE_ADAPTER_REVISION {
+        image::verify_source_namespace(&script)?;
+    }
     if inputs != execution_inputs(&header)? {
         return Err(ProcessSourceError);
     }
@@ -1289,7 +1300,7 @@ pub fn verify_runtime_image(raw: &[u8], snapshot: &Path) -> Result<String> {
 
 /// A native measurement retains the unmodified original launch, not a generated runtime envelope.
 pub fn image_record(raw: &[u8], snapshot: &Path, manifest: &str) -> Result<Observation> {
-    let fingerprint = verify_runtime_image(raw, snapshot)?;
+    let fingerprint = verify_runtime_image(raw, snapshot, IMAGE_ADAPTER_REVISION)?;
     let (header, _) = decode(raw)?;
     let process = header.process.as_ref().ok_or(ProcessSourceError)?;
     let Observation(mut record) = kernel_observation(raw.to_vec(), process, manifest)?;
@@ -1310,6 +1321,9 @@ pub fn image_record(raw: &[u8], snapshot: &Path, manifest: &str) -> Result<Obser
     record.session_ref = header.source_epoch;
     record.content_trust = ContentTrust::UntrustedSourceContent;
     record.surface_eligible = true;
+    record.adapter_revision = IMAGE_ADAPTER_REVISION;
+    record.parser_revision = IMAGE_ADAPTER_REVISION;
+    record.correlation.adapter_revision = IMAGE_ADAPTER_REVISION;
     record.eligible_event_manifest_ref = IMAGE_ELIGIBLE_EVENTS.into();
     Ok(Observation(record))
 }
@@ -1363,14 +1377,16 @@ pub fn image_record_matches(raw: &[u8], body: &crate::CaptureRecordBody) -> bool
         && body.source_sequence == 0
         && body.source_sequence_origin == Some(0)
         && body.close_watermark == Some(0)
-        && body.adapter_revision == 1
-        && body.parser_revision == 1
+        && matches!(
+            (body.adapter_revision, body.parser_revision),
+            (1, 1) | (2, 2)
+        )
         && body.canonicalization_revision == 1
         && body.eligible_event_manifest_ref == IMAGE_ELIGIBLE_EVENTS
         && body.correlation.occurrence_schema_version == 1
         && body.correlation.pairing_role == ObservationRole::StateProbe
         && body.correlation.adapter_manifest_ref == body.adapter_manifest_ref
-        && body.correlation.adapter_revision == 1
+        && body.correlation.adapter_revision == body.adapter_revision
         && body.correlation.partial_correlation_ref.is_none()
         && body.correlation.possible_duplicate_group_id.is_none()
         && body.correlation.admission == CorrelationAdmission::Unavailable
