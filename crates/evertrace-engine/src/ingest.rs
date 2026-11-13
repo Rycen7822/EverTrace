@@ -594,6 +594,12 @@ impl EvidenceIngestor {
             {
                 return Ok(false);
             }
+            if observation.observation_role == evertrace_domain::evidence::ObservationRole::Result {
+                return Ok(observation.content_trust
+                    == evertrace_domain::evidence::ContentTrust::Observed
+                    && observation.capture_completeness
+                        == evertrace_domain::evidence::CaptureCompleteness::Complete);
+            }
             let command_id = source_snapshot_command_id(observation_id, receipt.recorded_at_us)?;
             if self
                 .writer
@@ -776,6 +782,51 @@ impl EvidenceIngestor {
         Ok(false)
     }
 
+    async fn observe_live_process_terminal(
+        &self,
+        verified: &mut crate::capture::VerifiedCapture,
+    ) -> Result<(), IngestError> {
+        use evertrace_capture::process_source;
+        use evertrace_domain::evidence::{CaptureCompleteness, ContentTrust, ObservationRole};
+        let body = &verified.body;
+        if body.source_revision.as_str() != process_source::SOURCE_REVISION
+            || (body.adapter_revision, body.parser_revision)
+                != (
+                    process_source::ADAPTER_REVISION,
+                    process_source::PARSER_REVISION,
+                )
+            || body.observation_role != ObservationRole::Result
+            || body.correlation.native_request_id.is_none()
+            || body.correlation.physical_execution_ordinal.is_none()
+        {
+            return Ok(());
+        }
+        let Some(surface) = verified.surface.as_ref() else {
+            return Ok(());
+        };
+        let raw = surface.protected_text.as_bytes().to_vec();
+        let snapshot = RuntimeSnapshot::snapshot_path(
+            self.snapshot
+                .data_dir()
+                .map_err(|_| IngestError::Snapshot)?,
+        );
+        let observed = tokio::task::spawn_blocking(move || {
+            process_source::verify_native_terminal(&raw, &snapshot).is_ok()
+        })
+        .await
+        .map_err(|_| IngestError::Store)?;
+        if observed {
+            verified.receipt.capture_completeness = CaptureCompleteness::Complete;
+            verified.observation.capture_completeness = CaptureCompleteness::Complete;
+            verified.observation.content_trust = ContentTrust::Observed;
+            if let Some(surface) = &mut verified.surface {
+                surface.capture_completeness = CaptureCompleteness::Complete;
+                surface.content_trust = ContentTrust::Observed;
+            }
+        }
+        Ok(())
+    }
+
     async fn normalize_live_native(
         &self,
         verified: &crate::capture::VerifiedCapture,
@@ -787,8 +838,25 @@ impl EvidenceIngestor {
             normalize_live_observation_once,
         };
         use evertrace_capture::execution_source::{Profile, is_execution};
-        if Profile::from_revision(verified.receipt.parser_revision) != Some(Profile::Context)
-            || !is_execution(&verified.observation, &verified.receipt)
+        let process_terminal = verified.receipt.source_revision.as_str()
+            == evertrace_capture::process_source::SOURCE_REVISION
+            && (
+                verified.receipt.adapter_revision,
+                verified.receipt.parser_revision,
+            ) == (
+                evertrace_capture::process_source::ADAPTER_REVISION,
+                evertrace_capture::process_source::PARSER_REVISION,
+            )
+            && verified.observation.observation_role
+                == evertrace_domain::evidence::ObservationRole::Result
+            && verified.observation.content_trust
+                == evertrace_domain::evidence::ContentTrust::Observed
+            && verified.observation.capture_completeness
+                == evertrace_domain::evidence::CaptureCompleteness::Complete
+            && verified.observation.correlation.exact_key().is_some();
+        if (!process_terminal
+            && (Profile::from_revision(verified.receipt.parser_revision) != Some(Profile::Context)
+                || !is_execution(&verified.observation, &verified.receipt)))
             || !spool.pending_gap_markers().map_err(map_spool)?.is_empty()
             || std::fs::read_dir(self.snapshot.spool_dir.join("quarantine"))
                 .map_err(|_| IngestError::Spool)?
@@ -800,11 +868,22 @@ impl EvidenceIngestor {
         let Some(canary) = &self.execution_canary else {
             return Ok(());
         };
-        let Some(source) = canary.execution_scope_source() else {
-            return Ok(());
-        };
-        let Some(report) = canary.execution_source_report() else {
-            return Ok(());
+        let (report, source) = if process_terminal {
+            let Some(report) = canary.process_source_report().filter(|report| {
+                report.manifest().adapter_manifest_id == verified.receipt.adapter_manifest_ref
+            }) else {
+                return Ok(());
+            };
+            // The source owns its namespace; no directory or authority is inherited from the parent.
+            (report, None)
+        } else {
+            let Some(source) = canary.execution_scope_source() else {
+                return Ok(());
+            };
+            let Some(report) = canary.execution_source_report() else {
+                return Ok(());
+            };
+            (report, Some(source))
         };
         let input = ReconcileInput {
             runtime_snapshot: self.snapshot.clone(),
@@ -1089,10 +1168,10 @@ impl EvidenceIngestor {
                     };
                 let process_profile = verified.body.source_revision.as_str()
                     == evertrace_capture::process_source::SOURCE_REVISION
-                    && verified.body.adapter_revision
-                        == evertrace_capture::process_source::ADAPTER_REVISION
-                    && verified.body.parser_revision
-                        == evertrace_capture::process_source::PARSER_REVISION;
+                    && evertrace_capture::process_source::is_native_profile(
+                        verified.body.adapter_revision,
+                        verified.body.parser_revision,
+                    );
                 let native_profile = process_profile
                     || (evertrace_capture::execution_source::is_source_revision(
                         verified.body.source_revision.as_str(),
@@ -1131,6 +1210,11 @@ impl EvidenceIngestor {
                             weak.correlation.admission =
                                 evertrace_domain::evidence::CorrelationAdmission::Unavailable;
                             weak.correlation.strong_gate_receipt_ref = None;
+                            if process_profile {
+                                weak.content_trust = verified.observation.content_trust;
+                                weak.capture_completeness =
+                                    verified.observation.capture_completeness;
+                            }
                             if weak == verified.observation
                                 && (process_profile
                                     || evertrace_capture::execution_source::is_execution(
@@ -1139,6 +1223,18 @@ impl EvidenceIngestor {
                                     ))
                             {
                                 verified.observation.correlation = original.correlation.clone();
+                                if process_profile {
+                                    verified.observation.content_trust = original.content_trust;
+                                    verified.observation.capture_completeness =
+                                        original.capture_completeness;
+                                    verified.receipt.capture_completeness =
+                                        original.capture_completeness;
+                                    if let Some(surface) = &mut verified.surface {
+                                        surface.content_trust = original.content_trust;
+                                        surface.capture_completeness =
+                                            original.capture_completeness;
+                                    }
+                                }
                             }
                         }
                     }
@@ -1201,6 +1297,7 @@ impl EvidenceIngestor {
                     progress.projected_surfaces += surface_count;
                     continue;
                 }
+                self.observe_live_process_terminal(&mut verified).await?;
                 if native_profile {
                     if let Some(report) = self.execution_canary.as_ref().and_then(|canary| {
                         if process_profile {

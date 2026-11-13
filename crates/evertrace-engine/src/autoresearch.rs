@@ -2017,11 +2017,22 @@ impl ControlledRunResolver {
                     Some("trial_finished") => ObservationRole::Result,
                     _ => return Ok(Vec::new()),
                 };
-                if witness.source_instance_id != launch.source_instance_id
+                let measured_terminal = role == ObservationRole::Result
+                    && (witness.adapter_revision, witness.parser_revision)
+                        == (
+                            process_source::ADAPTER_REVISION,
+                            process_source::PARSER_REVISION,
+                        )
+                    && witness.content_trust == ContentTrust::Observed
+                    && witness.capture_completeness
+                        == evertrace_domain::evidence::CaptureCompleteness::Complete;
+                let same_capture = witness.content_trust == launch.content_trust
+                    && witness.capture_completeness == launch.capture_completeness;
+                if (!same_capture && !measured_terminal)
+                    || witness.source_instance_id != launch.source_instance_id
                     || witness.source_revision != launch.source_revision
                     || witness.adapter_revision != launch.adapter_revision
                     || witness.parser_revision != launch.parser_revision
-                    || witness.content_trust != launch.content_trust
                     || witness.source_role != SourceRole::Tool
                     || witness.observation_role != role
                     || witness.correlation.exact_key().as_ref() != Some(&key)

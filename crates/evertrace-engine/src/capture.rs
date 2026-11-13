@@ -205,26 +205,27 @@ pub(crate) fn verify_capture_frame_presented(
     if body.source_revision.as_str() == evertrace_capture::process_source::SOURCE_REVISION {
         use evertrace_capture::process_source;
         use evertrace_codex::probe::HostProbeReport;
-        let contract = if (body.adapter_revision, body.parser_revision)
-            == (
-                process_source::ADAPTER_REVISION,
-                process_source::PARSER_REVISION,
-            ) {
-            HostProbeReport::native_source_contract(
-                &process_source::adapter_version(),
-                process_source::ELIGIBLE_EVENTS,
-                process_source::FORMAT,
-            )
-        } else if (body.adapter_revision, body.parser_revision) == (9, 6) {
-            // Frozen v4 history verifies its own weak contract; it cannot acquire today's grant.
-            HostProbeReport::unobserved_source_contract(
-                &format!("{}:capture-9", process_source::SOURCE_REVISION),
-                process_source::ELIGIBLE_EVENTS,
-            )
-        } else {
-            return Err(IngestError::InvalidRecord);
-        }
-        .map_err(|_| IngestError::InvalidRecord)?;
+        let contract =
+            if process_source::is_native_profile(body.adapter_revision, body.parser_revision) {
+                HostProbeReport::native_source_contract(
+                    &format!(
+                        "{}:capture-{}",
+                        process_source::SOURCE_REVISION,
+                        body.adapter_revision
+                    ),
+                    process_source::ELIGIBLE_EVENTS,
+                    process_source::FORMAT,
+                )
+            } else if (body.adapter_revision, body.parser_revision) == (9, 6) {
+                // Frozen v4 history verifies its own weak contract; it cannot acquire today's grant.
+                HostProbeReport::unobserved_source_contract(
+                    &format!("{}:capture-9", process_source::SOURCE_REVISION),
+                    process_source::ELIGIBLE_EVENTS,
+                )
+            } else {
+                return Err(IngestError::InvalidRecord);
+            }
+            .map_err(|_| IngestError::InvalidRecord)?;
         if body.adapter_manifest_ref != contract.manifest().adapter_manifest_id
             || !process_source::record_matches(&protected, &body)
         {
@@ -614,13 +615,14 @@ pub(crate) async fn reconcile_scoped_observations_once(
     .await
 }
 
-/// Preserve a measured Native directory while its process carrier is still alive.
+/// Consume one accepted native physical target while its source is held.
+/// An optional measured directory is local evidence, never inherited namespace authority.
 /// L0 is already accepted; lane/receipt reconciliation remains background work.
 pub(crate) async fn normalize_live_observation_once(
     input: ReconcileInput,
     writer: &WriterHandle,
     observation_id: SourceObservationId,
-    source: crate::repository::ExecutionScopeSource,
+    source: Option<crate::repository::ExecutionScopeSource>,
 ) -> Result<ReconcileProgress, ReconcileError> {
     // Unrelated background appends can advance the single-writer frontier.
     // Retry now, not after the short-lived process carrier has disappeared.
@@ -631,7 +633,7 @@ pub(crate) async fn normalize_live_observation_once(
             writer,
             Some(&[observation_id]),
             None,
-            Some(source.clone()),
+            source.clone(),
             ReconcilePass::Physical,
         )
         .await;
@@ -1039,7 +1041,7 @@ async fn reconcile_selected(
             .then_some(dirty_frontier.frontier),
     )
     .await?;
-    if pass == ReconcilePass::Physical && scopes.claims.is_empty() {
+    if pass == ReconcilePass::Physical && source.is_some() && scopes.claims.is_empty() {
         return Ok(ReconcileProgress {
             no_delta: true,
             frontier: dirty_frontier.frontier,
@@ -2004,7 +2006,18 @@ fn normalize_selected_dirty(
             progress.physical_normalization_recorded += 1;
         }
     }
-    for id in selected_ids {
+    let mut completed_ids = selected_ids;
+    // The bounded snapshot normalized the whole group, including related pending members.
+    // Consume their targets atomically rather than leaving stale queued inputs behind.
+    completed_ids.extend(
+        normalized
+            .occurrences
+            .iter()
+            .flat_map(|value| value.source_observation_refs.iter())
+            .filter(|id| !state.normalization_watermarks.contains_key(id))
+            .copied(),
+    );
+    for id in completed_ids {
         // Another selected member may already have normalized this occurrence.
         // Its unchanged payload still supports this target's watermark command.
         let occurrence = normalized

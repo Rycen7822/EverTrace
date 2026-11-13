@@ -30,8 +30,8 @@ const PREFIX: &[u8] = b"{\"format\":\"process-trial-source-v4\",";
 pub const FORMAT: &str = "process-trial-source-v4";
 pub const SOURCE_REVISION: &str =
     "process-trial-source-v4:84e413385043c92b6723c629b7c0b0481539671827b539dc2f910cf01d432d1d";
-pub const ADAPTER_REVISION: u32 = 10;
-pub const PARSER_REVISION: u32 = 7;
+pub const ADAPTER_REVISION: u32 = 11;
+pub const PARSER_REVISION: u32 = 8;
 pub const ELIGIBLE_EVENTS: &str = "process-trial-source-events-v4";
 pub const KERNEL_SOURCE_REVISION: &str = "linux-proc-stat-v1";
 pub const KERNEL_ADAPTER_REVISION: u32 = 1;
@@ -80,8 +80,11 @@ impl Observation {
         self.0
     }
 
-    pub fn launch_locator(&self) -> Result<Option<SourceObservationId>> {
-        if self.0.observation_role != ObservationRole::Intent {
+    pub fn execution_locator(&self) -> Result<Option<SourceObservationId>> {
+        if !matches!(
+            self.0.observation_role,
+            ObservationRole::Intent | ObservationRole::Result
+        ) {
             return Ok(None);
         }
         source_observation_id(
@@ -1215,6 +1218,34 @@ pub fn native_correlation_matches(raw: &[u8], value: &HostCorrelationEvidence) -
         && value.pairing_role == role
 }
 
+/// Native v4 normalization history keeps its original capture contract across replay.
+pub fn is_native_profile(adapter: u32, parser: u32) -> bool {
+    matches!(
+        (adapter, parser),
+        (10, 7) | (ADAPTER_REVISION, PARSER_REVISION)
+    )
+}
+
+/// A new L0 observation may adopt only a currently verified, original native terminal.
+/// This proves the terminal event and scorer bytes, not a complete experiment contract.
+pub fn verify_native_terminal(raw: &[u8], snapshot: &Path) -> Result<()> {
+    let (header, role) = decode(raw)?;
+    if role != ObservationRole::Result || header.event != "trial_finished" {
+        return Err(ProcessSourceError);
+    }
+    let script = controller_peer(&header, None, snapshot)?;
+    let (_, ordinal) = published_record(raw, &header, &script)?;
+    if ordinal.is_none() || ordinal != header.execution_ordinal {
+        return Err(ProcessSourceError);
+    }
+    physical_scope(&header)?;
+    execution_output(&header, &script)?;
+    // A held zombie and the same nonce-bound source are still required at the end of the read.
+    physical_scope(&header)?;
+    published_record(raw, &header, &script)?;
+    Ok(())
+}
+
 /// Verify frozen metadata against original protected bytes without re-reading a live process.
 pub fn record_matches(raw: &[u8], body: &crate::CaptureRecordBody) -> bool {
     let Ok((header, role)) = decode(raw) else {
@@ -1227,8 +1258,7 @@ pub fn record_matches(raw: &[u8], body: &crate::CaptureRecordBody) -> bool {
         header.controller.pid,
         header.controller.start_ticks
     );
-    let known_profile = (body.adapter_revision, body.parser_revision)
-        == (ADAPTER_REVISION, PARSER_REVISION)
+    let known_profile = is_native_profile(body.adapter_revision, body.parser_revision)
         || (body.adapter_revision, body.parser_revision) == (9, 6);
     let file_view = body
         .source_instance_id

@@ -157,7 +157,7 @@ fn run() -> Result<(), ()> {
                 .map_err(|_| ())?
                 .into_iter();
                 let record = records.next().ok_or(())?;
-                let source_locator = record.launch_locator().map_err(|_| ())?;
+                let source_locator = record.execution_locator().map_err(|_| ())?;
                 let closed = evertrace_capture::process_source::closed_records(&record, path);
                 let snapshot = RuntimeSnapshot::load(path).map_err(|_| ())?;
                 let socket = snapshot.recovery_socket_path.clone();
