@@ -17,6 +17,86 @@ use super::{WorkCommandContext, WorkIdentityError};
 
 const MAX_EVIDENCE: usize = 64;
 
+/// Attach an already proven source execution without replacing another accepted assignment.
+pub(crate) fn source_run_binding(
+    operation: &evertrace_domain::evidence::Operation,
+    current: Option<&WorkBindingRevision>,
+    primary: PrimaryWorkBinding,
+    mut evidence_refs: Vec<String>,
+) -> Result<BindingResolution, WorkIdentityError> {
+    if operation.pairing_state != evertrace_domain::evidence::PairingState::Paired
+        || primary.task_id.is_none()
+        || primary.workstream_id.is_none()
+        || primary.episode_id.is_none()
+        || primary.attempt_id.is_none()
+        || primary.experiment_run_id.is_none()
+        || evidence_refs.is_empty()
+    {
+        return Err(WorkIdentityError::InvalidInput);
+    }
+    if let Some(current) = current {
+        let previous = &current.primary_binding;
+        if current.assignment_status == AssignmentStatus::Conflicted
+            || previous
+                .task_id
+                .is_some_and(|id| Some(id) != primary.task_id)
+            || previous
+                .workstream_id
+                .is_some_and(|id| Some(id) != primary.workstream_id)
+            || previous
+                .episode_id
+                .is_some_and(|id| Some(id) != primary.episode_id)
+            || previous
+                .attempt_id
+                .is_some_and(|id| Some(id) != primary.attempt_id)
+            || previous
+                .experiment_run_id
+                .is_some_and(|id| Some(id) != primary.experiment_run_id)
+            || previous
+                .competing_group_id
+                .is_some_and(|id| Some(id) != primary.competing_group_id)
+        {
+            return Ok(BindingResolution::NoDelta);
+        }
+        evidence_refs.extend(current.evidence_refs.iter().cloned());
+    }
+    evidence_refs.sort();
+    evidence_refs.dedup();
+    let mut scopes = operation.scope_effect_ids.clone();
+    scopes.sort();
+    if current.is_some_and(|value| {
+        value.assignment_status == AssignmentStatus::Resolved
+            && value.primary_binding == primary
+            && value.scope_effect_refs == scopes
+            && value.evidence_refs == evidence_refs
+    }) {
+        return Ok(BindingResolution::NoDelta);
+    }
+    let binding = WorkBindingRevision {
+        work_binding_revision_id: WorkBindingRevisionId::new_v7(),
+        operation_id: operation.operation_id,
+        revision_generation: current
+            .map_or(Some(1), |value| value.revision_generation.checked_add(1))
+            .ok_or(WorkIdentityError::InvalidInput)?,
+        predecessor_revision_id: current.map(|value| value.work_binding_revision_id),
+        primary_binding: primary,
+        secondary_bindings: current.map_or_else(Vec::new, |value| value.secondary_bindings.clone()),
+        scope_effect_refs: scopes,
+        assignment_status: AssignmentStatus::Resolved,
+        evidence_refs,
+        resolver_version: 1,
+    };
+    binding
+        .validate()
+        .map_err(|_| WorkIdentityError::InvalidInput)?;
+    if let Some(current) = current {
+        current
+            .validate_successor(&binding)
+            .map_err(|_| WorkIdentityError::Conflict)?;
+    }
+    Ok(BindingResolution::Revision(Box::new(binding)))
+}
+
 /// Root intent comes from a live publisher witness, never an annotation or a caller-supplied confidence.
 pub(crate) fn source_root_task(
     context: WorkCommandContext,

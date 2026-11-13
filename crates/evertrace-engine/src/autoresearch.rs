@@ -241,14 +241,41 @@ fn source_resolved(
                                 })))
             });
     }
-    if matches!(envelope, SourceCandidate::Trial(_)) {
-        return current.other_data_rows().any(|row| {
-            row.payload_json
+    if let SourceCandidate::Trial(trial) = envelope {
+        let external_key = format!("{}/{}", trial.source_epoch, trial.execution_key);
+        let run = current.other_data_rows().find_map(|row| {
+            if row.object_kind.as_deref() != Some("experiment_run") {
+                return None;
+            }
+            let JournalPayload::ExperimentRunRecorded(run) = row
+                .payload_json
                 .as_deref()
-                .and_then(|json| serde_json::from_str::<JournalPayload>(json).ok())
-                .is_some_and(|payload| {
-                    matches!(payload, JournalPayload::ExperimentRunRecorded(run)
-                if run.source_receipt_refs.contains(&observation.source_receipt_ref))
+                .and_then(|json| serde_json::from_str::<JournalPayload>(json).ok())?
+            else {
+                return None;
+            };
+            (run.external_system_id.as_deref() == Some(evertrace_capture::process_source::FORMAT)
+                && run.external_run_key.as_deref() == Some(external_key.as_str())
+                && run
+                    .source_receipt_refs
+                    .contains(&observation.source_receipt_ref))
+            .then_some(run.run_id)
+        });
+        let Some(run) = run else {
+            return false;
+        };
+        // Frozen weak admission cannot become a physical binding on a later scan.
+        if observation.correlation.exact_key().is_none() {
+            return true;
+        }
+        let source = observation.source_observation_id.to_string();
+        return current.other_data_rows().any(|row| {
+            row.object_kind.as_deref() == Some("work_binding")
+                && row.payload_json.as_deref().is_some_and(|json| {
+                    matches!(serde_json::from_str::<JournalPayload>(json),
+                        Ok(JournalPayload::WorkBindingRecorded(binding))
+                        if binding.primary_binding.experiment_run_id == Some(run)
+                            && binding.evidence_refs.contains(&source))
                 })
         });
     }
@@ -738,10 +765,28 @@ pub(crate) fn controlled_source_snapshot(
             }
             let mut refs = process_work_refs(current, opening, &declaration, &resolver.cas)?;
             refs.insert(opening.to_string());
+            let opening_receipt = current
+                .source_observation(opening)
+                .ok_or(AutoresearchError::EvidenceIncomplete)?
+                .0
+                .source_receipt_ref;
+            let external_key = format!("{}/{}", trial.source_epoch, trial.execution_key);
             let deadline = std::time::Instant::now() + std::time::Duration::from_millis(40);
             for row in current.other_data_rows() {
                 if std::time::Instant::now() >= deadline {
                     return Err(AutoresearchError::SelectionDeferred);
+                }
+                if row.object_kind.as_deref() == Some("experiment_run")
+                    && let Some(JournalPayload::ExperimentRunRecorded(run)) = row
+                        .payload_json
+                        .as_deref()
+                        .and_then(|json| serde_json::from_str(json).ok())
+                    && run.external_system_id.as_deref()
+                        == Some(evertrace_capture::process_source::FORMAT)
+                    && run.external_run_key.as_deref() == Some(external_key.as_str())
+                    && run.source_receipt_refs.contains(&opening_receipt)
+                {
+                    refs.insert(run.run_id.to_string());
                 }
                 if row.object_kind.as_deref() != Some("workstream") {
                     continue;
@@ -1501,36 +1546,220 @@ impl ControlledRunResolver {
             facts.receipt(opening_source)?,
         )
         .ok_or(AutoresearchError::EvidenceIncomplete)?;
-        let Some((attempt, anchor)) =
-            process_trial_target(&facts, &trial, &plan, source, opening_source)?
-        else {
-            return Ok(ControlledRunCommand::NoDelta);
-        };
+        if trial.study_key != plan.study_key || trial.source_epoch != plan.source_epoch {
+            return Err(AutoresearchError::UntrustedRunEvidence);
+        }
         let external_key = format!("{}/{}", trial.source_epoch, trial.execution_key);
-        if facts.runs.runs.values().any(|run| {
-            run.external_system_id.as_deref() == Some(evertrace_capture::process_source::FORMAT)
-                && run.external_run_key.as_deref() == Some(external_key.as_str())
-        }) {
+        let opening_receipt = facts.receipt(opening_source)?.source_receipt_id;
+        let existing = facts
+            .runs
+            .runs
+            .values()
+            .filter(|run| {
+                run.external_system_id.as_deref() == Some(evertrace_capture::process_source::FORMAT)
+                    && run.external_run_key.as_deref() == Some(external_key.as_str())
+                    && run.source_receipt_refs.contains(&opening_receipt)
+            })
+            .collect::<Vec<_>>();
+        if existing.len() > 1 {
+            return Err(AutoresearchError::ImmutableConflict);
+        }
+        let (run, attempt, is_new) = if let Some(run) = existing.first() {
+            let mut expected = vec![
+                facts.receipt(source)?.source_receipt_id,
+                facts.receipt(opening_source)?.source_receipt_id,
+            ];
+            expected.sort();
+            if run.source_receipt_refs != expected
+                || run.comparison_execution_binding.is_some()
+                || run.origin != RunOrigin::External
+            {
+                return Err(AutoresearchError::ImmutableConflict);
+            }
+            let attempt = run
+                .attempt_id
+                .and_then(|id| facts.attempts.get(&id))
+                .ok_or(AutoresearchError::EvidenceIncomplete)?;
+            ((*run).clone(), attempt, false)
+        } else {
+            let Some((attempt, anchor)) =
+                process_trial_target(&facts, &trial, &plan, source, opening_source)?
+            else {
+                return Ok(ControlledRunCommand::NoDelta);
+            };
+            let mut input = process_trial_input(&trial, attempt, anchor, context.occurred_at_us)?;
+            input.source_receipt_refs = vec![
+                facts.receipt(source)?.source_receipt_id,
+                facts.receipt(opening_source)?.source_receipt_id,
+            ];
+            let mut run = create_experiment_run(attempt, input)?;
+            run.origin = RunOrigin::External;
+            run.external_system_id = Some(evertrace_capture::process_source::FORMAT.into());
+            run.external_run_key = Some(external_key);
+            run.validate()
+                .map_err(|_| AutoresearchError::InvalidInput)?;
+            (run, attempt, true)
+        };
+        let bindings =
+            self.process_trial_bindings(&facts, source, &trial, opening_source, &run, attempt)?;
+        if !is_new && bindings.is_empty() {
             return Ok(ControlledRunCommand::NoDelta);
         }
-        let mut input = process_trial_input(&trial, attempt, anchor, context.occurred_at_us)?;
-        input.source_receipt_refs = vec![
-            facts.receipt(source)?.source_receipt_id,
-            facts.receipt(opening_source)?.source_receipt_id,
-        ];
-        let mut run = create_experiment_run(attempt, input)?;
-        run.origin = RunOrigin::External;
-        run.external_system_id = Some(evertrace_capture::process_source::FORMAT.into());
-        run.external_run_key = Some(external_key);
-        run.validate()
-            .map_err(|_| AutoresearchError::InvalidInput)?;
-        let command = run_command(context.clone(), &run)?;
+        let (mut payloads, attempt) = run_binding_updates(attempt, &bindings)?;
+        if is_new {
+            payloads.insert(
+                0,
+                JournalPayload::ExperimentRunRecorded(Box::new(run.clone())),
+            );
+        }
+        let command = payload_command(context.clone(), payloads)?;
         Ok(ControlledRunCommand::Declaration {
             run: Box::new(run),
-            bindings: Vec::new(),
-            attempt: None,
+            bindings,
+            attempt: attempt.map(Box::new),
             command,
         })
+    }
+
+    fn process_trial_bindings(
+        &self,
+        facts: &ControlledFacts,
+        source: SourceObservationId,
+        trial: &ProcessTrialDeclaration,
+        opening: SourceObservationId,
+        run: &ExperimentRun,
+        attempt: &Attempt,
+    ) -> Result<Vec<WorkBindingRevision>, AutoresearchError> {
+        use evertrace_capture::process_source;
+        use evertrace_domain::evidence::{ObservationRole, OperationKind};
+        let launch = facts
+            .observations
+            .get(&source)
+            .ok_or(AutoresearchError::EvidenceIncomplete)?;
+        let Some(key) = launch.correlation.exact_key() else {
+            return Ok(Vec::new());
+        };
+        if launch.source_revision.as_str() != process_source::SOURCE_REVISION
+            || (launch.adapter_revision, launch.parser_revision)
+                != (
+                    process_source::ADAPTER_REVISION,
+                    process_source::PARSER_REVISION,
+                )
+            || launch.source_role != SourceRole::Tool
+            || launch.content_trust != ContentTrust::UntrustedSourceContent
+            || launch.observation_role != ObservationRole::Intent
+            || !process_source::native_correlation_matches(
+                &self.protected_source(facts, source)?,
+                &launch.correlation,
+            )
+        {
+            return Err(AutoresearchError::UntrustedRunEvidence);
+        }
+        let stream = facts
+            .workstreams
+            .get(&run.workstream_id)
+            .ok_or(AutoresearchError::EvidenceIncomplete)?;
+        let anchor = facts
+            .snapshots
+            .get(&run.code_snapshot_id)
+            .ok_or(AutoresearchError::EvidenceIncomplete)?;
+        let reference = opening.to_string();
+        if run.attempt_binding_status != AttemptBindingStatus::Resolved
+            || run.attempt_id != Some(attempt.attempt_id)
+            || attempt.workstream_id != stream.workstream_id
+            || !stream.worktree_lineage_refs.contains(&reference)
+            || anchor.capture_status
+                != evertrace_domain::repository::SnapshotCaptureStatus::Complete
+            || !stream
+                .worktree_instance_ids
+                .contains(&anchor.worktree_instance_id)
+            || facts
+                .worktrees
+                .get(&anchor.worktree_instance_id)
+                .is_none_or(|tree| {
+                    Some(tree.repository_instance_id) != stream.repository_instance_id
+                })
+            || anchor.head_oid.as_deref() != Some(trial.source_anchor.commit.as_str())
+            || anchor.tree_oid.as_deref() != Some(trial.source_anchor.tree.as_str())
+            || !facts.bindings.values().any(|binding| {
+                binding.assignment_status == AssignmentStatus::Resolved
+                    && binding.primary_binding.task_id == Some(stream.task_id)
+                    && binding.primary_binding.workstream_id == Some(stream.workstream_id)
+                    && !binding.scope_effect_refs.is_empty()
+                    && binding.evidence_refs.contains(&reference)
+            })
+        {
+            return Ok(Vec::new());
+        }
+        let mut bindings = Vec::new();
+        for operation in facts.operations.values().filter(|operation| {
+            operation.operation_kind == OperationKind::Verify
+                && operation.pairing_state == PairingState::Paired
+                && operation.input_source_observation_refs.as_slice() == [source]
+        }) {
+            let mut refs = vec![
+                source.to_string(),
+                reference.clone(),
+                run.code_snapshot_id.to_string(),
+            ];
+            let mut terminal_seen = false;
+            for witness_id in &operation.result_source_observation_refs {
+                let witness = facts
+                    .observations
+                    .get(witness_id)
+                    .ok_or(AutoresearchError::EvidenceIncomplete)?;
+                let receipt = facts.receipt(*witness_id)?;
+                let bytes = self.protected_source(facts, *witness_id)?;
+                let raw: serde_json::Value = serde_json::from_slice(&bytes)
+                    .map_err(|_| AutoresearchError::UntrustedRunEvidence)?;
+                let role = match raw["event"].as_str() {
+                    Some("trial_started") => ObservationRole::Other,
+                    Some("trial_finished") => ObservationRole::Result,
+                    _ => return Ok(Vec::new()),
+                };
+                if witness.source_instance_id != launch.source_instance_id
+                    || witness.source_revision != launch.source_revision
+                    || witness.adapter_revision != launch.adapter_revision
+                    || witness.parser_revision != launch.parser_revision
+                    || witness.content_trust != launch.content_trust
+                    || witness.source_role != SourceRole::Tool
+                    || witness.observation_role != role
+                    || witness.correlation.exact_key().as_ref() != Some(&key)
+                    || !process_source::native_correlation_matches(&bytes, &witness.correlation)
+                    || raw["format"] != process_source::FORMAT
+                    || raw["event_key"].as_str() != Some(receipt.source_record_identity.as_str())
+                    || raw["sequence"].as_u64() != Some(receipt.source_sequence)
+                    || raw["launch_event"] != trial.event_key
+                    || raw["source_epoch"] != trial.source_epoch
+                    || raw["execution_key"] != trial.execution_key
+                    || raw["study_key"] != trial.study_key
+                {
+                    return Ok(Vec::new());
+                }
+                terminal_seen |= role == ObservationRole::Result;
+                refs.push(witness_id.to_string());
+            }
+            if !terminal_seen {
+                continue;
+            }
+            let current = facts.bindings.get(&operation.operation_id);
+            let primary = evertrace_domain::work::PrimaryWorkBinding {
+                task_id: Some(stream.task_id),
+                workstream_id: Some(stream.workstream_id),
+                episode_id: attempt.episode_id,
+                attempt_id: Some(attempt.attempt_id),
+                experiment_run_id: Some(run.run_id),
+                competing_group_id: current
+                    .and_then(|binding| binding.primary_binding.competing_group_id),
+            };
+            if let crate::work::binding::BindingResolution::Revision(binding) =
+                crate::work::binding::source_run_binding(operation, current, primary, refs)
+                    .map_err(|_| AutoresearchError::ImmutableConflict)?
+            {
+                bindings.push(*binding);
+            }
+        }
+        Ok(bindings)
     }
 
     fn resolve_root_goal(
@@ -1827,35 +2056,11 @@ impl ControlledRunResolver {
             .map_err(|_| AutoresearchError::InvalidInput)?;
         run.validate()
             .map_err(|_| AutoresearchError::InvalidInput)?;
-        let mut payloads = vec![JournalPayload::ExperimentRunRecorded(Box::new(run.clone()))];
-        let mut attempt_successor = None;
-        if !binding_successors.is_empty() {
-            payloads.extend(
-                binding_successors
-                    .iter()
-                    .cloned()
-                    .map(|binding| JournalPayload::WorkBindingRecorded(Box::new(binding))),
-            );
-            let mut next_attempt = attempt.clone();
-            next_attempt.revision_id = RevisionId::new_v7();
-            next_attempt.predecessor_revision_id = Some(attempt.revision_id);
-            next_attempt.revision_generation = attempt.revision_generation.saturating_add(1);
-            next_attempt.work_binding_revision_refs.extend(
-                binding_successors
-                    .iter()
-                    .map(|binding| binding.work_binding_revision_id),
-            );
-            next_attempt.work_binding_revision_refs.sort();
-            next_attempt.work_binding_revision_refs.dedup();
-            next_attempt.source_watermark = next_attempt.source_watermark.saturating_add(1);
-            attempt
-                .validate_successor(&next_attempt)
-                .map_err(|_| AutoresearchError::ImmutableConflict)?;
-            payloads.push(JournalPayload::AttemptRecorded(Box::new(
-                next_attempt.clone(),
-            )));
-            attempt_successor = Some(next_attempt);
-        }
+        let (mut payloads, attempt_successor) = run_binding_updates(attempt, &binding_successors)?;
+        payloads.insert(
+            0,
+            JournalPayload::ExperimentRunRecorded(Box::new(run.clone())),
+        );
         let command = payload_command(context, payloads)?;
         Ok(ControlledRunCommand::Declaration {
             run: Box::new(run),
@@ -2064,9 +2269,6 @@ fn process_trial_target<'a>(
     source: SourceObservationId,
     opening: SourceObservationId,
 ) -> Result<Option<(&'a Attempt, &'a WorktreeSnapshot)>, AutoresearchError> {
-    if trial.study_key != plan.study_key || trial.source_epoch != plan.source_epoch {
-        return Err(AutoresearchError::UntrustedRunEvidence);
-    }
     let reference = opening.to_string();
     let mut streams = facts
         .workstreams
@@ -2102,6 +2304,7 @@ fn process_trial_target<'a>(
             binding.assignment_status == AssignmentStatus::Resolved
                 && binding.primary_binding.workstream_id == Some(stream.workstream_id)
                 && binding.primary_binding.task_id == Some(stream.task_id)
+                && !binding.scope_effect_refs.is_empty()
                 && binding.evidence_refs.contains(&reference)
         })
         .collect::<Vec<_>>();
@@ -2709,6 +2912,37 @@ impl ControlledFacts {
         }
         Ok(())
     }
+}
+
+fn run_binding_updates(
+    attempt: &Attempt,
+    bindings: &[WorkBindingRevision],
+) -> Result<(Vec<JournalPayload>, Option<Attempt>), AutoresearchError> {
+    if bindings.is_empty() {
+        return Ok((Vec::new(), None));
+    }
+    let mut payloads = bindings
+        .iter()
+        .cloned()
+        .map(|binding| JournalPayload::WorkBindingRecorded(Box::new(binding)))
+        .collect::<Vec<_>>();
+    let mut next = attempt.clone();
+    next.revision_id = RevisionId::new_v7();
+    next.predecessor_revision_id = Some(attempt.revision_id);
+    next.revision_generation = attempt.revision_generation.saturating_add(1);
+    next.work_binding_revision_refs.extend(
+        bindings
+            .iter()
+            .map(|binding| binding.work_binding_revision_id),
+    );
+    next.work_binding_revision_refs.sort();
+    next.work_binding_revision_refs.dedup();
+    next.source_watermark = next.source_watermark.saturating_add(1);
+    attempt
+        .validate_successor(&next)
+        .map_err(|_| AutoresearchError::ImmutableConflict)?;
+    payloads.push(JournalPayload::AttemptRecorded(Box::new(next.clone())));
+    Ok((payloads, Some(next)))
 }
 
 fn exact_bound_run(
