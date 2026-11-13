@@ -5,6 +5,7 @@ from pathlib import PurePosixPath
 
 from .backend import BackendError, _decode, _read_boundary, normalize_source_query, normalize_archive_query
 from .memories import _metadata_card
+from .content import _decode_cursor
 
 _REFERENCE_ALGORITHM = "source_revision_reference_metadata_v10"
 _ARCHIVE_ALGORITHM = "source_archive_metadata_v1"
@@ -54,9 +55,7 @@ async def read_source_catalog(backend, query=None, after=None, frontier=None, li
     expected, identity = _read_boundary(frontier, None)
     position = None
     if after is not None:
-        if not isinstance(after, str) or not 0 < len(after.encode()) <= 4096:
-            raise BackendError("invalid_input")
-        cursor = _decode(after.encode())
+        cursor = _decode_cursor(after)
         if (not isinstance(cursor, dict) or set(cursor) != {"algorithm", "query", "frontier", "data_identity", "position"}
             or cursor["algorithm"] != _CATALOG_ALGORITHM or cursor["query"] != query):
             raise BackendError("invalid_input")
@@ -222,9 +221,7 @@ async def read_source_links(backend, reference, frontier, revision, after=None, 
     expected, identity = _read_boundary(frontier, None)
     position, bound = None, {"stable_key":reference, "revision_ref":revision}
     if after is not None:
-        if not isinstance(after, str) or not 0 < len(after.encode()) <= 4096:
-            raise BackendError("invalid_input")
-        cursor = _decode(after.encode())
+        cursor = _decode_cursor(after)
         if (not isinstance(cursor, dict) or set(cursor) != {"algorithm", "reference", "frontier", "data_identity", "position"}
             or cursor["algorithm"] != _REFERENCE_ALGORITHM or cursor["reference"] != bound):
             raise BackendError("invalid_input")
@@ -327,9 +324,7 @@ async def read_source_archive(backend, query, after=None, frontier=None, limit=3
     expected, identity = _read_boundary(frontier, None)
     position = None
     if after is not None:
-        if not isinstance(after, str) or not 0 < len(after.encode()) <= 4096:
-            raise BackendError("invalid_input")
-        cursor = _decode(after.encode())
+        cursor = _decode_cursor(after)
         if (not isinstance(cursor, dict) or set(cursor) != {"algorithm", "query", "frontier", "data_identity", "position"}
             or cursor["algorithm"] != _ARCHIVE_ALGORITHM or cursor["query"] != query):
             raise BackendError("invalid_input")
@@ -398,9 +393,7 @@ async def read_revisions(backend, reference, frontier, revision, after=None, lim
     source = {"stable_key":reference, "revision_ref":revision}
     position, expected, identity = None, None, None
     if after is not None:
-        if not isinstance(after, str) or not 0 < len(after.encode()) <= 4096:
-            raise BackendError("invalid_input")
-        cursor = _decode(after.encode())
+        cursor = _decode_cursor(after)
         if not isinstance(cursor, dict) or set(cursor) != {"algorithm", "reference", "frontier", "data_identity", "position"}:
             raise BackendError("invalid_input")
         if cursor["algorithm"] != _REVISION_ALGORITHM or cursor["reference"] != source:
