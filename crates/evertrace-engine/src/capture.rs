@@ -1105,7 +1105,9 @@ async fn reconcile_selected(
             &mut remaining,
         )?;
     }
-    if scopes.repositories.iter().any(|pin| !pin.valid()) {
+    if scopes.repositories.iter().any(|pin| !pin.valid())
+        || scopes.non_repositories.iter().any(|scope| !scope.valid())
+    {
         return Err(ReconcileError::StaleFrontier);
     }
     let committed = if payloads.is_empty() {
@@ -1118,6 +1120,7 @@ async fn reconcile_selected(
                 observation_id,
                 expected: dirty_frontier.items,
                 repositories: scopes.repositories,
+                non_repositories: scopes.non_repositories,
             };
             writer
                 .commit_live_normalization(command, input.occurred_at_us, guard)
@@ -1677,6 +1680,7 @@ pub(crate) struct LiveNormalizationGuard {
     observation_id: SourceObservationId,
     expected: Vec<evertrace_store::ReconciliationWorkItem>,
     repositories: Vec<crate::repository::RepositoryObservationGuard>,
+    non_repositories: Vec<crate::repository::NonRepositoryObservationGuard>,
 }
 
 impl LiveNormalizationGuard {
@@ -1688,11 +1692,20 @@ impl LiveNormalizationGuard {
         &self.repositories
     }
 
+    pub(crate) fn non_repository_directories(&self) -> impl Iterator<Item = &str> {
+        self.non_repositories
+            .iter()
+            .map(|scope| scope.path.as_str())
+    }
+
     pub(crate) fn validate(
         &self,
         current: &ReconciliationFrontier,
     ) -> Result<(), evertrace_store::StoreError> {
-        if current.items != self.expected || self.repositories.iter().any(|pin| !pin.valid()) {
+        if current.items != self.expected
+            || self.repositories.iter().any(|pin| !pin.valid())
+            || self.non_repositories.iter().any(|scope| !scope.valid())
+        {
             return Err(evertrace_store::StoreError::StaleFrontier);
         }
         Ok(())
@@ -1703,6 +1716,7 @@ impl LiveNormalizationGuard {
 struct ObservedSourceScopes {
     claims: BTreeMap<SourceObservationId, evertrace_domain::evidence::ScopeEffectClaim>,
     repositories: Vec<crate::repository::RepositoryObservationGuard>,
+    non_repositories: Vec<crate::repository::NonRepositoryObservationGuard>,
 }
 
 async fn observe_execution_scopes(
@@ -1768,19 +1782,46 @@ async fn observe_execution_scopes(
             let namespace = authority.observe(&observation, &receipt, &protected)?;
             let deadline = Instant::now() + Duration::from_millis(500);
             let location =
-                crate::repository::workspace_git_location(Path::new(&namespace.cwd), deadline)
-                    .ok()??;
-            let trust = namespace.trust(location.worktree_path.to_str()?, deadline);
-            if trust.state != evertrace_codex::policy::RepositoryTrustState::Trusted {
-                return None;
-            }
+                crate::repository::workspace_git_location(&namespace.directory_path()?, deadline)
+                    .ok()?;
             let mut references = vec![receipt.source_ref, namespace.evidence_ref(&id.to_string())];
-            references.extend(trust.evidence_refs);
+            if let Some(location) = &location {
+                let trust = namespace.trust(location.worktree_path.to_str()?, deadline);
+                if trust.state != evertrace_codex::policy::RepositoryTrustState::Trusted {
+                    return None;
+                }
+                references.extend(trust.evidence_refs);
+            }
             Some((namespace, location, references, deadline))
         })
         .await
         .map_err(|_| ReconcileError::Projection)?;
         let Some((namespace, location, references, deadline)) = located else {
+            continue;
+        };
+        let Some(location) = location else {
+            let Some(guard) = namespace.non_repository() else {
+                continue;
+            };
+            if matches!(
+                writer.recorded_repository_contains_path(&guard.path).await,
+                Ok(false)
+            ) {
+                observed.claims.insert(
+                    id,
+                    ScopeEffectClaim {
+                        effect_role: EffectRole::Observe,
+                        repository_instance_id: None,
+                        worktree_instance_id: None,
+                        pre_snapshot_id: None,
+                        post_snapshot_id: None,
+                        experiment_run_ids: Vec::new(),
+                        artifact_refs: Vec::new(),
+                        evidence_refs: vec![id],
+                    },
+                );
+                observed.non_repositories.push(guard);
+            }
             continue;
         };
         let (view, purged) = writer

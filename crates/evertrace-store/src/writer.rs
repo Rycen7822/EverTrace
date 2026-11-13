@@ -759,6 +759,10 @@ impl JournalWriter {
             .source_repository_read_context(identity, retained_ids)
     }
 
+    pub fn recorded_repository_contains_path(&self, path: &str) -> Result<bool, StoreError> {
+        self.admission_state.recorded_repository_contains_path(path)
+    }
+
     pub fn repository_resolution_context(
         &self,
         identity: evertrace_domain::repository::FilesystemIdentity,

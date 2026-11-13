@@ -12055,6 +12055,33 @@ impl JournalAdmissionState {
         self.repository_read_context(&ids)
     }
 
+    /// A negative scope check must not turn a retained/revoked code path into non-repository work.
+    pub(crate) fn recorded_repository_contains_path(&self, path: &str) -> Result<bool, StoreError> {
+        let path = std::path::Path::new(path);
+        if !path.is_absolute() {
+            return Err(StoreError::InvalidInput);
+        }
+        let deadline = std::time::Instant::now() + std::time::Duration::from_millis(50);
+        let roots = self
+            .repositories
+            .values()
+            .map(|(repository, _)| repository.current_path.as_str())
+            .chain(
+                self.worktrees
+                    .values()
+                    .filter_map(|(tree, _)| tree.current_path.as_deref()),
+            );
+        for (count, root) in roots.enumerate() {
+            if count >= READ_DEPENDENCY_LIMIT || std::time::Instant::now() >= deadline {
+                return Err(StoreError::InvalidInput);
+            }
+            if path.starts_with(root) {
+                return Ok(true);
+            }
+        }
+        Ok(false)
+    }
+
     /// Only current snapshots are selected. Resolution callers must mark the
     /// omitted snapshot history incomplete; absence is never continuity proof.
     pub(crate) fn repository_resolution_context(

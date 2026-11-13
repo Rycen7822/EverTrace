@@ -403,6 +403,20 @@ impl ExecutionNamespace {
         self.revalidate(&mut ReadBudget::new()).is_some()
     }
 
+    pub(crate) fn directory_path(&self) -> Option<PathBuf> {
+        let path = fs::read_link(self.child.path("cwd")).ok()?;
+        self.valid().then_some(path)
+    }
+
+    pub(crate) fn non_repository(self) -> Option<NonRepositoryObservationGuard> {
+        let path = self.directory_path()?.into_os_string().into_string().ok()?;
+        let guard = NonRepositoryObservationGuard {
+            namespace: self,
+            path,
+        };
+        guard.valid().then_some(guard)
+    }
+
     pub(crate) fn evidence_ref(&self, source: &str) -> String {
         format!(
             "native-execution-directory:{source}:{}:{}:{}",
@@ -421,6 +435,24 @@ impl ExecutionNamespace {
             result.evidence_refs.clear();
         }
         result
+    }
+}
+
+/// One live negative observation, pinned to the child's actual directory, not a caller's alias.
+pub(crate) struct NonRepositoryObservationGuard {
+    namespace: ExecutionNamespace,
+    pub(crate) path: String,
+}
+
+impl NonRepositoryObservationGuard {
+    pub(crate) fn valid(&self) -> bool {
+        let deadline = Instant::now() + OBSERVATION_BUDGET;
+        self.namespace.directory_path().as_deref() == Some(Path::new(&self.path))
+            && matches!(
+                super::workspace_git_location(Path::new(&self.path), deadline),
+                Ok(None)
+            )
+            && self.namespace.valid()
     }
 }
 

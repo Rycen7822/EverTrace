@@ -255,6 +255,10 @@ enum WriterRequest {
         filesystem: Option<evertrace_domain::repository::FilesystemIdentity>,
         reply: oneshot::Sender<Result<evertrace_store::RepositoryReadContext, WriterActorError>>,
     },
+    RecordedRepositoryPath {
+        path: String,
+        reply: oneshot::Sender<Result<bool, WriterActorError>>,
+    },
     RepositoryResolutionContext {
         identity: evertrace_domain::repository::FilesystemIdentity,
         reply: oneshot::Sender<
@@ -551,6 +555,21 @@ impl WriterHandle {
             .send(WriterRequest::RepositoryReadContext {
                 ids: retained_ids,
                 filesystem: Some(identity),
+                reply,
+            })
+            .await
+            .map_err(|_| WriterActorError::Stopped)?;
+        response.await.map_err(|_| WriterActorError::Stopped)?
+    }
+
+    pub(crate) async fn recorded_repository_contains_path(
+        &self,
+        path: &str,
+    ) -> Result<bool, WriterActorError> {
+        let (reply, response) = oneshot::channel();
+        self.sender
+            .send(WriterRequest::RecordedRepositoryPath {
+                path: path.to_owned(),
                 reply,
             })
             .await
@@ -1558,6 +1577,11 @@ async fn run_writer(
                                     .physical_normalization_context(guard.observation_id())
                                     .await?;
                                 guard.validate(&current)?;
+                                for path in guard.non_repository_directories() {
+                                    if writer.recorded_repository_contains_path(path)? {
+                                        return Err(StoreError::StaleFrontier);
+                                    }
+                                }
                                 for repository in guard.repositories() {
                                     let (view, purged) = writer
                                         .repository_resolution_context(repository.identity())?;
@@ -2213,6 +2237,14 @@ async fn run_writer(
                         None => writer.repository_read_context(&ids),
                     }
                     .map_err(map_store_error);
+                    let _ = reply.send(result);
+                }
+                WriterRequest::RecordedRepositoryPath { path, reply } => {
+                    let result = writer
+                        .as_ref()
+                        .ok_or(WriterActorError::Stopped)?
+                        .recorded_repository_contains_path(&path)
+                        .map_err(map_store_error);
                     let _ = reply.send(result);
                 }
                 WriterRequest::RepositoryResolutionContext { identity, reply } => {
