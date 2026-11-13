@@ -70,9 +70,7 @@ pub(crate) fn validate_controlled_command<'a>(
         })
         .collect::<Vec<_>>();
     for run in &runs {
-        if run.metric_extractor_version
-            == evertrace_domain::work::NATIVE_TEST_CONTRACT_PARSER_VERSION
-        {
+        if evertrace_domain::work::is_native_test_contract_parser(&run.metric_extractor_version) {
             validate_native_contract(&view, run, error)?;
         }
         if run.comparison_execution_binding.is_none() && !run.is_declaration_only() {
@@ -537,7 +535,32 @@ fn validate_native_contract(
     };
     let (receipt, launch, raw) =
         native_source_bytes(view, *launch_id, ObservationRole::Intent, false, error)?;
-    let anchor = &view.snapshots.get(&run.code_snapshot_id).ok_or(error)?.0;
+    let basis = &view.snapshots.get(&run.code_snapshot_id).ok_or(error)?.0;
+    let anchor = if run.metric_extractor_version
+        == evertrace_domain::work::NATIVE_TEST_COHORT_PARSER_VERSION
+    {
+        let prefix = format!(
+            "native-execution-directory:{}:",
+            launch.source_observation_id
+        );
+        let witnesses = view
+            .snapshots
+            .values()
+            .filter(|(snapshot, _)| {
+                snapshot
+                    .evidence_refs
+                    .iter()
+                    .any(|reference| reference.starts_with(&prefix))
+            })
+            .map(|(snapshot, _)| snapshot)
+            .collect::<Vec<_>>();
+        let [witness] = witnesses.as_slice() else {
+            return Err(error);
+        };
+        *witness
+    } else {
+        basis
+    };
     let contract = evertrace_domain::work::NativeTestContract::decode(
         raw,
         anchor,
@@ -590,6 +613,17 @@ fn validate_native_contract(
         .get(&anchor.worktree_instance_id)
         .ok_or(error)?
         .0;
+    let entry = episode
+        .entry_worktree_snapshot_id
+        .and_then(|id| view.snapshots.get(&id))
+        .map(|(value, _)| value);
+    if run.metric_extractor_version == evertrace_domain::work::NATIVE_TEST_COHORT_PARSER_VERSION
+        && evertrace_domain::work::NativeTestContract::code_basis(anchor, entry)
+            .worktree_snapshot_id
+            != run.code_snapshot_id
+    {
+        return Err(error);
+    }
     if !contract.matches_run(run)
         || run.comparison_execution_binding.is_some()
         || run.origin != evertrace_domain::work::RunOrigin::External
@@ -646,7 +680,7 @@ fn validate_native_terminal_cohort(
     error: StoreError,
 ) -> Result<(), StoreError> {
     use evertrace_domain::semantic::{EvidenceCompleteness, ParserStatus, ResultScope};
-    if run.metric_extractor_version != evertrace_domain::work::NATIVE_TEST_CONTRACT_PARSER_VERSION {
+    if !evertrace_domain::work::is_native_test_contract_parser(&run.metric_extractor_version) {
         return Err(error);
     }
     let current = &view.runs.get(&run.run_id).ok_or(error)?.0;
@@ -739,9 +773,9 @@ fn validate_native_test_result(
     let run = command_run
         .or_else(|| view.runs.get(&result.experiment_run_id).map(|(run, _)| run))
         .ok_or(error)?;
-    let full = run.metric_extractor_version
-        == evertrace_domain::work::NATIVE_TEST_CONTRACT_PARSER_VERSION
-        && result.result_scope == ResultScope::Complete;
+    let full =
+        evertrace_domain::work::is_native_test_contract_parser(&run.metric_extractor_version)
+            && result.result_scope == ResultScope::Complete;
     if result.experiment_run_revision_id != run.revision_id
         || !is_native_test_parser(&run.metric_extractor_version)
         || result.parser_receipt.parser_version != run.metric_extractor_version
@@ -971,6 +1005,7 @@ pub(crate) fn validate_relations(input: AutoresearchRelationInputs<'_>) -> Resul
                 "evertrace.result_metric.v1"
                     | evertrace_domain::work::NATIVE_TEST_RESULT_PARSER_VERSION
                     | evertrace_domain::work::NATIVE_TEST_CONTRACT_PARSER_VERSION
+                    | evertrace_domain::work::NATIVE_TEST_COHORT_PARSER_VERSION
             )
             || result
                 .verifier_receipt
@@ -1481,8 +1516,9 @@ fn allowed_run_shape(value: &ExperimentRun) -> bool {
     value.is_declaration_only()
         || value.is_controlled_declaration()
         || (value.comparison_execution_binding.is_some()
-            || value.metric_extractor_version
-                == evertrace_domain::work::NATIVE_TEST_CONTRACT_PARSER_VERSION)
+            || evertrace_domain::work::is_native_test_contract_parser(
+                &value.metric_extractor_version,
+            ))
             && value.observability == RunObservability::Full
             && value.execution_status == RunExecutionStatus::Completed
             && value.contract_validity == RunContractValidity::Valid

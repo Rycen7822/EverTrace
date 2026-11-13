@@ -164,12 +164,17 @@ impl ControlledRunSourceEnvelope {
 /// The original source event and embedded xUnit2 bytes, not a generated metric envelope.
 pub const NATIVE_TEST_RESULT_PARSER_VERSION: &str = "evertrace.native_test_result.v1";
 pub const NATIVE_TEST_CONTRACT_PARSER_VERSION: &str = "evertrace.native_test_result.v2";
+pub const NATIVE_TEST_COHORT_PARSER_VERSION: &str = "evertrace.native_test_result.v3";
 
-pub fn is_native_test_parser(version: &str) -> bool {
+pub fn is_native_test_contract_parser(version: &str) -> bool {
     matches!(
         version,
-        NATIVE_TEST_RESULT_PARSER_VERSION | NATIVE_TEST_CONTRACT_PARSER_VERSION
+        NATIVE_TEST_CONTRACT_PARSER_VERSION | NATIVE_TEST_COHORT_PARSER_VERSION
     )
+}
+
+pub fn is_native_test_parser(version: &str) -> bool {
+    version == NATIVE_TEST_RESULT_PARSER_VERSION || is_native_test_contract_parser(version)
 }
 
 /// Transient compilation of the fixed original launch, never a second persisted contract.
@@ -182,6 +187,16 @@ pub struct NativeTestContract {
 }
 
 impl NativeTestContract {
+    /// Keep the direct execution witness distinct from the already recorded comparison basis.
+    pub fn code_basis<'a>(
+        witness: &'a crate::repository::WorktreeSnapshot,
+        episode_entry: Option<&'a crate::repository::WorktreeSnapshot>,
+    ) -> &'a crate::repository::WorktreeSnapshot {
+        episode_entry
+            .filter(|entry| witness.same_code_state(entry))
+            .unwrap_or(witness)
+    }
+
     pub fn decode(
         raw: &[u8],
         snapshot: &crate::repository::WorktreeSnapshot,
@@ -271,7 +286,7 @@ impl NativeTestContract {
             && run.seed_values.is_empty()
             && !run.nondeterministic
             && run.metric_definition == "TestTaskEval passed tests"
-            && run.metric_extractor_version == NATIVE_TEST_CONTRACT_PARSER_VERSION
+            && is_native_test_contract_parser(&run.metric_extractor_version)
             && run.multi_cas_metric_policy == MultiCasMetricPolicy::RejectMultipleParsed
             && run.created_at_us <= self.started_at_us
     }

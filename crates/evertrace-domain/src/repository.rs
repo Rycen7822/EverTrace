@@ -389,6 +389,31 @@ pub struct WorktreeSnapshot {
 }
 
 impl WorktreeSnapshot {
+    /// Repository code-state equivalence only; Run environment identity is checked independently.
+    pub fn same_code_state(&self, other: &Self) -> bool {
+        self.capture_status == SnapshotCaptureStatus::Complete
+            && other.capture_status == SnapshotCaptureStatus::Complete
+            && self.head_oid.is_some()
+            && self.tree_oid.is_some()
+            && self.tracked_diff_digest.is_some()
+            && self.index_digest.is_some()
+            && self.untracked_manifest_digest.is_some()
+            && self.worktree_instance_id == other.worktree_instance_id
+            && self.head_oid == other.head_oid
+            && self.tree_oid == other.tree_oid
+            && self.branch_ref == other.branch_ref
+            && self.detached_head == other.detached_head
+            && self.tracked_diff_digest == other.tracked_diff_digest
+            && self.index_digest == other.index_digest
+            && self.untracked_manifest_digest == other.untracked_manifest_digest
+            && self.relevant_anchor_digests == other.relevant_anchor_digests
+            && self.dependency_fingerprints == other.dependency_fingerprints
+            && self.toolchain_fingerprint == other.toolchain_fingerprint
+            && self.git_operation == other.git_operation
+            && self.omission_reasons.is_empty()
+            && other.omission_reasons.is_empty()
+    }
+
     pub fn validate(&self) -> Result<(), RepositoryError> {
         if self.captured_at_us < 0 {
             return Err(RepositoryError::InvalidSnapshot);

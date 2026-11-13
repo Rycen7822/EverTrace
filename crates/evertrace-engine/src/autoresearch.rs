@@ -1856,7 +1856,7 @@ impl ControlledRunResolver {
         AutoresearchError,
     > {
         use evertrace_domain::work::{
-            NATIVE_TEST_CONTRACT_PARSER_VERSION, NativeTestResult, is_native_test_parser,
+            NativeTestResult, is_native_test_contract_parser, is_native_test_parser,
         };
         let terminal = facts
             .observations
@@ -1913,7 +1913,7 @@ impl ControlledRunResolver {
                 .ok_or(AutoresearchError::EvidenceIncomplete)?,
             run.workstream_id,
         )?;
-        if run.metric_extractor_version == NATIVE_TEST_CONTRACT_PARSER_VERSION
+        if is_native_test_contract_parser(&run.metric_extractor_version)
             && result.metric().is_some()
         {
             return self
@@ -2018,9 +2018,10 @@ impl ControlledRunResolver {
     ) -> Result<ControlledRunCommand, AutoresearchError> {
         use evertrace_capture::process_source;
         use evertrace_domain::work::{
-            NATIVE_TEST_CONTRACT_PARSER_VERSION, NativeTestContract, NativeTestResult,
+            NATIVE_TEST_COHORT_PARSER_VERSION, NativeTestContract, NativeTestResult,
+            is_native_test_contract_parser,
         };
-        if current.metric_extractor_version != NATIVE_TEST_CONTRACT_PARSER_VERSION {
+        if !is_native_test_contract_parser(&current.metric_extractor_version) {
             return Err(AutoresearchError::UntrustedRunEvidence);
         }
         if !current.is_declaration_only() {
@@ -2046,10 +2047,42 @@ impl ControlledRunResolver {
             facts.receipt(launch.source_observation_id)?,
         )
         .ok_or(AutoresearchError::UntrustedRunEvidence)?;
-        let anchor = facts
-            .snapshots
-            .get(&current.code_snapshot_id)
-            .ok_or(AutoresearchError::EvidenceIncomplete)?;
+        let anchor = if current.metric_extractor_version == NATIVE_TEST_COHORT_PARSER_VERSION {
+            let opening = facts
+                .process_opening(launch.source_observation_id)?
+                .source_observation_id;
+            let plan = ProcessWorkDeclaration::decode(
+                &self.protected_source(facts, opening)?,
+                facts.receipt(opening)?,
+            )
+            .ok_or(AutoresearchError::UntrustedRunEvidence)?;
+            if trial.study_key != plan.study_key || trial.source_epoch != plan.source_epoch {
+                return Err(AutoresearchError::UntrustedRunEvidence);
+            }
+            let Some((attempt, witness)) =
+                process_trial_target(facts, &trial, &plan, launch.source_observation_id, opening)?
+            else {
+                return Ok(ControlledRunCommand::NoDelta);
+            };
+            let entry = attempt
+                .episode_id
+                .and_then(|id| facts.current_episodes.get(&id))
+                .and_then(|revision| facts.episodes.get(revision))
+                .and_then(|episode| episode.entry_worktree_snapshot_id)
+                .and_then(|id| facts.snapshots.get(&id));
+            if current.attempt_id != Some(attempt.attempt_id)
+                || NativeTestContract::code_basis(witness, entry).worktree_snapshot_id
+                    != current.code_snapshot_id
+            {
+                return Err(AutoresearchError::UntrustedRunEvidence);
+            }
+            witness
+        } else {
+            facts
+                .snapshots
+                .get(&current.code_snapshot_id)
+                .ok_or(AutoresearchError::EvidenceIncomplete)?
+        };
         let contract = NativeTestContract::decode(
             &raw,
             anchor,
@@ -2301,7 +2334,16 @@ impl ControlledRunResolver {
                 input.normalized_config = contract.normalized_config;
                 input.variable_declaration = contract.variable_declaration;
                 input.metric_extractor_version =
-                    evertrace_domain::work::NATIVE_TEST_CONTRACT_PARSER_VERSION.into();
+                    evertrace_domain::work::NATIVE_TEST_COHORT_PARSER_VERSION.into();
+                let entry = attempt
+                    .episode_id
+                    .and_then(|id| facts.current_episodes.get(&id))
+                    .and_then(|revision| facts.episodes.get(revision))
+                    .and_then(|episode| episode.entry_worktree_snapshot_id)
+                    .and_then(|id| facts.snapshots.get(&id));
+                input.code_snapshot_id =
+                    evertrace_domain::work::NativeTestContract::code_basis(anchor, entry)
+                        .worktree_snapshot_id;
                 input.created_at_us = input.created_at_us.min(contract.started_at_us);
             }
             receipts.extend([facts.receipt(source)?.source_receipt_id, opening_receipt]);
@@ -4202,6 +4244,7 @@ fn require_result_run(
             RESULT_PARSER_VERSION
                 | evertrace_domain::work::NATIVE_TEST_RESULT_PARSER_VERSION
                 | evertrace_domain::work::NATIVE_TEST_CONTRACT_PARSER_VERSION
+                | evertrace_domain::work::NATIVE_TEST_COHORT_PARSER_VERSION
         )
         || result.parser_receipt.parser_version != run.metric_extractor_version
     {
