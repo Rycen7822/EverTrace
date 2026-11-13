@@ -241,6 +241,34 @@ fn source_resolved(
                                 })))
             });
     }
+    if let SourceCandidate::TestResult(event) = envelope {
+        let key = format!("{}/{}", event.source_epoch, event.execution_key);
+        // Old declarations keep their original extractor contract; do not reopen their namespace.
+        if current.other_data_rows().any(|row| row.object_kind.as_deref() == Some("experiment_run")
+            && row.payload_json.as_deref().is_some_and(|json| {
+                matches!(serde_json::from_str::<JournalPayload>(json),
+                    Ok(JournalPayload::ExperimentRunRecorded(run))
+                    if run.external_system_id.as_deref() == Some(evertrace_capture::process_source::FORMAT)
+                        && run.external_run_key.as_deref() == Some(key.as_str())
+                        && run.metric_extractor_version != evertrace_domain::work::NATIVE_TEST_RESULT_PARSER_VERSION)
+            }))
+        {
+            return true;
+        }
+        let Some((receipt, _)) = current.source_receipt(observation.source_receipt_ref) else {
+            return false;
+        };
+        return current.other_data_rows().any(|row| {
+            row.object_kind.as_deref() == Some("result_evidence")
+                && row.payload_json.as_deref().is_some_and(|json| {
+                    matches!(serde_json::from_str::<JournalPayload>(json),
+                        Ok(JournalPayload::ResultEvidenceRecorded(result))
+                        if result.parser_receipt.parser_version
+                            == evertrace_domain::work::NATIVE_TEST_RESULT_PARSER_VERSION
+                            && result.raw_cas_refs.iter().any(|cas| hex(&cas.as_digest()) == receipt.cas_ref))
+                })
+        });
+    }
     if let SourceCandidate::Trial(trial) = envelope {
         let external_key = format!("{}/{}", trial.source_epoch, trial.execution_key);
         let run = current.other_data_rows().find_map(|row| {
@@ -550,6 +578,7 @@ fn runtime_environment_fingerprint(value: &serde_json::Value) -> Result<String, 
 }
 
 enum SourceCandidate {
+    TestResult(Box<evertrace_domain::work::NativeTestResult>),
     WorkPlan(Box<ProcessWorkDeclaration>),
     Trial(Box<ProcessTrialDeclaration>),
     Run(ControlledRunSourceEnvelope),
@@ -565,6 +594,16 @@ fn source_candidate(
 ) -> Option<SourceCandidate> {
     use evertrace_domain::evidence::{ContentTrust, SourceRole};
     let (observation, _) = current.source_observation(id)?;
+    if observation.source_revision.as_str() == evertrace_capture::process_source::SOURCE_REVISION
+        && observation.source_role == SourceRole::Tool
+        && observation.content_trust == ContentTrust::Observed
+        && observation.capture_completeness == CaptureCompleteness::Complete
+        && observation.correlation.exact_key().is_some()
+    {
+        let (surface, _) = current.evidence_surface(id)?;
+        return evertrace_domain::work::NativeTestResult::decode(surface.protected_text.as_bytes())
+            .map(|value| SourceCandidate::TestResult(Box::new(value)));
+    }
     if observation.source_revision.as_str() == evertrace_capture::process_source::SOURCE_REVISION
         && observation.source_role == SourceRole::Tool
         && observation.content_trust == ContentTrust::UntrustedSourceContent
@@ -903,6 +942,48 @@ pub(crate) fn controlled_source_snapshot(
     let Some(envelope) = source_candidate(current, id) else {
         return Ok(None);
     };
+    if let SourceCandidate::TestResult(result) = &envelope {
+        let observation = current
+            .source_observation(id)
+            .ok_or(AutoresearchError::EvidenceIncomplete)?
+            .0;
+        let launch = current.source_observations().find_map(|(value, _)| {
+            (value.source_instance_id == observation.source_instance_id
+                && value.source_record_identity.as_str() == result.launch_event
+                && value.observation_role == evertrace_domain::evidence::ObservationRole::Intent)
+                .then_some(value.source_observation_id)
+        });
+        let Some(launch) = launch else {
+            return Ok(None);
+        };
+        // Exactly one level: the target is a verified Intent, never another terminal.
+        let Some(mut snapshot) = controlled_source_snapshot(current, launch, resolver)? else {
+            return Ok(None);
+        };
+        for kind in ["source_observation", "source_receipt", "evidence_surface"] {
+            let key = if kind == "source_receipt" {
+                observation.source_receipt_ref.to_string()
+            } else {
+                id.to_string()
+            };
+            if let Some(row) = current.selected_source_row(kind, &key)?
+                && !snapshot.rows.iter().any(|value| value.row_id == row.row_id)
+            {
+                snapshot.rows.push(row);
+            }
+        }
+        if snapshot.rows.len() > 256
+            || snapshot
+                .rows
+                .iter()
+                .map(|row| row.payload_json.as_ref().map_or(0, |json| json.len()))
+                .sum::<usize>()
+                > 2 * 1024 * 1024
+        {
+            return Err(AutoresearchError::EvidenceIncomplete);
+        }
+        return Ok(Some(snapshot));
+    }
     let process_refs = match &envelope {
         SourceCandidate::WorkPlan(declaration) => {
             process_work_refs(current, id, declaration, &resolver.cas)?
@@ -979,6 +1060,7 @@ pub(crate) fn controlled_source_snapshot(
     let mut refs = BTreeSet::from([id.to_string()]);
     refs.extend(process_refs);
     match envelope {
+        SourceCandidate::TestResult(_) => return Err(AutoresearchError::InvalidInput),
         SourceCandidate::WorkPlan(_) | SourceCandidate::Trial(_) => {}
         SourceCandidate::RootGoal { reference, .. } => {
             refs.insert(reference);
@@ -1285,6 +1367,9 @@ pub enum ControlledRunCommand {
         attempt: Option<Box<Attempt>>,
         command: JournalCommand,
     },
+    Result {
+        command: JournalCommand,
+    },
     Terminal {
         run: Box<ExperimentRun>,
         result: Box<ResultEvidence>,
@@ -1324,6 +1409,19 @@ impl ControlledRunResolver {
                 .observations
                 .get(&source)
                 .ok_or(AutoresearchError::EvidenceIncomplete)?;
+            if evertrace_domain::work::NativeTestResult::decode(
+                &self.protected_source(&facts, source)?,
+            )
+            .is_some()
+            {
+                return self.resolve_process_result(
+                    snapshot,
+                    &facts,
+                    source,
+                    context,
+                    goal_key_dir,
+                );
+            }
             if ProcessTrialDeclaration::decode(
                 &self.protected_source(&facts, source)?,
                 observation,
@@ -1688,6 +1786,138 @@ impl ControlledRunResolver {
             context.clone(),
         )
         .map(|command| (command, policy))
+    }
+
+    fn resolve_process_result(
+        &self,
+        snapshot: &ProjectionSnapshot,
+        facts: &ControlledFacts,
+        source: SourceObservationId,
+        context: &AutoresearchCommandContext,
+        key_dir: Option<&std::path::Path>,
+    ) -> Result<
+        (
+            ControlledRunCommand,
+            Option<crate::repository::SourcePolicy>,
+        ),
+        AutoresearchError,
+    > {
+        use evertrace_domain::work::{NATIVE_TEST_RESULT_PARSER_VERSION, NativeTestResult};
+        let terminal = facts
+            .observations
+            .get(&source)
+            .ok_or(AutoresearchError::EvidenceIncomplete)?;
+        let raw = self.protected_source(facts, source)?;
+        let result =
+            NativeTestResult::decode(&raw).ok_or(AutoresearchError::UntrustedRunEvidence)?;
+        let launch = facts
+            .observations
+            .values()
+            .find(|value| {
+                value.source_instance_id == terminal.source_instance_id
+                    && value.source_record_identity.as_str() == result.launch_event
+            })
+            .ok_or(AutoresearchError::EvidenceIncomplete)?;
+        let launch_source = launch.source_observation_id;
+        let (command, policy) =
+            self.resolve_process_trial(snapshot, facts, launch_source, context, key_dir)?;
+        if !matches!(command, ControlledRunCommand::NoDelta) || policy.is_none() {
+            return Ok((command, policy));
+        }
+        let key = format!("{}/{}", result.source_epoch, result.execution_key);
+        let runs = facts
+            .runs
+            .runs
+            .values()
+            .filter(|run| {
+                run.external_system_id.as_deref() == Some(evertrace_capture::process_source::FORMAT)
+                    && run.external_run_key.as_deref() == Some(key.as_str())
+                    && run.source_receipt_refs.contains(&launch.source_receipt_ref)
+            })
+            .collect::<Vec<_>>();
+        let [run] = runs.as_slice() else {
+            return Ok((ControlledRunCommand::NoDelta, policy));
+        };
+        if run.metric_extractor_version != NATIVE_TEST_RESULT_PARSER_VERSION
+            || !run.is_declaration_only()
+        {
+            return Ok((ControlledRunCommand::NoDelta, policy));
+        }
+        if terminal.source_role != SourceRole::Tool
+            || terminal.content_trust != ContentTrust::Observed
+            || terminal.capture_completeness != CaptureCompleteness::Complete
+            || terminal.correlation.exact_key().is_none()
+            || terminal.correlation.exact_key() != launch.correlation.exact_key()
+        {
+            return Err(AutoresearchError::UntrustedRunEvidence);
+        }
+        require_bound_operations(
+            facts,
+            source,
+            false,
+            run.run_id,
+            run.attempt_id
+                .ok_or(AutoresearchError::EvidenceIncomplete)?,
+            run.workstream_id,
+        )?;
+        let digest = CasDigest::from_str(&facts.receipt(source)?.cas_ref)
+            .map_err(|_| AutoresearchError::Cas)?;
+        let cas = CasId::from_digest(*digest.as_bytes());
+        if facts
+            .runs
+            .results
+            .values()
+            .any(|value| value.experiment_run_id == run.run_id && value.raw_cas_refs.contains(&cas))
+        {
+            return Ok((ControlledRunCommand::NoDelta, policy));
+        }
+        let snapshot = facts
+            .snapshots
+            .get(&run.code_snapshot_id)
+            .ok_or(AutoresearchError::EvidenceIncomplete)?;
+        let worktree = facts
+            .worktrees
+            .get(&snapshot.worktree_instance_id)
+            .ok_or(AutoresearchError::EvidenceIncomplete)?;
+        let artifact = ArtifactService::new(self.cas.clone()).create(ArtifactRevision {
+            revision_id: RevisionId::new_v7(),
+            parent_revision_id: None,
+            kind: evertrace_domain::work::WorkArtifactKind::ExperimentOutput,
+            logical_name: "Native test output".into(),
+            scope: ArtifactScope::Worktree {
+                repository_instance_id: worktree.repository_instance_id,
+                worktree_instance_id: snapshot.worktree_instance_id,
+            },
+            media_type: "application/json".into(),
+            content_blob_ref: Some(cas),
+            external_reference: None,
+            content_fingerprint: None,
+            payload_status: ArtifactPayloadStatus::Available,
+            produced_by_refs: Vec::new(),
+            consumed_by_refs: Vec::new(),
+            source_observation_refs: vec![source],
+            derivability: evertrace_domain::work::ArtifactDerivability::Original,
+            retention: evertrace_domain::work::ArtifactRetention::Task,
+            created_at_us: context.occurred_at_us,
+        })?;
+        let mut parsed = ResultEvidenceService::new(self.cas.clone()).parse(
+            run,
+            ResultParseRequest {
+                scope: ResultScope::Partial,
+                raw_cas_refs: vec![cas],
+                created_at_us: context.occurred_at_us,
+            },
+        )?;
+        parsed.raw_artifact_refs = vec![artifact.work_artifact_id];
+        parsed.parser_receipt.input_artifact_refs = parsed.raw_artifact_refs.clone();
+        let command = payload_command(
+            context.clone(),
+            vec![
+                JournalPayload::WorkArtifactRecorded(Box::new(artifact)),
+                JournalPayload::ResultEvidenceRecorded(Box::new(parsed)),
+            ],
+        )?;
+        Ok((ControlledRunCommand::Result { command }, policy))
     }
 
     fn declare_process_trial(
@@ -2757,7 +2987,7 @@ fn process_trial_input(
         seed_values: Vec::new(),
         nondeterministic: false,
         metric_definition: "TestTaskEval passed tests".into(),
-        metric_extractor_version: "pytest-junit-xunit2".into(),
+        metric_extractor_version: evertrace_domain::work::NATIVE_TEST_RESULT_PARSER_VERSION.into(),
         multi_cas_metric_policy: MultiCasMetricPolicy::RejectMultipleParsed,
         environment_fingerprint,
         created_at_us,
@@ -3394,11 +3624,19 @@ impl ResultEvidenceService {
         mut request: ResultParseRequest,
     ) -> Result<ResultEvidence, AutoresearchError> {
         require_declaration_run(run)?;
+        if run.metric_extractor_version == evertrace_domain::work::NATIVE_TEST_RESULT_PARSER_VERSION
+            && request.scope != ResultScope::Partial
+        {
+            return Err(AutoresearchError::UntrustedRunEvidence);
+        }
         request.raw_cas_refs.sort();
         request.raw_cas_refs.dedup();
         let bytes = self.read_all(&request.raw_cas_refs)?;
-        let (status, metric, parser_failure) =
-            parse_metric_set(&bytes, run.multi_cas_metric_policy)?;
+        let (status, metric, parser_failure) = parse_metric_set(
+            &bytes,
+            run.multi_cas_metric_policy,
+            &run.metric_extractor_version,
+        )?;
         let result = ResultEvidence {
             result_evidence_id: ResultEvidenceId::new_v7(),
             revision_id: RevisionId::new_v7(),
@@ -3410,7 +3648,7 @@ impl ResultEvidenceService {
             raw_cas_refs: request.raw_cas_refs.clone(),
             parsed_metric: metric,
             parser_receipt: ParserReceipt {
-                parser_version: RESULT_PARSER_VERSION.into(),
+                parser_version: run.metric_extractor_version.clone(),
                 input_artifact_refs: Vec::new(),
                 input_cas_refs: request.raw_cas_refs,
                 status,
@@ -3457,14 +3695,18 @@ impl ResultEvidenceService {
             return Ok(AutoresearchResolution::NoDelta);
         }
         let bytes = self.read_all(&combined)?;
-        let (status, metric, parser_failure) =
-            parse_metric_set(&bytes, run.multi_cas_metric_policy).map_err(|error| {
-                if current.parsed_metric.is_some() {
-                    AutoresearchError::ImmutableConflict
-                } else {
-                    error
-                }
-            })?;
+        let (status, metric, parser_failure) = parse_metric_set(
+            &bytes,
+            run.multi_cas_metric_policy,
+            &run.metric_extractor_version,
+        )
+        .map_err(|error| {
+            if current.parsed_metric.is_some() {
+                AutoresearchError::ImmutableConflict
+            } else {
+                error
+            }
+        })?;
         if current.parsed_metric.is_some() && metric != current.parsed_metric {
             return Err(AutoresearchError::ImmutableConflict);
         }
@@ -3493,10 +3735,18 @@ impl ResultEvidenceService {
         created_at_us: i64,
     ) -> Result<AutoresearchResolution<ResultEvidence>, AutoresearchError> {
         require_result_run(run, current)?;
+        // A successful native reparse cannot manufacture the missing execution contract.
+        if run.metric_extractor_version == evertrace_domain::work::NATIVE_TEST_RESULT_PARSER_VERSION
+        {
+            return Err(AutoresearchError::UntrustedRunEvidence);
+        }
         let bytes = self.read_all(&current.raw_cas_refs)?;
-        let (parser_status, parsed_metric, parser_failure) =
-            parse_metric_set(&bytes, run.multi_cas_metric_policy)
-                .map_err(|_| AutoresearchError::ImmutableConflict)?;
+        let (parser_status, parsed_metric, parser_failure) = parse_metric_set(
+            &bytes,
+            run.multi_cas_metric_policy,
+            &run.metric_extractor_version,
+        )
+        .map_err(|_| AutoresearchError::ImmutableConflict)?;
         let matches = parser_status == current.parser_receipt.status
             && parsed_metric == current.parsed_metric
             && parser_failure == current.parser_receipt.failure_code;
@@ -3598,7 +3848,11 @@ fn require_result_run(
     require_declaration_run(run)?;
     if result.experiment_run_id != run.run_id
         || result.experiment_run_revision_id != run.revision_id
-        || run.metric_extractor_version != RESULT_PARSER_VERSION
+        || !matches!(
+            run.metric_extractor_version.as_str(),
+            RESULT_PARSER_VERSION | evertrace_domain::work::NATIVE_TEST_RESULT_PARSER_VERSION
+        )
+        || result.parser_receipt.parser_version != run.metric_extractor_version
     {
         return Err(AutoresearchError::ImmutableConflict);
     }
@@ -3626,10 +3880,20 @@ fn preserve_valid_decimal(value: &str) -> Option<String> {
 fn parse_metric_set(
     bytes: &[Vec<u8>],
     policy: MultiCasMetricPolicy,
+    version: &str,
 ) -> Result<(ParserStatus, Option<MetricValue>, Option<ParserFailureCode>), AutoresearchError> {
     let parsed = bytes
         .iter()
-        .filter_map(|value| parse_metric(value))
+        .filter_map(|value| {
+            if version == evertrace_domain::work::NATIVE_TEST_RESULT_PARSER_VERSION {
+                evertrace_domain::work::NativeTestResult::decode(value)
+                    .and_then(|value| value.metric())
+            } else if version == RESULT_PARSER_VERSION {
+                parse_metric(value)
+            } else {
+                None
+            }
+        })
         .collect::<Vec<_>>();
     match parsed.as_slice() {
         [] => Ok((
@@ -3860,7 +4124,7 @@ pub fn read_result_cohort(
                             && Some(&metric) == result.parsed_metric.as_ref()
                             && artifact_refs == result.raw_artifact_refs && artifact_refs == run.work_artifact_refs))
             } else {
-                matches!(parse_metric_set(&inputs, run.multi_cas_metric_policy),
+                matches!(parse_metric_set(&inputs, run.multi_cas_metric_policy, &run.metric_extractor_version),
                     Ok((ParserStatus::Parsed, Some(metric), None)) if Some(&metric) == result.parsed_metric.as_ref())
             };
             if !matches {

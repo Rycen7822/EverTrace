@@ -29,6 +29,7 @@ hmac = "=0.12.1"
 lancedb = { version = "=0.37.1", default-features = false }
 ratatui = { version = "=0.29.0", default-features = false, features = ["crossterm"] }
 reqwest = { version = "=0.12.24", default-features = false, features = ["json", "rustls-tls"] }
+roxmltree = "=0.21.1"
 rusqlite = { version = "=0.40.1", default-features = false, features = ["bundled", "hooks"] }
 rustix = { version = "=1.1.4", features = ["fs", "net"] }
 serde = { version = "=1.0.228", features = ["derive"] }

@@ -55,6 +55,14 @@ pub(crate) fn validate_controlled_command<'a>(
     error: StoreError,
 ) -> Result<(), StoreError> {
     let payloads = payloads.into_iter().collect::<Vec<_>>();
+    for payload in &payloads {
+        if let JournalPayload::ResultEvidenceRecorded(result) = payload
+            && result.parser_receipt.parser_version
+                == evertrace_domain::work::NATIVE_TEST_RESULT_PARSER_VERSION
+        {
+            validate_native_test_result(&view, result, &payloads, error)?;
+        }
+    }
     let runs = payloads
         .iter()
         .filter_map(|payload| match payload {
@@ -438,6 +446,176 @@ fn launch_matches(
         && run.started_at_us == Some(*started_at_us)
 }
 
+fn validate_native_test_result(
+    view: &ControlledRunAdmissionView<'_>,
+    result: &ResultEvidence,
+    payloads: &[&JournalPayload],
+    error: StoreError,
+) -> Result<(), StoreError> {
+    use evertrace_domain::{
+        semantic::{EvidenceCompleteness, ParserFailureCode, ParserStatus, ResultScope},
+        work::{NATIVE_TEST_RESULT_PARSER_VERSION, NativeTestResult},
+    };
+    let run = &view.runs.get(&result.experiment_run_id).ok_or(error)?.0;
+    if result.experiment_run_revision_id != run.revision_id
+        || !run.is_declaration_only()
+        || run.metric_extractor_version != NATIVE_TEST_RESULT_PARSER_VERSION
+        || run.attempt_binding_status != AttemptBindingStatus::Resolved
+        || result.parent_revision_id.is_some()
+        || result.result_scope != ResultScope::Partial
+        || result.completeness != EvidenceCompleteness::Incomplete
+        || result.verifier_receipt.is_some()
+        || result.raw_artifact_refs.len() != 1
+        || result.parser_receipt.input_artifact_refs != result.raw_artifact_refs
+        || result.raw_cas_refs.len() != 1
+        || result.parser_receipt.input_cas_refs != result.raw_cas_refs
+    {
+        return Err(error);
+    }
+    let digest = hex(&result.raw_cas_refs[0].as_digest());
+    let receipts = view
+        .receipts
+        .values()
+        .filter(|(value, _)| {
+            value.cas_ref == digest
+                && value.capture_completeness == CaptureCompleteness::Complete
+                && value.source_revision.as_str()
+                    == evertrace_capture::process_source::SOURCE_REVISION
+                && (value.adapter_revision, value.parser_revision)
+                    == (
+                        evertrace_capture::process_source::ADAPTER_REVISION,
+                        evertrace_capture::process_source::PARSER_REVISION,
+                    )
+        })
+        .collect::<Vec<_>>();
+    let [(receipt, _)] = receipts.as_slice() else {
+        return Err(error);
+    };
+    let id = receipt.source_observation_id;
+    let artifact_id = result.raw_artifact_refs[0];
+    let artifact = view
+        .artifacts
+        .get(&artifact_id)
+        .map(|(value, _)| value)
+        .or_else(|| {
+            payloads.iter().find_map(|payload| match payload {
+                JournalPayload::WorkArtifactRecorded(value)
+                    if value.work_artifact_id == artifact_id =>
+                {
+                    Some(value.as_ref())
+                }
+                _ => None,
+            })
+        })
+        .ok_or(error)?;
+    let snapshot = &view.snapshots.get(&run.code_snapshot_id).ok_or(error)?.0;
+    let worktree = &view
+        .worktrees
+        .get(&snapshot.worktree_instance_id)
+        .ok_or(error)?
+        .0;
+    if artifact.revision.source_observation_refs != [id]
+        || artifact.revision.content_blob_ref != result.raw_cas_refs.first().copied()
+        || artifact.revision.scope
+            != (ArtifactScope::Worktree {
+                repository_instance_id: worktree.repository_instance_id,
+                worktree_instance_id: snapshot.worktree_instance_id,
+            })
+    {
+        return Err(error);
+    }
+    let observation = &view.observations.get(&id).ok_or(error)?.0;
+    let surface = &view.surfaces.get(&id).ok_or(error)?.0;
+    surface.validate().map_err(|_| error)?;
+    let raw = surface.protected_text.as_bytes();
+    if surface.source_observation_revision_ref != id
+        || surface.canonicalization_version != receipt.canonicalization_revision
+        || observation.canonicalization_revision != receipt.canonicalization_revision
+        || observation.source_record_identity != receipt.source_record_identity
+        || observation.observation_role != evertrace_domain::evidence::ObservationRole::Result
+        || receipt.identity_domain != evertrace_capture::process_source::FORMAT
+        || receipt.unsupported_record_classification.is_some()
+        || observation.source_role != SourceRole::Tool
+        || observation.content_trust != ContentTrust::Observed
+        || observation.capture_completeness != CaptureCompleteness::Complete
+        || observation.source_receipt_ref != receipt.source_receipt_id
+        || observation.source_instance_id != receipt.source_instance_id
+        || observation.source_revision != receipt.source_revision
+        || surface.source_role != observation.source_role
+        || surface.content_trust != observation.content_trust
+        || surface.capture_completeness != CaptureCompleteness::Complete
+        || receipt.archive_mode != SourceArchiveMode::Exact
+        || receipt.protected_secret_digest.is_some()
+        || !receipt.redaction_spans.is_empty()
+        || receipt.protected_length != raw.len() as u64
+        || CasDigest::for_protected_bytes(raw).to_string() != receipt.cas_ref
+        || observation.payload_fingerprint
+            != hex(
+                &payload_fingerprint(receipt.canonicalization_revision, raw, None)
+                    .map_err(|_| error)?,
+            )
+    {
+        return Err(error);
+    }
+    let event = NativeTestResult::decode(raw).ok_or(error)?;
+    let launch = view
+        .observations
+        .values()
+        .find_map(|(value, _)| {
+            (value.source_instance_id == observation.source_instance_id
+                && value.source_record_identity.as_str() == event.launch_event
+                && value.observation_role == evertrace_domain::evidence::ObservationRole::Intent)
+                .then_some(value)
+        })
+        .ok_or(error)?;
+    let key = format!("{}/{}", event.source_epoch, event.execution_key);
+    if receipt.source_record_identity.as_str() != event.event_key
+        || observation.correlation.exact_key().is_none()
+        || observation.correlation.exact_key() != launch.correlation.exact_key()
+        || observation.correlation.host_trace_lineage_id.as_deref()
+            != Some(event.source_epoch.as_str())
+        || observation.correlation.native_request_id.as_deref() != Some(event.request_key.as_str())
+        || observation.correlation.physical_execution_ordinal != Some(event.execution_ordinal)
+        || !run.source_receipt_refs.contains(&launch.source_receipt_ref)
+        || run.external_system_id.as_deref() != Some(evertrace_capture::process_source::FORMAT)
+        || run.external_run_key.as_deref() != Some(key.as_str())
+    {
+        return Err(error);
+    }
+    let bindings = current_binding_lineage(view.work_bindings.values().map(|(value, _)| value))
+        .map_err(|_| error)?;
+    let operations = view
+        .operations
+        .values()
+        .filter(|(value, _)| value.result_source_observation_refs.contains(&id))
+        .map(|(value, _)| value)
+        .collect::<Vec<_>>();
+    if operations.is_empty()
+        || operations.iter().any(|operation| {
+            operation.pairing_state != PairingState::Paired
+                || bindings.get(&operation.operation_id).is_none_or(|binding| {
+                    binding.assignment_status != AssignmentStatus::Resolved
+                        || binding.primary_binding.experiment_run_id != Some(run.run_id)
+                        || binding.primary_binding.attempt_id != run.attempt_id
+                        || binding.primary_binding.workstream_id != Some(run.workstream_id)
+                })
+        })
+    {
+        return Err(error);
+    }
+    let metric = event.metric();
+    let failure = metric
+        .is_none()
+        .then_some(ParserFailureCode::MetricParseFailed);
+    if result.parsed_metric != metric
+        || result.parser_receipt.failure_code != failure
+        || (result.parser_receipt.status == ParserStatus::Failed) != failure.is_some()
+    {
+        return Err(error);
+    }
+    Ok(())
+}
+
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
 pub struct AutoresearchCurrentView {
     pub frontier: u64,
@@ -507,8 +685,12 @@ pub(crate) fn validate_relations(input: AutoresearchRelationInputs<'_>) -> Resul
             .ok_or(StoreError::StoreCorrupt)?
             .0;
         if run.run_id != result.experiment_run_id
-            || run.metric_extractor_version != "evertrace.result_metric.v1"
-            || result.parser_receipt.parser_version != "evertrace.result_metric.v1"
+            || run.metric_extractor_version != result.parser_receipt.parser_version
+            || !matches!(
+                result.parser_receipt.parser_version.as_str(),
+                "evertrace.result_metric.v1"
+                    | evertrace_domain::work::NATIVE_TEST_RESULT_PARSER_VERSION
+            )
             || result
                 .verifier_receipt
                 .as_ref()

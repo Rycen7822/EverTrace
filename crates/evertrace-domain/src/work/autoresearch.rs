@@ -161,6 +161,122 @@ impl ControlledRunSourceEnvelope {
     }
 }
 
+/// The original source event and embedded xUnit2 bytes, not a generated metric envelope.
+pub const NATIVE_TEST_RESULT_PARSER_VERSION: &str = "evertrace.native_test_result.v1";
+
+#[derive(Debug, Deserialize)]
+pub struct NativeTestResult {
+    format: String,
+    event: String,
+    pub event_key: String,
+    pub source_epoch: String,
+    pub execution_key: String,
+    pub launch_event: String,
+    pub request_key: String,
+    pub execution_ordinal: u32,
+    returncode: i32,
+    scorer: Option<NativeTestReport>,
+}
+
+#[derive(Debug, Deserialize)]
+struct NativeTestReport {
+    format: String,
+    original_xml: String,
+}
+
+impl NativeTestResult {
+    pub fn decode(raw: &[u8]) -> Option<Self> {
+        if raw.len() > 65536 {
+            return None;
+        }
+        let value: Self = serde_json::from_slice(raw).ok()?;
+        let keys = [
+            &value.event_key,
+            &value.source_epoch,
+            &value.execution_key,
+            &value.launch_event,
+            &value.request_key,
+        ];
+        (value.format == "process-trial-source-v4"
+            && value.event == "trial_finished"
+            && value.execution_ordinal > 0
+            && keys
+                .iter()
+                .all(|key| uuid::Uuid::parse_str(key).is_ok_and(|id| id.to_string() == **key)))
+        .then_some(value)
+    }
+
+    /// Count original passed cases only after validating the complete fixed scorer structure.
+    /// Parsing never proves the Run's code/data/seed/environment contract.
+    pub fn metric(&self) -> Option<MetricValue> {
+        let report = self.scorer.as_ref()?;
+        if report.format != "pytest-junit-xunit2" || !matches!(self.returncode, 0 | 1) {
+            return None;
+        }
+        let document = roxmltree::Document::parse_with_options(
+            &report.original_xml,
+            roxmltree::ParsingOptions {
+                allow_dtd: false,
+                nodes_limit: 2048,
+                ..Default::default()
+            },
+        )
+        .ok()?;
+        let root = document.root_element();
+        let suites = root
+            .children()
+            .filter(|node| node.is_element())
+            .collect::<Vec<_>>();
+        if root.tag_name().name() != "testsuites"
+            || root.tag_name().namespace().is_some()
+            || suites.len() != 1
+            || suites[0].tag_name().name() != "testsuite"
+            || suites[0].tag_name().namespace().is_some()
+        {
+            return None;
+        }
+        let suite = suites[0];
+        let count = |name| suite.attribute(name)?.parse::<usize>().ok();
+        if count("tests") != Some(2) || count("errors") != Some(0) || count("skipped") != Some(0) {
+            return None;
+        }
+        let mut names = BTreeSet::new();
+        let mut failures = 0;
+        for case in suite.children().filter(|node| node.is_element()) {
+            if case.tag_name().name() != "testcase"
+                || case.tag_name().namespace().is_some()
+                || case.attribute("classname") != Some("fixed_scorer.TestTaskEval")
+                || !names.insert(case.attribute("name")?)
+            {
+                return None;
+            }
+            let mut failed = false;
+            for child in case.children().filter(|node| node.is_element()) {
+                if child.tag_name().name() != "failure"
+                    || child.tag_name().namespace().is_some()
+                    || failed
+                    || child.children().any(|node| node.is_element())
+                {
+                    return None;
+                }
+                failed = true;
+            }
+            failures += usize::from(failed);
+        }
+        if names != BTreeSet::from(["test_pass_rate", "test_anchor_mean_missing_scores_zero"])
+            || count("failures") != Some(failures)
+            || self.returncode != i32::from(failures > 0)
+        {
+            return None;
+        }
+        Some(MetricValue {
+            decimal: (2 - failures).to_string(),
+            unit: "tests".into(),
+            uncertainty_decimal: None,
+        })
+    }
+}
+
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum RunOrigin {

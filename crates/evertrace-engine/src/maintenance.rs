@@ -1948,6 +1948,7 @@ impl BackgroundScheduler {
                 Ok((ControlledRunCommand::NoDelta, _)) => continue,
                 Ok((ControlledRunCommand::WorkRoot { command }, policy))
                 | Ok((ControlledRunCommand::Declaration { command, .. }, policy))
+                | Ok((ControlledRunCommand::Result { command }, policy))
                 | Ok((ControlledRunCommand::Terminal { command, .. }, policy)) => (command, policy),
                 Err(AutoresearchError::Store(_)) => return Err(BackgroundSchedulerError::Store),
                 // Absent/contradictory/untrusted evidence is not a write or a fabricated terminal result.
