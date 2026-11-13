@@ -506,7 +506,47 @@ impl EvidenceIngestor {
         else {
             return Ok(false);
         };
-        self.drain_observations_once(&[observation_id]).await?;
+        // Admit durable Native starts with the child cue. Selective child-only intake can leave
+        // its live parent queued behind unrelated records until the process carrier has exited.
+        let spool = DurableSpool::open_read_only(
+            &self.snapshot.spool_dir,
+            self.snapshot
+                .spool_limits()
+                .map_err(|_| IngestError::Snapshot)?,
+        )
+        .map_err(map_spool)?;
+        let records = match spool.read_durable_records(MAX_SEGMENTS_PER_DRAIN, 64 * 1024 * 1024) {
+            Ok(records) => records,
+            Err(evertrace_capture::SpoolError::ResourceExhausted) => {
+                self.drain_once().await?;
+                return Ok(false);
+            }
+            Err(error) => return Err(map_spool(error)),
+        };
+        let mut observations = BTreeSet::from([observation_id]);
+        for record in records {
+            let Ok((body, id)) = decode_validated_record_body(&record) else {
+                continue;
+            };
+            if evertrace_capture::execution_source::is_source_revision(
+                body.source_revision.as_str(),
+            ) && evertrace_capture::execution_source::Profile::from_revision(
+                body.parser_revision,
+            ) == Some(evertrace_capture::execution_source::Profile::Context)
+                && body.observation_role == evertrace_domain::evidence::ObservationRole::Intent
+            {
+                observations.insert(id);
+                if observations.len() > MAX_SELECTED_OBSERVATIONS {
+                    break;
+                }
+            }
+        }
+        if observations.len() > MAX_SELECTED_OBSERVATIONS {
+            self.drain_once().await?;
+            return Ok(false);
+        }
+        self.drain_observations_once(&observations.into_iter().collect::<Vec<_>>())
+            .await?;
         let cas = CasStore::open_existing(&self.snapshot.cas_dir).map_err(|_| IngestError::Cas)?;
         let snapshot_path = RuntimeSnapshot::snapshot_path(
             self.snapshot
