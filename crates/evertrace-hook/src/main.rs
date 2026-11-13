@@ -161,10 +161,54 @@ fn run() -> Result<(), ()> {
                 let closed = evertrace_capture::process_source::closed_records(&record, path);
                 let snapshot = RuntimeSnapshot::load(path).map_err(|_| ())?;
                 let socket = snapshot.recovery_socket_path.clone();
-                let mut runtime = CaptureRuntime::open_for_admission(snapshot).map_err(|_| ())?;
+                let observe = |source| {
+                    let _ = evertrace_protocol::request_process_source_observation_sync(
+                        &socket,
+                        env!("CARGO_PKG_VERSION"),
+                        source,
+                        Duration::from_secs(2),
+                    );
+                };
+                let launch = record.is_launch();
+                let mut runtime =
+                    CaptureRuntime::open_for_admission(snapshot.clone()).map_err(|_| ())?;
                 let outcome = runtime
                     .capture_process_observation(record)
                     .map_err(|_| ())?;
+                if launch {
+                    drop(runtime);
+                    // Preserve the original short-lived repository snapshot before any image IO.
+                    if matches!(outcome, CaptureOutcome::Durable { .. })
+                        && let Some(source) = source_locator
+                    {
+                        observe(source);
+                    }
+                    let contract =
+                        evertrace_codex::probe::HostProbeReport::unobserved_source_contract(
+                            &evertrace_capture::process_source::image_adapter_version(),
+                            evertrace_capture::process_source::IMAGE_ELIGIBLE_EVENTS,
+                        )
+                        .map_err(|_| ())?;
+                    if let Ok(image) = evertrace_capture::process_source::image_record(
+                        &bytes,
+                        path,
+                        &contract.manifest().adapter_manifest_id,
+                    ) {
+                        let locator = image.execution_locator().map_err(|_| ())?;
+                        runtime =
+                            CaptureRuntime::open_for_admission(snapshot.clone()).map_err(|_| ())?;
+                        let captured =
+                            runtime.capture_process_observation(image).map_err(|_| ())?;
+                        drop(runtime);
+                        if matches!(captured, CaptureOutcome::Durable { .. })
+                            && let Some(source) = locator
+                        {
+                            observe(source);
+                        }
+                    }
+                    // Only now release the runtime inputs used by first Run declaration.
+                    runtime = CaptureRuntime::open_for_admission(snapshot).map_err(|_| ())?;
+                }
                 for record in records {
                     runtime
                         .capture_process_observation(record)
@@ -176,17 +220,11 @@ fn run() -> Result<(), ()> {
                         .map_err(|_| ())?;
                 }
                 drop(runtime);
-                if matches!(outcome, CaptureOutcome::Durable { .. })
-                    && let Some(locator) = source_locator
+                if !launch
+                    && matches!(outcome, CaptureOutcome::Durable { .. })
+                    && let Some(source) = source_locator
                 {
-                    // Durable source acceptance does not depend on live metadata availability.
-                    // The producer's existing wait keeps this trial held during observation.
-                    let _ = evertrace_protocol::request_process_source_observation_sync(
-                        &socket,
-                        env!("CARGO_PKG_VERSION"),
-                        locator,
-                        Duration::from_secs(2),
-                    );
+                    observe(source);
                 }
                 Ok(())
             } else {

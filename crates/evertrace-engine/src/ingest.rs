@@ -588,13 +588,18 @@ impl EvidenceIngestor {
             else {
                 return Err(IngestError::InvalidRecord);
             };
-            if receipt.source_revision.as_str() != process_source::SOURCE_REVISION
-                || receipt.source_observation_id != observation_id
+            if !matches!(
+                receipt.source_revision.as_str(),
+                process_source::SOURCE_REVISION | process_source::IMAGE_SOURCE_REVISION
+            ) || receipt.source_observation_id != observation_id
                 || observation.source_observation_id != observation_id
             {
                 return Ok(false);
             }
-            if observation.observation_role == evertrace_domain::evidence::ObservationRole::Result {
+            if receipt.source_revision.as_str() == process_source::IMAGE_SOURCE_REVISION
+                || observation.observation_role
+                    == evertrace_domain::evidence::ObservationRole::Result
+            {
                 return Ok(observation.content_trust
                     == evertrace_domain::evidence::ContentTrust::Observed
                     && observation.capture_completeness
@@ -782,22 +787,24 @@ impl EvidenceIngestor {
         Ok(false)
     }
 
-    async fn observe_live_process_terminal(
+    async fn observe_live_process(
         &self,
         verified: &mut crate::capture::VerifiedCapture,
     ) -> Result<(), IngestError> {
         use evertrace_capture::process_source;
         use evertrace_domain::evidence::{CaptureCompleteness, ContentTrust, ObservationRole};
         let body = &verified.body;
-        if body.source_revision.as_str() != process_source::SOURCE_REVISION
-            || (body.adapter_revision, body.parser_revision)
-                != (
-                    process_source::ADAPTER_REVISION,
-                    process_source::PARSER_REVISION,
-                )
-            || body.observation_role != ObservationRole::Result
-            || body.correlation.native_request_id.is_none()
-            || body.correlation.physical_execution_ordinal.is_none()
+        let image = body.source_revision.as_str() == process_source::IMAGE_SOURCE_REVISION;
+        if !image
+            && (body.source_revision.as_str() != process_source::SOURCE_REVISION
+                || (body.adapter_revision, body.parser_revision)
+                    != (
+                        process_source::ADAPTER_REVISION,
+                        process_source::PARSER_REVISION,
+                    )
+                || body.observation_role != ObservationRole::Result
+                || body.correlation.native_request_id.is_none()
+                || body.correlation.physical_execution_ordinal.is_none())
         {
             return Ok(());
         }
@@ -810,8 +817,14 @@ impl EvidenceIngestor {
                 .data_dir()
                 .map_err(|_| IngestError::Snapshot)?,
         );
+        let identity = body.source_record_identity.as_str().to_owned();
         let observed = tokio::task::spawn_blocking(move || {
-            process_source::verify_native_terminal(&raw, &snapshot).is_ok()
+            if image {
+                process_source::verify_runtime_image(&raw, &snapshot)
+                    .is_ok_and(|value| value == identity)
+            } else {
+                process_source::verify_native_terminal(&raw, &snapshot).is_ok()
+            }
         })
         .await
         .map_err(|_| IngestError::Store)?;
@@ -1172,6 +1185,9 @@ impl EvidenceIngestor {
                         verified.body.adapter_revision,
                         verified.body.parser_revision,
                     );
+                let runtime_image = verified.body.source_revision.as_str()
+                    == evertrace_capture::process_source::IMAGE_SOURCE_REVISION;
+                let frozen_process = process_profile || runtime_image;
                 let native_profile = process_profile
                     || (evertrace_capture::execution_source::is_source_revision(
                         verified.body.source_revision.as_str(),
@@ -1190,7 +1206,7 @@ impl EvidenceIngestor {
                         .map_err(map_writer_error)?,
                 };
                 if let Some(committed_command) = committed_command {
-                    if native_profile {
+                    if native_profile || runtime_image {
                         if let Some(original) =
                             committed_command
                                 .payloads
@@ -1210,20 +1226,20 @@ impl EvidenceIngestor {
                             weak.correlation.admission =
                                 evertrace_domain::evidence::CorrelationAdmission::Unavailable;
                             weak.correlation.strong_gate_receipt_ref = None;
-                            if process_profile {
+                            if frozen_process {
                                 weak.content_trust = verified.observation.content_trust;
                                 weak.capture_completeness =
                                     verified.observation.capture_completeness;
                             }
                             if weak == verified.observation
-                                && (process_profile
+                                && (frozen_process
                                     || evertrace_capture::execution_source::is_execution(
                                         original,
                                         &verified.receipt,
                                     ))
                             {
                                 verified.observation.correlation = original.correlation.clone();
-                                if process_profile {
+                                if frozen_process {
                                     verified.observation.content_trust = original.content_trust;
                                     verified.observation.capture_completeness =
                                         original.capture_completeness;
@@ -1297,7 +1313,7 @@ impl EvidenceIngestor {
                     progress.projected_surfaces += surface_count;
                     continue;
                 }
-                self.observe_live_process_terminal(&mut verified).await?;
+                self.observe_live_process(&mut verified).await?;
                 if native_profile {
                     if let Some(report) = self.execution_canary.as_ref().and_then(|canary| {
                         if process_profile {

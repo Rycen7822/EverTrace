@@ -202,6 +202,19 @@ pub(crate) fn verify_capture_frame_presented(
             return Err(IngestError::InvalidRecord);
         }
     }
+    if body.source_revision.as_str() == evertrace_capture::process_source::IMAGE_SOURCE_REVISION {
+        use evertrace_capture::process_source;
+        let contract = evertrace_codex::probe::HostProbeReport::unobserved_source_contract(
+            &process_source::image_adapter_version(),
+            process_source::IMAGE_ELIGIBLE_EVENTS,
+        )
+        .map_err(|_| IngestError::InvalidRecord)?;
+        if body.adapter_manifest_ref != contract.manifest().adapter_manifest_id
+            || !process_source::image_record_matches(&protected, &body)
+        {
+            return Err(IngestError::InvalidRecord);
+        }
+    }
     if body.source_revision.as_str() == evertrace_capture::process_source::SOURCE_REVISION {
         use evertrace_capture::process_source;
         use evertrace_codex::probe::HostProbeReport;

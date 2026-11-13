@@ -506,6 +506,52 @@ fn process_runtime_groups<'a>(
     Ok(groups)
 }
 
+fn process_runtime_images<'a>(
+    trial: &ProcessTrialDeclaration,
+    receipts: impl Iterator<Item = &'a SourceReceipt>,
+) -> Result<Vec<SourceObservationId>, AutoresearchError> {
+    let Some(process) = trial.process.as_ref() else {
+        return Ok(Vec::new());
+    };
+    let text = |name| {
+        process[name]
+            .as_str()
+            .ok_or(AutoresearchError::EvidenceIncomplete)
+    };
+    let number = |name| {
+        process[name]
+            .as_u64()
+            .ok_or(AutoresearchError::EvidenceIncomplete)
+    };
+    let instance = format!(
+        "native-runtime:{}:{}:{}:{}",
+        text("boot_id")?,
+        number("pid_namespace")?,
+        number("pid")?,
+        number("start_ticks")?
+    );
+    let reference = format!(
+        "runtime:{}:{}@{}",
+        trial.source_epoch,
+        trial.execution_key,
+        number("start_ticks")?
+    );
+    let mut result = Vec::new();
+    for receipt in receipts {
+        if receipt.source_revision.as_str()
+            == evertrace_capture::process_source::IMAGE_SOURCE_REVISION
+            && receipt.source_instance_id.as_str() == instance
+            && receipt.source_ref == reference
+        {
+            result.push(receipt.source_observation_id);
+            if result.len() > 4 {
+                return Err(AutoresearchError::EvidenceIncomplete);
+            }
+        }
+    }
+    Ok(result)
+}
+
 fn recorded_runtime_source(observation: &SourceObservation, receipt: &SourceReceipt) -> bool {
     use evertrace_capture::process_source as source;
     use evertrace_domain::evidence::{
@@ -1002,6 +1048,14 @@ pub(crate) fn controlled_source_snapshot(
             )? {
                 refs.extend(evidence.into_iter().map(|id| id.to_string()));
             }
+            refs.extend(
+                process_runtime_images(
+                    trial,
+                    current.source_receipts().map(|(value, _)| value.as_ref()),
+                )?
+                .into_iter()
+                .map(|id| id.to_string()),
+            );
             refs.insert(opening.to_string());
             let opening_receipt = current
                 .source_observation(opening)
@@ -2143,10 +2197,57 @@ impl ControlledRunResolver {
             }
             fingerprint = Some(current);
         }
+        let mut measured = None;
+        for id in process_runtime_images(trial, facts.receipts.values())? {
+            let receipt = facts.receipt(id)?;
+            let observation = facts
+                .observations
+                .get(&id)
+                .ok_or(AutoresearchError::EvidenceIncomplete)?;
+            if observation.content_trust != ContentTrust::Observed
+                || observation.capture_completeness != CaptureCompleteness::Complete
+                || receipt.capture_completeness != CaptureCompleteness::Complete
+            {
+                continue;
+            }
+            let raw: ProcessTrialDeclaration =
+                serde_json::from_slice(&self.protected_source(facts, id)?)
+                    .map_err(|_| AutoresearchError::UntrustedRunEvidence)?;
+            if receipt.adapter_revision != 1
+                || receipt.parser_revision != 1
+                || observation.observation_role
+                    != evertrace_domain::evidence::ObservationRole::StateProbe
+                || observation.source_role != SourceRole::Tool
+                || receipt.identity_domain != process_source::IMAGE_SOURCE_REVISION
+                || receipt.identity_strength
+                    != evertrace_domain::evidence::IdentityStrength::StableNative
+                || raw.event_key != trial.event_key
+                || raw.source_epoch != trial.source_epoch
+                || raw.execution_key != trial.execution_key
+                || raw.config != trial.config
+                || !receipt
+                    .source_record_identity
+                    .as_str()
+                    .starts_with("measured-runtime-v1:")
+            {
+                return Err(AutoresearchError::UntrustedRunEvidence);
+            }
+            let current = receipt.source_record_identity.as_str().to_owned();
+            if measured
+                .as_ref()
+                .is_some_and(|previous| previous != &current)
+            {
+                return Err(AutoresearchError::ImmutableConflict);
+            }
+            measured = Some(current);
+            receipts.push(receipt.source_receipt_id);
+        }
         receipts.sort();
         receipts.dedup();
         Ok((
-            fingerprint.ok_or(AutoresearchError::EvidenceIncomplete)?,
+            measured
+                .or(fingerprint)
+                .ok_or(AutoresearchError::EvidenceIncomplete)?,
             receipts,
         ))
     }

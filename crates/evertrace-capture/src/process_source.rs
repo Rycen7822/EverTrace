@@ -3,6 +3,8 @@
 //! Publisher claims remain untrusted/partial. Separately read kernel state is observed
 //! metadata only: it supplies no inherited namespace, execution, or semantic Work authority.
 
+mod image;
+
 use std::{
     collections::BTreeSet,
     fs,
@@ -43,6 +45,12 @@ pub const OUTPUT_ELIGIBLE_EVENTS: &str = "junit-xunit2-output-snapshot-v1";
 
 pub const CONDITIONS_SOURCE_REVISION: &str = "python-execution-conditions-v1";
 pub const CONDITIONS_ELIGIBLE_EVENTS: &str = "python-execution-conditions-snapshot-v1";
+pub const IMAGE_SOURCE_REVISION: &str = "python-native-runtime-v1";
+pub const IMAGE_ELIGIBLE_EVENTS: &str = "python-native-runtime-measurement-v1";
+
+pub fn image_adapter_version() -> String {
+    format!("{IMAGE_SOURCE_REVISION}:capture-1")
+}
 
 pub fn is_owned_revision(revision: &str) -> bool {
     revision.starts_with("process-trial-source-v")
@@ -52,6 +60,7 @@ pub fn is_owned_revision(revision: &str) -> bool {
                 | INPUT_SOURCE_REVISION
                 | OUTPUT_SOURCE_REVISION
                 | CONDITIONS_SOURCE_REVISION
+                | IMAGE_SOURCE_REVISION
         )
 }
 const LIMIT: usize = 65_536;
@@ -80,11 +89,17 @@ impl Observation {
         self.0
     }
 
+    pub fn is_launch(&self) -> bool {
+        self.0.observation_role == ObservationRole::Intent
+    }
+
     pub fn execution_locator(&self) -> Result<Option<SourceObservationId>> {
-        if !matches!(
-            self.0.observation_role,
-            ObservationRole::Intent | ObservationRole::Result
-        ) {
+        if self.0.source_revision != IMAGE_SOURCE_REVISION
+            && !matches!(
+                self.0.observation_role,
+                ObservationRole::Intent | ObservationRole::Result
+            )
+        {
             return Ok(None);
         }
         source_observation_id(
@@ -1244,6 +1259,131 @@ pub fn verify_native_terminal(raw: &[u8], snapshot: &Path) -> Result<()> {
     physical_scope(&header)?;
     published_record(raw, &header, &script)?;
     Ok(())
+}
+
+/// The same canonical environment identity is measured by the reader and again at first L0 admission.
+pub fn verify_runtime_image(raw: &[u8], snapshot: &Path) -> Result<String> {
+    let (header, role) = decode(raw)?;
+    if role != ObservationRole::Intent {
+        return Err(ProcessSourceError);
+    }
+    let script = controller_peer(&header, None, snapshot)?;
+    let (_, ordinal) = published_record(raw, &header, &script)?;
+    if ordinal.is_none() || ordinal != header.execution_ordinal {
+        return Err(ProcessSourceError);
+    }
+    physical_scope(&header)?;
+    let inputs = execution_inputs(&header)?;
+    if inputs.len() != 2 {
+        return Err(ProcessSourceError);
+    }
+    let (conditions, _) = execution_conditions(&header, &script)?;
+    let fingerprint = image::fingerprint(&header, &conditions)?;
+    if inputs != execution_inputs(&header)? {
+        return Err(ProcessSourceError);
+    }
+    physical_scope(&header)?;
+    published_record(raw, &header, &script)?;
+    Ok(fingerprint)
+}
+
+/// A native measurement retains the unmodified original launch, not a generated runtime envelope.
+pub fn image_record(raw: &[u8], snapshot: &Path, manifest: &str) -> Result<Observation> {
+    let fingerprint = verify_runtime_image(raw, snapshot)?;
+    let (header, _) = decode(raw)?;
+    let process = header.process.as_ref().ok_or(ProcessSourceError)?;
+    let Observation(mut record) = kernel_observation(raw.to_vec(), process, manifest)?;
+    record.source_instance_id = format!(
+        "native-runtime:{}:{}:{}:{}",
+        process.boot_id, process.pid_namespace, process.pid, process.start_ticks
+    );
+    record.source_revision = IMAGE_SOURCE_REVISION.into();
+    record.source_record_identity = Some(fingerprint);
+    record.identity_strength = Some(IdentityStrength::StableNative);
+    record.identity_domain = IMAGE_SOURCE_REVISION.into();
+    record.source_ref = format!(
+        "runtime:{}:{}@{}",
+        header.source_epoch,
+        header.execution_key.as_deref().ok_or(ProcessSourceError)?,
+        process.start_ticks
+    );
+    record.session_ref = header.source_epoch;
+    record.content_trust = ContentTrust::UntrustedSourceContent;
+    record.surface_eligible = true;
+    record.eligible_event_manifest_ref = IMAGE_ELIGIBLE_EVENTS.into();
+    Ok(Observation(record))
+}
+
+/// The untrusted frame cannot grant the native measurement's Observed/Complete L0 classification.
+pub fn image_record_matches(raw: &[u8], body: &crate::CaptureRecordBody) -> bool {
+    let Ok((header, role)) = decode(raw) else {
+        return false;
+    };
+    let Some(process) = header.process.as_ref() else {
+        return false;
+    };
+    let Some(execution) = header.execution_key.as_deref() else {
+        return false;
+    };
+    let Some(digest) = body
+        .source_record_identity
+        .as_str()
+        .strip_prefix("measured-runtime-v1:")
+    else {
+        return false;
+    };
+    role == ObservationRole::Intent
+        && body.source_revision.as_str() == IMAGE_SOURCE_REVISION
+        && digest.len() == 64
+        && digest.bytes().all(|byte| byte.is_ascii_hexdigit())
+        && body.source_instance_id.as_str()
+            == format!(
+                "native-runtime:{}:{}:{}:{}",
+                process.boot_id, process.pid_namespace, process.pid, process.start_ticks
+            )
+        && body.source_ref
+            == format!(
+                "runtime:{}:{execution}@{}",
+                header.source_epoch, process.start_ticks
+            )
+        && body.source_session_ref == header.source_epoch
+        && body.identity_domain == IMAGE_SOURCE_REVISION
+        && body.identity_strength == IdentityStrength::StableNative
+        && body.source_kind == EvidenceSourceKind::Other
+        && body.source_role == SourceRole::Tool
+        && body.content_trust == ContentTrust::UntrustedSourceContent
+        && body.capture_completeness == CaptureCompleteness::Partial
+        && body.observation_role == ObservationRole::StateProbe
+        && body.task_id.is_none()
+        && body.repository_instance_id.is_none()
+        && body.worktree_instance_id.is_none()
+        && body.unsupported_record_classification.is_none()
+        && body.surface_eligible
+        && body.lifecycle.is_none()
+        && body.source_sequence == 0
+        && body.source_sequence_origin == Some(0)
+        && body.close_watermark == Some(0)
+        && body.adapter_revision == 1
+        && body.parser_revision == 1
+        && body.canonicalization_revision == 1
+        && body.eligible_event_manifest_ref == IMAGE_ELIGIBLE_EVENTS
+        && body.correlation.occurrence_schema_version == 1
+        && body.correlation.pairing_role == ObservationRole::StateProbe
+        && body.correlation.adapter_manifest_ref == body.adapter_manifest_ref
+        && body.correlation.adapter_revision == 1
+        && body.correlation.partial_correlation_ref.is_none()
+        && body.correlation.possible_duplicate_group_id.is_none()
+        && body.correlation.admission == CorrelationAdmission::Unavailable
+        && body.correlation.host_instance_id.is_none()
+        && body.correlation.host_trace_lineage_id.is_none()
+        && body.correlation.host_lane_key.is_none()
+        && body.correlation.canonical_event_family.is_none()
+        && body.correlation.native_request_id.is_none()
+        && body.correlation.physical_execution_ordinal.is_none()
+        && body.correlation.field_provenance.is_empty()
+        && body.correlation.strong_gate_receipt_ref.is_none()
+        && body.scope_effect_claims.is_empty()
+        && body.source_local_evidence.is_none()
 }
 
 /// Verify frozen metadata against original protected bytes without re-reading a live process.
