@@ -191,10 +191,11 @@ fn source_resolved(
                             })
                             && scopes.iter().all(|scope| {
                                 task.scope_memberships.iter().any(|membership| {
-                                    membership.repository_instance_id == Some(scope.repository)
-                                        && membership
-                                            .worktree_instance_ids
-                                            .contains(&scope.worktree)
+                                    membership.repository_instance_id == scope.repository
+                                        && scope.worktree.map_or_else(
+                                            || membership.worktree_instance_ids.is_empty(),
+                                            |tree| membership.worktree_instance_ids.contains(&tree),
+                                        )
                                 })
                             })))
             });
@@ -708,8 +709,18 @@ struct RootScopeCandidate {
     source: SourceObservationId,
     operation: OperationId,
     effect: evertrace_domain::ids::ScopeEffectId,
-    repository: evertrace_domain::ids::RepositoryId,
-    worktree: evertrace_domain::ids::WorktreeId,
+    repository: Option<evertrace_domain::ids::RepositoryId>,
+    worktree: Option<evertrace_domain::ids::WorktreeId>,
+}
+
+fn observed_without_repository(effect: &evertrace_domain::evidence::ScopeEffect) -> bool {
+    effect.repository_instance_id.is_none()
+        && effect.worktree_instance_id.is_none()
+        && effect.effect_role == evertrace_domain::evidence::EffectRole::Observe
+        && effect.pre_snapshot_id.is_none()
+        && effect.post_snapshot_id.is_none()
+        && effect.experiment_run_ids.is_empty()
+        && effect.artifact_refs.is_empty()
 }
 
 /// Stored matches only select a finite candidate closure. The resolver must
@@ -815,11 +826,12 @@ fn root_scope_candidates(
         if !operation.scope_effect_ids.contains(&effect.scope_effect_id) {
             continue;
         }
-        let (Some(repository), Some(worktree)) =
-            (effect.repository_instance_id, effect.worktree_instance_id)
-        else {
+        let (repository, worktree) = (effect.repository_instance_id, effect.worktree_instance_id);
+        if !matches!((repository, worktree), (Some(_), Some(_)))
+            && !observed_without_repository(&effect)
+        {
             continue;
-        };
+        }
         let Some(source) = operation
             .input_source_observation_refs
             .iter()
@@ -899,13 +911,16 @@ fn process_work_refs(
             declaration.controller.start_ticks,
         ));
         for scope in root_scope_candidates(current, receipt.source_observation_id, directory)? {
+            let (Some(repository), Some(worktree)) = (scope.repository, scope.worktree) else {
+                continue; // Research code/snapshot qualification cannot inherit an unscoped witness.
+            };
             causal.insert(scope.source);
             refs.extend([
                 scope.source.to_string(),
                 scope.operation.to_string(),
                 scope.effect.to_string(),
-                scope.repository.to_string(),
-                scope.worktree.to_string(),
+                repository.to_string(),
+                worktree.to_string(),
             ]);
         }
     }
@@ -1152,9 +1167,9 @@ pub(crate) fn controlled_source_snapshot(
                 scope.source.to_string(),
                 scope.operation.to_string(),
                 scope.effect.to_string(),
-                scope.repository.to_string(),
-                scope.worktree.to_string(),
             ]);
+            refs.extend(scope.repository.map(|repository| repository.to_string()));
+            refs.extend(scope.worktree.map(|worktree| worktree.to_string()));
         }
     }
     let mut selected = BTreeSet::new();
@@ -2797,6 +2812,11 @@ impl ControlledRunResolver {
             if !witnessed {
                 continue;
             }
+            if observed_without_repository(effect) {
+                memberships.entry(None).or_default();
+                scope_watermark = scope_watermark.max(*sequence);
+                continue;
+            }
             let (Some(repository), Some(worktree)) =
                 (effect.repository_instance_id, effect.worktree_instance_id)
             else {
@@ -2810,14 +2830,17 @@ impl ControlledRunResolver {
             {
                 return Err(AutoresearchError::UntrustedRunEvidence);
             }
-            memberships.entry(repository).or_default().insert(worktree);
+            memberships
+                .entry(Some(repository))
+                .or_default()
+                .insert(worktree);
             scope_watermark = scope_watermark.max(*sequence);
         }
         let memberships = memberships
             .into_iter()
             .map(
                 |(repository, worktrees)| evertrace_domain::work::TaskScopeMembership {
-                    repository_instance_id: Some(repository),
+                    repository_instance_id: repository,
                     worktree_instance_ids: worktrees.into_iter().collect(),
                 },
             )
