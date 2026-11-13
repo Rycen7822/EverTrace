@@ -55,7 +55,7 @@ pub fn is_owned_revision(revision: &str) -> bool {
         )
 }
 const LIMIT: usize = 65_536;
-const SOURCE_BYTES: u64 = 262_144;
+pub const SOURCE_BYTES: u64 = 262_144;
 const SOURCE_RECORDS: u64 = 64;
 
 pub fn adapter_version() -> String {

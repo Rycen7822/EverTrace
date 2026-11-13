@@ -363,6 +363,8 @@ struct ProcessTrialDeclaration {
     execution_key: String,
     request_key: String,
     execution_ordinal: u32,
+    process: Option<serde_json::Value>,
+    argv: Option<Vec<String>>,
     config: serde_json::Value,
     source_anchor: ProcessTrialAnchor,
 }
@@ -396,6 +398,155 @@ impl ProcessTrialDeclaration {
             && value.execution_ordinal != 0)
             .then_some(value)
     }
+}
+
+fn process_runtime_groups<'a>(
+    trial: &ProcessTrialDeclaration,
+    receipts: impl Iterator<Item = &'a SourceReceipt>,
+) -> Result<Vec<[SourceObservationId; 4]>, AutoresearchError> {
+    use evertrace_capture::process_source as source;
+    let Some(process) = trial.process.as_ref() else {
+        return Ok(Vec::new());
+    };
+    let (Some(pid), Some(birth)) = (process["pid"].as_u64(), process["start_ticks"].as_u64())
+    else {
+        return Ok(Vec::new());
+    };
+    let prefix = format!(
+        "procfs:{}:{}:",
+        trial.controller.boot_id, trial.controller.pid_namespace
+    );
+    let stat = format!("procfs:/proc/{pid}/stat@{birth}");
+    let command = format!("procfs:/proc/{pid}/cmdline@{birth}");
+    let environment = format!("procfs:/proc/{pid}/environ@{birth}");
+    let conditions = format!(":trial-{}.conditions.json", trial.execution_key);
+    let deadline = std::time::Instant::now() + std::time::Duration::from_millis(40);
+    let mut selected = Vec::new();
+    for receipt in receipts {
+        if std::time::Instant::now() >= deadline {
+            return Err(AutoresearchError::SelectionDeferred);
+        }
+        if receipt.source_instance_id.as_str().starts_with(&prefix)
+            && match receipt.source_revision.as_str() {
+                source::KERNEL_SOURCE_REVISION => receipt.source_ref == stat,
+                source::INPUT_SOURCE_REVISION => {
+                    receipt.source_ref == command || receipt.source_ref == environment
+                }
+                source::CONDITIONS_SOURCE_REVISION => receipt.source_ref.ends_with(&conditions),
+                _ => false,
+            }
+        {
+            selected.push(receipt);
+            if selected.len() > 64 {
+                return Err(AutoresearchError::EvidenceIncomplete);
+            }
+        }
+    }
+    let mut groups = Vec::new();
+    for kernel in selected
+        .iter()
+        .filter(|value| value.source_revision.as_str() == source::KERNEL_SOURCE_REVISION)
+    {
+        let observer = kernel.source_instance_id.as_str();
+        let mut group = vec![kernel.source_observation_id];
+        for (suffix, revision, reference) in [
+            (":cmdline", source::INPUT_SOURCE_REVISION, command.as_str()),
+            (
+                ":environ",
+                source::INPUT_SOURCE_REVISION,
+                environment.as_str(),
+            ),
+            (":runtime", source::CONDITIONS_SOURCE_REVISION, ""),
+        ] {
+            let instance = format!("{observer}{suffix}");
+            let mut matching = selected.iter().filter(|value| {
+                value.source_instance_id.as_str() == instance
+                    && value.source_revision.as_str() == revision
+                    && (reference.is_empty() || value.source_ref == reference)
+            });
+            if let Some(receipt) = matching.next() {
+                if matching.next().is_some() {
+                    return Err(AutoresearchError::EvidenceIncomplete);
+                }
+                group.push(receipt.source_observation_id);
+            }
+        }
+        if let Ok(group) = group.try_into() {
+            groups.push(group);
+        }
+    }
+    Ok(groups)
+}
+
+fn recorded_runtime_source(observation: &SourceObservation, receipt: &SourceReceipt) -> bool {
+    use evertrace_capture::process_source as source;
+    use evertrace_domain::evidence::{
+        CorrelationAdmission, EvidenceSourceKind, IdentityStrength, ObservationRole,
+    };
+    matches!(
+        receipt.source_revision.as_str(),
+        source::KERNEL_SOURCE_REVISION
+            | source::INPUT_SOURCE_REVISION
+            | source::CONDITIONS_SOURCE_REVISION
+    ) && receipt.source_kind == EvidenceSourceKind::Other
+        && receipt.identity_strength == IdentityStrength::SynthesizedBestEffort
+        && observation.identity_strength == receipt.identity_strength
+        && observation.source_role == SourceRole::Tool
+        && observation.content_trust == ContentTrust::Observed
+        && observation.capture_completeness == CaptureCompleteness::Partial
+        && observation.observation_role == ObservationRole::StateProbe
+        && receipt.lifecycle.is_none()
+        && observation.correlation.admission == CorrelationAdmission::Unavailable
+        && observation.scope_effect_claims.is_empty()
+        && observation.source_local_evidence.is_none()
+        && receipt.identity_domain == receipt.source_revision.as_str()
+        && receipt.adapter_revision == source::KERNEL_ADAPTER_REVISION
+        && observation.adapter_revision == receipt.adapter_revision
+        && receipt.parser_revision == 1
+        && observation.parser_revision == 1
+        && receipt.canonicalization_revision == 1
+        && receipt.source_sequence == 0
+        && receipt.source_sequence_origin == Some(0)
+        && receipt.close_watermark == Some(0)
+}
+
+fn runtime_environment_fingerprint(value: &serde_json::Value) -> Result<String, AutoresearchError> {
+    use evertrace_domain::canonical::{CanonicalValue, sha256};
+    fn canonical(value: &serde_json::Value) -> Option<CanonicalValue> {
+        use serde_json::Value;
+        Some(match value {
+            Value::Null => CanonicalValue::Null,
+            Value::Bool(value) => CanonicalValue::Bool(*value),
+            Value::Number(value) => CanonicalValue::Integer(
+                value
+                    .as_i64()
+                    .map(i128::from)
+                    .or_else(|| value.as_u64().map(i128::from))?,
+            ),
+            Value::String(value) => CanonicalValue::String(value.clone()),
+            Value::Array(values) => {
+                CanonicalValue::Sequence(values.iter().map(canonical).collect::<Option<_>>()?)
+            }
+            Value::Object(values) => CanonicalValue::Map(
+                values
+                    .iter()
+                    .map(|(key, value)| Some((key.clone(), canonical(value)?)))
+                    .collect::<Option<_>>()?,
+            ),
+        })
+    }
+    let fields = ["python", "framework", "environment", "packages"]
+        .into_iter()
+        .map(|key| Some((key.to_owned(), canonical(value.get(key)?)?)))
+        .collect::<Option<Vec<_>>>()
+        .ok_or(AutoresearchError::EvidenceIncomplete)?;
+    let digest = sha256(
+        "evertrace.recorded_runtime_environment",
+        1,
+        &CanonicalValue::Map(fields),
+    )
+    .map_err(|_| AutoresearchError::InvalidInput)?;
+    Ok(format!("recorded-runtime-v1:{}", hex(&digest)))
 }
 
 enum SourceCandidate {
@@ -764,6 +915,12 @@ pub(crate) fn controlled_source_snapshot(
                 return Ok(None);
             }
             let mut refs = process_work_refs(current, opening, &declaration, &resolver.cas)?;
+            for evidence in process_runtime_groups(
+                trial,
+                current.source_receipts().map(|(value, _)| value.as_ref()),
+            )? {
+                refs.extend(evidence.into_iter().map(|id| id.to_string()));
+            }
             refs.insert(opening.to_string());
             let opening_receipt = current
                 .source_observation(opening)
@@ -1221,9 +1378,17 @@ impl ControlledRunResolver {
             .get(&source)
             .ok_or(AutoresearchError::EvidenceIncomplete)?;
         let digest = CasDigest::from_str(&receipt.cas_ref).map_err(|_| AutoresearchError::Cas)?;
+        let limit = if recorded_runtime_source(observation, receipt)
+            && receipt.source_revision.as_str()
+                == evertrace_capture::process_source::CONDITIONS_SOURCE_REVISION
+        {
+            evertrace_capture::process_source::SOURCE_BYTES
+        } else {
+            65536
+        };
         let bytes = self
             .cas
-            .read_bounded(&digest, 128 * 1024, 65536)
+            .read_bounded(&digest, limit * 2, limit)
             .map_err(|_| AutoresearchError::Cas)?
             .0;
         if receipt.archive_mode != SourceArchiveMode::Exact
@@ -1254,7 +1419,9 @@ impl ControlledRunResolver {
             {
                 return Err(AutoresearchError::UntrustedRunEvidence);
             }
-        } else if !evertrace_capture::execution_source::is_execution(observation, receipt) {
+        } else if !evertrace_capture::execution_source::is_execution(observation, receipt)
+            && !recorded_runtime_source(observation, receipt)
+        {
             return Err(AutoresearchError::EvidenceIncomplete);
         }
         Ok(bytes)
@@ -1570,11 +1737,26 @@ impl ControlledRunResolver {
                 facts.receipt(opening_source)?.source_receipt_id,
             ];
             expected.sort();
-            if run.source_receipt_refs != expected
+            if !expected
+                .iter()
+                .all(|id| run.source_receipt_refs.contains(id))
                 || run.comparison_execution_binding.is_some()
                 || run.origin != RunOrigin::External
             {
                 return Err(AutoresearchError::ImmutableConflict);
+            }
+            let native = run
+                .source_receipt_refs
+                .iter()
+                .filter(|id| !expected.contains(id))
+                .collect::<Vec<_>>();
+            if !native.is_empty() {
+                let (fingerprint, receipts) = self.process_runtime_environment(&facts, &trial)?;
+                if run.environment_fingerprint != fingerprint
+                    || native.iter().any(|id| !receipts.contains(id))
+                {
+                    return Err(AutoresearchError::ImmutableConflict);
+                }
             }
             let attempt = run
                 .attempt_id
@@ -1587,11 +1769,11 @@ impl ControlledRunResolver {
             else {
                 return Ok(ControlledRunCommand::NoDelta);
             };
-            let mut input = process_trial_input(&trial, attempt, anchor, context.occurred_at_us)?;
-            input.source_receipt_refs = vec![
-                facts.receipt(source)?.source_receipt_id,
-                facts.receipt(opening_source)?.source_receipt_id,
-            ];
+            let (fingerprint, mut receipts) = self.process_runtime_environment(&facts, &trial)?;
+            let mut input =
+                process_trial_input(&trial, attempt, anchor, fingerprint, context.occurred_at_us)?;
+            receipts.extend([facts.receipt(source)?.source_receipt_id, opening_receipt]);
+            input.source_receipt_refs = receipts;
             let mut run = create_experiment_run(attempt, input)?;
             run.origin = RunOrigin::External;
             run.external_system_id = Some(evertrace_capture::process_source::FORMAT.into());
@@ -1619,6 +1801,124 @@ impl ControlledRunResolver {
             attempt: attempt.map(Box::new),
             command,
         })
+    }
+
+    fn process_runtime_environment(
+        &self,
+        facts: &ControlledFacts,
+        trial: &ProcessTrialDeclaration,
+    ) -> Result<(String, Vec<SourceReceiptId>), AutoresearchError> {
+        use evertrace_capture::process_source;
+        let process = trial
+            .process
+            .as_ref()
+            .ok_or(AutoresearchError::EvidenceIncomplete)?;
+        let argv = trial
+            .argv
+            .as_ref()
+            .ok_or(AutoresearchError::EvidenceIncomplete)?;
+        let command = argv
+            .iter()
+            .flat_map(|arg| arg.bytes().chain(std::iter::once(0)))
+            .collect::<Vec<_>>();
+        let mut fingerprint = None;
+        let mut receipts = Vec::new();
+        for group in process_runtime_groups(trial, facts.receipts.values())? {
+            let mut raw = Vec::new();
+            for id in group {
+                let receipt = facts.receipt(id)?;
+                let observation = facts
+                    .observations
+                    .get(&id)
+                    .ok_or(AutoresearchError::EvidenceIncomplete)?;
+                if !recorded_runtime_source(observation, receipt) {
+                    return Err(AutoresearchError::UntrustedRunEvidence);
+                }
+                raw.push(self.protected_source(facts, id)?);
+                receipts.push(receipt.source_receipt_id);
+            }
+            let [stat, actual_command, environment, conditions] = raw.as_slice() else {
+                return Err(AutoresearchError::EvidenceIncomplete);
+            };
+            let stat =
+                std::str::from_utf8(stat).map_err(|_| AutoresearchError::EvidenceIncomplete)?;
+            let (head, fields) = stat
+                .rsplit_once(") ")
+                .ok_or(AutoresearchError::EvidenceIncomplete)?;
+            let fields = fields.split_whitespace().collect::<Vec<_>>();
+            if head
+                .split_whitespace()
+                .next()
+                .and_then(|value| value.parse::<u64>().ok())
+                != process["pid"].as_u64()
+                || fields.first().is_none_or(|value| *value == "Z")
+                || fields.get(1).and_then(|value| value.parse::<u32>().ok())
+                    != Some(trial.controller.pid)
+                || fields.get(19).and_then(|value| value.parse::<u64>().ok())
+                    != process["start_ticks"].as_u64()
+                || actual_command != &command
+                || !environment.ends_with(&[0])
+            {
+                return Err(AutoresearchError::UntrustedRunEvidence);
+            }
+            let mut actual_environment = BTreeMap::new();
+            for entry in environment[..environment.len() - 1].split(|byte| *byte == 0) {
+                let entry = std::str::from_utf8(entry)
+                    .map_err(|_| AutoresearchError::UntrustedRunEvidence)?;
+                let (key, value) = entry
+                    .split_once('=')
+                    .ok_or(AutoresearchError::UntrustedRunEvidence)?;
+                if actual_environment.insert(key, value).is_some() {
+                    return Err(AutoresearchError::UntrustedRunEvidence);
+                }
+            }
+            let environment = serde_json::to_value(actual_environment)
+                .map_err(|_| AutoresearchError::InvalidInput)?;
+            let conditions: serde_json::Value = serde_json::from_slice(conditions)
+                .map_err(|_| AutoresearchError::EvidenceIncomplete)?;
+            if conditions["format"] != process_source::CONDITIONS_SOURCE_REVISION
+                || conditions.as_object().is_none_or(|value| value.len() != 6)
+                || conditions["process"] != *process
+                || conditions["environment"] != environment
+                || environment != trial.config["environment"]
+                || conditions["python"]["version"] != trial.config["python"]
+                || conditions["framework"]["name"] != trial.config["framework"]
+                || conditions["framework"]["version"] != trial.config["framework_version"]
+            {
+                return Err(AutoresearchError::UntrustedRunEvidence);
+            }
+            let packages = conditions["packages"]
+                .as_array()
+                .ok_or(AutoresearchError::EvidenceIncomplete)?;
+            let names = packages
+                .iter()
+                .filter_map(|value| value["name"].as_str())
+                .collect::<BTreeSet<_>>();
+            if names != BTreeSet::from(["pytest", "pluggy", "iniconfig", "packaging", "Pygments"])
+                || packages.len() != names.len()
+                || packages.iter().any(|value| {
+                    ["metadata", "record"]
+                        .iter()
+                        .any(|field| value[field].as_str().is_none_or(str::is_empty))
+                })
+            {
+                return Err(AutoresearchError::EvidenceIncomplete);
+            }
+            let current = runtime_environment_fingerprint(&conditions)?;
+            if fingerprint
+                .as_ref()
+                .is_some_and(|previous| previous != &current)
+            {
+                return Err(AutoresearchError::ImmutableConflict);
+            }
+            fingerprint = Some(current);
+        }
+        receipts.sort();
+        receipts.dedup();
+        Ok((
+            fingerprint.ok_or(AutoresearchError::EvidenceIncomplete)?,
+            receipts,
+        ))
     }
 
     fn process_trial_bindings(
@@ -2379,6 +2679,7 @@ fn process_trial_input(
     trial: &ProcessTrialDeclaration,
     attempt: &Attempt,
     snapshot: &WorktreeSnapshot,
+    environment_fingerprint: String,
     created_at_us: i64,
 ) -> Result<RunCreateInput, AutoresearchError> {
     let value = &trial.config;
@@ -2392,8 +2693,8 @@ fn process_trial_input(
     let selected = text("selected")?;
     let implementation = text("implementation")?;
     let framework = text("framework")?;
-    let framework_version = text("framework_version")?;
-    let python = text("python")?;
+    text("framework_version")?;
+    text("python")?;
     let environment = value
         .get("environment")
         .and_then(serde_json::Value::as_object)
@@ -2417,10 +2718,6 @@ fn process_trial_input(
     {
         return Err(AutoresearchError::EvidenceIncomplete);
     }
-    // These are the source's declared conditions, not an immutable runtime qualification.
-    let environment_fingerprint = serde_json::to_string(&serde_json::json!({"environment":environment,
-        "framework":framework,"framework_version":framework_version,"python":python,"uses_model":false}))
-        .map_err(|_| AutoresearchError::InvalidInput)?;
     Ok(RunCreateInput {
         workstream_id: attempt.workstream_id,
         source_receipt_refs: Vec::new(),
