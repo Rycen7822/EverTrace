@@ -10,8 +10,8 @@ use evertrace_domain::{
         SourceArchiveMode, SourceObservation, SourceReceipt, SourceRole, hex, payload_fingerprint,
     },
     ids::{
-        AttemptId, CasId, CommandId, OperationId, ResultEvidenceId, SourceObservationId,
-        SourceReceiptId, WorkArtifactId,
+        AttemptId, CasId, CommandId, ExecutionLaneId, OperationId, ResultEvidenceId,
+        SourceObservationId, SourceReceiptId, WorkArtifactId,
     },
     procedure::{ProcedureRevision, ProcedureUsageRevision},
     repository::{WorktreeInstance, WorktreeSnapshot},
@@ -23,8 +23,8 @@ use evertrace_domain::{
     },
     work::{
         ArtifactActor, ArtifactPayloadStatus, ArtifactRevision, ArtifactScope, AssignmentStatus,
-        Attempt, AttemptBindingStatus, ContractField, ControlledRunSourceEnvelope, ExperimentRun,
-        MultiCasMetricPolicy, ResultCohortAssessment, ResultComparisonIssue,
+        Attempt, AttemptBindingStatus, CaptureReceipt, ContractField, ControlledRunSourceEnvelope,
+        ExperimentRun, MultiCasMetricPolicy, ResultCohortAssessment, ResultComparisonIssue,
         ResultComparisonReason, RunContractValidity, RunExecutionStatus, RunObservability,
         RunOrigin, SeedPolicy, Task, VariableDeclaration, WorkArtifact, WorkBindingRevision,
         WorkEpisode, Workstream,
@@ -148,6 +148,58 @@ impl ControlledSourceScan {
     }
 }
 
+fn lane_capture_receipt<'a>(
+    rows: impl Iterator<Item = &'a evertrace_store::ObjectRow>,
+    lane: ExecutionLaneId,
+) -> Result<Option<CaptureReceipt>, AutoresearchError> {
+    let id = lane.to_string();
+    rows.filter(|row| {
+        row.object_kind.as_deref() == Some("capture_receipt")
+            && row.object_id.as_deref() == Some(id.as_str())
+    })
+    .max_by_key(|row| row.source_event_seq)
+    .map(|row| {
+        let json = row
+            .payload_json
+            .as_deref()
+            .ok_or(AutoresearchError::EvidenceIncomplete)?;
+        match serde_json::from_str::<JournalPayload>(json) {
+            Ok(JournalPayload::CaptureReceiptRecorded(receipt))
+                if receipt.execution_lane_id == lane =>
+            {
+                Ok(*receipt)
+            }
+            _ => Err(AutoresearchError::EvidenceIncomplete),
+        }
+    })
+    .transpose()
+}
+
+fn phase_capture_current(
+    current: &evertrace_store::CurrentFacts,
+    id: evertrace_domain::ids::WorkEpisodeId,
+    deadline: std::time::Instant,
+) -> bool {
+    let id = id.to_string();
+    let episode = current
+        .other_data_rows()
+        .take_while(|_| std::time::Instant::now() < deadline)
+        .filter(|row| {
+            row.object_kind.as_deref() == Some("work_episode")
+                && row.object_id.as_deref() == Some(id.as_str())
+        })
+        .max_by_key(|row| row.source_event_seq)
+        .and_then(|row| serde_json::from_str::<JournalPayload>(row.payload_json.as_deref()?).ok());
+    let Some(JournalPayload::WorkEpisodeRecorded(episode)) = episode else {
+        return false;
+    };
+    episode.execution_lane_ids.iter().all(|lane| {
+        matches!(lane_capture_receipt(current.other_data_rows()
+            .take_while(|_| std::time::Instant::now() < deadline), *lane), Ok(Some(receipt))
+            if episode.capture_receipt_revision_ids.contains(&receipt.capture_receipt_revision_id))
+    })
+}
+
 // Replaying an already admitted source must not reopen a repository or mutate current trust.
 fn source_resolved(
     current: &evertrace_store::CurrentFacts,
@@ -233,7 +285,11 @@ fn source_resolved(
                         )
                     });
                 (value.worktree_lineage_refs.contains(&reference) || bound)
-                    && (value.status.is_terminal() || (value.active_episode_id.is_some() && bound))
+                    && (value.status.is_terminal()
+                        || (bound
+                            && value.active_episode_id.is_some_and(|episode| {
+                                phase_capture_current(current, episode, deadline)
+                            })))
             });
     }
     if let SourceCandidate::TestResult(event) = envelope {
@@ -3551,33 +3607,10 @@ fn process_work_command(
         .operations
         .get(&anchor.effect.operation_id)
         .and_then(|operation| operation.execution_lane_id);
-    let root_capture = if let Some(lane) = root_lane {
-        let id = lane.to_string();
-        snapshot
-            .data_rows()
-            .filter(|row| {
-                row.object_kind.as_deref() == Some("capture_receipt")
-                    && row.object_id.as_deref() == Some(id.as_str())
-            })
-            .max_by_key(|row| row.source_event_seq)
-            .map(|row| {
-                let json = row
-                    .payload_json
-                    .as_deref()
-                    .ok_or(AutoresearchError::EvidenceIncomplete)?;
-                match serde_json::from_str::<JournalPayload>(json) {
-                    Ok(JournalPayload::CaptureReceiptRecorded(receipt))
-                        if receipt.execution_lane_id == lane =>
-                    {
-                        Ok(*receipt)
-                    }
-                    _ => Err(AutoresearchError::EvidenceIncomplete),
-                }
-            })
-            .transpose()?
-    } else {
-        None
-    };
+    let root_capture = root_lane
+        .map(|lane| lane_capture_receipt(snapshot.data_rows(), lane))
+        .transpose()?
+        .flatten();
     let root_lane = root_capture
         .as_ref()
         .map(|receipt| receipt.execution_lane_id);
@@ -3609,7 +3642,33 @@ fn process_work_command(
         if stream.status.is_terminal() {
             return Ok(None);
         }
-        if stream.active_episode_id.is_some() {
+        if let Some(episode_id) = stream.active_episode_id {
+            let phase = facts
+                .current_episodes
+                .get(&episode_id)
+                .and_then(|revision| facts.episodes.get(revision))
+                .ok_or(AutoresearchError::EvidenceIncomplete)?;
+            let mut events = Vec::new();
+            if phase.phase_contract == plan.phase && !phase.execution_lane_ids.is_empty() {
+                let receipts = phase
+                    .execution_lane_ids
+                    .iter()
+                    .map(|lane| {
+                        lane_capture_receipt(snapshot.data_rows(), *lane)?
+                            .ok_or(AutoresearchError::EvidenceIncomplete)
+                    })
+                    .collect::<Result<Vec<_>, _>>()?;
+                if let Some(next) = episode::refresh_capture(phase, &receipts, snapshot.frontier)
+                    .map_err(map_error)?
+                {
+                    events.push(JournalEventDraft::runtime(
+                        context.occurred_at_us,
+                        context.effective_config_hash,
+                        context.algorithm_revision,
+                        JournalPayload::WorkEpisodeRecorded(Box::new(next)),
+                    ));
+                }
+            }
             let view = evertrace_store::WorkIdentityCurrentView::from_snapshot(snapshot)?;
             let binding = crate::work::binding::source_root_workstream(
                 &view,
@@ -3621,11 +3680,22 @@ fn process_work_command(
             )
             .map_err(map_error)?
             .into_revision();
-            return binding
-                .map(|binding| {
-                    crate::work::binding::record_binding(context, binding).map_err(map_error)
-                })
-                .transpose();
+            if let Some(binding) = binding {
+                events.extend(
+                    crate::work::binding::record_binding(context, binding)
+                        .map_err(map_error)?
+                        .events()
+                        .iter()
+                        .cloned(),
+                );
+            }
+            return if events.is_empty() {
+                Ok(None)
+            } else {
+                JournalCommand::new(context.command_id, events)
+                    .map(Some)
+                    .map_err(AutoresearchError::Store)
+            };
         }
         let attempts = facts
             .attempts

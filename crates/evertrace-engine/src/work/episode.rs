@@ -432,6 +432,44 @@ pub fn save_checkpoint(
     .map(Some)
 }
 
+pub(crate) fn refresh_capture(
+    current: &WorkEpisode,
+    receipts: &[evertrace_domain::work::CaptureReceipt],
+    source_watermark: u64,
+) -> Result<Option<WorkEpisode>, WorkIdentityError> {
+    let mut lanes = receipts
+        .iter()
+        .map(|receipt| receipt.execution_lane_id)
+        .collect::<Vec<_>>();
+    sort_unique(&mut lanes);
+    if lanes != current.execution_lane_ids {
+        return Err(WorkIdentityError::InvalidInput);
+    }
+    let mut next = current.clone();
+    pin_capture_receipts(&mut next, receipts)?;
+    if next == *current {
+        return Ok(None);
+    }
+    if source_watermark <= current.source_watermark {
+        return Err(WorkIdentityError::InvalidInput);
+    }
+    next.revision_id = RevisionId::new_v7();
+    next.predecessor_revision_id = Some(current.revision_id);
+    next.revision_generation = current
+        .revision_generation
+        .checked_add(1)
+        .ok_or(WorkIdentityError::InvalidInput)?;
+    next.source_watermark = source_watermark;
+    next.pending_semantic_delta = Some(PendingSemanticInterval {
+        after_watermark: next.semantic_watermark,
+        through_watermark: source_watermark,
+    });
+    current
+        .validate_successor(&next)
+        .map_err(|_| WorkIdentityError::InvalidInput)?;
+    Ok(Some(next))
+}
+
 pub(crate) fn pin_capture_receipts(
     episode: &mut WorkEpisode,
     receipts: &[evertrace_domain::work::CaptureReceipt],
