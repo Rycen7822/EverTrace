@@ -4222,6 +4222,8 @@ struct ObjectDeletionPreviewInputs<'a> {
 }
 
 struct RepositoryScopePreviewInputs<'a> {
+    work_bindings: &'a BTreeMap<WorkBindingRevisionId, (WorkBindingRevision, u64)>,
+    source_observations: &'a SourceObservationFacts,
     inventory: &'a inventory::InventoryState,
     session_imports: &'a BTreeMap<String, crate::session_import::SessionImportCurrent>,
     jobs: Vec<&'a DurableJob>,
@@ -4997,6 +4999,8 @@ impl ReducerState {
             inventory: &self.inventory,
             session_imports: &self.session_imports,
             jobs: self.jobs.values().map(|(job, _)| job).collect(),
+            work_bindings: &self.work_bindings,
+            source_observations: &self.source_observations,
             host_occurrences: &self.host_occurrences,
             operations: &self.operations,
             scope_effects: &self.scope_effects,
@@ -9239,6 +9243,8 @@ impl JournalAdmissionState {
             inventory: &self.inventory,
             session_imports: &self.session_imports,
             jobs: self.jobs.values().collect(),
+            work_bindings: &self.work_bindings,
+            source_observations: &self.source_observations,
             host_occurrences: &self.host_occurrences,
             operations: &self.operations,
             scope_effects: &self.scope_effects,
@@ -9555,6 +9561,59 @@ fn derive_object_deletion_preview_from_inputs(
     )
 }
 
+fn process_source_repository_scopes(
+    bindings: &BTreeMap<WorkBindingRevisionId, (WorkBindingRevision, u64)>,
+    observations: &SourceObservationFacts,
+    effects: &BTreeMap<ScopeEffectId, (ScopeEffect, u64)>,
+    source_filter: Option<&BTreeSet<String>>,
+    deadline: Option<std::time::Instant>,
+) -> Result<SourceRepositoryScopes, StoreError> {
+    use evertrace_domain::work::AssignmentStatus;
+    let mut scopes = SourceRepositoryScopes::new();
+    // One derivation for current reads and purge: historical bindings retain restrictions.
+    // Only Work metadata is scanned; Evidence payloads and whole projections are not read.
+    for (binding, _) in bindings.values() {
+        if deadline.is_some_and(|deadline| std::time::Instant::now() >= deadline) {
+            return Err(StoreError::Io);
+        }
+        if binding.assignment_status != AssignmentStatus::Resolved {
+            continue;
+        }
+        for reference in &binding.evidence_refs {
+            let Some((source, _)) = reference
+                .parse::<SourceObservationId>()
+                .ok()
+                .and_then(|id| observations.get(&id))
+                .filter(|(source, _)| {
+                    source.source_instance_id.as_str().starts_with("process:")
+                        && source_filter.is_none_or(|sources| {
+                            sources.contains(source.source_instance_id.as_str())
+                        })
+                        && evertrace_capture::process_source::is_owned_revision(
+                            source.source_revision.as_str(),
+                        )
+                })
+            else {
+                continue;
+            };
+            let repositories = scopes
+                .entry(source.source_instance_id.as_str().to_owned())
+                .or_default();
+            for id in &binding.scope_effect_refs {
+                let (effect, _) = effects.get(id).ok_or(StoreError::StoreCorrupt)?;
+                if effect.operation_id != binding.operation_id {
+                    return Err(StoreError::StoreCorrupt);
+                }
+                repositories.extend(effect.repository_instance_id);
+            }
+            if repositories.len() > usize::from(evertrace_domain::query::METADATA_READ_LIMIT) {
+                return Err(StoreError::InvalidInput);
+            }
+        }
+    }
+    Ok(scopes)
+}
+
 fn derive_repository_scope_purge_preview(
     inputs: RepositoryScopePreviewInputs<'_>,
     repository_id: RepositoryId,
@@ -9595,11 +9654,29 @@ fn derive_repository_scope_purge_preview(
         })
         .map(crate::session_import::SessionImportCurrent::source_key)
         .collect::<BTreeSet<_>>();
-    let target_source_instances = target_session_ids
+    let process_scopes = process_source_repository_scopes(
+        inputs.work_bindings,
+        inputs.source_observations,
+        inputs.scope_effects,
+        None,
+        None,
+    )?;
+    if process_scopes
+        .values()
+        .any(|ids| ids.contains(&repository_id) && ids.iter().any(|id| *id != repository_id))
+    {
+        cross_scope_dependency = true;
+    }
+    let mut target_source_instances = target_session_ids
         .iter()
         .filter_map(|key| inputs.session_imports.get(key))
         .map(crate::session_import::SessionImportCurrent::source_instance)
         .collect::<BTreeSet<_>>();
+    target_source_instances.extend(
+        process_scopes
+            .iter()
+            .filter_map(|(source, ids)| ids.contains(&repository_id).then(|| source.clone())),
+    );
     let target_snapshot_ids = inputs
         .worktree_snapshots
         .values()
@@ -12030,50 +12107,16 @@ impl JournalAdmissionState {
         sources: &BTreeSet<String>,
         deadline: std::time::Instant,
     ) -> Result<SourceRepositoryScopes, StoreError> {
-        use evertrace_domain::work::AssignmentStatus;
         if sources.len() > usize::from(evertrace_domain::query::METADATA_READ_LIMIT) {
             return Err(StoreError::InvalidInput);
         }
-        let mut scopes = SourceRepositoryScopes::new();
-        // Scan only the admitted Work family, not Evidence payloads or a whole projection.
-        // Immutable binding revisions retain known restrictions even after a current rebind.
-        for (binding, _) in self.work_bindings.values() {
-            if std::time::Instant::now() >= deadline {
-                return Err(StoreError::Io);
-            }
-            if binding.assignment_status != AssignmentStatus::Resolved {
-                continue;
-            }
-            for reference in &binding.evidence_refs {
-                let Some((source, _)) = reference
-                    .parse::<SourceObservationId>()
-                    .ok()
-                    .and_then(|id| self.source_observations.get(&id))
-                    .filter(|(source, _)| {
-                        sources.contains(source.source_instance_id.as_str())
-                            && evertrace_capture::process_source::is_owned_revision(
-                                source.source_revision.as_str(),
-                            )
-                    })
-                else {
-                    continue;
-                };
-                let repositories = scopes
-                    .entry(source.source_instance_id.as_str().to_owned())
-                    .or_default();
-                for id in &binding.scope_effect_refs {
-                    let (effect, _) = self.scope_effects.get(id).ok_or(StoreError::StoreCorrupt)?;
-                    if effect.operation_id != binding.operation_id {
-                        return Err(StoreError::StoreCorrupt);
-                    }
-                    repositories.extend(effect.repository_instance_id);
-                }
-                if repositories.len() > usize::from(evertrace_domain::query::METADATA_READ_LIMIT) {
-                    return Err(StoreError::InvalidInput);
-                }
-            }
-        }
-        Ok(scopes)
+        process_source_repository_scopes(
+            &self.work_bindings,
+            &self.source_observations,
+            &self.scope_effects,
+            Some(sources),
+            Some(deadline),
+        )
     }
 
     pub(crate) fn repository_read_context(
