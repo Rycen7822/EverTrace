@@ -3615,7 +3615,20 @@ fn process_work_command(
         let linked = episode::link_attempt_to_episode(attempt, &episode, snapshot.frontier)
             .map_err(map_error)?;
         episode.attempt_ids.push(linked.attempt_id);
-        return episode::activate_episode(context, stream, episode, vec![linked], vec![])
+        let bindings = if facts.observations.get(&source).is_some_and(|observation| {
+            evertrace_capture::process_source::is_work_revision(
+                observation.source_revision.as_str(),
+            )
+        }) {
+            // This observed invocation opened this Phase; its strategy is still only Proposed.
+            let binding = current_binding
+                .filter(|binding| source_owns_stream(binding, stream, &source_ref))
+                .ok_or(AutoresearchError::EvidenceIncomplete)?;
+            vec![episode::link_binding_to_episode(binding, &episode).map_err(map_error)?]
+        } else {
+            vec![]
+        };
+        return episode::activate_episode(context, stream, episode, vec![linked], bindings)
             .map(Some)
             .map_err(map_error);
     }
