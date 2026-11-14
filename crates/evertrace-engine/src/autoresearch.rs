@@ -200,7 +200,71 @@ fn phase_capture_current(
     })
 }
 
-// Replaying an already admitted source must not reopen a repository or mutate current trust.
+fn strategy_start_candidate(
+    current: &evertrace_store::CurrentFacts,
+    attempt: Option<evertrace_domain::ids::AttemptId>,
+) -> bool {
+    use evertrace_domain::work::{
+        AttemptExecutionStatus, AttemptLifecycleStatus, EpisodeLifecycle,
+    };
+    let Some(attempt_id) = attempt else {
+        return false;
+    };
+    let latest = |kind: &str, id: String| {
+        current
+            .other_data_rows()
+            .filter(|row| {
+                row.object_kind.as_deref() == Some(kind)
+                    && row.object_id.as_deref() == Some(id.as_str())
+            })
+            .max_by_key(|row| row.source_event_seq)
+            .and_then(|row| {
+                serde_json::from_str::<JournalPayload>(row.payload_json.as_deref()?).ok()
+            })
+    };
+    let Some(JournalPayload::AttemptRecorded(attempt)) = latest("attempt", attempt_id.to_string())
+    else {
+        return false;
+    };
+    if attempt.execution_status != AttemptExecutionStatus::Proposed
+        || attempt.lifecycle_status != AttemptLifecycleStatus::Active
+    {
+        return false;
+    }
+    let Some(episode_id) = attempt.episode_id else {
+        return false;
+    };
+    let Some(JournalPayload::WorkEpisodeRecorded(episode)) =
+        latest("work_episode", episode_id.to_string())
+    else {
+        return false;
+    };
+    let Some(JournalPayload::WorkstreamRecorded(stream)) =
+        latest("workstream", attempt.workstream_id.to_string())
+    else {
+        return false;
+    };
+    if episode.lifecycle_status != EpisodeLifecycle::Open
+        || stream.status.is_terminal()
+        || stream.active_episode_id != Some(episode_id)
+    {
+        return false;
+    }
+    let lanes = episode
+        .execution_lane_ids
+        .iter()
+        .map(ToString::to_string)
+        .collect::<BTreeSet<_>>();
+    current.other_data_rows().any(|row| {
+        row.object_kind.as_deref() == Some("execution_lane")
+            && row.object_id.as_ref().is_some_and(|id| lanes.contains(id))
+            && matches!(row.payload_json.as_deref().and_then(|json| serde_json::from_str::<JournalPayload>(json).ok()),
+                Some(JournalPayload::ExecutionLaneRecorded(lane)) if lane.status == LaneStatus::Active)
+    })
+}
+
+// Resolved replay must not reopen a repository or mutate current trust.
+// New relevant canonical facts can keep an unfinished source pending.
 fn source_resolved(
     current: &evertrace_store::CurrentFacts,
     observation: &SourceObservation,
@@ -337,14 +401,18 @@ fn source_resolved(
                 && run
                     .source_receipt_refs
                     .contains(&observation.source_receipt_ref))
-            .then_some(run.run_id)
+            .then_some((run.run_id, run.attempt_id))
         });
-        let Some(run) = run else {
+        let Some((run, attempt)) = run else {
             return false;
         };
         // Frozen weak admission cannot become a physical binding on a later scan.
         if observation.correlation.exact_key().is_none() {
             return true;
+        }
+        // A later native carrier must revisit the original exact declaration, not create another Run.
+        if strategy_start_candidate(current, attempt) {
+            return false;
         }
         let source = observation.source_observation_id.to_string();
         return current.other_data_rows().any(|row| {
@@ -2530,15 +2598,16 @@ impl ControlledRunResolver {
         };
         let bindings =
             self.process_trial_bindings(&facts, source, &trial, opening_source, &run, attempt)?;
-        if !is_new && bindings.is_empty() {
+        let active = if observation.correlation.exact_key().is_some() {
+            self.activate_process_attempt(&facts, &plan, &trial, attempt, snapshot.frontier)?
+        } else {
+            None
+        };
+        if !is_new && bindings.is_empty() && active.is_none() {
             return Ok(ControlledRunCommand::NoDelta);
         }
         let (mut payloads, mut revision) = run_binding_updates(attempt, &bindings)?;
-        if is_new
-            && observation.correlation.exact_key().is_some()
-            && let Some(active) =
-                self.activate_process_attempt(&facts, &plan, &trial, attempt, snapshot.frontier)?
-        {
+        if let Some(active) = active {
             let mut next = revision.take().unwrap_or_else(|| active.clone());
             next.execution_status = active.execution_status;
             next.execution_lane_ids = active.execution_lane_ids;
@@ -2573,8 +2642,11 @@ impl ControlledRunResolver {
         attempt: &Attempt,
         watermark: u64,
     ) -> Result<Option<Attempt>, AutoresearchError> {
-        use evertrace_domain::work::AttemptExecutionStatus;
+        use evertrace_domain::work::{
+            AttemptExecutionStatus, AttemptLifecycleStatus, EpisodeLifecycle,
+        };
         if attempt.execution_status != AttemptExecutionStatus::Proposed
+            || attempt.lifecycle_status != AttemptLifecycleStatus::Active
             || plan.controller.pid != trial.controller.pid
             || plan.controller.start_ticks != trial.controller.start_ticks
         {
@@ -2585,7 +2657,14 @@ impl ControlledRunResolver {
             .and_then(|id| facts.current_episodes.get(&id))
             .and_then(|revision| facts.episodes.get(revision))
             .ok_or(AutoresearchError::EvidenceIncomplete)?;
-        if episode.phase_contract != plan.definition.phase
+        if episode.lifecycle_status != EpisodeLifecycle::Open
+            || facts
+                .workstreams
+                .get(&attempt.workstream_id)
+                .is_none_or(|stream| {
+                    stream.status.is_terminal() || stream.active_episode_id != attempt.episode_id
+                })
+            || episode.phase_contract != plan.definition.phase
             || attempt.strategy_contract != plan.definition.strategy
         {
             return Ok(None);
