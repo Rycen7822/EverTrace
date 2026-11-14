@@ -5144,7 +5144,7 @@ fn is_verified_importer_weak_normalization(
         && receipt.adapter_manifest_ref == "codex-session-import-v1"
         && receipt.eligible_event_manifest_ref == "codex-session-import-events-v1"
         && receipt.adapter_revision == 1
-        && receipt.parser_revision == 1
+        && matches!(receipt.parser_revision, 1 | 2)
         && receipt.canonicalization_revision == 1
         && observation.adapter_revision == receipt.adapter_revision
         && correlation.occurrence_schema_version == 1
