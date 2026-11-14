@@ -93,6 +93,10 @@ async def _read_recall_trace(backend, reference, revision, request_id, after):
             page["history_state"] = "recorded"
         elif cursor is None and next_scan is None:
             page["history_state"] = "not_recorded"
+        sealed = await backend.read_record_window(reference, None,
+            data_identity=state["data_identity"], selection=current["selection"])
+        if sealed["kind"] == "conflict" or not _same_page(current, sealed["page"]):
+            return {"kind":"conflict"}
         return {"kind":"recall_trace", "page":page}
 
 
