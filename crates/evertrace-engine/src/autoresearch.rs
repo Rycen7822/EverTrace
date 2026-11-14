@@ -3545,6 +3545,42 @@ fn process_work_command(
     let worktree = anchor
         .code
         .map(|(_, snapshot)| snapshot.worktree_instance_id);
+    // Only the already admitted Phase-opening Operation supplies this association.
+    // A child source's process/thread claims never manufacture an Agent Host lane.
+    let root_lane = facts
+        .operations
+        .get(&anchor.effect.operation_id)
+        .and_then(|operation| operation.execution_lane_id);
+    let root_capture = if let Some(lane) = root_lane {
+        let id = lane.to_string();
+        snapshot
+            .data_rows()
+            .filter(|row| {
+                row.object_kind.as_deref() == Some("capture_receipt")
+                    && row.object_id.as_deref() == Some(id.as_str())
+            })
+            .max_by_key(|row| row.source_event_seq)
+            .map(|row| {
+                let json = row
+                    .payload_json
+                    .as_deref()
+                    .ok_or(AutoresearchError::EvidenceIncomplete)?;
+                match serde_json::from_str::<JournalPayload>(json) {
+                    Ok(JournalPayload::CaptureReceiptRecorded(receipt))
+                        if receipt.execution_lane_id == lane =>
+                    {
+                        Ok(*receipt)
+                    }
+                    _ => Err(AutoresearchError::EvidenceIncomplete),
+                }
+            })
+            .transpose()?
+    } else {
+        None
+    };
+    let root_lane = root_capture
+        .as_ref()
+        .map(|receipt| receipt.execution_lane_id);
     let source_ref = source.to_string();
     let sources = vec![
         source_ref.clone(),
@@ -3612,6 +3648,11 @@ fn process_work_command(
         )
         .map_err(map_error)?;
         episode.session_ids = vec![anchor.session.to_owned()];
+        episode.execution_lane_ids = root_lane.into_iter().collect();
+        if let Some(receipt) = root_capture.as_ref() {
+            episode::pin_capture_receipts(&mut episode, std::slice::from_ref(receipt))
+                .map_err(|_| AutoresearchError::InvalidInput)?;
+        }
         let linked = episode::link_attempt_to_episode(attempt, &episode, snapshot.frontier)
             .map_err(map_error)?;
         episode.attempt_ids.push(linked.attempt_id);
@@ -3654,7 +3695,7 @@ fn process_work_command(
         acceptance_boundary: plan.phase.acceptance_boundary.clone(),
         phase_contract: plan.phase.clone(),
         active_episode_id: None,
-        execution_lane_ids: vec![],
+        execution_lane_ids: root_lane.into_iter().collect(),
         source_watermark: snapshot.frontier,
     };
     let attempt = attempt::new_attempt(

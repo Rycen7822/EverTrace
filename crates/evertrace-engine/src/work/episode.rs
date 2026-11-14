@@ -221,22 +221,7 @@ fn revise_episode_from_step(
             .checked_add(1)
             .ok_or(WorkIdentityError::InvalidInput)?;
     }
-    next.capture_receipt_revision_ids = provided_receipt_ids;
-    next.capture_gap_refs = pinned_receipts
-        .iter()
-        .flat_map(|receipt| receipt.capture_gap_marker_refs.iter().cloned())
-        .collect();
-    next.capture_outage_refs = pinned_receipts
-        .iter()
-        .flat_map(|receipt| receipt.capture_outage_interval_refs.iter().copied())
-        .collect();
-    next.capture_watermark = pinned_receipts
-        .iter()
-        .map(|receipt| receipt.import_watermark)
-        .min()
-        .unwrap_or(0);
-    next.capture_summary = evertrace_domain::work::CaptureSummary::from_receipts(pinned_receipts)
-        .map_err(|_| WorkIdentityError::InvalidInput)?;
+    pin_capture_receipts(&mut next, pinned_receipts)?;
     next.pending_semantic_delta =
         (next.semantic_watermark < next.source_watermark).then_some(PendingSemanticInterval {
             after_watermark: next.semantic_watermark,
@@ -445,6 +430,35 @@ pub fn save_checkpoint(
         vec![checkpoint],
     )
     .map(Some)
+}
+
+pub(crate) fn pin_capture_receipts(
+    episode: &mut WorkEpisode,
+    receipts: &[evertrace_domain::work::CaptureReceipt],
+) -> Result<(), WorkIdentityError> {
+    episode.capture_receipt_revision_ids = receipts
+        .iter()
+        .map(|receipt| receipt.capture_receipt_revision_id)
+        .collect();
+    episode.capture_gap_refs = receipts
+        .iter()
+        .flat_map(|receipt| receipt.capture_gap_marker_refs.iter().cloned())
+        .collect();
+    episode.capture_outage_refs = receipts
+        .iter()
+        .flat_map(|receipt| receipt.capture_outage_interval_refs.iter().copied())
+        .collect();
+    episode.capture_watermark = receipts
+        .iter()
+        .map(|receipt| receipt.import_watermark)
+        .min()
+        .unwrap_or(0);
+    episode.capture_summary = evertrace_domain::work::CaptureSummary::from_receipts(receipts)
+        .map_err(|_| WorkIdentityError::InvalidInput)?;
+    sort_unique(&mut episode.capture_receipt_revision_ids);
+    sort_unique(&mut episode.capture_gap_refs);
+    sort_unique(&mut episode.capture_outage_refs);
+    Ok(())
 }
 
 pub fn activate_episode(
