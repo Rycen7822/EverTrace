@@ -887,9 +887,12 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
                                 state: Box::new(state),
                             }));
                         }
+                        // Neutral retained reads use this daemon's native user configuration, not the
+                        // most recently observed Host. Session/import and bound MCP keep their own reports.
+                        let retained_read_report = Arc::new(RwLock::new(None));
                         if let HumanGovernanceRequest::Read { request: HumanReadRequest::ReadRevisionPair { query } } = &command {
                             let page = EngineService::read_revision_pair(
-                                writer.clone(), query.clone(), config_snapshot.hash(), Arc::clone(&session_catalog_report),
+                                writer.clone(), query.clone(), config_snapshot.hash(), Arc::clone(&retained_read_report),
                                 runtime_snapshot.cas_dir.clone(),
                             ).await?;
                             return Ok(Response::HumanGovernance(HumanGovernanceResponse::RevisionPair { page: Box::new(page) }));
@@ -899,11 +902,11 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
                             let reply = match query.as_ref() {
                                 ExactReadQuery::Fields(fields) => HumanGovernanceResponse::StoredFields {
                                     page: Box::new(EngineService::read_exact_fields(writer.clone(), Box::new(fields.clone()),
-                                        config_snapshot.hash(), Arc::clone(&session_catalog_report)).await?),
+                                        config_snapshot.hash(), Arc::clone(&retained_read_report)).await?),
                                 },
                                 ExactReadQuery::Record(record) => match EngineService::read_exact_record(
                                     writer.clone(), Box::new(record.clone()), config_snapshot.hash(),
-                                    Arc::clone(&session_catalog_report), runtime_snapshot.cas_dir.clone(),
+                                    Arc::clone(&retained_read_report), runtime_snapshot.cas_dir.clone(),
                                 ).await? {
                                     MetadataReadOutcome::Page(page) => HumanGovernanceResponse::RecordWindow { page },
                                     MetadataReadOutcome::Conflict(current_frontier) => HumanGovernanceResponse::Conflict {
@@ -913,7 +916,7 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
                                 },
                                 ExactReadQuery::SourceText(source) => match EngineService::read_exact_source(
                                     writer.clone(), Box::new(source.clone()), config_snapshot.hash(),
-                                    Arc::clone(&session_catalog_report), runtime_snapshot.cas_dir.clone(),
+                                    Arc::clone(&retained_read_report), runtime_snapshot.cas_dir.clone(),
                                 ).await? {
                                     MetadataReadOutcome::Page(page) => HumanGovernanceResponse::SourceWindow { page },
                                     MetadataReadOutcome::Conflict(current_frontier) => HumanGovernanceResponse::Conflict {
@@ -927,7 +930,7 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
                         if let HumanGovernanceRequest::Read { request: HumanReadRequest::ReadBatch { query } } = &command {
                             let outcome = EngineService::read_metadata_batch(
                                 writer.clone(), query.clone(), config_snapshot.hash(), &config_snapshot.config().llm,
-                                Arc::clone(&session_catalog_report),
+                                Arc::clone(&retained_read_report),
                             ).await.map_err(|error| match error {
                                 evertrace_engine::WriterActorError::InvalidInput => ErrorCode::InvalidInput,
                                 _ => ErrorCode::Internal,
@@ -957,7 +960,7 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
                             request: HumanReadRequest::CompiledProjections { query, expected_frontier, after, limit },
                         } = &command {
                             let result = evertrace_engine::CompiledProjectionReader::new(
-                                writer.clone(), config_snapshot.hash(), Arc::clone(&session_catalog_report),
+                                writer.clone(), config_snapshot.hash(), Arc::clone(&retained_read_report),
                                 runtime_snapshot.cas_dir.clone(),
                             ).read(query.clone(), *expected_frontier, after.as_deref(), *limit).await?;
                             return Ok(Response::HumanGovernance(match result {
@@ -979,10 +982,11 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
                         .map_err(|_| ErrorCode::Internal)?;
                         let response = match command {
                             HumanGovernanceRequest::Export { selections } => {
-                                let result = human_governance.export(selections.into_iter().map(|item| evertrace_engine::HumanExportSelection {
-                                    object_ref: item.object_ref,
-                                    expected_revision_ref: item.expected_revision_ref,
-                                }).collect()).await;
+                                let result = human_governance.with_session_report(retained_read_report)
+                                    .export(selections.into_iter().map(|item| evertrace_engine::HumanExportSelection {
+                                        object_ref: item.object_ref,
+                                        expected_revision_ref: item.expected_revision_ref,
+                                    }).collect()).await;
                                 HumanGovernanceResponse::Export {
                                     result: evertrace_protocol::dto::HumanExportResult {
                                         status: match result.status {
