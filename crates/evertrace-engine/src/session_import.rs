@@ -3562,11 +3562,10 @@ pub(crate) async fn source_instance_read_assessment(
     let restrictions = if processes.is_empty() {
         BTreeMap::new()
     } else {
+        // This is queued metadata work, not a filesystem probe. Keep the caller's
+        // absolute deadline instead of truncating its remaining budget to a probe quantum.
         writer
-            .process_source_repository_scopes(
-                processes,
-                deadline.min(Instant::now() + crate::repository::SESSION_ROOT_PROBE_BUDGET),
-            )
+            .process_source_repository_scopes(processes, deadline)
             .await
             .map_err(map_writer)?
     };
