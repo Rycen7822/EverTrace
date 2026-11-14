@@ -1117,6 +1117,7 @@ async fn reconcile_selected(
             &mut progress,
             &mut remaining,
         )?;
+        reconcile_attempt_lanes(&state, &mut payloads, dirty_frontier.frontier)?;
     }
     if scopes.repositories.iter().any(|pin| !pin.valid())
         || scopes.non_repositories.iter().any(|scope| !scope.valid())
@@ -1284,6 +1285,7 @@ struct CurrentCaptureState {
         BTreeMap<evertrace_domain::ids::SourceObservationId, NormalizationWatermark>,
     execution_lanes: BTreeMap<ExecutionLaneId, ExecutionLane>,
     execution_lane_event_seq: BTreeMap<ExecutionLaneId, u64>,
+    attempts: BTreeMap<evertrace_domain::ids::AttemptId, evertrace_domain::work::Attempt>,
     capture_receipts: BTreeMap<ExecutionLaneId, CaptureReceipt>,
     capture_gaps: BTreeMap<String, CaptureGapMarkerEvidence>,
     capture_outages: BTreeMap<CaptureOutageIntervalId, CaptureOutageInterval>,
@@ -1314,6 +1316,15 @@ impl CurrentCaptureState {
         dependency: NamedCurrentDependency,
     ) -> Result<(), ReconcileError> {
         match dependency.payload {
+            JournalPayload::AttemptRecorded(value) => {
+                if self
+                    .attempts
+                    .get(&value.attempt_id)
+                    .is_none_or(|current| current.revision_generation < value.revision_generation)
+                {
+                    self.attempts.insert(value.attempt_id, *value);
+                }
+            }
             JournalPayload::SourceReceiptRecorded(value) => {
                 if self
                     .source_receipt_event_seq
@@ -2974,6 +2985,50 @@ struct LaneReconcileContext<'a> {
     explicit_targets: &'a BTreeSet<LaneIdentityKey>,
     pending_marker_ids: &'a [String],
     pending_quarantine_ids: &'a [String],
+}
+
+fn reconcile_attempt_lanes(
+    state: &CurrentCaptureState,
+    payloads: &mut Vec<JournalPayload>,
+    watermark: u64,
+) -> Result<(), ReconcileError> {
+    use evertrace_domain::work::{AttemptExecutionStatus, LaneStatus};
+    let changed = payloads
+        .iter()
+        .filter_map(|payload| match payload {
+            JournalPayload::ExecutionLaneRecorded(lane) if lane.status != LaneStatus::Active => {
+                Some(lane.execution_lane_id)
+            }
+            _ => None,
+        })
+        .collect::<BTreeSet<_>>();
+    for attempt in state.attempts.values().filter(|attempt| {
+        attempt.execution_status == AttemptExecutionStatus::Active
+            && attempt
+                .execution_lane_ids
+                .iter()
+                .any(|id| changed.contains(id))
+    }) {
+        let related = attempt
+            .execution_lane_ids
+            .iter()
+            .map(|id| {
+                state
+                    .execution_lanes
+                    .get(id)
+                    .ok_or(ReconcileError::Projection)
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        match crate::work::attempt::reconcile_execution_lanes(attempt, &related, watermark)
+            .map_err(|_| ReconcileError::Domain)?
+        {
+            crate::work::attempt::AttemptResolution::Revision(value) => {
+                payloads.push(JournalPayload::AttemptRecorded(value))
+            }
+            crate::work::attempt::AttemptResolution::NoDelta => (),
+        }
+    }
+    Ok(())
 }
 
 fn reconcile_lane_groups(

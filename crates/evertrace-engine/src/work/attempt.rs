@@ -11,8 +11,9 @@ use evertrace_domain::{
     work::{
         Attempt, AttemptAdoptionStatus, AttemptBindingStatus, AttemptExecutionStatus,
         AttemptLifecycleStatus, AttemptOutcomeState, AttemptVerification, CompetingAttemptGroup,
-        CompetingResolutionStatus, InterruptionReason, ResumeStateAssessment, RunContractValidity,
-        RunExecutionStatus, RunObservability, StrategyContract,
+        CompetingResolutionStatus, ExecutionLane, InterruptionReason, LaneStatus,
+        ResumeStateAssessment, RunContractValidity, RunExecutionStatus, RunObservability,
+        StrategyContract, TerminalKind,
     },
 };
 use evertrace_store::projections::MarkNewAttemptCurrentView;
@@ -229,6 +230,81 @@ pub fn revise_execution(
     next.validate()
         .map_err(|_| WorkIdentityError::InvalidInput)?;
     Ok(AttemptResolution::Revision(Box::new(next)))
+}
+
+/// Fold observed lane termination into execution only; a lane is never an adoption or verifier.
+pub(crate) fn reconcile_execution_lanes(
+    current: &Attempt,
+    lanes: &[&ExecutionLane],
+    watermark: u64,
+) -> Result<AttemptResolution<Attempt>, WorkIdentityError> {
+    if current.execution_status != AttemptExecutionStatus::Active {
+        return Ok(AttemptResolution::NoDelta);
+    }
+    let mut ids = lanes
+        .iter()
+        .map(|lane| lane.execution_lane_id)
+        .collect::<Vec<_>>();
+    ids.sort();
+    if ids != current.execution_lane_ids || lanes.is_empty() {
+        return Err(WorkIdentityError::InvalidInput);
+    }
+    if lanes
+        .iter()
+        .any(|lane| matches!(lane.status, LaneStatus::Active | LaneStatus::Unresolved))
+    {
+        return Ok(AttemptResolution::NoDelta);
+    }
+    if current.outcome_state == AttemptOutcomeState::Known
+        || matches!(
+            current.verification,
+            AttemptVerification::Passed | AttemptVerification::Failed
+        )
+        || lanes
+            .iter()
+            .any(|lane| matches!(lane.status, LaneStatus::Returned | LaneStatus::Stopped))
+    {
+        return revise_execution(
+            current,
+            AttemptExecutionStatus::Completed,
+            ids,
+            vec![],
+            None,
+            vec![],
+            watermark,
+        );
+    }
+    let mut reason = None;
+    let mut refs = current.interruption_refs.clone();
+    for lane in lanes {
+        let observed = match lane.terminal_kind {
+            Some(TerminalKind::Timeout) => InterruptionReason::Timeout,
+            Some(TerminalKind::Cancelled) => InterruptionReason::Cancelled,
+            Some(TerminalKind::Crashed) => InterruptionReason::Crashed,
+            Some(TerminalKind::SourceClosedUnconfirmed) => {
+                InterruptionReason::SourceClosedUnconfirmed
+            }
+            _ => return Err(WorkIdentityError::InvalidInput),
+        };
+        reason = Some(match reason {
+            Some(previous) if previous != observed => InterruptionReason::Mixed,
+            _ => observed,
+        });
+        refs.extend(lane.termination_evidence_refs.iter().cloned());
+        refs.extend(lane.terminal_event_ref.iter().cloned());
+        refs.extend(lane.liveness_probe_refs.iter().cloned());
+    }
+    refs.sort();
+    refs.dedup();
+    revise_execution(
+        current,
+        AttemptExecutionStatus::Interrupted,
+        ids,
+        refs,
+        reason,
+        vec![],
+        watermark,
+    )
 }
 
 pub fn revise_adoption(

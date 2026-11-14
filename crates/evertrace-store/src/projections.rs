@@ -2023,6 +2023,7 @@ fn collect_capture_dependencies(
     let incarnation_ref = source_incarnation_ref(selected).ok_or(StoreError::StoreCorrupt)?;
     let mut cohort_observation_ids = BTreeSet::from([selected.source_observation_id]);
     let mut manifests = BTreeSet::new();
+    let mut terminal_observed = false;
     for (value, _) in snapshot.source_receipts() {
         if value.lifecycle.as_ref().is_some_and(|candidate| {
             candidate.host_session_id == lifecycle.host_session_id
@@ -2031,6 +2032,12 @@ fn collect_capture_dependencies(
                 && source_incarnation_ref(value).as_ref() == Some(&incarnation_ref)
         }) {
             cohort_observation_ids.insert(value.source_observation_id);
+            if let Some(lifecycle) = &value.lifecycle {
+                terminal_observed |= lifecycle.terminal_kind.is_some()
+                    || lifecycle.source_close_ref.is_some()
+                    || lifecycle.parent_session_end_ref.is_some()
+                    || lifecycle.liveness_state == evertrace_domain::work::LivenessState::Absent;
+            }
             if manifests.insert(value.adapter_manifest_ref.clone()) {
                 dependencies.insert(source_receipt_dependency(
                     snapshot,
@@ -2101,6 +2108,9 @@ fn collect_capture_dependencies(
         }
         dependencies.insert(lane_dependency)?;
     }
+    if terminal_observed && let Some((lane, _, _)) = &current_lane {
+        collect_lane_attempt_dependencies(snapshot, *lane, dependencies)?;
+    }
     // Source import can precede physical normalization. Materialized or unlinked
     // operations must wake this target without another source event.
     let mut operations = BTreeMap::new();
@@ -2151,6 +2161,59 @@ fn collect_capture_dependencies(
         .map(|(_, (_, sequence, _))| *sequence)
         .max();
     Ok((import_watermark, has_current_lane_receipt, pending))
+}
+
+fn collect_lane_attempt_dependencies(
+    snapshot: &CurrentFacts,
+    lane: ExecutionLaneId,
+    dependencies: &mut DependencyCollector,
+) -> Result<(), StoreError> {
+    let mut attempts = BTreeMap::new();
+    for row in snapshot
+        .other_data_rows()
+        .filter(|row| row.object_kind.as_deref() == Some("attempt"))
+    {
+        let dependency = current_payload(row)?;
+        let JournalPayload::AttemptRecorded(value) = &dependency.payload else {
+            return Err(StoreError::StoreCorrupt);
+        };
+        if attempts
+            .get(&value.attempt_id)
+            .is_none_or(|current: &NamedCurrentDependency| {
+                current.source_event_seq < dependency.source_event_seq
+            })
+        {
+            attempts.insert(value.attempt_id, dependency);
+        }
+    }
+    let mut related = BTreeSet::new();
+    for dependency in attempts.into_values() {
+        let JournalPayload::AttemptRecorded(value) = &dependency.payload else {
+            unreachable!()
+        };
+        if value.execution_status != AttemptExecutionStatus::Active
+            || !value.execution_lane_ids.contains(&lane)
+        {
+            continue;
+        }
+        related.extend(value.execution_lane_ids.iter().copied());
+        dependencies.insert(dependency)?;
+    }
+    for row in snapshot
+        .other_data_rows()
+        .filter(|row| row.object_kind.as_deref() == Some("execution_lane"))
+    {
+        let id = row
+            .object_id
+            .as_deref()
+            .ok_or(StoreError::StoreCorrupt)?
+            .parse::<ExecutionLaneId>()
+            .map_err(|_| StoreError::StoreCorrupt)?;
+        if related.contains(&id) {
+            dependencies.insert(current_payload(row)?)?;
+        }
+    }
+    Ok(())
 }
 
 fn source_incarnation_ref(receipt: &SourceReceipt) -> Option<String> {
@@ -12307,6 +12370,8 @@ impl JournalAdmissionState {
             StoreError::InvalidInput,
         )?;
         self.validate_transition_pairs(command.events().iter().map(|event| &event.payload))?;
+        self.validate_attempt_starts(command.events().iter().map(|event| &event.payload))
+            .map_err(|_| StoreError::InvalidInput)?;
         self.validate_episode_binding_activation(
             command.events().iter().map(|event| &event.payload),
         )?;
@@ -12429,6 +12494,54 @@ impl JournalAdmissionState {
         Ok(next)
     }
 
+    /// A new start needs a running carrier; later uncertainty does not undo an accepted start.
+    fn validate_attempt_starts<'a>(
+        &self,
+        payloads: impl Iterator<Item = &'a JournalPayload> + Clone,
+    ) -> Result<(), StoreError> {
+        let starts = payloads
+            .clone()
+            .filter_map(|payload| {
+                let JournalPayload::AttemptRecorded(attempt) = payload else {
+                    return None;
+                };
+                let already_active =
+                    self.attempts
+                        .get(&attempt.attempt_id)
+                        .is_some_and(|(previous, _)| {
+                            previous.execution_status == AttemptExecutionStatus::Active
+                        });
+                (attempt.execution_status == AttemptExecutionStatus::Active && !already_active)
+                    .then_some(attempt.as_ref())
+            })
+            .collect::<Vec<_>>();
+        if starts.is_empty() {
+            return Ok(());
+        }
+        let observed = payloads
+            .filter_map(|payload| match payload {
+                JournalPayload::ExecutionLaneRecorded(lane)
+                    if lane.status == LaneStatus::Active =>
+                {
+                    Some(lane.execution_lane_id)
+                }
+                _ => None,
+            })
+            .collect::<BTreeSet<_>>();
+        for attempt in starts {
+            if !attempt.execution_lane_ids.iter().any(|id| {
+                observed.contains(id)
+                    || self
+                        .execution_lanes
+                        .get(id)
+                        .is_some_and(|(lane, _)| lane.status == LaneStatus::Active)
+            }) {
+                return Err(StoreError::StoreCorrupt);
+            }
+        }
+        Ok(())
+    }
+
     fn validate_episode_binding_activation<'a>(
         &self,
         payloads: impl IntoIterator<Item = &'a JournalPayload>,
@@ -12542,6 +12655,7 @@ impl JournalAdmissionState {
         )?;
         self.validate_transition_pairs(parsed.iter().map(|(payload, _, _)| payload))
             .map_err(|_| StoreError::StoreCorrupt)?;
+        self.validate_attempt_starts(parsed.iter().map(|(payload, _, _)| payload))?;
         self.validate_episode_binding_activation(parsed.iter().map(|(payload, _, _)| payload))
             .map_err(|_| StoreError::StoreCorrupt)?;
         self.validate_competing_selected_command(
@@ -15888,7 +16002,10 @@ fn validate_attempt_relations(
         match attempt.execution_status {
             AttemptExecutionStatus::Proposed | AttemptExecutionStatus::Abandoned => {}
             AttemptExecutionStatus::Active => {
-                if !lanes.iter().any(|lane| lane.status == LaneStatus::Active) {
+                if !lanes
+                    .iter()
+                    .any(|lane| matches!(lane.status, LaneStatus::Active | LaneStatus::Unresolved))
+                {
                     return Err(StoreError::StoreCorrupt);
                 }
             }
@@ -15909,7 +16026,12 @@ fn validate_attempt_relations(
                 if lanes
                     .iter()
                     .any(|lane| matches!(lane.status, LaneStatus::Active | LaneStatus::Unresolved))
-                    || (!has_normal_terminal && attempt.outcome_state != AttemptOutcomeState::Known)
+                    || (!has_normal_terminal
+                        && attempt.outcome_state != AttemptOutcomeState::Known
+                        && !matches!(
+                            attempt.verification,
+                            AttemptVerification::Passed | AttemptVerification::Failed
+                        ))
                 {
                     return Err(StoreError::StoreCorrupt);
                 }

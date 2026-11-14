@@ -24,10 +24,10 @@ use evertrace_domain::{
     work::{
         ArtifactActor, ArtifactPayloadStatus, ArtifactRevision, ArtifactScope, AssignmentStatus,
         Attempt, AttemptBindingStatus, CaptureReceipt, ContractField, ControlledRunSourceEnvelope,
-        ExperimentRun, MultiCasMetricPolicy, ResultCohortAssessment, ResultComparisonIssue,
-        ResultComparisonReason, RunContractValidity, RunExecutionStatus, RunObservability,
-        RunOrigin, SeedPolicy, Task, VariableDeclaration, WorkArtifact, WorkBindingRevision,
-        WorkEpisode, Workstream,
+        ExecutionLane, ExperimentRun, LaneStatus, MultiCasMetricPolicy, ResultCohortAssessment,
+        ResultComparisonIssue, ResultComparisonReason, RunContractValidity, RunExecutionStatus,
+        RunObservability, RunOrigin, SeedPolicy, Task, VariableDeclaration, WorkArtifact,
+        WorkBindingRevision, WorkEpisode, Workstream,
     },
 };
 use evertrace_store::{
@@ -2533,7 +2533,23 @@ impl ControlledRunResolver {
         if !is_new && bindings.is_empty() {
             return Ok(ControlledRunCommand::NoDelta);
         }
-        let (mut payloads, attempt) = run_binding_updates(attempt, &bindings)?;
+        let (mut payloads, mut revision) = run_binding_updates(attempt, &bindings)?;
+        if is_new
+            && observation.correlation.exact_key().is_some()
+            && let Some(active) =
+                self.activate_process_attempt(&facts, &plan, &trial, attempt, snapshot.frontier)?
+        {
+            let mut next = revision.take().unwrap_or_else(|| active.clone());
+            next.execution_status = active.execution_status;
+            next.execution_lane_ids = active.execution_lane_ids;
+            next.source_watermark = next.source_watermark.max(active.source_watermark);
+            attempt
+                .validate_successor(&next)
+                .map_err(|_| AutoresearchError::ImmutableConflict)?;
+            payloads.retain(|payload| !matches!(payload, JournalPayload::AttemptRecorded(_)));
+            payloads.push(JournalPayload::AttemptRecorded(Box::new(next.clone())));
+            revision = Some(next);
+        }
         if is_new {
             payloads.insert(
                 0,
@@ -2544,9 +2560,100 @@ impl ControlledRunResolver {
         Ok(ControlledRunCommand::Declaration {
             run: Box::new(run),
             bindings,
-            attempt: attempt.map(Box::new),
+            attempt: revision.map(Box::new),
             command,
         })
+    }
+
+    fn activate_process_attempt(
+        &self,
+        facts: &ControlledFacts,
+        plan: &ProcessWorkDeclaration,
+        trial: &ProcessTrialDeclaration,
+        attempt: &Attempt,
+        watermark: u64,
+    ) -> Result<Option<Attempt>, AutoresearchError> {
+        use evertrace_domain::work::AttemptExecutionStatus;
+        if attempt.execution_status != AttemptExecutionStatus::Proposed
+            || plan.controller.pid != trial.controller.pid
+            || plan.controller.start_ticks != trial.controller.start_ticks
+        {
+            return Ok(None);
+        }
+        let episode = attempt
+            .episode_id
+            .and_then(|id| facts.current_episodes.get(&id))
+            .and_then(|revision| facts.episodes.get(revision))
+            .ok_or(AutoresearchError::EvidenceIncomplete)?;
+        if episode.phase_contract != plan.definition.phase
+            || attempt.strategy_contract != plan.definition.strategy
+        {
+            return Ok(None);
+        }
+        let mut carriers = BTreeSet::new();
+        for binding in facts.bindings.values().filter(|binding| {
+            binding.assignment_status == AssignmentStatus::Resolved
+                && binding.primary_binding.task_id == Some(attempt.task_id)
+                && binding.primary_binding.workstream_id == Some(attempt.workstream_id)
+                && binding
+                    .primary_binding
+                    .episode_id
+                    .is_none_or(|id| Some(id) == attempt.episode_id)
+        }) {
+            let Some(operation) = facts.operations.get(&binding.operation_id) else {
+                continue;
+            };
+            let Some(lane) = operation.execution_lane_id else {
+                continue;
+            };
+            if !episode.execution_lane_ids.contains(&lane)
+                || !facts
+                    .execution_lanes
+                    .get(&lane)
+                    .is_some_and(|lane| lane.status == LaneStatus::Active)
+            {
+                continue;
+            }
+            for source in &operation.input_source_observation_refs {
+                let Some(observation) = facts.observations.get(source) else {
+                    continue;
+                };
+                let receipt = facts.receipt(*source)?;
+                if !evertrace_capture::execution_source::is_execution(observation, receipt) {
+                    continue;
+                }
+                let bytes = self.protected_source(facts, *source)?;
+                if evertrace_capture::execution_source::execution_directory(
+                    observation,
+                    receipt,
+                    &bytes,
+                ) == Some((
+                    plan.definition.scope.clone(),
+                    trial.controller.pid,
+                    trial.controller.start_ticks,
+                )) {
+                    carriers.insert(lane);
+                }
+            }
+        }
+        let lane = match carriers.into_iter().collect::<Vec<_>>().as_slice() {
+            [lane] => *lane,
+            _ => return Ok(None),
+        };
+        match crate::work::attempt::revise_execution(
+            attempt,
+            AttemptExecutionStatus::Active,
+            vec![lane],
+            vec![],
+            None,
+            vec![],
+            watermark,
+        )
+        .map_err(|_| AutoresearchError::ImmutableConflict)?
+        {
+            crate::work::attempt::AttemptResolution::Revision(value) => Ok(Some(*value)),
+            crate::work::attempt::AttemptResolution::NoDelta => Ok(None),
+        }
     }
 
     fn process_runtime_environment(
@@ -3824,6 +3931,7 @@ struct ControlledFacts {
     workstreams: std::collections::BTreeMap<evertrace_domain::ids::WorkstreamId, Workstream>,
     episodes: std::collections::BTreeMap<RevisionId, WorkEpisode>,
     current_episodes: std::collections::BTreeMap<evertrace_domain::ids::WorkEpisodeId, RevisionId>,
+    execution_lanes: BTreeMap<ExecutionLaneId, ExecutionLane>,
     worktrees: std::collections::BTreeMap<evertrace_domain::ids::WorktreeId, WorktreeInstance>,
     snapshots:
         std::collections::BTreeMap<evertrace_domain::ids::WorktreeSnapshotId, WorktreeSnapshot>,
@@ -3877,6 +3985,7 @@ impl ControlledFacts {
             workstreams: Default::default(),
             episodes: Default::default(),
             current_episodes: Default::default(),
+            execution_lanes: Default::default(),
             worktrees: Default::default(),
             snapshots: Default::default(),
             receipts: Default::default(),
@@ -3913,6 +4022,7 @@ impl ControlledFacts {
                         | "operation"
                         | "scope_effect"
                         | "work_binding"
+                        | "execution_lane"
                 )
             )
         }) {
@@ -3922,6 +4032,17 @@ impl ControlledFacts {
             let payload = serde_json::from_str::<JournalPayload>(payload)
                 .map_err(|_| AutoresearchError::Store(evertrace_store::StoreError::StoreCorrupt))?;
             match payload {
+                JournalPayload::ExecutionLaneRecorded(value) => {
+                    let replace = facts
+                        .execution_lanes
+                        .get(&value.execution_lane_id)
+                        .is_none_or(|current| current.lane_revision < value.lane_revision);
+                    if replace {
+                        facts
+                            .execution_lanes
+                            .insert(value.execution_lane_id, *value);
+                    }
+                }
                 JournalPayload::AttemptRecorded(value) => {
                     if attempt_seq
                         .get(&value.attempt_id)
