@@ -1899,6 +1899,9 @@ impl BackgroundScheduler {
                             value.source_revision.as_str(),
                         ) || value.source_revision.as_str()
                             == evertrace_capture::process_source::SOURCE_REVISION
+                            || evertrace_capture::process_source::is_work_revision(
+                                value.source_revision.as_str(),
+                            )
                     });
             // Source Work uses its independently verified RootGoal publisher's
             // policy, never another installed Host or the daemon's HOME fallback.

@@ -1,4 +1,4 @@
-//! A fixed source-side recorder's original bytes, never a caller-selected authority level.
+//! Source-owned process records, never caller-selected execution or Work authority.
 //!
 //! Publisher claims remain untrusted/partial. Separately read kernel state is observed
 //! metadata only: it supplies no inherited namespace, execution, or semantic Work authority.
@@ -30,6 +30,11 @@ use crate::{CaptureRecordInput, ConfinedFile, ConfinedReadLimits, ConfinedRoot};
 
 const PREFIX: &[u8] = b"{\"format\":\"process-trial-source-v4\",";
 pub const FORMAT: &str = "process-trial-source-v4";
+pub const WORK_FORMAT: &str = "process-work-source-v1";
+const WORK_PREFIX: &[u8] = b"{\"format\":\"process-work-source-v1\",";
+pub const WORK_ADAPTER_REVISION: u32 = 1;
+pub const WORK_PARSER_REVISION: u32 = 1;
+pub const WORK_ELIGIBLE_EVENTS: &str = "process-work-start-events-v1";
 pub const SOURCE_REVISION: &str =
     "process-trial-source-v4:84e413385043c92b6723c629b7c0b0481539671827b539dc2f910cf01d432d1d";
 pub const ADAPTER_REVISION: u32 = 11;
@@ -56,6 +61,7 @@ pub fn image_adapter_version(revision: u32) -> String {
 
 pub fn is_owned_revision(revision: &str) -> bool {
     revision.starts_with("process-trial-source-v")
+        || revision.starts_with(WORK_FORMAT)
         || matches!(
             revision,
             KERNEL_SOURCE_REVISION
@@ -73,8 +79,28 @@ pub fn adapter_version() -> String {
     format!("{SOURCE_REVISION}:capture-{ADAPTER_REVISION}")
 }
 
+pub fn work_adapter_version() -> String {
+    format!("{WORK_FORMAT}:capture-{WORK_ADAPTER_REVISION}")
+}
+
+pub fn is_work_revision(revision: &str) -> bool {
+    revision
+        .strip_prefix(WORK_FORMAT)
+        .and_then(|value| value.strip_prefix(':'))
+        .is_some_and(|digest| {
+            digest.len() == 64
+                && digest
+                    .bytes()
+                    .all(|byte| byte.is_ascii_hexdigit() && !byte.is_ascii_uppercase())
+        })
+}
+
+pub fn is_work_record(raw: &[u8]) -> bool {
+    raw.starts_with(WORK_PREFIX)
+}
+
 pub fn is_record(raw: &[u8]) -> bool {
-    raw.starts_with(PREFIX)
+    raw.starts_with(PREFIX) || is_work_record(raw)
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -237,6 +263,7 @@ struct Header {
     event: String,
     event_key: String,
     source_epoch: String,
+    #[serde(alias = "work_key")]
     study_key: String,
     sequence: u64,
     time_us: i64,
@@ -370,7 +397,11 @@ fn controller_peer(header: &Header, executable: Option<&Path>, snapshot: &Path) 
     if !metadata.is_file() || metadata.uid() != own_uid || metadata.mode() & 0o022 != 0 {
         return Err(ProcessSourceError);
     }
-    if format!("{FORMAT}:{:x}", Sha256::digest(bytes(&script)?)) != SOURCE_REVISION {
+    // Generic Work declarations are untrusted intent, not the fixed trial producer's
+    // execution evidence. Its immutable source revision is measured separately below.
+    if header.format == FORMAT
+        && format!("{FORMAT}:{:x}", Sha256::digest(bytes(&script)?)) != SOURCE_REVISION
+    {
         return Err(ProcessSourceError);
     }
     for (flag, expected) in [
@@ -481,6 +512,30 @@ fn decode(raw: &[u8]) -> Result<(Header, ObservationRole)> {
     }
     let value: Value = serde_json::from_slice(raw).map_err(|_| ProcessSourceError)?;
     let fields = value.as_object().ok_or(ProcessSourceError)?;
+    let work = fields.get("format").and_then(Value::as_str) == Some(WORK_FORMAT);
+    if work
+        && fields.keys().any(|key| {
+            !matches!(
+                key.as_str(),
+                "format"
+                    | "event"
+                    | "event_key"
+                    | "source_epoch"
+                    | "work_key"
+                    | "sequence"
+                    | "time_us"
+                    | "controller"
+                    | "definition"
+                    | "lane_thread_id"
+                    | "probe_endpoint"
+            )
+        })
+    {
+        return Err(ProcessSourceError);
+    }
+    if !work && fields.contains_key("work_key") {
+        return Err(ProcessSourceError);
+    }
     if fields.keys().any(|key| {
         !matches!(
             key.as_str(),
@@ -492,6 +547,7 @@ fn decode(raw: &[u8]) -> Result<(Header, ObservationRole)> {
                 | "time_us"
                 | "controller"
                 | "study_key"
+                | "work_key"
                 | "definition"
                 | "trial_key"
                 | "argv"
@@ -515,15 +571,18 @@ fn decode(raw: &[u8]) -> Result<(Header, ObservationRole)> {
     }
     let header: Header = serde_json::from_value(value).map_err(|_| ProcessSourceError)?;
     let role = match header.event.as_str() {
+        "work_started" if work && header.sequence == 1 => ObservationRole::Other,
+        _ if work => return Err(ProcessSourceError),
         "study_opened" | "controller_finished" => ObservationRole::Other,
         "trial_launch" => ObservationRole::Intent,
         "trial_started" => ObservationRole::Other,
         "trial_finished" => ObservationRole::Result,
         _ => return Err(ProcessSourceError),
     };
-    if header.format != FORMAT
+    let probe = if work { "work" } else { "trial" };
+    if !matches!(header.format.as_str(), FORMAT | WORK_FORMAT)
         || header.lane_thread_id != header.controller.pid
-        || header.probe_endpoint != format!(".trial-probe-{}.sock", header.source_epoch)
+        || header.probe_endpoint != format!(".{probe}-probe-{}.sock", header.source_epoch)
         || !uuid(&header.event_key)
         || !uuid(&header.source_epoch)
         || !uuid(&header.study_key)
@@ -562,6 +621,22 @@ pub fn records(
     let executable = std::env::current_exe().map_err(|_| ProcessSourceError)?;
     let script = peer(&header, &executable, snapshot)?;
     let (source_range, native_ordinal) = published_record(raw, &header, &script)?;
+    let work = header.format == WORK_FORMAT;
+    let (revision, adapter, parser, events) = if work {
+        (
+            format!("{WORK_FORMAT}:{:x}", Sha256::digest(bytes(&script)?)),
+            WORK_ADAPTER_REVISION,
+            WORK_PARSER_REVISION,
+            WORK_ELIGIBLE_EVENTS,
+        )
+    } else {
+        (
+            SOURCE_REVISION.into(),
+            ADAPTER_REVISION,
+            PARSER_REVISION,
+            ELIGIBLE_EVENTS,
+        )
+    };
     let source_instance_id = format!(
         "process:{}:{}:{}:{}",
         header.controller.boot_id,
@@ -581,7 +656,7 @@ pub fn records(
         pairing_role: role,
         field_provenance: vec![],
         adapter_manifest_ref: manifest_ref.into(),
-        adapter_revision: ADAPTER_REVISION,
+        adapter_revision: adapter,
         strong_gate_receipt_ref: None,
         admission: CorrelationAdmission::Unavailable,
         partial_correlation_ref: None,
@@ -645,11 +720,11 @@ pub fn records(
         spool_record_id: Some(header.event_key.clone()),
         source_observation_id_hint: None,
         source_instance_id,
-        source_revision: SOURCE_REVISION.into(),
+        source_revision: revision,
         source_record_identity: Some(header.event_key),
         identity_strength: Some(IdentityStrength::StableNative),
         source_kind: EvidenceSourceKind::Other,
-        identity_domain: FORMAT.into(),
+        identity_domain: header.format,
         source_ref,
         session_ref: header.source_epoch,
         turn_ref: None,
@@ -673,10 +748,10 @@ pub fn records(
         content_trust: ContentTrust::UntrustedSourceContent,
         capture_completeness: CaptureCompleteness::Partial,
         surface_eligible: true,
-        adapter_revision: ADAPTER_REVISION,
+        adapter_revision: adapter,
         adapter_manifest_ref: manifest_ref.into(),
-        eligible_event_manifest_ref: ELIGIBLE_EVENTS.into(),
-        parser_revision: PARSER_REVISION,
+        eligible_event_manifest_ref: events.into(),
+        parser_revision: parser,
         canonicalization_revision: 1,
         // The original clock value remains in raw bytes; its uncertainty is not qualified.
         event_time_us: None,
@@ -1160,8 +1235,13 @@ fn source_probe(header: &Header, deadline: Instant) -> Result<Vec<u8>> {
         .set_write_timeout(Some(deadline.saturating_duration_since(Instant::now())))
         .map_err(|_| ProcessSourceError)?;
     let nonce = Uuid::new_v4().to_string();
+    let format = if header.format == WORK_FORMAT {
+        "process-work-probe-v1"
+    } else {
+        "process-trial-probe-v1"
+    };
     let mut request = serde_json::to_vec(&serde_json::json!({
-        "format":"process-trial-probe-v1", "nonce":nonce
+        "format":format, "nonce":nonce
     }))
     .map_err(|_| ProcessSourceError)?;
     request.push(b'\n');
@@ -1176,7 +1256,7 @@ fn source_probe(header: &Header, deadline: Instant) -> Result<Vec<u8>> {
     probe_read(&mut socket, &mut raw, deadline)?;
     let snapshot: ProbeSnapshot = serde_json::from_slice(&raw).map_err(|_| ProcessSourceError)?;
     let after = fs::symlink_metadata(&path).map_err(|_| ProcessSourceError)?;
-    if snapshot.format != "process-trial-probe-v1"
+    if snapshot.format != format
         || snapshot.nonce != nonce
         || snapshot.controller != header.controller
         || snapshot.source_epoch != header.source_epoch
@@ -1414,8 +1494,27 @@ pub fn record_matches(raw: &[u8], body: &crate::CaptureRecordBody) -> bool {
         header.controller.pid,
         header.controller.start_ticks
     );
-    let known_profile = is_native_profile(body.adapter_revision, body.parser_revision)
-        || (body.adapter_revision, body.parser_revision) == (9, 6);
+    let work = header.format == WORK_FORMAT;
+    let known_profile = if work {
+        is_work_revision(body.source_revision.as_str())
+            && (body.adapter_revision, body.parser_revision)
+                == (WORK_ADAPTER_REVISION, WORK_PARSER_REVISION)
+            && body.identity_domain == WORK_FORMAT
+            && body.eligible_event_manifest_ref == WORK_ELIGIBLE_EVENTS
+            && body.scope_effect_claims.is_empty()
+            && body.source_local_evidence.is_none()
+            && body.correlation.host_instance_id.is_none()
+            && body.correlation.host_trace_lineage_id.is_none()
+            && body.correlation.host_lane_key.is_none()
+            && body.correlation.canonical_event_family.is_none()
+            && body.correlation.native_request_id.is_none()
+            && body.correlation.physical_execution_ordinal.is_none()
+            && body.correlation.field_provenance.is_empty()
+    } else {
+        body.source_revision.as_str() == SOURCE_REVISION
+            && (is_native_profile(body.adapter_revision, body.parser_revision)
+                || (body.adapter_revision, body.parser_revision) == (9, 6))
+    };
     let file_view = body
         .source_instance_id
         .as_str()
@@ -1436,12 +1535,11 @@ pub fn record_matches(raw: &[u8], body: &crate::CaptureRecordBody) -> bool {
         && body.correlation.physical_execution_ordinal.is_none()
         && body.correlation.field_provenance.is_empty();
     body.source_kind == EvidenceSourceKind::Other
-        && body.source_revision.as_str() == SOURCE_REVISION
         && known_profile
         && body.correlation.adapter_revision == body.adapter_revision
         && body.correlation.admission == CorrelationAdmission::Unavailable
         && body.correlation.strong_gate_receipt_ref.is_none()
-        && (body.source_instance_id.as_str() == instance || file_view)
+        && (body.source_instance_id.as_str() == instance || (!work && file_view))
         && body.source_record_identity.as_str() == header.event_key
         && body.source_sequence == header.sequence
         && body.source_role == SourceRole::Tool
@@ -1548,7 +1646,14 @@ fn published_record(
             || header.controller != selected.controller
             || header.source_epoch != selected.source_epoch
             || header.study_key != selected.study_key
-            || (count == 1 && header.event != "study_opened")
+            || header.format != selected.format
+            || (count == 1
+                && header.event
+                    != if header.format == WORK_FORMAT {
+                        "work_started"
+                    } else {
+                        "study_opened"
+                    })
         {
             return Err(ProcessSourceError);
         }

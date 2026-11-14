@@ -1296,6 +1296,27 @@ impl JournalWriter {
         decode_committed_command(rows).map(Some)
     }
 
+    /// Read one accepted source command through its existing observation/sequence indexes.
+    pub async fn source_observation_command(
+        &self,
+        source: evertrace_domain::ids::SourceObservationId,
+    ) -> Result<Option<CommittedCommand>, StoreError> {
+        let Some(seq) = self
+            .validated_current_read(|state, _| Ok(state.source_observation_journal_seq(source)))
+            .await?
+        else {
+            return Ok(None);
+        };
+        let rows = self.lock_sqlite()?.rows_page(seq.saturating_sub(1), seq)?;
+        let [row] = rows.as_slice() else {
+            return Err(StoreError::StoreCorrupt);
+        };
+        if row.seq != seq || row.event_type != "source_observation_recorded_v1" {
+            return Err(StoreError::StoreCorrupt);
+        }
+        self.committed_command(row.command_id).await
+    }
+
     pub async fn committed_commands(
         &self,
         command_ids: &[evertrace_domain::ids::CommandId],

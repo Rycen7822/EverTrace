@@ -8874,6 +8874,10 @@ impl JournalAdmissionState {
         self.repository_read_context(&ids)
     }
 
+    pub(crate) fn source_observation_journal_seq(&self, id: SourceObservationId) -> Option<u64> {
+        self.source_observations.get(&id).map(|(_, seq)| *seq)
+    }
+
     pub(crate) fn source_observation_revision_has_facts(
         &self,
         source: &SourceInstanceId,

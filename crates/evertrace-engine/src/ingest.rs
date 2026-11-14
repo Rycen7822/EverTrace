@@ -1206,7 +1206,20 @@ impl EvidenceIngestor {
                         .await
                         .map_err(map_writer_error)?,
                 };
+                let work_source = evertrace_capture::process_source::is_work_revision(
+                    verified.body.source_revision.as_str(),
+                );
+                let committed_command = if committed_command.is_none() && work_source {
+                    self.writer
+                        .source_observation_command(verified.observation.source_observation_id)
+                        .await
+                        .map_err(map_writer_error)?
+                } else {
+                    committed_command
+                };
                 if let Some(committed_command) = committed_command {
+                    let fresh_work_presentation =
+                        work_source && committed_command.command_id != verified.body.command_id;
                     if native_profile || runtime_image {
                         if let Some(original) =
                             committed_command
@@ -1265,6 +1278,21 @@ impl EvidenceIngestor {
                             _ => None,
                         })
                         .ok_or(IngestError::StoreCorrupt)?;
+                    if fresh_work_presentation {
+                        use evertrace_domain::evidence::EventTimeProvenance::RecordedAtFallback;
+                        if verified.receipt.event_time_provenance != Some(RecordedAtFallback)
+                            || receipt.event_time_provenance != Some(RecordedAtFallback)
+                        {
+                            return Err(IngestError::IdempotencyConflict);
+                        }
+                        // Re-observing one source event does not revise its first L0 clock.
+                        verified.receipt.recorded_at_us = receipt.recorded_at_us;
+                        verified.receipt.event_time_us = receipt.event_time_us;
+                        if let Some(surface) = verified.surface.as_mut() {
+                            surface.recorded_at_us = receipt.recorded_at_us;
+                            surface.event_time_us = receipt.event_time_us;
+                        }
+                    }
                     verified
                         .receipt
                         .protected_presentation
@@ -1971,7 +1999,10 @@ fn map_writer_error(error: WriterActorError) -> IngestError {
     match error {
         WriterActorError::IdempotencyConflict => IngestError::IdempotencyConflict,
         WriterActorError::StoreCorrupt => IngestError::StoreCorrupt,
-        _ => IngestError::Store,
+        error => {
+            tracing::warn!(target: "evertrace_lifecycle", ?error, "capture writer operation failed");
+            IngestError::Store
+        }
     }
 }
 

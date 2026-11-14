@@ -232,6 +232,10 @@ enum WriterRequest {
         command_id: evertrace_domain::ids::CommandId,
         reply: oneshot::Sender<Result<Option<CommittedCommand>, WriterActorError>>,
     },
+    SourceObservationCommand {
+        source: evertrace_domain::ids::SourceObservationId,
+        reply: oneshot::Sender<Result<Option<CommittedCommand>, WriterActorError>>,
+    },
     ProjectAtFrontier {
         frontier: u64,
         reply: oneshot::Sender<Result<ProjectionSnapshot, WriterActorError>>,
@@ -1128,6 +1132,18 @@ impl WriterHandle {
         let (reply, response) = oneshot::channel();
         self.sender
             .send(WriterRequest::CommittedCommand { command_id, reply })
+            .await
+            .map_err(|_| WriterActorError::Stopped)?;
+        response.await.map_err(|_| WriterActorError::Stopped)?
+    }
+
+    pub async fn source_observation_command(
+        &self,
+        source: evertrace_domain::ids::SourceObservationId,
+    ) -> Result<Option<CommittedCommand>, WriterActorError> {
+        let (reply, response) = oneshot::channel();
+        self.sender
+            .send(WriterRequest::SourceObservationCommand { source, reply })
             .await
             .map_err(|_| WriterActorError::Stopped)?;
         response.await.map_err(|_| WriterActorError::Stopped)?
@@ -2115,6 +2131,19 @@ async fn run_writer(
                         .as_ref()
                         .ok_or(WriterActorError::Stopped)?
                         .committed_command(command_id)
+                        .await
+                        .map_err(map_store_error);
+                    let fatal = result.is_err();
+                    let _ = reply.send(result);
+                    if fatal {
+                        return Err(WriterActorError::Store);
+                    }
+                }
+                WriterRequest::SourceObservationCommand { source, reply } => {
+                    let result = writer
+                        .as_ref()
+                        .ok_or(WriterActorError::Stopped)?
+                        .source_observation_command(source)
                         .await
                         .map_err(map_store_error);
                     let fatal = result.is_err();

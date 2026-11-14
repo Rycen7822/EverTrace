@@ -115,11 +115,18 @@ fn run() -> Result<(), ()> {
         Some("--runtime-snapshot") => {
             let path = Path::new(&path);
             if evertrace_capture::process_source::is_record(&bytes) {
-                let contract = evertrace_codex::probe::HostProbeReport::native_source_contract(
-                    &evertrace_capture::process_source::adapter_version(),
-                    evertrace_capture::process_source::ELIGIBLE_EVENTS,
-                    evertrace_capture::process_source::FORMAT,
-                )
+                let contract = if evertrace_capture::process_source::is_work_record(&bytes) {
+                    evertrace_codex::probe::HostProbeReport::unobserved_source_contract(
+                        &evertrace_capture::process_source::work_adapter_version(),
+                        evertrace_capture::process_source::WORK_ELIGIBLE_EVENTS,
+                    )
+                } else {
+                    evertrace_codex::probe::HostProbeReport::native_source_contract(
+                        &evertrace_capture::process_source::adapter_version(),
+                        evertrace_capture::process_source::ELIGIBLE_EVENTS,
+                        evertrace_capture::process_source::FORMAT,
+                    )
+                }
                 .map_err(|_| ())?;
                 let kernel_contract =
                     evertrace_codex::probe::HostProbeReport::unobserved_source_contract(

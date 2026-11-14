@@ -217,29 +217,23 @@ fn source_resolved(
                 else {
                     return false;
                 };
-                value.worktree_lineage_refs.contains(&reference)
-                    && (value.status.is_terminal()
-                        || (value.active_episode_id.is_some()
-                            && current
-                                .other_data_rows()
-                                .take_while(|_| std::time::Instant::now() < deadline)
-                                .any(|row| {
-                                    if row.object_kind.as_deref() != Some("work_binding") {
-                                        return false;
-                                    }
-                                    let Some(JournalPayload::WorkBindingRecorded(binding)) =
-                                        row.payload_json.as_deref().and_then(|json| {
-                                            serde_json::from_str::<JournalPayload>(json).ok()
-                                        })
-                                    else {
-                                        return false;
-                                    };
-                                    binding.assignment_status == AssignmentStatus::Resolved
-                                        && binding.primary_binding.task_id == Some(value.task_id)
-                                        && binding.primary_binding.workstream_id
-                                            == Some(value.workstream_id)
-                                        && binding.evidence_refs.contains(&reference)
-                                })))
+                let bound = current
+                    .other_data_rows()
+                    .take_while(|_| std::time::Instant::now() < deadline)
+                    .any(|row| {
+                        if row.object_kind.as_deref() != Some("work_binding") {
+                            return false;
+                        }
+                        matches!(
+                            row.payload_json.as_deref().and_then(|json| {
+                                serde_json::from_str::<JournalPayload>(json).ok()
+                            }),
+                            Some(JournalPayload::WorkBindingRecorded(binding))
+                                if source_owns_stream(&binding, &value, &reference)
+                        )
+                    });
+                (value.worktree_lineage_refs.contains(&reference) || bound)
+                    && (value.status.is_terminal() || (value.active_episode_id.is_some() && bound))
             });
     }
     if let SourceCandidate::TestResult(event) = envelope {
@@ -334,11 +328,22 @@ fn source_resolved(
 
 #[derive(Deserialize)]
 struct ProcessWorkPlan {
+    #[serde(alias = "work_key")]
     study_key: String,
     goal: String,
     scope: String,
+    #[serde(default)]
+    scope_kind: ProcessWorkScope,
     phase: evertrace_domain::work::PhaseContract,
     strategy: evertrace_domain::work::StrategyContract,
+}
+
+#[derive(Default, Deserialize, Eq, PartialEq)]
+#[serde(rename_all = "snake_case")]
+enum ProcessWorkScope {
+    #[default]
+    Repository,
+    NonRepository,
 }
 
 #[derive(Deserialize)]
@@ -354,6 +359,7 @@ struct ProcessWorkDeclaration {
     format: String,
     event: String,
     source_epoch: String,
+    #[serde(alias = "work_key")]
     study_key: String,
     controller: ProcessController,
     definition: ProcessWorkPlan,
@@ -361,14 +367,29 @@ struct ProcessWorkDeclaration {
 
 impl ProcessWorkDeclaration {
     fn decode(bytes: &[u8], receipt: &SourceReceipt) -> Option<Self> {
-        let value: Self = serde_json::from_slice(bytes).ok()?;
+        let raw: serde_json::Value = serde_json::from_slice(bytes).ok()?;
+        if raw["format"] == evertrace_capture::process_source::WORK_FORMAT
+            && raw["definition"].as_object()?.keys().any(|key| {
+                !matches!(
+                    key.as_str(),
+                    "work_key" | "goal" | "scope" | "scope_kind" | "phase" | "strategy"
+                )
+            })
+        {
+            return None;
+        }
+        let value: Self = serde_json::from_value(raw).ok()?;
         let controller = &value.controller;
         let instance = format!(
             "process:{}:{}:{}:{}",
             controller.boot_id, controller.pid_namespace, controller.pid, controller.start_ticks
         );
-        (value.format == evertrace_capture::process_source::FORMAT
+        let fixed = value.format == evertrace_capture::process_source::FORMAT
             && value.event == "study_opened"
+            && value.definition.scope_kind == ProcessWorkScope::Repository;
+        let work = value.format == evertrace_capture::process_source::WORK_FORMAT
+            && value.event == "work_started";
+        ((fixed || work)
             && value.study_key == value.definition.study_key
             && !value.source_epoch.is_empty()
             && receipt.source_sequence == 1
@@ -650,7 +671,10 @@ fn source_candidate(
         return evertrace_domain::work::NativeTestResult::decode(surface.protected_text.as_bytes())
             .map(|value| SourceCandidate::TestResult(Box::new(value)));
     }
-    if observation.source_revision.as_str() == evertrace_capture::process_source::SOURCE_REVISION
+    if (observation.source_revision.as_str() == evertrace_capture::process_source::SOURCE_REVISION
+        || evertrace_capture::process_source::is_work_revision(
+            observation.source_revision.as_str(),
+        ))
         && observation.source_role == SourceRole::Tool
         && observation.content_trust == ContentTrust::UntrustedSourceContent
     {
@@ -911,17 +935,19 @@ fn process_work_refs(
             declaration.controller.start_ticks,
         ));
         for scope in root_scope_candidates(current, receipt.source_observation_id, directory)? {
-            let (Some(repository), Some(worktree)) = (scope.repository, scope.worktree) else {
-                continue; // Research code/snapshot qualification cannot inherit an unscoped witness.
-            };
+            if declaration.definition.scope_kind == ProcessWorkScope::Repository
+                && (scope.repository.is_none() || scope.worktree.is_none())
+            {
+                continue;
+            }
             causal.insert(scope.source);
             refs.extend([
                 scope.source.to_string(),
                 scope.operation.to_string(),
                 scope.effect.to_string(),
-                repository.to_string(),
-                worktree.to_string(),
             ]);
+            refs.extend(scope.repository.map(|id| id.to_string()));
+            refs.extend(scope.worktree.map(|id| id.to_string()));
         }
     }
     let prefixes = causal
@@ -1471,6 +1497,11 @@ impl ControlledRunResolver {
     > {
         let facts = ControlledFacts::from_snapshot(snapshot)?;
         if facts.observations.get(&source).is_some_and(|value| {
+            evertrace_capture::process_source::is_work_revision(value.source_revision.as_str())
+        }) {
+            return self.resolve_process_work(snapshot, &facts, source, context, goal_key_dir);
+        }
+        if facts.observations.get(&source).is_some_and(|value| {
             value.source_revision.as_str() == evertrace_capture::process_source::SOURCE_REVISION
         }) {
             let observation = facts
@@ -1613,20 +1644,41 @@ impl ControlledRunResolver {
         let bytes = self.protected_source(facts, source)?;
         let declaration = ProcessWorkDeclaration::decode(&bytes, receipt)
             .ok_or(AutoresearchError::EvidenceIncomplete)?;
-        let manifest = evertrace_codex::probe::HostProbeReport::native_source_contract(
-            &process_source::adapter_version(),
-            process_source::ELIGIBLE_EVENTS,
-            process_source::FORMAT,
-        )
+        let work = declaration.format == process_source::WORK_FORMAT;
+        let (adapter, parser, events) = if work {
+            (
+                process_source::WORK_ADAPTER_REVISION,
+                process_source::WORK_PARSER_REVISION,
+                process_source::WORK_ELIGIBLE_EVENTS,
+            )
+        } else {
+            (
+                process_source::ADAPTER_REVISION,
+                process_source::PARSER_REVISION,
+                process_source::ELIGIBLE_EVENTS,
+            )
+        };
+        let manifest = if work {
+            evertrace_codex::probe::HostProbeReport::unobserved_source_contract(
+                &process_source::work_adapter_version(),
+                process_source::WORK_ELIGIBLE_EVENTS,
+            )
+        } else {
+            evertrace_codex::probe::HostProbeReport::native_source_contract(
+                &process_source::adapter_version(),
+                process_source::ELIGIBLE_EVENTS,
+                process_source::FORMAT,
+            )
+        }
         .map_err(|_| AutoresearchError::UntrustedRunEvidence)?;
         if receipt.identity_domain != declaration.format
             || receipt.source_kind != evertrace_domain::evidence::EvidenceSourceKind::Other
             || receipt.unsupported_record_classification.is_some()
             || receipt.canonicalization_revision != 1
-            || receipt.adapter_revision != process_source::ADAPTER_REVISION
+            || receipt.adapter_revision != adapter
             || receipt.adapter_manifest_ref != manifest.manifest().adapter_manifest_id
-            || receipt.eligible_event_manifest_ref != process_source::ELIGIBLE_EVENTS
-            || receipt.parser_revision != process_source::PARSER_REVISION
+            || receipt.eligible_event_manifest_ref != events
+            || receipt.parser_revision != parser
             || receipt.capture_completeness != CaptureCompleteness::Partial
             || observation.capture_completeness != CaptureCompleteness::Partial
             || observation.source_role != SourceRole::Tool
@@ -1647,6 +1699,24 @@ impl ControlledRunResolver {
             };
             if !operation.scope_effect_ids.contains(&effect.scope_effect_id) {
                 continue;
+            }
+            match declaration.definition.scope_kind {
+                ProcessWorkScope::Repository
+                    if effect.repository_instance_id.is_none()
+                        || effect.worktree_instance_id.is_none() =>
+                {
+                    continue;
+                }
+                ProcessWorkScope::NonRepository
+                    if !observed_without_repository(effect)
+                        || facts.scope_effects.values().any(|(other, _)| {
+                            other.operation_id == operation.operation_id
+                                && !observed_without_repository(other)
+                        }) =>
+                {
+                    continue;
+                }
+                _ => {}
             }
             for id in &operation.input_source_observation_refs {
                 if !effect.evidence_refs.contains(id) {
@@ -1735,70 +1805,101 @@ impl ControlledRunResolver {
         let [task] = tasks.as_slice() else {
             return Ok((ControlledRunCommand::NoDelta, Some(policy)));
         };
-        let (Some(repository), Some(worktree)) =
-            (effect.repository_instance_id, effect.worktree_instance_id)
-        else {
-            return Err(AutoresearchError::EvidenceIncomplete);
-        };
-        let mut anchors = Vec::new();
-        for launch in facts.observations.values().filter(|value| {
-            value.source_instance_id == observation.source_instance_id
-                && value.source_revision == observation.source_revision
-        }) {
-            let launch_receipt = facts.receipt(launch.source_observation_id)?;
-            let raw: serde_json::Value = serde_json::from_slice(
-                &self.protected_source(facts, launch.source_observation_id)?,
-            )
-            .map_err(|_| AutoresearchError::EvidenceIncomplete)?;
-            if raw["event"] != "trial_launch" || raw["study_key"] != declaration.study_key {
-                continue;
-            }
-            let direct = format!(
-                "native-execution-directory:{}:",
-                launch.source_observation_id
-            );
-            let native = format!("native-execution-directory:{native}:");
-            for anchor in facts.snapshots.values().filter(|anchor| {
-                anchor.worktree_instance_id == worktree
-                    && anchor.capture_status
-                        == evertrace_domain::repository::SnapshotCaptureStatus::Complete
-                    && anchor.head_oid.as_deref() == raw["source_anchor"]["commit"].as_str()
-                    && anchor.tree_oid.as_deref() == raw["source_anchor"]["tree"].as_str()
-                    && anchor
+        let code = if declaration.definition.scope_kind == ProcessWorkScope::NonRepository {
+            None
+        } else if work {
+            let repository = effect
+                .repository_instance_id
+                .ok_or(AutoresearchError::EvidenceIncomplete)?;
+            // Observe carries no before/after change claim. Its independently captured
+            // entry snapshot is linked by the exact Native source, not by a path or title.
+            let prefix = format!("native-execution-directory:{native}:");
+            let anchors = facts
+                .snapshots
+                .values()
+                .filter(|anchor| {
+                    Some(anchor.worktree_instance_id) == effect.worktree_instance_id
+                        && anchor.capture_status
+                            == evertrace_domain::repository::SnapshotCaptureStatus::Complete
+                        && anchor
+                            .evidence_refs
+                            .iter()
+                            .any(|reference| reference.starts_with(&prefix))
+                })
+                .collect::<Vec<_>>();
+            let [anchor] = anchors.as_slice() else {
+                return Ok((ControlledRunCommand::NoDelta, Some(policy)));
+            };
+            Some((repository, *anchor))
+        } else {
+            let (Some(repository), Some(worktree)) =
+                (effect.repository_instance_id, effect.worktree_instance_id)
+            else {
+                return Err(AutoresearchError::EvidenceIncomplete);
+            };
+            let mut anchors = Vec::new();
+            for launch in facts.observations.values().filter(|value| {
+                value.source_instance_id == observation.source_instance_id
+                    && value.source_revision == observation.source_revision
+            }) {
+                let launch_receipt = facts.receipt(launch.source_observation_id)?;
+                let raw: serde_json::Value = serde_json::from_slice(
+                    &self.protected_source(facts, launch.source_observation_id)?,
+                )
+                .map_err(|_| AutoresearchError::EvidenceIncomplete)?;
+                if raw["event"] != "trial_launch" || raw["study_key"] != declaration.study_key {
+                    continue;
+                }
+                let direct = format!(
+                    "native-execution-directory:{}:",
+                    launch.source_observation_id
+                );
+                let native = format!("native-execution-directory:{native}:");
+                for anchor in facts.snapshots.values().filter(|anchor| {
+                    anchor.worktree_instance_id == worktree
+                        && anchor.capture_status
+                            == evertrace_domain::repository::SnapshotCaptureStatus::Complete
+                        && anchor.head_oid.as_deref() == raw["source_anchor"]["commit"].as_str()
+                        && anchor.tree_oid.as_deref() == raw["source_anchor"]["tree"].as_str()
+                        && anchor
+                            .evidence_refs
+                            .iter()
+                            .any(|value| value.starts_with(&direct) || value.starts_with(&native))
+                }) {
+                    let inherited = !anchor
                         .evidence_refs
                         .iter()
-                        .any(|value| value.starts_with(&direct) || value.starts_with(&native))
-            }) {
-                let inherited = !anchor
-                    .evidence_refs
-                    .iter()
-                    .any(|value| value.starts_with(&direct));
-                anchors.push((
-                    launch_receipt.source_sequence,
-                    inherited,
-                    anchor.worktree_snapshot_id,
-                ));
+                        .any(|value| value.starts_with(&direct));
+                    anchors.push((
+                        launch_receipt.source_sequence,
+                        inherited,
+                        anchor.worktree_snapshot_id,
+                    ));
+                }
             }
-        }
-        anchors.sort();
-        anchors.dedup();
-        let Some((first, inherited, anchor)) = anchors.first().copied() else {
-            return Ok((ControlledRunCommand::NoDelta, Some(policy)));
+            anchors.sort();
+            anchors.dedup();
+            let Some((first, inherited, anchor)) = anchors.first().copied() else {
+                return Ok((ControlledRunCommand::NoDelta, Some(policy)));
+            };
+            if anchors
+                .iter()
+                .filter(|(sequence, fallback, _)| *sequence == first && *fallback == inherited)
+                .count()
+                != 1
+            {
+                return Err(AutoresearchError::EvidenceIncomplete);
+            }
+            Some((
+                repository,
+                facts
+                    .snapshots
+                    .get(&anchor)
+                    .ok_or(AutoresearchError::EvidenceIncomplete)?,
+            ))
         };
-        if anchors
-            .iter()
-            .filter(|(sequence, fallback, _)| *sequence == first && *fallback == inherited)
-            .count()
-            != 1
-        {
-            return Err(AutoresearchError::EvidenceIncomplete);
-        }
         let anchor = ProcessWorkAnchor {
-            repository,
-            snapshot: facts
-                .snapshots
-                .get(&anchor)
-                .ok_or(AutoresearchError::EvidenceIncomplete)?,
+            code,
             session: &facts.receipt(native)?.source_session_ref,
             effect,
             root_source: native,
@@ -3409,9 +3510,15 @@ fn process_trial_input(
     })
 }
 
+fn source_owns_stream(binding: &WorkBindingRevision, stream: &Workstream, source: &str) -> bool {
+    binding.assignment_status == AssignmentStatus::Resolved
+        && binding.primary_binding.task_id == Some(stream.task_id)
+        && binding.primary_binding.workstream_id == Some(stream.workstream_id)
+        && binding.evidence_refs.iter().any(|value| value == source)
+}
+
 struct ProcessWorkAnchor<'a> {
-    repository: evertrace_domain::ids::RepositoryId,
-    snapshot: &'a WorktreeSnapshot,
+    code: Option<(evertrace_domain::ids::RepositoryId, &'a WorktreeSnapshot)>,
     session: &'a str,
     effect: &'a evertrace_domain::evidence::ScopeEffect,
     root_source: SourceObservationId,
@@ -3434,19 +3541,31 @@ fn process_work_command(
         effective_config_hash: context.effective_config_hash,
         algorithm_revision: context.algorithm_revision,
     };
-    let repository = anchor.repository;
-    let worktree = anchor.snapshot.worktree_instance_id;
+    let repository = anchor.code.map(|(repository, _)| repository);
+    let worktree = anchor
+        .code
+        .map(|(_, snapshot)| snapshot.worktree_instance_id);
     let source_ref = source.to_string();
+    let sources = vec![
+        source_ref.clone(),
+        anchor.root_source.to_string(),
+        anchor.goal_source.to_string(),
+    ];
+    let current_binding = facts.bindings.get(&anchor.effect.operation_id);
     let streams = facts
         .workstreams
         .values()
-        .filter(|stream| stream.worktree_lineage_refs.contains(&source_ref))
+        .filter(|stream| {
+            stream.worktree_lineage_refs.contains(&source_ref)
+                || current_binding
+                    .is_some_and(|binding| source_owns_stream(binding, stream, &source_ref))
+        })
         .collect::<Vec<_>>();
     let map_error = |_| AutoresearchError::ImmutableConflict;
     if let [stream] = streams.as_slice() {
         if stream.task_id != task.task_id
-            || stream.repository_instance_id != Some(repository)
-            || stream.worktree_instance_ids != [worktree]
+            || stream.repository_instance_id != repository
+            || stream.worktree_instance_ids != worktree.into_iter().collect::<Vec<_>>()
             || stream.phase_contract != plan.phase
         {
             return Err(AutoresearchError::ImmutableConflict);
@@ -3456,11 +3575,6 @@ fn process_work_command(
         }
         if stream.active_episode_id.is_some() {
             let view = evertrace_store::WorkIdentityCurrentView::from_snapshot(snapshot)?;
-            let sources = vec![
-                source.to_string(),
-                anchor.root_source.to_string(),
-                anchor.goal_source.to_string(),
-            ];
             let binding = crate::work::binding::source_root_workstream(
                 &view,
                 stream,
@@ -3491,7 +3605,9 @@ fn process_work_command(
         };
         let mut episode = episode::new_episode(
             stream,
-            Some(anchor.snapshot.worktree_snapshot_id),
+            anchor
+                .code
+                .map(|(_, snapshot)| snapshot.worktree_snapshot_id),
             snapshot.frontier,
         )
         .map_err(map_error)?;
@@ -3511,10 +3627,10 @@ fn process_work_command(
         revision_id: RevisionId::new_v7(),
         predecessor_revision_id: None,
         task_id: task.task_id,
-        repository_instance_id: Some(repository),
-        worktree_instance_ids: vec![worktree],
-        active_worktree_instance_id: Some(worktree),
-        worktree_lineage_refs: vec![source_ref],
+        repository_instance_id: repository,
+        worktree_instance_ids: worktree.into_iter().collect(),
+        active_worktree_instance_id: worktree,
+        worktree_lineage_refs: repository.map(|_| source_ref).into_iter().collect(),
         parent_workstream_id: None,
         dependency_workstream_ids: vec![],
         status: evertrace_domain::work::WorkstreamStatus::Active,
@@ -3531,8 +3647,8 @@ fn process_work_command(
     let attempt = attempt::new_attempt(
         task.task_id,
         stream.workstream_id,
-        Some(repository),
-        vec![worktree],
+        repository,
+        worktree.into_iter().collect(),
         vec![],
         plan.strategy.clone(),
         snapshot.frontier,
@@ -3540,6 +3656,22 @@ fn process_work_command(
     .map_err(map_error)?;
     let repositories = evertrace_store::repository::RepositoryCurrentView::from_snapshot(snapshot)
         .map_err(AutoresearchError::Store)?;
+    // Keep source ownership in the same transaction, before a later job activates the Episode.
+    let mut view = evertrace_store::WorkIdentityCurrentView::from_snapshot(snapshot)?;
+    view.workstreams
+        .insert(stream.workstream_id, stream.clone());
+    let binding = crate::work::binding::source_root_workstream(
+        &view,
+        &stream,
+        anchor.effect.operation_id,
+        anchor.effect.scope_effect_id,
+        current_binding,
+        &sources,
+    )
+    .map_err(map_error)?
+    .into_revision()
+    .ok_or(AutoresearchError::ImmutableConflict)?;
+    let binding = crate::work::binding::record_binding(context, binding).map_err(map_error)?;
     let declaration =
         workstream::create_workstream(context, task, &repositories, stream).map_err(map_error)?;
     let attempt = attempt::create_attempt(context, attempt).map_err(map_error)?;
@@ -3549,6 +3681,7 @@ fn process_work_command(
             .events()
             .iter()
             .chain(attempt.events())
+            .chain(binding.events())
             .cloned()
             .collect(),
     )
