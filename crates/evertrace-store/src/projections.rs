@@ -2947,6 +2947,9 @@ pub(crate) struct ReadDependencyBudget {
     bytes: u64,
 }
 
+/// Request-local repository restrictions derived from already admitted source/Work facts.
+pub type SourceRepositoryScopes = BTreeMap<String, BTreeSet<RepositoryId>>;
+
 /// Exact immutable root plus its finite authority inputs; no UI model or whole-library snapshot.
 #[derive(Debug, PartialEq)]
 pub struct StoredFieldsContext {
@@ -12020,6 +12023,57 @@ impl JournalAdmissionState {
             source_receipts: &self.source_receipts,
             source_observations: &self.source_observations,
         }
+    }
+
+    pub(crate) fn process_source_repository_scopes(
+        &self,
+        sources: &BTreeSet<String>,
+        deadline: std::time::Instant,
+    ) -> Result<SourceRepositoryScopes, StoreError> {
+        use evertrace_domain::work::AssignmentStatus;
+        if sources.len() > usize::from(evertrace_domain::query::METADATA_READ_LIMIT) {
+            return Err(StoreError::InvalidInput);
+        }
+        let mut scopes = SourceRepositoryScopes::new();
+        // Scan only the admitted Work family, not Evidence payloads or a whole projection.
+        // Immutable binding revisions retain known restrictions even after a current rebind.
+        for (binding, _) in self.work_bindings.values() {
+            if std::time::Instant::now() >= deadline {
+                return Err(StoreError::Io);
+            }
+            if binding.assignment_status != AssignmentStatus::Resolved {
+                continue;
+            }
+            for reference in &binding.evidence_refs {
+                let Some((source, _)) = reference
+                    .parse::<SourceObservationId>()
+                    .ok()
+                    .and_then(|id| self.source_observations.get(&id))
+                    .filter(|(source, _)| {
+                        sources.contains(source.source_instance_id.as_str())
+                            && evertrace_capture::process_source::is_owned_revision(
+                                source.source_revision.as_str(),
+                            )
+                    })
+                else {
+                    continue;
+                };
+                let repositories = scopes
+                    .entry(source.source_instance_id.as_str().to_owned())
+                    .or_default();
+                for id in &binding.scope_effect_refs {
+                    let (effect, _) = self.scope_effects.get(id).ok_or(StoreError::StoreCorrupt)?;
+                    if effect.operation_id != binding.operation_id {
+                        return Err(StoreError::StoreCorrupt);
+                    }
+                    repositories.extend(effect.repository_instance_id);
+                }
+                if repositories.len() > usize::from(evertrace_domain::query::METADATA_READ_LIMIT) {
+                    return Err(StoreError::InvalidInput);
+                }
+            }
+        }
+        Ok(scopes)
     }
 
     pub(crate) fn repository_read_context(

@@ -254,6 +254,13 @@ enum WriterRequest {
         source_episode: Option<evertrace_domain::revision::RevisionId>,
         reply: oneshot::Sender<Result<Vec<RecallCurrentContext>, WriterActorError>>,
     },
+    ProcessSourceRepositoryScopes {
+        sources: std::collections::BTreeSet<String>,
+        deadline: Instant,
+        reply: oneshot::Sender<
+            Result<evertrace_store::projections::SourceRepositoryScopes, WriterActorError>,
+        >,
+    },
     RepositoryReadContext {
         ids: std::collections::BTreeSet<evertrace_domain::ids::RepositoryId>,
         filesystem: Option<evertrace_domain::repository::FilesystemIdentity>,
@@ -526,6 +533,23 @@ impl WriterHandle {
             .send(WriterRequest::SourceObservationRevisionHasFacts {
                 source,
                 revision,
+                reply,
+            })
+            .await
+            .map_err(|_| WriterActorError::Stopped)?;
+        response.await.map_err(|_| WriterActorError::Stopped)?
+    }
+
+    pub async fn process_source_repository_scopes(
+        &self,
+        sources: std::collections::BTreeSet<String>,
+        deadline: Instant,
+    ) -> Result<evertrace_store::projections::SourceRepositoryScopes, WriterActorError> {
+        let (reply, response) = oneshot::channel();
+        self.sender
+            .send(WriterRequest::ProcessSourceRepositoryScopes {
+                sources,
+                deadline,
                 reply,
             })
             .await
@@ -2254,6 +2278,18 @@ async fn run_writer(
                     if fatal {
                         return Err(WriterActorError::Store);
                     }
+                }
+                WriterRequest::ProcessSourceRepositoryScopes {
+                    sources,
+                    deadline,
+                    reply,
+                } => {
+                    let result = writer
+                        .as_ref()
+                        .ok_or(WriterActorError::Stopped)?
+                        .process_source_repository_scopes(&sources, deadline)
+                        .map_err(map_store_error);
+                    let _ = reply.send(result);
                 }
                 WriterRequest::RepositoryReadContext {
                     ids,

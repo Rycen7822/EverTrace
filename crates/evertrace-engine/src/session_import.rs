@@ -3292,6 +3292,31 @@ pub(crate) async fn blocked_source_observations(
     refs: &[String],
     config_hash: [u8; 32],
 ) -> Result<std::collections::BTreeSet<String>, SessionImportServiceError> {
+    let (blocked, revoked) = source_observations_read_assessment(
+        writer,
+        &crate::repository::RepositoryReadAuthority::observed(report),
+        current,
+        refs,
+    )
+    .await?;
+    crate::repository::record_trust_revocations(writer, revoked, config_hash)
+        .await
+        .map_err(map_writer)?;
+    Ok(blocked)
+}
+
+pub(crate) async fn source_observations_read_assessment(
+    writer: &WriterHandle,
+    authority: &crate::repository::RepositoryReadAuthority<'_>,
+    current: &evertrace_store::projections::CurrentFacts,
+    refs: &[String],
+) -> Result<
+    (
+        BTreeSet<String>,
+        Vec<evertrace_domain::repository::RepositoryInstance>,
+    ),
+    SessionImportServiceError,
+> {
     if refs.len() > 64 || !refs.windows(2).all(|pair| pair[0] < pair[1]) {
         return Err(SessionImportServiceError::Unavailable);
     }
@@ -3308,7 +3333,7 @@ pub(crate) async fn blocked_source_observations(
             observation.source_instance_id.as_str().to_owned(),
         );
     }
-    blocked_source_instances(writer, report, sources, config_hash, None).await
+    source_instance_read_assessment(writer, authority, sources, None).await
 }
 
 /// The source gate over a named request-local closure.  It intentionally
@@ -3527,9 +3552,42 @@ pub(crate) async fn source_instance_read_assessment(
             (source, allowed)
         })
         .collect::<BTreeMap<_, _>>();
+    // Live process archives have no historical-session approval record. Once their
+    // Work source is independently bound to a physical scope, that restriction still applies.
+    let processes = sources
+        .values()
+        .filter(|source| source.starts_with("process:"))
+        .cloned()
+        .collect::<BTreeSet<_>>();
+    let restrictions = if processes.is_empty() {
+        BTreeMap::new()
+    } else {
+        writer
+            .process_source_repository_scopes(
+                processes,
+                deadline.min(Instant::now() + crate::repository::SESSION_ROOT_PROBE_BUDGET),
+            )
+            .await
+            .map_err(map_writer)?
+    };
+    let (blocked_repositories, observations) = crate::repository::repository_read_assessment(
+        writer,
+        restrictions.values().flatten().copied().collect(),
+        authority,
+        deadline,
+    )
+    .await
+    .map_err(map_writer)?;
+    revoked.extend(observations);
     let blocked = sources
         .into_iter()
-        .filter_map(|(row, source)| (permissions.get(&source) == Some(&false)).then_some(row))
+        .filter_map(|(row, source)| {
+            (permissions.get(&source) == Some(&false)
+                || restrictions
+                    .get(&source)
+                    .is_some_and(|ids| !ids.is_disjoint(&blocked_repositories)))
+            .then_some(row)
+        })
         .collect();
     Ok((blocked, revoked))
 }

@@ -743,6 +743,15 @@ impl JournalWriter {
             .recall_source_contexts(self.frontier(), episode, limit)
     }
 
+    pub fn process_source_repository_scopes(
+        &self,
+        sources: &std::collections::BTreeSet<String>,
+        deadline: std::time::Instant,
+    ) -> Result<crate::projections::SourceRepositoryScopes, StoreError> {
+        self.admission_state
+            .process_source_repository_scopes(sources, deadline)
+    }
+
     pub fn repository_read_context(
         &self,
         ids: &std::collections::BTreeSet<evertrace_domain::ids::RepositoryId>,

@@ -1918,16 +1918,18 @@ impl BackgroundScheduler {
             {
                 continue;
             }
-            let denied = crate::session_import::blocked_source_observations(
-                &self.writer,
-                report.as_ref(),
-                current,
-                &refs,
-                self.runtime.effective_config_hash,
-            )
-            .await
-            .map_err(|_| BackgroundSchedulerError::Store)?;
-            if !denied.is_empty() {
+            if !source_owned_policy
+                && !crate::session_import::blocked_source_observations(
+                    &self.writer,
+                    report.as_ref(),
+                    current,
+                    &refs,
+                    self.runtime.effective_config_hash,
+                )
+                .await
+                .map_err(|_| BackgroundSchedulerError::Store)?
+                .is_empty()
+            {
                 continue;
             }
             let context = AutoresearchCommandContext {
@@ -1957,19 +1959,6 @@ impl BackgroundScheduler {
                 // Absent/contradictory/untrusted evidence is not a write or a fabricated terminal result.
                 Err(_) => continue,
             };
-            if !crate::session_import::blocked_source_observations(
-                &self.writer,
-                report.as_ref(),
-                current,
-                &refs,
-                self.runtime.effective_config_hash,
-            )
-            .await
-            .map_err(|_| BackgroundSchedulerError::Store)?
-            .is_empty()
-            {
-                continue;
-            }
             let authority = if source_owned_policy {
                 policy.as_ref().map_or(
                     crate::repository::RepositoryReadAuthority::Unavailable,
@@ -1978,7 +1967,17 @@ impl BackgroundScheduler {
             } else {
                 crate::repository::RepositoryReadAuthority::observed(report.as_ref())
             };
-            let (blocked, revoked) = crate::repository::repository_read_assessment(
+            // Resolving a live source also authenticates its publisher's policy. Assess
+            // its sources with that authority, never an absent or unrelated installed Host.
+            let (denied, mut revoked) = crate::session_import::source_observations_read_assessment(
+                &self.writer,
+                &authority,
+                current,
+                &refs,
+            )
+            .await
+            .map_err(|_| BackgroundSchedulerError::Store)?;
+            let (blocked, observations) = crate::repository::repository_read_assessment(
                 &self.writer,
                 repositories,
                 &authority,
@@ -1986,6 +1985,7 @@ impl BackgroundScheduler {
             )
             .await
             .map_err(|_| BackgroundSchedulerError::Store)?;
+            revoked.extend(observations);
             crate::repository::record_trust_revocations(
                 &self.writer,
                 revoked,
@@ -1993,7 +1993,7 @@ impl BackgroundScheduler {
             )
             .await
             .map_err(|_| BackgroundSchedulerError::Store)?;
-            if !blocked.is_empty() {
+            if !denied.is_empty() || !blocked.is_empty() {
                 continue;
             }
             match self
