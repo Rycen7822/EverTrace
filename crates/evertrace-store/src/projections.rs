@@ -7211,6 +7211,14 @@ impl JournalAdmissionState {
         }
         // These exact-read rows are transient. Derive physical scope here without changing business projections.
         for row in rows.values_mut() {
+            if row.object_kind.as_deref() == Some("work_binding") {
+                if let Some(id) = &row.workstream_id {
+                    let id = id.parse().map_err(|_| StoreError::StoreCorrupt)?;
+                    let (stream, _) = self.workstreams.get(&id).ok_or(StoreError::StoreCorrupt)?;
+                    row.repository_id = stream.repository_instance_id.map(|id| id.to_string());
+                }
+                continue;
+            }
             let repository = match row.object_kind.as_deref() {
                 Some(
                     "worktree"

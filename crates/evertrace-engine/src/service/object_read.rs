@@ -223,6 +223,14 @@ fn fields_metadata(
     })
 }
 
+fn workstream_scoped_fields(row: &ObjectRow) -> bool {
+    row.workstream_id.is_some()
+        && matches!(
+            row.object_kind.as_deref(),
+            Some("workstream" | "work_episode" | "attempt" | "work_binding")
+        )
+}
+
 async fn fields_access(
     writer: &crate::WriterHandle,
     context: &evertrace_store::projections::StoredFieldsContext,
@@ -232,7 +240,26 @@ async fn fields_access(
     if context.source_suppressed {
         return Err(ErrorCode::Untrusted);
     }
-    let references = context.rows.iter().collect::<Vec<_>>();
+    let root = context.selected.as_ref().ok_or(ErrorCode::StoreCorrupt)?;
+    // Project only authorization coordinates; canonical rows, sources and suppression/coherence remain intact.
+    // A structural parent Task is not a child's ambient scope. Reading the Task itself still checks all its members.
+    let scope_rows = context
+        .rows
+        .iter()
+        .filter(|row| {
+            !(workstream_scoped_fields(root)
+                && row.object_kind.as_deref() == Some("task")
+                && row.object_id == root.task_id)
+        })
+        .cloned()
+        .map(|mut row| {
+            if workstream_scoped_fields(&row) {
+                row.task_id = None;
+            }
+            row
+        })
+        .collect::<Vec<_>>();
+    let references = scope_rows.iter().collect::<Vec<_>>();
     let host = report.read().await.clone();
     check_source_access(writer, host.as_ref(), &context.rows, &references, deadline).await
 }
