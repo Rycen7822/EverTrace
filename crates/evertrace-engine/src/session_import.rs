@@ -3568,6 +3568,7 @@ pub(crate) async fn source_instance_read_assessment(
             .process_source_repository_scopes(processes, deadline)
             .await
             .map_err(map_writer)?
+            .ok_or(SessionImportServiceError::Unavailable)?
     };
     let (blocked_repositories, observations) = crate::repository::repository_read_assessment(
         writer,

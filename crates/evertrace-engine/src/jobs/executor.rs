@@ -258,7 +258,7 @@ enum WriterRequest {
         sources: std::collections::BTreeSet<String>,
         deadline: Instant,
         reply: oneshot::Sender<
-            Result<evertrace_store::projections::SourceRepositoryScopes, WriterActorError>,
+            Result<Option<evertrace_store::projections::SourceRepositoryScopes>, WriterActorError>,
         >,
     },
     RepositoryReadContext {
@@ -544,7 +544,8 @@ impl WriterHandle {
         &self,
         sources: std::collections::BTreeSet<String>,
         deadline: Instant,
-    ) -> Result<evertrace_store::projections::SourceRepositoryScopes, WriterActorError> {
+    ) -> Result<Option<evertrace_store::projections::SourceRepositoryScopes>, WriterActorError>
+    {
         let (reply, response) = oneshot::channel();
         self.sender
             .send(WriterRequest::ProcessSourceRepositoryScopes {

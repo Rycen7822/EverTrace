@@ -9630,14 +9630,17 @@ fn process_source_repository_scopes(
     effects: &BTreeMap<ScopeEffectId, (ScopeEffect, u64)>,
     source_filter: Option<&BTreeSet<String>>,
     deadline: Option<std::time::Instant>,
-) -> Result<SourceRepositoryScopes, StoreError> {
+) -> Result<Option<SourceRepositoryScopes>, StoreError> {
     use evertrace_domain::work::AssignmentStatus;
+    if deadline.is_some_and(|deadline| std::time::Instant::now() >= deadline) {
+        return Ok(None);
+    }
     let mut scopes = SourceRepositoryScopes::new();
     // One derivation for current reads and purge: historical bindings retain restrictions.
     // Only Work metadata is scanned; Evidence payloads and whole projections are not read.
     for (binding, _) in bindings.values() {
         if deadline.is_some_and(|deadline| std::time::Instant::now() >= deadline) {
-            return Err(StoreError::Io);
+            return Ok(None);
         }
         if binding.assignment_status != AssignmentStatus::Resolved {
             continue;
@@ -9674,7 +9677,11 @@ fn process_source_repository_scopes(
             }
         }
     }
-    Ok(scopes)
+    if deadline.is_some_and(|deadline| std::time::Instant::now() >= deadline) {
+        Ok(None)
+    } else {
+        Ok(Some(scopes))
+    }
 }
 
 fn derive_repository_scope_purge_preview(
@@ -9723,7 +9730,8 @@ fn derive_repository_scope_purge_preview(
         inputs.scope_effects,
         None,
         None,
-    )?;
+    )?
+    .ok_or(StoreError::StoreCorrupt)?;
     if process_scopes
         .values()
         .any(|ids| ids.contains(&repository_id) && ids.iter().any(|id| *id != repository_id))
@@ -12169,7 +12177,7 @@ impl JournalAdmissionState {
         &self,
         sources: &BTreeSet<String>,
         deadline: std::time::Instant,
-    ) -> Result<SourceRepositoryScopes, StoreError> {
+    ) -> Result<Option<SourceRepositoryScopes>, StoreError> {
         if sources.len() > usize::from(evertrace_domain::query::METADATA_READ_LIMIT) {
             return Err(StoreError::InvalidInput);
         }

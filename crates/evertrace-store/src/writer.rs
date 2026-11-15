@@ -743,11 +743,12 @@ impl JournalWriter {
             .recall_source_contexts(self.frontier(), episode, limit)
     }
 
+    /// None means the lookup deadline expired, never that the source has no restrictions.
     pub fn process_source_repository_scopes(
         &self,
         sources: &std::collections::BTreeSet<String>,
         deadline: std::time::Instant,
-    ) -> Result<crate::projections::SourceRepositoryScopes, StoreError> {
+    ) -> Result<Option<crate::projections::SourceRepositoryScopes>, StoreError> {
         self.admission_state
             .process_source_repository_scopes(sources, deadline)
     }

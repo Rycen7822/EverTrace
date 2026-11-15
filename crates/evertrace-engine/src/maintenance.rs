@@ -1969,14 +1969,23 @@ impl BackgroundScheduler {
             };
             // Resolving a live source also authenticates its publisher's policy. Assess
             // its sources with that authority, never an absent or unrelated installed Host.
-            let (denied, mut revoked) = crate::session_import::source_observations_read_assessment(
-                &self.writer,
-                &authority,
-                current,
-                &refs,
-            )
-            .await
-            .map_err(|_| BackgroundSchedulerError::Store)?;
+            let (denied, mut revoked) =
+                match crate::session_import::source_observations_read_assessment(
+                    &self.writer,
+                    &authority,
+                    current,
+                    &refs,
+                )
+                .await
+                {
+                    Ok(assessment) => assessment,
+                    Err(crate::session_import::SessionImportServiceError::Unavailable) => {
+                        self.controlled_cursor.lock().await.defer();
+                        outcome.retryable = true;
+                        continue;
+                    }
+                    Err(_) => return Err(BackgroundSchedulerError::Store),
+                };
             let (blocked, observations) = crate::repository::repository_read_assessment(
                 &self.writer,
                 repositories,
