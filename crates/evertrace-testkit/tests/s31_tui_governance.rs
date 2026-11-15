@@ -774,8 +774,6 @@ fn human_wire_is_closed_and_tui_renders_daemon_snapshot() {
         forget_preview: None,
         repository_purge_preview: None,
         negative_review: None,
-        recovery_detail: None,
-        execution_integrity_detail: None,
         system_detail: None,
         stable_key: "proposal-row".into(),
         row_class: HumanRowClass::Object,
@@ -5115,10 +5113,9 @@ async fn plain_accept_uses_one_real_command_for_atom_procedure_and_core_inner() 
         .await
         .unwrap()
         .unwrap();
-    let [detail] = worktree_detail.items.as_slice() else {
+    let [_] = worktree_detail.items.as_slice() else {
         panic!("worktree detail must contain exactly one current row")
     };
-    assert!(detail.recovery_detail.is_none());
     let system = service
         .list(HumanSurface::System, None, None, HUMAN_PAGE_LIMIT)
         .await

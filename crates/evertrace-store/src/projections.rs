@@ -6540,9 +6540,15 @@ impl JournalAdmissionState {
                 *seq,
             )?);
         }
-        if let Ok(id) = reference.parse::<ExecutionLaneId>()
-            && let Some((value, seq)) = self.execution_lanes.get(&id)
-        {
+        let lane = evertrace_domain::query::parse_lane_revision(reference)
+            .and_then(|key| self.execution_lane_revisions.get(&key))
+            .or_else(|| {
+                reference
+                    .parse::<ExecutionLaneId>()
+                    .ok()
+                    .and_then(|id| self.execution_lanes.get(&id))
+            });
+        if let Some((value, seq)) = lane {
             rows.push(inbox_work_row(
                 &JournalPayload::ExecutionLaneRecorded(Box::new(value.clone())),
                 *seq,
@@ -6738,6 +6744,10 @@ impl JournalAdmissionState {
                 self.operations
                     .get(&id)
                     .map(|(value, _)| format!("{id}@{}", value.operation_revision))
+            } else if let Ok(id) = reference.parse::<ExecutionLaneId>() {
+                self.execution_lanes
+                    .get(&id)
+                    .map(|(value, _)| format!("{id}@{}", value.lane_revision))
             } else if let Ok(id) = reference.parse::<HostOccurrenceId>() {
                 self.host_occurrences
                     .get(&id)
@@ -7063,6 +7073,7 @@ impl JournalAdmissionState {
                                 | "work_artifact"
                                 | "experiment_run"
                                 | "result_evidence"
+                                | "execution_lane"
                                 | "capture_receipt"
                                 | "capture_receipt_revision"
                         )
@@ -7168,10 +7179,12 @@ impl JournalAdmissionState {
             return Ok(Outcome::Page(Box::new(context)));
         };
         let root_id = root.row_id.clone();
-        let source_cohort = matches!(
-            root.object_kind.as_deref(),
-            Some("source_receipt" | "source_observation" | "capture_receipt")
-        );
+        let lane_root = root.object_kind.as_deref() == Some("execution_lane");
+        let source_cohort = lane_root
+            || matches!(
+                root.object_kind.as_deref(),
+                Some("source_receipt" | "source_observation" | "capture_receipt")
+            );
         let mut effect_scope = None;
         let mut pending = if let Some(value) = procedure_effect::restore(&root)? {
             if let evertrace_domain::procedure::ProcedureContextAnchor::Repository {
@@ -7190,7 +7203,7 @@ impl JournalAdmissionState {
                     .ok_or(StoreError::StoreCorrupt)?,
             )
             .map_err(|_| StoreError::StoreCorrupt)?;
-            let Some(refs) = self.stored_read_dependencies(
+            let Some(mut refs) = self.stored_read_dependencies(
                 &root,
                 &payload,
                 cancelled,
@@ -7200,6 +7213,10 @@ impl JournalAdmissionState {
             else {
                 return Ok(Outcome::TooLarge);
             };
+            // A direct lane body uses its exact receipt's gate; a lane reference in Work is not its body.
+            if let JournalPayload::ExecutionLaneRecorded(lane) = payload {
+                refs.insert(lane.active_capture_receipt_revision_id.to_string());
+            }
             refs
         };
         let mut visited = BTreeSet::new();
@@ -7240,6 +7257,7 @@ impl JournalAdmissionState {
                 // Evidence reads use only their source cohort plus direct Task/Worktree scope facts.
                 // Following a Task's unrelated request roots would incorrectly inherit their revocation or suppression.
                 if !source_cohort
+                    || lane_root && matches!(&payload, JournalPayload::CaptureReceiptRecorded(_))
                     || matches!(
                         &payload,
                         JournalPayload::SourceReceiptRecorded(_)

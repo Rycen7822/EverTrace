@@ -55,14 +55,6 @@
        '分段读取完整采集覆盖凭证' if item.object_kind in ('capture_receipt', 'capture_receipt_revision') else '分段读取完整语义结构' }}
   </button>
 </div>
-{% if item.object_kind == 'capture_receipt' and detail.state == 'too_large' %}
-{% set capture = item.execution_integrity_detail %}
-{% if capture and capture.kind == 'receipt' and capture.predecessor_revision_id %}
-<button class="button" type="button" data-link-key="{{ capture.predecessor_revision_id }}"
-  data-revision="{{ capture.predecessor_revision_id }}" data-object="{{ capture.predecessor_revision_id }}"
-  data-kind="capture_receipt">读取原前序凭证</button>
-{% endif %}
-{% endif %}
 {% endif %}
 {% if item.object_kind == 'recall_need' and detail and detail.state == 'ready' %}
 <label>request ID（可留空，读取此 Need 的账本）

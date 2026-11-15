@@ -31,6 +31,46 @@
 {% else %}
 <p>本修订没有可供读取的载荷；不回退到文件、外部引用或其他修订。</p>
 {% endif %}
+{% elif content.kind == 'execution_lane' %}
+<h2>执行通道</h2>
+<p>通道：{{ value.execution_lane_id }} · 修订：{{ value.lane_revision }}</p>
+<dl class="semantic-fields">
+  {% for label, field in [
+    ('执行状态', 'status'), ('存活探测', 'liveness_state'), ('已结束采集', 'finalized'),
+    ('观察覆盖', 'coverage_level'), ('来源完整性', 'source_coverage'), ('配对完整性', 'pairing_integrity'),
+    ('内容完整性', 'payload_integrity'), ('顺序完整性', 'ordering_integrity')
+  ] %}<dt>{{ label }}</dt><dd>{{ value[field] }}</dd>{% endfor %}
+  <dt>终止类型</dt><dd>{{ value.terminal_kind or '未记录' }}</dd>
+  <dt>来源水位</dt><dd>{{ value.event_watermark }}</dd>
+</dl>
+<p class="reading-note">这里显示所选修订，不证明目前仍在运行。开始、存活探测和终止是不同事实；缺终态不补成完成、成功或失败。</p>
+<p>reasoning 可见类型：{{ value.reasoning_visibility|join('、') or '未记录' }}；不提供 reasoning/CoT 原文。</p>
+<button class="button" type="button" data-link-key="{{ value.active_capture_receipt_revision_id }}"
+  data-object="{{ value.active_capture_receipt_revision_id }}" data-revision="{{ value.active_capture_receipt_revision_id }}"
+  data-kind="capture_receipt">读取此修订引用的采集凭证</button>
+{% if value.predecessor_revision is not none %}
+{% set previous = value.execution_lane_id ~ '@' ~ value.predecessor_revision %}
+<button class="text-button" type="button" data-link-key="{{ value.execution_lane_id }}"
+  data-object="{{ value.execution_lane_id }}" data-revision="{{ previous }}"
+  data-kind="execution_lane">读取原前序通道修订</button>
+{% endif %}
+{% if value.parent_lane_id %}
+<button class="text-button" type="button" data-link-key="{{ value.parent_lane_id }}"
+  data-object="{{ value.parent_lane_id }}" data-kind="execution_lane">读取父通道当前修订</button>
+{% endif %}
+<details><summary>物理身份与来源引用</summary>
+  <p>宿主会话：{{ value.host_session_id }} · Agent：{{ value.agent_id }}</p>
+  <p>宿主通道键：{{ value.host_lane_key }} · incarnation：{{ value.incarnation_ref }}</p>
+  <p>父宿主通道键：{{ value.parent_host_lane_key or '未记录' }}</p>
+  <p>派生事件：{{ value.spawn_event_ref or '未记录' }} · 终止事件：{{ value.terminal_event_ref or '未记录' }}</p>
+  <p>委派目标：{{ value.delegated_goal_ref or '未记录' }} · 修正原因：{{ value.correction_reason or '未记录' }}</p>
+  {{ text_list('委派对象', value.delegated_target_refs) }}
+  {{ text_list('委派验收', value.delegated_acceptance_refs) }}
+  {{ text_list('终止证据', value.termination_evidence_refs) }}
+  {{ text_list('存活探测引用', value.liveness_probe_refs) }}
+  {{ text_list('adapter manifest', value.adapter_manifest_ids) }}
+  {{ text_list('关联操作', value.operation_ids, record_kind='operation') }}
+</details>
 {% elif content.kind == 'attempt' %}
 <h2>策略尝试</h2>
 <dl class="semantic-fields">
@@ -52,7 +92,7 @@
 {{ text_list('策略对象', value.strategy_contract.target_refs) }}
 <p>Task：{{ value.task_id }} · Workstream：{{ value.workstream_id }}</p>
 <p>Episode：{{ value.episode_id or '未记录' }} · 来源水位：{{ value.source_watermark }}</p>
-{{ text_list('执行通道', value.execution_lane_ids) }}
+{{ text_list('执行通道', value.execution_lane_ids, record_kind='execution_lane') }}
 <section class="semantic-section"><h3>中断与恢复</h3>
   <p>中断原因：{{ value.interruption_reason or '未记录' }}</p>
   {{ text_list('中断证据', value.interruption_refs) }}

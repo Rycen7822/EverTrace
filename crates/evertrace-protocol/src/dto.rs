@@ -1,25 +1,16 @@
 pub use evertrace_domain::query::ExactReadQuery;
 use evertrace_domain::{
-    evidence::IdentityStrength,
     ids::{
-        AttemptId, CaptureReceiptId, ExecutionLaneId, JobId, ProcedureNegativeEvidenceId,
-        RecoveryApplicationId, RecoveryBundleId, RepositoryId, RevisionProposalId, WorktreeId,
-        WorktreeSnapshotId,
+        AttemptId, JobId, ProcedureNegativeEvidenceId, RepositoryId, RevisionProposalId, WorktreeId,
     },
     procedure::ProcedureNegativeReviewStatus,
     purge::{ObjectDeletionTarget, ObjectReauthorizationRef},
-    repository::{RecoveryApplicationKind, RecoveryApplicationStatus, RecoveryInputDeliveryState},
     revision::RevisionId,
     semantic::{
         AtomProposalPayload, CoreMembershipProposalPayload, GlobalSupportState,
         ProcedureProposalPayload, ProposalEligibility, ProposalOperation, ProposalPayload,
         ProposalStatus, ProposalTargetId, ProposalTargetKind, RevisionProposal,
         SupportThresholdSnapshot,
-    },
-    work::{
-        AdmissionFailureObservability, CoverageLevel, LaneStatus, LivenessState,
-        OrderingIntegrity as WorkOrderingIntegrity, PairingIntegrity, PayloadIntegrity,
-        ReasoningVisibility, SourceCoverage, TerminalKind,
     },
 };
 use serde::{Deserialize, Serialize};
@@ -490,8 +481,6 @@ pub struct HumanSnapshotItem {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub repository_purge_preview: Option<Box<HumanRepositoryPurgePreview>>,
     pub negative_review: Option<HumanNegativeReviewMetadata>,
-    pub recovery_detail: Option<HumanRecoveryDetail>,
-    pub execution_integrity_detail: Option<HumanExecutionIntegrityDetail>,
     pub system_detail: Option<HumanSystemDetail>,
     pub stable_key: String,
     pub row_class: HumanRowClass,
@@ -508,62 +497,6 @@ pub struct HumanSnapshotItem {
     pub scope_ref: Option<String>,
     pub native_event_time_us: Option<i64>,
     pub source_event_seq: u64,
-}
-
-#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
-#[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
-pub enum HumanExecutionIntegrityDetail {
-    Lane {
-        execution_lane_id: ExecutionLaneId,
-        lane_revision: u32,
-        parent_lane_id: Option<ExecutionLaneId>,
-        status: LaneStatus,
-        terminal_kind: Option<TerminalKind>,
-        liveness_state: LivenessState,
-        finalized: bool,
-        event_watermark: u64,
-        active_capture_receipt_revision_id: CaptureReceiptId,
-        coverage_level: CoverageLevel,
-        source_coverage: SourceCoverage,
-        pairing_integrity: PairingIntegrity,
-        payload_integrity: PayloadIntegrity,
-        ordering_integrity: WorkOrderingIntegrity,
-        reasoning_visibility: Vec<ReasoningVisibility>,
-    },
-    Receipt {
-        capture_receipt_revision_id: CaptureReceiptId,
-        execution_lane_id: ExecutionLaneId,
-        predecessor_revision_id: Option<CaptureReceiptId>,
-        admission_failure_observability: AdmissionFailureObservability,
-        identity_strength: IdentityStrength,
-        delegation_start_seen: bool,
-        child_session_linked: bool,
-        parent_session_end_seen: bool,
-        lifecycle_end_seen: bool,
-        terminal_event_kind: Option<TerminalKind>,
-        finalized: bool,
-        first_sequence: Option<u64>,
-        last_sequence: Option<u64>,
-        sequence_gap_count: u32,
-        outage_count: u32,
-        tool_call_count: u32,
-        tool_result_count: u32,
-        unmatched_tool_call_count: u32,
-        unmatched_tool_result_count: u32,
-        truncation_count: u32,
-        redaction_count: u32,
-        corrupt_count: u32,
-        unsupported_count: u32,
-        import_watermark: u64,
-        coverage_level: CoverageLevel,
-        source_coverage: SourceCoverage,
-        pairing_integrity: PairingIntegrity,
-        payload_integrity: PayloadIntegrity,
-        ordering_integrity: WorkOrderingIntegrity,
-        reasoning_visibility: Vec<ReasoningVisibility>,
-        exact_byte_replay: bool,
-        resolver_version: u32,
-    },
 }
 
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -782,25 +715,6 @@ impl ConfigReloadAudit {
             && self.actor.len() <= 128
             && !self.actor.chars().any(char::is_control)
     }
-}
-
-#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
-#[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
-pub enum HumanRecoveryDetail {
-    Application {
-        application_id: RecoveryApplicationId,
-        revision_id: RevisionId,
-        bundle_id: RecoveryBundleId,
-        target_worktree_id: WorktreeId,
-        application_kind: RecoveryApplicationKind,
-        input_delivery_state: RecoveryInputDeliveryState,
-        status: RecoveryApplicationStatus,
-        pre_snapshot_id: WorktreeSnapshotId,
-        post_snapshot_id: Option<WorktreeSnapshotId>,
-        selected_input_count: u32,
-        result_count: u32,
-        verifier_count: u32,
-    },
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -1618,27 +1532,6 @@ impl HumanSnapshotItem {
                         .windows(2)
                         .all(|pair| pair[0] < pair[1])
             })
-            && self.recovery_detail.as_ref().is_none_or(|detail| {
-                self.category == HumanItemCategory::RecoveryEvidence
-                    && detail.validate(
-                        self.object_kind.as_str(),
-                        self.object_ref.as_deref(),
-                        self.revision_ref.as_deref(),
-                    )
-            })
-            && self
-                .execution_integrity_detail
-                .as_ref()
-                .is_none_or(|detail| {
-                    detail.validate(
-                        self.row_class,
-                        self.family,
-                        self.category,
-                        self.object_kind.as_str(),
-                        self.object_ref.as_deref(),
-                        self.revision_ref.as_deref(),
-                    )
-                })
             && self
                 .system_detail
                 .as_ref()
@@ -1771,67 +1664,6 @@ impl HumanSupportDetail {
                         Some(ProposalPayload::Atom(payload))
                             if matches!(payload.as_ref(), AtomProposalPayload::Replace { .. })
                     ))
-    }
-}
-
-impl HumanExecutionIntegrityDetail {
-    fn validate(
-        &self,
-        row_class: HumanRowClass,
-        family: HumanObjectFamily,
-        category: HumanItemCategory,
-        object_kind: &str,
-        object_ref: Option<&str>,
-        revision_ref: Option<&str>,
-    ) -> bool {
-        let visibility_valid = |values: &[ReasoningVisibility]| {
-            values.len() <= 3 && values.windows(2).all(|pair| pair[0] < pair[1])
-        };
-        match self {
-            Self::Lane {
-                execution_lane_id,
-                lane_revision,
-                reasoning_visibility,
-                ..
-            } => {
-                row_class == HumanRowClass::Object
-                    && family == HumanObjectFamily::Work
-                    && matches!(
-                        category,
-                        HumanItemCategory::LaneLifecycle | HumanItemCategory::Work
-                    )
-                    && object_kind == "execution_lane"
-                    && *lane_revision > 0
-                    && object_ref == Some(execution_lane_id.to_string().as_str())
-                    && revision_ref == Some(format!("{execution_lane_id}@{lane_revision}").as_str())
-                    && visibility_valid(reasoning_visibility)
-            }
-            Self::Receipt {
-                capture_receipt_revision_id,
-                execution_lane_id,
-                first_sequence,
-                last_sequence,
-                reasoning_visibility,
-                resolver_version,
-                ..
-            } => {
-                row_class == HumanRowClass::Object
-                    && family == HumanObjectFamily::Evidence
-                    && matches!(
-                        category,
-                        HumanItemCategory::CaptureIntegrity | HumanItemCategory::Evidence
-                    )
-                    && object_kind == "capture_receipt"
-                    && object_ref == Some(execution_lane_id.to_string().as_str())
-                    && revision_ref == Some(capture_receipt_revision_id.to_string().as_str())
-                    && first_sequence.is_some() == last_sequence.is_some()
-                    && first_sequence
-                        .zip(*last_sequence)
-                        .is_none_or(|(first, last)| first <= last)
-                    && *resolver_version > 0
-                    && visibility_valid(reasoning_visibility)
-            }
-        }
     }
 }
 
@@ -2094,27 +1926,6 @@ impl HumanBackupSummary {
             && self.file_count > 0
             && self.total_bytes > 0
             && self.required_space_bytes <= self.available_space_bytes_at_preflight
-    }
-}
-
-impl HumanRecoveryDetail {
-    fn validate(
-        &self,
-        object_kind: &str,
-        object_ref: Option<&str>,
-        revision_ref: Option<&str>,
-    ) -> bool {
-        match self {
-            Self::Application {
-                application_id,
-                revision_id,
-                ..
-            } => {
-                object_kind == "recovery_application_revision"
-                    && object_ref == Some(application_id.to_string().as_str())
-                    && revision_ref == Some(revision_id.to_string().as_str())
-            }
-        }
     }
 }
 
@@ -2476,8 +2287,6 @@ mod human_backup_summary_tests {
                 forget_preview: None,
                 repository_purge_preview: None,
                 negative_review: None,
-                recovery_detail: None,
-                execution_integrity_detail: None,
                 system_detail: Some(HumanSystemDetail::Job {
                     detail: Box::new(HumanJobDetail {
                         native_history_cleanup_availability: None,

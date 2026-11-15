@@ -25,15 +25,13 @@ use std::{
 use evertrace_capture::{CasDigest, CasStore, RuntimeSnapshot};
 use evertrace_domain::{
     config::GlobalPromotionConfig,
-    evidence::{IdentityStrength, hex},
+    evidence::hex,
     ids::{
-        AtomId, AttemptId, CaptureReceiptId, CommandId, CoreMembershipId, ExecutionLaneId, JobId,
-        ProcedureId, ProcedureNegativeEvidenceId, RecoveryApplicationId, RecoveryBundleId,
-        RepositoryId, RequestId, RevisionProposalId, WorktreeId, WorktreeSnapshotId,
+        AtomId, AttemptId, CommandId, CoreMembershipId, JobId, ProcedureId,
+        ProcedureNegativeEvidenceId, RepositoryId, RequestId, RevisionProposalId, WorktreeId,
     },
     procedure::{ProcedureNegativeReviewEvent, ProcedureNegativeReviewStatus},
     purge::{ObjectDeletionTarget, ObjectReauthorizationRef, RepositoryPurgeBlocker},
-    repository::{RecoveryApplicationKind, RecoveryApplicationStatus, RecoveryInputDeliveryState},
     revision::RevisionId,
     semantic::{
         AtomProposalPayload, GlobalSuccessorSupportContract, GlobalSupportState,
@@ -41,11 +39,7 @@ use evertrace_domain::{
         ProposalPayload, ProposalStatus, ProposalTargetId, ProposalTargetKind, RevisionProposal,
         SupportThresholdSnapshot,
     },
-    work::{
-        AdmissionFailureObservability, BoundaryStatus, CompetingResolutionStatus, CoverageLevel,
-        LaneStatus, LivenessState, OrderingIntegrity, PairingIntegrity, PayloadIntegrity,
-        ReasoningVisibility, SourceCoverage, TerminalKind,
-    },
+    work::{BoundaryStatus, CompetingResolutionStatus},
 };
 use evertrace_store::{
     BackupSummary as StoreBackupSummary, DurableJob, JobBudget, JobStatus, JobTerminalReason,
@@ -164,8 +158,6 @@ pub struct HumanSummary {
     pub forget_preview: Option<Box<HumanForgetPreview>>,
     pub repository_purge_preview: Option<Box<HumanRepositoryPurgePreview>>,
     pub negative_review: Option<HumanNegativeReviewSummary>,
-    pub recovery_detail: Option<HumanRecoveryDetail>,
-    pub execution_integrity_detail: Option<HumanExecutionIntegrityDetail>,
     pub system_detail: Option<HumanSystemDetail>,
     pub stable_key: String,
     pub row_class: HumanRowClass,
@@ -182,61 +174,6 @@ pub struct HumanSummary {
     pub scope_ref: Option<String>,
     pub native_event_time_us: Option<i64>,
     pub source_event_seq: u64,
-}
-
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub enum HumanExecutionIntegrityDetail {
-    Lane {
-        execution_lane_id: ExecutionLaneId,
-        lane_revision: u32,
-        parent_lane_id: Option<ExecutionLaneId>,
-        status: LaneStatus,
-        terminal_kind: Option<TerminalKind>,
-        liveness_state: LivenessState,
-        finalized: bool,
-        event_watermark: u64,
-        active_capture_receipt_revision_id: CaptureReceiptId,
-        coverage_level: CoverageLevel,
-        source_coverage: SourceCoverage,
-        pairing_integrity: PairingIntegrity,
-        payload_integrity: PayloadIntegrity,
-        ordering_integrity: OrderingIntegrity,
-        reasoning_visibility: Vec<ReasoningVisibility>,
-    },
-    Receipt {
-        capture_receipt_revision_id: CaptureReceiptId,
-        execution_lane_id: ExecutionLaneId,
-        predecessor_revision_id: Option<CaptureReceiptId>,
-        admission_failure_observability: AdmissionFailureObservability,
-        identity_strength: IdentityStrength,
-        delegation_start_seen: bool,
-        child_session_linked: bool,
-        parent_session_end_seen: bool,
-        lifecycle_end_seen: bool,
-        terminal_event_kind: Option<TerminalKind>,
-        finalized: bool,
-        first_sequence: Option<u64>,
-        last_sequence: Option<u64>,
-        sequence_gap_count: u32,
-        outage_count: u32,
-        tool_call_count: u32,
-        tool_result_count: u32,
-        unmatched_tool_call_count: u32,
-        unmatched_tool_result_count: u32,
-        truncation_count: u32,
-        redaction_count: u32,
-        corrupt_count: u32,
-        unsupported_count: u32,
-        import_watermark: u64,
-        coverage_level: CoverageLevel,
-        source_coverage: SourceCoverage,
-        pairing_integrity: PairingIntegrity,
-        payload_integrity: PayloadIntegrity,
-        ordering_integrity: OrderingIntegrity,
-        reasoning_visibility: Vec<ReasoningVisibility>,
-        exact_byte_replay: bool,
-        resolver_version: u32,
-    },
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -383,24 +320,6 @@ pub enum HumanSystemDetail {
         config_version: u32,
         effective_config_hash: [u8; 32],
         reload: Option<evertrace_store::ConfigReloadAudit>,
-    },
-}
-
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub enum HumanRecoveryDetail {
-    Application {
-        application_id: RecoveryApplicationId,
-        revision_id: RevisionId,
-        bundle_id: RecoveryBundleId,
-        target_worktree_id: WorktreeId,
-        application_kind: RecoveryApplicationKind,
-        input_delivery_state: RecoveryInputDeliveryState,
-        status: RecoveryApplicationStatus,
-        pre_snapshot_id: WorktreeSnapshotId,
-        post_snapshot_id: Option<WorktreeSnapshotId>,
-        selected_input_count: u32,
-        result_count: u32,
-        verifier_count: u32,
     },
 }
 
@@ -806,7 +725,6 @@ impl HumanGovernanceService {
                 item.semantic_detail = None;
                 item.proposal_base = None;
                 item.support_detail = None;
-                item.recovery_detail = None;
             }
         }
         Ok(())
@@ -3904,12 +3822,11 @@ fn summary(
     } else {
         None
     };
-    let (recovery_detail, execution_integrity_detail, system_detail) =
-        if include_detail || row.row_id.starts_with("runtime:job:") {
-            typed_current_detail(row)?
-        } else {
-            (None, None, None)
-        };
+    let system_detail = if include_detail || row.row_id.starts_with("runtime:job:") {
+        system_current_detail(row)?
+    } else {
+        None
+    };
     Ok(HumanSummary {
         reading_preview: None,
         semantic_detail: None,
@@ -3928,8 +3845,6 @@ fn summary(
         forget_preview,
         repository_purge_preview,
         negative_review,
-        recovery_detail,
-        execution_integrity_detail,
         system_detail,
         ..summary_fields(row, surface)
     })
@@ -3989,8 +3904,6 @@ fn summary_fields(row: &ObjectRow, surface: HumanSurface) -> HumanSummary {
         forget_preview: None,
         repository_purge_preview: None,
         negative_review: None,
-        recovery_detail: None,
-        execution_integrity_detail: None,
         system_detail: None,
         stable_key: row.row_id.clone(),
         row_class: human_row_class(row),
@@ -4045,46 +3958,33 @@ fn forget_target(row: &ObjectRow) -> Result<Option<ObjectDeletionTarget>, HumanG
     }
 }
 
-type HumanTypedDetails = (
-    Option<HumanRecoveryDetail>,
-    Option<HumanExecutionIntegrityDetail>,
-    Option<HumanSystemDetail>,
-);
-
-fn typed_current_detail(row: &ObjectRow) -> Result<HumanTypedDetails, HumanGovernanceError> {
+fn system_current_detail(
+    row: &ObjectRow,
+) -> Result<Option<HumanSystemDetail>, HumanGovernanceError> {
     if let Some(source) = evertrace_store::session_import::restore_current(row)
         .map_err(|_| HumanGovernanceError::Store)?
     {
-        return Ok((
-            None,
-            None,
-            Some(HumanSystemDetail::SessionImport {
-                session_id: source.session_id.clone(),
-                source_instance_id: source.source_instance(),
-                body_state: format!("{:?}", source.body_state),
-                access: source
-                    .access_decision
-                    .map_or_else(|| "None".to_owned(), |value| format!("{value:?}")),
-                workspace: format!("{:?}", source.metadata.workspace_resolution_kind),
-                repository_read_restrictions: source.metadata.repository_read_restrictions,
-            }),
-        ));
+        return Ok(Some(HumanSystemDetail::SessionImport {
+            session_id: source.session_id.clone(),
+            source_instance_id: source.source_instance(),
+            body_state: format!("{:?}", source.body_state),
+            access: source
+                .access_decision
+                .map_or_else(|| "None".to_owned(), |value| format!("{value:?}")),
+            workspace: format!("{:?}", source.metadata.workspace_resolution_kind),
+            repository_read_restrictions: source.metadata.repository_read_restrictions,
+        }));
     }
     let kind = match row.object_kind.as_deref() {
         Some(kind) => kind,
         None if row.row_class == Some(ObjectRowClass::Runtime) => "runtime_event",
-        None => return Ok((None, None, None)),
+        None => return Ok(None),
     };
     if !matches!(
         kind,
-        "recovery_application_revision"
-            | "execution_lane"
-            | "capture_receipt"
-            | "runtime_event"
-            | "repository"
-            | "capability_inventory"
+        "runtime_event" | "repository" | "capability_inventory"
     ) {
-        return Ok((None, None, None));
+        return Ok(None);
     }
     let payload: JournalPayload = serde_json::from_str(
         row.payload_json
@@ -4093,10 +3993,8 @@ fn typed_current_detail(row: &ObjectRow) -> Result<HumanTypedDetails, HumanGover
     )
     .map_err(|_| HumanGovernanceError::Store)?;
     match (kind, payload) {
-        ("repository", JournalPayload::RepositoryInstanceRecorded(value)) => Ok((
-            None,
-            None,
-            Some(HumanSystemDetail::Repository {
+        ("repository", JournalPayload::RepositoryInstanceRecorded(value)) => {
+            Ok(Some(HumanSystemDetail::Repository {
                 repository_id: value.repository_id,
                 repository_revision: value.repository_revision,
                 user_disabled: value.user_disabled,
@@ -4109,12 +4007,10 @@ fn typed_current_detail(row: &ObjectRow) -> Result<HumanTypedDetails, HumanGover
                     .as_ref()
                     .and_then(|state| state.revalidated_inventory_ref),
                 worktree_id: None,
-            }),
-        )),
-        ("capability_inventory", JournalPayload::CapabilityInventoryRecorded(value)) => Ok((
-            None,
-            None,
-            Some(HumanSystemDetail::CapabilityInventory {
+            }))
+        }
+        ("capability_inventory", JournalPayload::CapabilityInventoryRecorded(value)) => {
+            Ok(Some(HumanSystemDetail::CapabilityInventory {
                 job_id: value.job_id,
                 repository_id: value.context.repository_id,
                 repository_revision: value.repository_revision,
@@ -4126,94 +4022,8 @@ fn typed_current_detail(row: &ObjectRow) -> Result<HumanTypedDetails, HumanGover
                 unobserved_source_count: None,
                 unknown_contract_count: None,
                 asset_names: Vec::new(),
-            }),
-        )),
-        ("recovery_application_revision", JournalPayload::RecoveryApplicationRecorded(value)) => {
-            Ok((
-                Some(HumanRecoveryDetail::Application {
-                    application_id: value.recovery_application_id,
-                    revision_id: value.revision_id,
-                    bundle_id: value.recovery_bundle_id,
-                    target_worktree_id: value.target_worktree_instance_id,
-                    application_kind: value.application_kind,
-                    input_delivery_state: value.input_delivery_state,
-                    status: value.application_status,
-                    pre_snapshot_id: value.pre_application_snapshot_id,
-                    post_snapshot_id: value.post_application_snapshot_id,
-                    selected_input_count: bounded_count(value.selected_cas_refs.len())?,
-                    result_count: bounded_count(value.result_source_observation_ids.len())?,
-                    verifier_count: bounded_count(
-                        value
-                            .verifier_receipts
-                            .len()
-                            .checked_add(value.anchor_verifier_receipts.len())
-                            .ok_or(HumanGovernanceError::Store)?,
-                    )?,
-                }),
-                None,
-                None,
-            ))
+            }))
         }
-
-        ("execution_lane", JournalPayload::ExecutionLaneRecorded(value)) => Ok((
-            None,
-            Some(HumanExecutionIntegrityDetail::Lane {
-                execution_lane_id: value.execution_lane_id,
-                lane_revision: value.lane_revision,
-                parent_lane_id: value.parent_lane_id,
-                status: value.status,
-                terminal_kind: value.terminal_kind,
-                liveness_state: value.liveness_state,
-                finalized: value.finalized,
-                event_watermark: value.event_watermark,
-                active_capture_receipt_revision_id: value.active_capture_receipt_revision_id,
-                coverage_level: value.coverage_level,
-                source_coverage: value.source_coverage,
-                pairing_integrity: value.pairing_integrity,
-                payload_integrity: value.payload_integrity,
-                ordering_integrity: value.ordering_integrity,
-                reasoning_visibility: sorted_reasoning_visibility(&value.reasoning_visibility),
-            }),
-            None,
-        )),
-        ("capture_receipt", JournalPayload::CaptureReceiptRecorded(value)) => Ok((
-            None,
-            Some(HumanExecutionIntegrityDetail::Receipt {
-                capture_receipt_revision_id: value.capture_receipt_revision_id,
-                execution_lane_id: value.execution_lane_id,
-                predecessor_revision_id: value.predecessor_revision_id,
-                admission_failure_observability: value.admission_failure_observability,
-                identity_strength: value.identity_strength,
-                delegation_start_seen: value.delegation_start_seen,
-                child_session_linked: value.child_session_linked,
-                parent_session_end_seen: value.parent_session_end_seen,
-                lifecycle_end_seen: value.lifecycle_end_seen,
-                terminal_event_kind: value.terminal_event_kind,
-                finalized: value.finalized,
-                first_sequence: value.first_sequence,
-                last_sequence: value.last_sequence,
-                sequence_gap_count: bounded_count(value.sequence_gaps.len())?,
-                outage_count: bounded_count(value.capture_outage_interval_refs.len())?,
-                tool_call_count: bounded_count(value.tool_calls_seen.len())?,
-                tool_result_count: bounded_count(value.tool_results_seen.len())?,
-                unmatched_tool_call_count: bounded_count(value.unmatched_tool_call_ids.len())?,
-                unmatched_tool_result_count: bounded_count(value.unmatched_tool_result_ids.len())?,
-                truncation_count: bounded_count(value.payload_truncations.len())?,
-                redaction_count: bounded_count(value.redaction_refs.len())?,
-                corrupt_count: bounded_count(value.corrupt_payload_refs.len())?,
-                unsupported_count: bounded_count(value.unsupported_record_types.len())?,
-                import_watermark: value.import_watermark,
-                coverage_level: value.coverage_level,
-                source_coverage: value.source_coverage,
-                pairing_integrity: value.pairing_integrity,
-                payload_integrity: value.payload_integrity,
-                ordering_integrity: value.ordering_integrity,
-                reasoning_visibility: sorted_reasoning_visibility(&value.reasoning_visibility),
-                exact_byte_replay: value.exact_byte_replay,
-                resolver_version: value.resolver_version,
-            }),
-            None,
-        )),
         ("runtime_event", JournalPayload::JobState(value)) => {
             if row.row_id != format!("runtime:job:{}", value.job_id)
                 || row.object_id.is_some()
@@ -4221,48 +4031,46 @@ fn typed_current_detail(row: &ObjectRow) -> Result<HumanTypedDetails, HumanGover
             {
                 return Err(HumanGovernanceError::Store);
             }
-            Ok((
-                None,
-                None,
-                Some(HumanSystemDetail::Job {
-                    detail: Box::new(HumanJobDetail {
-                        native_history_cleanup_availability: matches!(value.algorithm_revision.as_str(),
-                            evertrace_store::purge::OBJECT_DELETION_ALGORITHM_REVISION |
-                            evertrace_store::purge::REPOSITORY_SCOPE_PURGE_ALGORITHM_REVISION)
-                            .then_some(HumanNativeHistoryCleanupAvailability::ExternalReaderExclusionUnverified),
-                        job_id: value.job_id,
-                        target_revision: value.target_revision,
-                        target_watermark: value.target_watermark,
-                        target_generation: value.target_generation,
-                        job_kind: value.kind,
-                        algorithm_revision: value.algorithm_revision,
-                        model_id: value.model_id,
-                        priority: value.priority,
-                        state: map_job_state(value.state),
-                        attempt: value.attempt,
-                        backoff_until_us: value.backoff_until_us,
-                        lease_until_us: value.lease_until_us,
-                        config_hash: value.config_hash,
-                        budget: HumanJobBudget {
-                            max_items: value.budget.max_items,
-                            max_bytes: value.budget.max_bytes,
-                            max_input_tokens: value.budget.max_input_tokens,
-                            max_output_tokens: value.budget.max_output_tokens,
-                            max_calls: value.budget.max_calls,
-                            max_wall_time_ms: value.budget.max_wall_time_ms,
-                        },
-                        terminal_reason: value
-                            .terminal
-                            .as_deref()
-                            .map(|terminal| map_job_terminal_reason(terminal.reason)),
-                        terminal_result_ref: value
-                            .terminal
-                            .and_then(|terminal| terminal.result_ref),
-                        backup_summary: None,
-                        gc_report: None,
-                    }),
+            Ok(Some(HumanSystemDetail::Job {
+                detail: Box::new(HumanJobDetail {
+                    native_history_cleanup_availability: matches!(
+                        value.algorithm_revision.as_str(),
+                        evertrace_store::purge::OBJECT_DELETION_ALGORITHM_REVISION
+                            | evertrace_store::purge::REPOSITORY_SCOPE_PURGE_ALGORITHM_REVISION
+                    )
+                    .then_some(
+                        HumanNativeHistoryCleanupAvailability::ExternalReaderExclusionUnverified,
+                    ),
+                    job_id: value.job_id,
+                    target_revision: value.target_revision,
+                    target_watermark: value.target_watermark,
+                    target_generation: value.target_generation,
+                    job_kind: value.kind,
+                    algorithm_revision: value.algorithm_revision,
+                    model_id: value.model_id,
+                    priority: value.priority,
+                    state: map_job_state(value.state),
+                    attempt: value.attempt,
+                    backoff_until_us: value.backoff_until_us,
+                    lease_until_us: value.lease_until_us,
+                    config_hash: value.config_hash,
+                    budget: HumanJobBudget {
+                        max_items: value.budget.max_items,
+                        max_bytes: value.budget.max_bytes,
+                        max_input_tokens: value.budget.max_input_tokens,
+                        max_output_tokens: value.budget.max_output_tokens,
+                        max_calls: value.budget.max_calls,
+                        max_wall_time_ms: value.budget.max_wall_time_ms,
+                    },
+                    terminal_reason: value
+                        .terminal
+                        .as_deref()
+                        .map(|terminal| map_job_terminal_reason(terminal.reason)),
+                    terminal_result_ref: value.terminal.and_then(|terminal| terminal.result_ref),
+                    backup_summary: None,
+                    gc_report: None,
                 }),
-            ))
+            }))
         }
         ("runtime_event", JournalPayload::ConfigAudit(value)) => {
             if !matches!(
@@ -4273,29 +4081,15 @@ fn typed_current_detail(row: &ObjectRow) -> Result<HumanTypedDetails, HumanGover
             {
                 return Err(HumanGovernanceError::Store);
             }
-            Ok((
-                None,
-                None,
-                Some(HumanSystemDetail::Config {
-                    config_version: value.config_version,
-                    effective_config_hash: value.effective_config_hash,
-                    reload: value.reload,
-                }),
-            ))
+            Ok(Some(HumanSystemDetail::Config {
+                config_version: value.config_version,
+                effective_config_hash: value.effective_config_hash,
+                reload: value.reload,
+            }))
         }
-        ("runtime_event", _) => Ok((None, None, None)),
+        ("runtime_event", _) => Ok(None),
         _ => Err(HumanGovernanceError::Store),
     }
-}
-
-fn bounded_count(value: usize) -> Result<u32, HumanGovernanceError> {
-    u32::try_from(value).map_err(|_| HumanGovernanceError::Store)
-}
-
-fn sorted_reasoning_visibility(values: &[ReasoningVisibility]) -> Vec<ReasoningVisibility> {
-    let mut values = values.to_vec();
-    values.sort();
-    values
 }
 
 fn map_job_state(value: JobStatus) -> HumanJobState {
@@ -4543,7 +4337,6 @@ fn valid_ref(value: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use evertrace_domain::work::ExecutionLane;
 
     #[test]
     fn explorer_selection_filters_before_keyset_pagination() {
@@ -4619,66 +4412,6 @@ mod tests {
             };
             assert!(page(&snapshot, HumanSurface::System, None, 64, true).is_err());
         }
-    }
-
-    #[test]
-    fn execution_lane_detail_is_exact_and_visibility_is_sorted() {
-        let lane_id = ExecutionLaneId::new_v7();
-        let receipt_id = CaptureReceiptId::new_v7();
-        let lane = ExecutionLane {
-            execution_lane_id: lane_id,
-            lane_revision: 1,
-            predecessor_revision: None,
-            host_session_id: "session:one".into(),
-            agent_id: "agent:one".into(),
-            host_lane_key: "lane:one".into(),
-            incarnation_ref: "incarnation:one".into(),
-            parent_lane_id: None,
-            parent_host_lane_key: None,
-            spawn_event_ref: None,
-            terminal_event_ref: None,
-            termination_evidence_refs: Vec::new(),
-            delegated_goal_ref: None,
-            delegated_target_refs: Vec::new(),
-            delegated_acceptance_refs: Vec::new(),
-            status: LaneStatus::Active,
-            terminal_kind: None,
-            liveness_state: LivenessState::Live,
-            liveness_probe_refs: Vec::new(),
-            finalized: false,
-            event_watermark: 3,
-            adapter_manifest_ids: vec!["manifest:one".into()],
-            active_capture_receipt_revision_id: receipt_id,
-            coverage_level: CoverageLevel::Full,
-            source_coverage: SourceCoverage::Open,
-            pairing_integrity: PairingIntegrity::Complete,
-            payload_integrity: PayloadIntegrity::Complete,
-            ordering_integrity: OrderingIntegrity::Complete,
-            reasoning_visibility: vec![ReasoningVisibility::Summary, ReasoningVisibility::Raw],
-            operation_ids: Vec::new(),
-            correction_reason: None,
-        };
-        let mut row = object_row("lane-row", 3);
-        row.object_kind = Some("execution_lane".into());
-        row.object_id = Some(lane_id.to_string());
-        row.current_revision_id = Some(format!("{lane_id}@1"));
-        row.payload_json = Some(
-            serde_json::to_string(&JournalPayload::ExecutionLaneRecorded(Box::new(lane)))
-                .unwrap()
-                .into(),
-        );
-
-        let (recovery, execution, system) = typed_current_detail(&row).unwrap();
-        assert!(recovery.is_none());
-        assert!(system.is_none());
-        assert!(matches!(
-            execution,
-            Some(HumanExecutionIntegrityDetail::Lane {
-                reasoning_visibility,
-                ..
-            }) if reasoning_visibility
-                == vec![ReasoningVisibility::Raw, ReasoningVisibility::Summary]
-        ));
     }
 
     #[test]

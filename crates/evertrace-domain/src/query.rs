@@ -379,6 +379,10 @@ pub fn parse_host_occurrence_revision(value: &str) -> Option<(crate::ids::HostOc
     parse_numbered_revision(value)
 }
 
+pub fn parse_lane_revision(value: &str) -> Option<(ExecutionLaneId, u32)> {
+    parse_numbered_revision(value)
+}
+
 pub fn parse_worktree_revision(value: &str) -> Option<(WorktreeId, u32)> {
     parse_numbered_revision(value)
 }
@@ -2776,6 +2780,7 @@ impl ExactRecordQuery {
                 })
                 .validate()
                     || revision.parse::<crate::ids::CaptureReceiptId>().is_ok()
+                    || parse_lane_revision(revision).is_some()
                     || parse_operation_revision(revision).is_some()
                     || parse_host_occurrence_revision(revision).is_some()
                     || parse_worktree_revision(revision).is_some()
@@ -2803,6 +2808,7 @@ impl ExactRecordQuery {
                     || key.parse::<crate::ids::AttemptId>().is_ok()
                     || key.parse::<crate::ids::OperationBurstId>().is_ok()
                     || key.parse::<crate::ids::OperationId>().is_ok()
+                    || key.parse::<ExecutionLaneId>().is_ok()
                     || key.parse::<crate::ids::HostOccurrenceId>().is_ok()
                     || key.parse::<WorktreeId>().is_ok()
                     || key.parse::<crate::ids::WorktreeSnapshotId>().is_ok()

@@ -2718,8 +2718,8 @@ mod tests {
         assert!(result.path.is_none());
     }
     use evertrace_domain::ids::{
-        AtomId, AttemptId, CaptureReceiptId, CompetingAttemptGroupId, ExecutionLaneId, JobId,
-        RecoveryBundleId, RevisionProposalId, WorktreeId,
+        AtomId, AttemptId, CompetingAttemptGroupId, JobId, RecoveryBundleId, RevisionProposalId,
+        WorktreeId,
     };
     use evertrace_domain::semantic::{
         ApplicabilityExpr, AtomDraft, AtomKind, AtomProposalPayload, AtomProvenance, AtomScope,
@@ -2728,24 +2728,16 @@ mod tests {
         SemanticQualifier, ValidityInterval,
     };
     use evertrace_domain::{
-        ids::{ProcedureNegativeEvidenceId, RepositoryId, WorktreeSnapshotId},
+        ids::{ProcedureNegativeEvidenceId, RepositoryId},
         procedure::ProcedureNegativeReviewStatus,
         purge::ObjectDeletionTarget,
-        repository::{
-            RecoveryApplicationKind, RecoveryApplicationStatus, RecoveryInputDeliveryState,
-        },
         revision::RevisionId,
-        work::{
-            CoverageLevel, LaneStatus, LivenessState, OrderingIntegrity as WorkOrderingIntegrity,
-            PairingIntegrity, PayloadIntegrity, ReasoningVisibility, SourceCoverage,
-        },
     };
     use evertrace_protocol::dto::{
         HealthMode, HumanBackupSummary, HumanBackupTableState, HumanBackupValidationResult,
-        HumanCompetingDetail, HumanDegradedReason, HumanExecutionIntegrityDetail,
-        HumanForgetPreview, HumanGovernanceResponse, HumanItemCategory, HumanItemKind,
-        HumanJobBudget, HumanJobDetail, HumanJobState, HumanNegativeReviewMetadata,
-        HumanObjectFamily, HumanProposalMetadata, HumanProposalReview, HumanRecoveryDetail,
+        HumanCompetingDetail, HumanDegradedReason, HumanForgetPreview, HumanGovernanceResponse,
+        HumanItemCategory, HumanItemKind, HumanJobBudget, HumanJobDetail, HumanJobState,
+        HumanNegativeReviewMetadata, HumanObjectFamily, HumanProposalMetadata, HumanProposalReview,
         HumanRelationKind, HumanRepositoryPurgePreview, HumanRowClass, HumanSnapshotItem,
         HumanSnapshotStatus, HumanSurface, HumanSystemDetail, NegativeReviewDecision,
         PROTOCOL_VERSION, ProposalHumanDecision,
@@ -3130,102 +3122,6 @@ mod tests {
         assert_eq!(request.recovery_bundle_id, bundle_two);
         assert!(app.take_recovery_confirmation().is_none());
 
-        let source_snapshot_id = WorktreeSnapshotId::new_v7();
-        let bundle_detail = snapshot_item("recovery_bundle", bundle_two.to_string());
-        app.state.detail = Some(bundle_detail.clone());
-        app.state.detail_frontier = None;
-
-        let mut worktree_detail = snapshot_item("worktree", worktree_one.to_string());
-        worktree_detail.recovery_detail = Some(HumanRecoveryDetail::Application {
-            application_id: evertrace_domain::ids::RecoveryApplicationId::new_v7(),
-            revision_id: RevisionId::new_v7(),
-            bundle_id: bundle_two,
-            target_worktree_id: worktree_one,
-            application_kind: RecoveryApplicationKind::FileRestore,
-            input_delivery_state: RecoveryInputDeliveryState::Delivered,
-            status: RecoveryApplicationStatus::Applied,
-            pre_snapshot_id: source_snapshot_id,
-            post_snapshot_id: Some(source_snapshot_id),
-            selected_input_count: 1,
-            result_count: 1,
-            verifier_count: 1,
-        });
-        assert!(
-            !HumanGovernanceResponse::Snapshot {
-                diagnostics: None,
-                frontier: 1,
-                status: HumanSnapshotStatus::Ready,
-                degraded_reasons: Vec::new(),
-                items: vec![worktree_detail],
-                next_cursor: None,
-            }
-            .validate()
-        );
-
-        let lane_id = ExecutionLaneId::new_v7();
-        let mut lane_detail = snapshot_item("execution_lane", lane_id.to_string());
-        lane_detail.revision_ref = Some(format!("{lane_id}@1"));
-        assert!(
-            HumanGovernanceResponse::Snapshot {
-                diagnostics: None,
-                frontier: 1,
-                status: HumanSnapshotStatus::Ready,
-                degraded_reasons: Vec::new(),
-                items: vec![lane_detail.clone()],
-                next_cursor: None,
-            }
-            .validate()
-        );
-        lane_detail.execution_integrity_detail = Some(HumanExecutionIntegrityDetail::Lane {
-            execution_lane_id: lane_id,
-            lane_revision: 1,
-            parent_lane_id: None,
-            status: LaneStatus::Active,
-            terminal_kind: None,
-            liveness_state: LivenessState::Live,
-            finalized: false,
-            event_watermark: 3,
-            active_capture_receipt_revision_id: CaptureReceiptId::new_v7(),
-            coverage_level: CoverageLevel::Full,
-            source_coverage: SourceCoverage::Open,
-            pairing_integrity: PairingIntegrity::Complete,
-            payload_integrity: PayloadIntegrity::Complete,
-            ordering_integrity: WorkOrderingIntegrity::Complete,
-            reasoning_visibility: vec![ReasoningVisibility::Raw],
-        });
-        app.state.detail = Some(lane_detail.clone());
-        app.state.detail_frontier = None;
-        let rendered = render_app(&app, 100, 30);
-        assert!(rendered.contains("lane/revision"));
-        assert!(rendered.contains(&lane_id.to_string()));
-        let valid_lane_detail = lane_detail.clone();
-        lane_detail.object_kind = "capture_receipt".into();
-        assert!(
-            !HumanGovernanceResponse::Snapshot {
-                diagnostics: None,
-                frontier: 1,
-                status: HumanSnapshotStatus::Ready,
-                degraded_reasons: Vec::new(),
-                items: vec![lane_detail],
-                next_cursor: None,
-            }
-            .validate()
-        );
-        let mut wrong_family = valid_lane_detail;
-        wrong_family.family = HumanObjectFamily::Evidence;
-        wrong_family.category = HumanItemCategory::Evidence;
-        assert!(
-            !HumanGovernanceResponse::Snapshot {
-                diagnostics: None,
-                frontier: 1,
-                status: HumanSnapshotStatus::Ready,
-                degraded_reasons: Vec::new(),
-                items: vec![wrong_family],
-                next_cursor: None,
-            }
-            .validate()
-        );
-
         let job_id = JobId::new_v7();
         let mut job_detail = snapshot_item("runtime_event", "ignored".into());
         job_detail.stable_key = format!("runtime:job:{job_id}");
@@ -3527,8 +3423,6 @@ mod tests {
             forget_preview: None,
             repository_purge_preview: None,
             negative_review: None,
-            recovery_detail: None,
-            execution_integrity_detail: None,
             system_detail: None,
             stable_key: "proposal-row".into(),
             row_class: HumanRowClass::Object,
@@ -4384,8 +4278,6 @@ mod tests {
             forget_preview: None,
             repository_purge_preview: None,
             negative_review: None,
-            recovery_detail: None,
-            execution_integrity_detail: None,
             system_detail: None,
             stable_key: format!("object:{family}:{object_ref}"),
             row_class: HumanRowClass::Object,
