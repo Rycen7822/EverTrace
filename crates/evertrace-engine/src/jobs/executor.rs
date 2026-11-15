@@ -254,6 +254,16 @@ enum WriterRequest {
         source_episode: Option<evertrace_domain::revision::RevisionId>,
         reply: oneshot::Sender<Result<Vec<RecallCurrentContext>, WriterActorError>>,
     },
+    ObservationRepositoryScopes {
+        sources: std::collections::BTreeSet<evertrace_domain::ids::SourceObservationId>,
+        deadline: Instant,
+        reply: oneshot::Sender<
+            Result<
+                Option<evertrace_store::projections::ObservationRepositoryScopes>,
+                WriterActorError,
+            >,
+        >,
+    },
     ProcessSourceRepositoryScopes {
         sources: std::collections::BTreeSet<String>,
         deadline: Instant,
@@ -533,6 +543,24 @@ impl WriterHandle {
             .send(WriterRequest::SourceObservationRevisionHasFacts {
                 source,
                 revision,
+                reply,
+            })
+            .await
+            .map_err(|_| WriterActorError::Stopped)?;
+        response.await.map_err(|_| WriterActorError::Stopped)?
+    }
+
+    pub async fn observation_repository_scopes(
+        &self,
+        sources: std::collections::BTreeSet<evertrace_domain::ids::SourceObservationId>,
+        deadline: Instant,
+    ) -> Result<Option<evertrace_store::projections::ObservationRepositoryScopes>, WriterActorError>
+    {
+        let (reply, response) = oneshot::channel();
+        self.sender
+            .send(WriterRequest::ObservationRepositoryScopes {
+                sources,
+                deadline,
                 reply,
             })
             .await
@@ -2279,6 +2307,18 @@ async fn run_writer(
                     if fatal {
                         return Err(WriterActorError::Store);
                     }
+                }
+                WriterRequest::ObservationRepositoryScopes {
+                    sources,
+                    deadline,
+                    reply,
+                } => {
+                    let result = writer
+                        .as_ref()
+                        .ok_or(WriterActorError::Stopped)?
+                        .observation_repository_scopes(&sources, deadline)
+                        .map_err(map_store_error);
+                    let _ = reply.send(result);
                 }
                 WriterRequest::ProcessSourceRepositoryScopes {
                     sources,

@@ -3379,6 +3379,7 @@ pub(crate) async fn source_rows_read_assessment(
 > {
     let mut sources = BTreeMap::new();
     let mut observations = BTreeMap::new();
+    let mut physical_sources = BTreeMap::new();
     let mut blocked = std::collections::BTreeSet::new();
     for row in rows {
         if !matches!(
@@ -3419,18 +3420,22 @@ pub(crate) async fn source_rows_read_assessment(
                 );
             }
             JournalPayload::SourceReceiptRecorded(receipt) => {
+                physical_sources.insert(row.row_id.clone(), receipt.source_observation_id);
                 sources.insert(
                     row.row_id.clone(),
                     receipt.source_instance_id.as_str().to_owned(),
                 );
             }
             JournalPayload::SourceObservationRecorded(observation) => {
+                physical_sources.insert(row.row_id.clone(), observation.source_observation_id);
                 sources.insert(
                     row.row_id.clone(),
                     observation.source_instance_id.as_str().to_owned(),
                 );
             }
             JournalPayload::EvidenceSurfaceRecorded(surface) => {
+                physical_sources
+                    .insert(row.row_id.clone(), surface.source_observation_revision_ref);
                 observations.insert(
                     format!(
                         "object:evidence:source_observation:{}",
@@ -3476,9 +3481,41 @@ pub(crate) async fn source_rows_read_assessment(
     {
         return Err(SessionImportServiceError::Corrupt);
     }
-    let (denied, revoked) =
-        source_instance_read_assessment(writer, authority, sources, deadline).await?;
+    let deadline =
+        deadline.unwrap_or_else(|| Instant::now() + crate::repository::SESSION_ROOT_PROBE_BUDGET);
+    let (denied, mut revoked) =
+        source_instance_read_assessment(writer, authority, sources, Some(deadline)).await?;
     blocked.extend(denied);
+    // An unscoped immutable receipt can still have independently observed physical restrictions.
+    // Match exact observation references; a shared Native context is not a repository boundary.
+    let physical = physical_sources
+        .values()
+        .copied()
+        .collect::<std::collections::BTreeSet<_>>()
+        .into_iter()
+        .collect::<Vec<_>>();
+    for ids in physical.chunks(usize::from(evertrace_domain::query::METADATA_READ_LIMIT)) {
+        let scopes = writer
+            .observation_repository_scopes(ids.iter().copied().collect(), deadline)
+            .await
+            .map_err(map_writer)?
+            .ok_or(SessionImportServiceError::Unavailable)?;
+        let (denied_repositories, observations) = crate::repository::repository_read_assessment(
+            writer,
+            scopes.values().flatten().copied().collect(),
+            authority,
+            deadline,
+        )
+        .await
+        .map_err(map_writer)?;
+        revoked.extend(observations);
+        blocked.extend(physical_sources.iter().filter_map(|(row, id)| {
+            scopes
+                .get(id)
+                .is_some_and(|ids| !ids.is_disjoint(&denied_repositories))
+                .then(|| row.clone())
+        }));
+    }
     Ok((blocked, revoked))
 }
 

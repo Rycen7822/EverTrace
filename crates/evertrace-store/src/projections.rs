@@ -3012,6 +3012,7 @@ pub(crate) struct ReadDependencyBudget {
 
 /// Request-local repository restrictions derived from already admitted source/Work facts.
 pub type SourceRepositoryScopes = BTreeMap<String, BTreeSet<RepositoryId>>;
+pub type ObservationRepositoryScopes = BTreeMap<SourceObservationId, BTreeSet<RepositoryId>>;
 
 /// Exact immutable root plus its finite authority inputs; no UI model or whole-library snapshot.
 #[derive(Debug, PartialEq)]
@@ -7316,7 +7317,8 @@ impl JournalAdmissionState {
                 .map_err(|_| StoreError::StoreCorrupt)?;
                 // Evidence reads use only their source cohort plus direct Task/Worktree scope facts.
                 // Following a Task's unrelated request roots would incorrectly inherit their revocation or suppression.
-                if !source_cohort
+                // A referenced coverage receipt is not its aggregate body; keep the root's exact source dependencies.
+                if !source_cohort && !matches!(&payload, JournalPayload::CaptureReceiptRecorded(_))
                     || lane_root && matches!(&payload, JournalPayload::CaptureReceiptRecorded(_))
                     || matches!(
                         &payload,
@@ -12256,6 +12258,75 @@ impl JournalAdmissionState {
             source_receipts: &self.source_receipts,
             source_observations: &self.source_observations,
         }
+    }
+
+    pub(crate) fn observation_repository_scopes(
+        &self,
+        sources: &BTreeSet<SourceObservationId>,
+        deadline: std::time::Instant,
+    ) -> Result<Option<ObservationRepositoryScopes>, StoreError> {
+        if sources.len() > usize::from(evertrace_domain::query::METADATA_READ_LIMIT) {
+            return Err(StoreError::InvalidInput);
+        }
+        let mut scopes = ObservationRepositoryScopes::new();
+        if !sources.is_empty() {
+            // Exact admitted references only; no source payload, projection rebuild or reverse index.
+            for (operation, _) in self.operations.values() {
+                if std::time::Instant::now() >= deadline {
+                    return Ok(None);
+                }
+                let matched = operation
+                    .input_source_observation_refs
+                    .iter()
+                    .chain(&operation.result_source_observation_refs)
+                    .filter(|id| sources.contains(id))
+                    .copied()
+                    .collect::<BTreeSet<_>>();
+                if matched.is_empty() {
+                    continue;
+                }
+                let mut repositories = BTreeSet::new();
+                for id in &operation.scope_effect_ids {
+                    let Some((effect, _)) = self.scope_effects.get(id) else {
+                        return Ok(None);
+                    };
+                    if effect.operation_id != operation.operation_id {
+                        return Err(StoreError::StoreCorrupt);
+                    }
+                    repositories.extend(effect.repository_instance_id);
+                    let mut trees = effect
+                        .worktree_instance_id
+                        .into_iter()
+                        .collect::<BTreeSet<_>>();
+                    for id in effect
+                        .pre_snapshot_id
+                        .into_iter()
+                        .chain(effect.post_snapshot_id)
+                    {
+                        let Some((snapshot, _)) = self.worktree_snapshots.get(&id) else {
+                            return Ok(None);
+                        };
+                        trees.insert(snapshot.worktree_instance_id);
+                    }
+                    for id in trees {
+                        let Some((tree, _)) = self.worktrees.get(&id) else {
+                            return Ok(None);
+                        };
+                        repositories.insert(tree.repository_instance_id);
+                    }
+                    if std::time::Instant::now() >= deadline {
+                        return Ok(None);
+                    }
+                }
+                for id in matched {
+                    scopes
+                        .entry(id)
+                        .or_default()
+                        .extend(repositories.iter().copied());
+                }
+            }
+        }
+        Ok((std::time::Instant::now() < deadline).then_some(scopes))
     }
 
     pub(crate) fn process_source_repository_scopes(

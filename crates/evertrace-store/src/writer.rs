@@ -743,6 +743,16 @@ impl JournalWriter {
             .recall_source_contexts(self.frontier(), episode, limit)
     }
 
+    /// None means unavailable metadata, not an unscoped observation.
+    pub fn observation_repository_scopes(
+        &self,
+        sources: &std::collections::BTreeSet<evertrace_domain::ids::SourceObservationId>,
+        deadline: std::time::Instant,
+    ) -> Result<Option<crate::projections::ObservationRepositoryScopes>, StoreError> {
+        self.admission_state
+            .observation_repository_scopes(sources, deadline)
+    }
+
     /// None means the lookup deadline expired, never that the source has no restrictions.
     pub fn process_source_repository_scopes(
         &self,
