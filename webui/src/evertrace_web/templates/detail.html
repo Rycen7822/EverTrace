@@ -70,6 +70,9 @@
 {% if evidence %}
 <section class="source-reading">
   <h2>受保护来源记录</h2>
+  {% if evidence.default_retrieval_suppressed %}
+  <p class="reading-note">[FORGOTTEN OBJECT SOURCE RETAINED] 对象已遗忘，原证保留供审计。</p>
+  {% endif %}
   <p>来源：{{ evidence.source_kind }} · 角色：{{ evidence.source_role }} · 信任：{{ evidence.content_trust }}</p>
   <p>观察：{{ evidence.observation_role }} · 捕获完整性：{{ evidence.capture_completeness }}</p>
   <p>归档模式：{{ evidence.archive_mode }} · 保护后 {{ evidence.protected_length }} 字节 · 原始 {{ evidence.original_length }} 字节。</p>

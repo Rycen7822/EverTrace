@@ -96,6 +96,7 @@ async def read_source_content(backend, reference, frontier, revision, after=None
         return {"kind": "conflict"}
     content = _unavailable(current, reference, revision)["content"]
     content.update({"text": text, "total_bytes": total, "range_start": start, "range_end": end,
+        "default_retrieval_suppressed": current["default_retrieval_suppressed"],
         "previous_cursor": _cursor(reference, revision, identity, source, start, True) if start > 0 else None,
         "next_cursor": _cursor(reference, revision, identity, source, end, False) if end < total else None})
     return {"kind": "content", "content": content}

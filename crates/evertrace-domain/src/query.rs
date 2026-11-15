@@ -3026,6 +3026,7 @@ pub struct ExactUtf8Window {
 #[serde(deny_unknown_fields)]
 pub struct ExactSourceWindow {
     pub field: SourceTextField,
+    pub default_retrieval_suppressed: bool,
     pub state: ObjectReadState,
     pub selection: Option<ExactFieldIdentity>,
     pub content_state: HumanContentState,
@@ -3050,7 +3051,11 @@ impl ExactSourceWindow {
                                 && window.text.len() <= usize::from(HUMAN_CONTENT_LIMIT)
                         })
                 }
-                _ => self.source.is_none() && self.window.is_none(),
+                _ => {
+                    !self.default_retrieval_suppressed
+                        && self.source.is_none()
+                        && self.window.is_none()
+                }
             }
     }
 }

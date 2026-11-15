@@ -111,11 +111,11 @@ Web migration is in progress; explicitly assemble/version-check its component. H
 | GC | 清理符合条件的无引用内容；不是任意缓存删除，也不保证立即回收所有磁盘。 / Eligible unreferenced-content cleanup, not arbitrary cache removal or immediate total reclamation. |
 | Export | 创建所选当前对象的可携带副本；不是完整数据库备份。 / Portable copies of selected current objects, not a whole-database backup. |
 
-Object Forget 删除对象及专属派生，并在默认检索中隐藏其专属来源。共享原证可以保留。显式来源审计应带 `[FORGOTTEN OBJECT SOURCE RETAINED]` 标记；Web 的遗忘确认和该审计入口尚未接入。
+Object Forget 删除对象及专属派生，默认检索隐藏专属来源，共用原证保留。按精确 ID 打开保留原证时，Web 显示 `[FORGOTTEN OBJECT SOURCE RETAINED]`。Web 遗忘确认尚未接入。
 
 Strict source erasure 尚未开放。需要擦除原始来源时，不要用 Object Forget、repository purge 或 GC 代替。
 
-Object Forget removes the object and its exclusive derivatives, suppressing exclusive refs in default retrieval. Shared evidence can remain. Explicit audit requires `[FORGOTTEN OBJECT SOURCE RETAINED]`; Web confirmation and retained-source audit integration are pending.
+Object Forget removes the object and exclusive derivatives. Default retrieval hides exclusive sources; shared evidence remains. Exact-ID Web reads mark retained evidence with `[FORGOTTEN OBJECT SOURCE RETAINED]`. Web Forget confirmation is not yet connected.
 
 Strict source erasure is not available. Object Forget, repository purge and GC do not erase all original sources.
 

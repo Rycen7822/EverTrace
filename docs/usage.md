@@ -114,6 +114,8 @@ Task 视图列出该任务及其声明关联的仓库/工作树资产。仓库/�
 
 原证通过 SourceObservation/SourceReceipt 的精确 ID 读取。当前已知的物理范围仍在读取时复验；同一个 Native 会话跨多个仓库，不等于这些原证共享一个权限范围。撤权不交付此前暂存的正文，恢复须重新读取，不能复用旧预览。
 
+对象遗忘后，按 ID 打开保留原证会显示 `[FORGOTTEN OBJECT SOURCE RETAINED]`。共用原证不会随一个对象一起隐藏；保留原证也不免除当前权限检查。
+
 直接打开通道或覆盖凭证的正文会核其聚合来源范围。普通工作记录引用凭证，不等于读取该凭证的全部内容；一个仓库停用不应仅因同会话关联而关闭独立仓库的工作记录。
 
 工作状态编辑尚未开放。来源事件/时间筛选、完整关联、Wiki 历史、生产搜索和其余业务页面仍在接入，未接入页面不显示样例。
@@ -181,6 +183,8 @@ The original JSONL need not remain present to read authorized retained archives.
 The Work page supports known-ID reads of connected Task/Workstream/Episode/Attempt/Operation, ExecutionLane and CaptureReceipt records. Lane history uses numbered revisions; receipt reads use exact IDs. Navigation does not replace a selected old revision with current.
 
 Exact source records retain their own current physical-scope checks, even within a shared Native session. A direct lane/receipt body checks its aggregate sources; merely linking that receipt from an independent work record does not read the aggregate body.
+
+Exact-ID reads of evidence retained after Object Forget show `[FORGOTTEN OBJECT SOURCE RETAINED]`. Shared evidence stays visible when one object is forgotten. Current access checks still apply.
 
 Missing execution, adoption or verification evidence stays unknown. Capture completion does not mark work complete. Work editing is not yet available.
 

@@ -137,7 +137,8 @@ async def _source_preview(backend, reference, revision, meta):
             return page["content_state"], None, None
         window = page["window"]
         if (page["source"] != info["source"] or page["selection"] != meta["selection"]
-            or page["state"]["data_identity"] != identity):
+            or page["state"]["data_identity"] != identity
+            or page["default_retrieval_suppressed"] != info["record"]["default_retrieval_suppressed"]):
             return "conflict", None, None
         if (window is None or window["start"] != offset or window["end"] - offset != len(window["text"].encode())
             or total is not None and total != window["total_bytes"] or window["end"] <= offset < window["total_bytes"]):
@@ -199,7 +200,8 @@ async def read_source_detail(backend, reference, frontier, revision, object_kind
                 "source_role":record["source_role"], "content_trust":record["content_trust"],
                 "capture_completeness":record["completeness"], "protected_length":source["protected_bytes"],
                 "original_length":source["original_bytes"], "archive_mode":record["archive_mode"],
-                "protected_presentation":presentation}
+                "protected_presentation":presentation,
+                "default_retrieval_suppressed":record["default_retrieval_suppressed"]}
     final = await backend.read_record_window(reference, revision,
         data_identity=meta["state"]["data_identity"], selection=meta["selection"])
     if final["kind"] == "conflict":
@@ -361,7 +363,8 @@ async def read_source_archive(backend, query, after=None, frontier=None, limit=3
                 source, window = value["source"], value["window"]
                 if (source["source_instance_ref"] != query["source_instance_id"] or source["source_revision"] != query["source_revision"]
                     or source["observation_ref"] != record["observation_id"] or source["receipt_ref"] != record["receipt_id"]
-                    or value["state"]["data_identity"] != identity):
+                    or value["state"]["data_identity"] != identity
+                    or value["default_retrieval_suppressed"] != record["default_retrieval_suppressed"]):
                     return {"kind":"conflict"}
                 if window is None or window["start"] != 0 or window["end"] != len(window["text"].encode()) or window["end"] > 512:
                     raise BackendError("invalid_read_response")

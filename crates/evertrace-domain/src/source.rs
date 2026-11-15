@@ -246,7 +246,9 @@ impl SourceArchiveQuery {
         Ok(())
     }
     pub fn includes(&self, sequence: u64) -> bool {
-        matches!(self,Self::Records{from_sequence,until_sequence,..} if from_sequence.is_none_or(|from|sequence>=from) && until_sequence.is_none_or(|until|sequence<until))
+        matches!(self, Self::Records {from_sequence, until_sequence, ..}
+            if from_sequence.is_none_or(|from| sequence >= from)
+                && until_sequence.is_none_or(|until| sequence < until))
     }
 }
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -303,11 +305,13 @@ pub struct SourceRecordMetadata {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub event_time_provenance: Option<crate::evidence::EventTimeProvenance>,
     pub presentation: SourceRecordPresentation,
+    pub default_retrieval_suppressed: bool,
 }
 impl SourceRecordMetadata {
     pub fn from_records(
         receipt: &crate::evidence::SourceReceipt,
         observation: &crate::evidence::SourceObservation,
+        default_retrieval_suppressed: bool,
     ) -> Option<Self> {
         use crate::evidence::ProtectedPresentation as P;
         if receipt.source_observation_id != observation.source_observation_id
@@ -336,6 +340,7 @@ impl SourceRecordMetadata {
             event_time_us: receipt.event_time_us,
             recorded_at_us: receipt.recorded_at_us,
             event_time_provenance: receipt.event_time_provenance,
+            default_retrieval_suppressed,
             presentation: match &receipt.protected_presentation {
                 Some(P::Inline { .. }) => SourceRecordPresentation::Inline,
                 Some(P::Preview { .. }) => SourceRecordPresentation::Preview,

@@ -41,6 +41,9 @@
 <button class="linked-record" type="button" data-archive-record data-link-key="{{ record.stable_key }}"
   data-revision="{{ record.observation_id }}" data-object="{{ record.observation_id }}" data-kind="source_observation">
   <strong>{{ record.observation_role }} · {{ record.sequence }}</strong>
+  {% if record.default_retrieval_suppressed %}
+  <span>[FORGOTTEN OBJECT SOURCE RETAINED] 对象已遗忘，原证保留供审计。</span>
+  {% endif %}
   <span>{{ record.source_role }} · {{ record.content_trust }} · 单条记录完整度 {{ record.completeness }} · {{ record.archive_mode }}</span>
   <span>{{ source_time(record) }}</span>
   {% if record.byte_range is not none %}

@@ -8,7 +8,6 @@ pub struct SourceArchiveMetadataContext {
     pub page: SourceArchiveMetadataPage,
     pub scope_rows: Vec<ObjectRow>,
     pub references: Vec<ObjectRow>,
-    pub suppressed: bool,
 }
 
 impl JournalAdmissionState {
@@ -85,7 +84,6 @@ impl JournalAdmissionState {
             },
             scope_rows: Vec::new(),
             references: Vec::new(),
-            suppressed: false,
         };
         let check = || {
             if cancelled.load(std::sync::atomic::Ordering::SeqCst) {
@@ -222,25 +220,6 @@ impl JournalAdmissionState {
                         if scopes.len() >= READ_DEPENDENCY_LIMIT {
                             return Ok(O::TooLarge);
                         }
-                        // Exact matching_count is also protected: an off-page suppression cannot leak through the total.
-                        if self.deletions.events().next().is_some()
-                            && let Some((surface, seq)) =
-                                self.evidence_surfaces.get(&receipt.source_observation_id)
-                            && !self
-                                .capture_product_rows(vec![surface_row(
-                                    receipt.source_observation_id,
-                                    surface.as_ref(),
-                                    *seq,
-                                )?])?
-                                .is_empty()
-                        {
-                            context.suppressed |= source_suppressed(
-                                self.deletions.events(),
-                                lookup
-                                    .suppression_refs(receipt.source_observation_id)?
-                                    .as_ref(),
-                            );
-                        }
                         let is_after = match after {
                             Some(SourceArchivePosition::Record {
                                 sequence: previous,
@@ -255,6 +234,12 @@ impl JournalAdmissionState {
                             SourceRecordMetadata::from_records(
                                 receipt.as_ref(),
                                 observation.as_ref(),
+                                source_suppressed(
+                                    self.deletions.events(),
+                                    lookup
+                                        .suppression_refs(receipt.source_observation_id)?
+                                        .as_ref(),
+                                ),
                             )
                             .ok_or(StoreError::StoreCorrupt)?,
                         );
@@ -300,24 +285,6 @@ impl JournalAdmissionState {
                         reference.worktree_id.clone(),
                     );
                     scopes.insert(key, reference);
-                    if self.deletions.events().next().is_some()
-                        && let Some((surface, seq)) =
-                            self.evidence_surfaces.get(&receipt.source_observation_id)
-                        && !self
-                            .capture_product_rows(vec![surface_row(
-                                receipt.source_observation_id,
-                                surface.as_ref(),
-                                *seq,
-                            )?])?
-                            .is_empty()
-                    {
-                        context.suppressed |= source_suppressed(
-                            self.deletions.events(),
-                            lookup
-                                .suppression_refs(receipt.source_observation_id)?
-                                .as_ref(),
-                        );
-                    }
                 }
                 let mut scope_rows = BTreeMap::new();
                 let mut scope_bytes = 0_u64;

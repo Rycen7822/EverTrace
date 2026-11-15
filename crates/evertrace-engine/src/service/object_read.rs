@@ -240,6 +240,32 @@ async fn fields_access(
     if context.source_suppressed {
         return Err(ErrorCode::Untrusted);
     }
+    fields_scope_access(writer, context, report, deadline).await
+}
+
+// Explicit source audit keeps retained evidence; ordinary derived reads still honor suppression.
+async fn source_fields_access(
+    writer: &crate::WriterHandle,
+    context: &evertrace_store::projections::StoredFieldsContext,
+    report: &std::sync::Arc<tokio::sync::RwLock<Option<evertrace_codex::HostProbeReport>>>,
+    deadline: Instant,
+) -> Result<(), ErrorCode> {
+    let root = context.selected.as_ref().ok_or(ErrorCode::StoreCorrupt)?;
+    if !matches!(
+        root.object_kind.as_deref(),
+        Some("source_receipt" | "source_observation")
+    ) {
+        return fields_access(writer, context, report, deadline).await;
+    }
+    fields_scope_access(writer, context, report, deadline).await
+}
+
+async fn fields_scope_access(
+    writer: &crate::WriterHandle,
+    context: &evertrace_store::projections::StoredFieldsContext,
+    report: &std::sync::Arc<tokio::sync::RwLock<Option<evertrace_codex::HostProbeReport>>>,
+    deadline: Instant,
+) -> Result<(), ErrorCode> {
     let root = context.selected.as_ref().ok_or(ErrorCode::StoreCorrupt)?;
     // Project only authorization coordinates; canonical rows, sources and suppression/coherence remain intact.
     // A structural parent Task is not a child's ambient scope. Reading the Task itself still checks all its members.
@@ -726,6 +752,7 @@ impl EngineService {
         let metadata = fields_metadata(&before)?;
         let mut result = ExactSourceWindow {
             field: query.field,
+            default_retrieval_suppressed: false,
             state: metadata.state,
             selection: metadata.selection,
             content_state: State::Missing,
@@ -741,7 +768,7 @@ impl EngineService {
             result.content_state = State::Unavailable;
             return Ok(Outcome::Page(Box::new(result)));
         }
-        if let Err(code) = fields_access(&writer, &before, &report, deadline).await {
+        if let Err(code) = source_fields_access(&writer, &before, &report, deadline).await {
             result.content_state = if code == ErrorCode::Untrusted {
                 State::AccessDenied
             } else {
@@ -831,7 +858,7 @@ impl EngineService {
         };
         result.state = current.state.clone();
         result.selection = fields_metadata(&current)?.selection;
-        if let Err(code) = fields_access(&writer, &current, &report, deadline).await {
+        if let Err(code) = source_fields_access(&writer, &current, &report, deadline).await {
             result.content_state = if code == ErrorCode::Untrusted {
                 State::AccessDenied
             } else {
@@ -842,6 +869,7 @@ impl EngineService {
         } else if before.state.data_identity != current.state.data_identity
             || before.selected != current.selected
             || before.rows != current.rows
+            || before.source_suppressed != current.source_suppressed
         {
             return Ok(Outcome::Conflict(current.state.frontier));
         } else if matches!(read, Some(Err(_))) {
@@ -861,6 +889,7 @@ impl EngineService {
                 result.window = presentation;
             }
             result.source = Some(source);
+            result.default_retrieval_suppressed = current.source_suppressed;
             result.content_state = State::Ready;
         }
         if !result.validate() {
@@ -935,7 +964,7 @@ impl EngineService {
         {
             return Ok(Outcome::Conflict(before.state.frontier));
         }
-        if let Err(code) = fields_access(&writer, &before, &report, deadline).await {
+        if let Err(code) = source_fields_access(&writer, &before, &report, deadline).await {
             result.content_state = if code == ErrorCode::Untrusted {
                 State::AccessDenied
             } else {
@@ -954,6 +983,7 @@ impl EngineService {
                 let record = evertrace_domain::source::SourceRecordMetadata::from_records(
                     &receipt,
                     &observation,
+                    before.source_suppressed,
                 )
                 .ok_or(ErrorCode::StoreCorrupt)?;
                 (
@@ -1056,7 +1086,7 @@ impl EngineService {
             .selected
             .as_ref()
             .map(|row| evertrace_store::JournalWriter::metadata_record(row, None));
-        if let Err(code) = fields_access(&writer, &current, &report, deadline).await {
+        if let Err(code) = source_fields_access(&writer, &current, &report, deadline).await {
             result.content_state = if code == ErrorCode::Untrusted {
                 State::AccessDenied
             } else {
@@ -1067,6 +1097,7 @@ impl EngineService {
         } else if before.state.data_identity != current.state.data_identity
             || before.selected != current.selected
             || before.rows != current.rows
+            || before.source_suppressed != current.source_suppressed
         {
             return Ok(Outcome::Conflict(current.state.frontier));
         } else {
@@ -1675,7 +1706,7 @@ impl EngineService {
                 deadline,
             )
             .await?;
-            if context.suppressed || !source.0.is_empty() || !repositories.0.is_empty() {
+            if !source.0.is_empty() || !repositories.0.is_empty() {
                 page.clear(S::AccessDenied);
             }
             if Instant::now() >= deadline {

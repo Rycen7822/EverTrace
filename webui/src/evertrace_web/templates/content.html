@@ -18,6 +18,9 @@
   这是可重建的当前投影，不是 Procedure 修订的历史正文；不执行路由或更新 usage。</p>{% endif %}
 <button class="button" type="button" data-detail-open>返回所选详情</button>
 {% if content.state == "ready" %}
+{% if content.get("default_retrieval_suppressed") %}
+<p class="reading-note">[FORGOTTEN OBJECT SOURCE RETAINED] 对象已遗忘，原证保留供审计。</p>
+{% endif %}
 <p class="state">UTF-8 字节区间 [{{ content.range_start }}, {{ content.range_end }}) / {{ content.total_bytes }}；仅显示本段，不自动加载全文。</p>
 <div class="chunk-controls">
 <button class="button" type="button" data-content-nav="first"
