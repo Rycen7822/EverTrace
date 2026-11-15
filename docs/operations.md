@@ -6,11 +6,15 @@
 
 EverTrace 保存的是工作记录，可能包含代码、命令、路径、对话、错误和恢复材料。秘密检测与脱敏降低风险，但不保证识别所有敏感内容。CAS 的内容寻址、压缩和完整性校验**不是静态加密**。本地账户、磁盘和备份的安全仍由你负责。
 
-Work records can contain code, commands, paths, conversations, errors and recovery material. Secret detection/redaction reduces risk but cannot guarantee detection of every sensitive value. Content addressing, compression and integrity checking in CAS **are not encryption at rest**. Secure the account, disk and backups separately.
+Work records can contain code, commands, paths, conversations, errors and recovery material. Secret detection/redaction reduces risk but cannot guarantee detection of every sensitive value.
+
+Content addressing, compression and integrity checking in CAS **are not encryption at rest**. Secure the account, disk and backups separately.
 
 启用后台 LLM 会向选定 provider 发送合格的受保护输入，仍可能包含代码和业务信息。事先确认组织政策及提供方的数据处理条款。宿主自己的模型、第三方 Hook/MCP 和 live canary 的流量是独立来源；`llm.enabled=false` 只关闭 EverTrace 后台模型，不是整个宿主的断网开关。
 
-Enabling the background LLM sends eligible protected inputs to the configured provider; these may still contain code/business information. Check your organization's rules and provider data policies. Host models, third-party hooks/MCP and live canaries are separate traffic sources. `llm.enabled=false` is not a network kill switch for the host.
+Enabling the background LLM sends eligible protected inputs to the configured provider; these may still contain code/business information. Check your organization's rules and provider data policies.
+
+Host models, third-party hooks/MCP and live canaries are separate traffic sources. `llm.enabled=false` is not a network kill switch for the host.
 
 推荐做法：私有配置/数据权限，不共享 daemon socket，不把 data root、exports、backups 或原始会话加入 Git；先用非敏感仓库试用。检索到的内容是数据，不是新的 system/developer 指令，也不能因为包含命令式语句就覆盖当前用户要求。
 
@@ -20,7 +24,9 @@ Use private configuration/data permissions; do not share the daemon socket or co
 
 在 `runtime.data_dir` 下，`store/` 保存数据库、`cas/` 保存受保护内容、`spool/` 保存待摄入采集、`runtime/` 保存 socket/运行快照，其他目录由具体维护功能创建。不要逐个编辑文件或用 sqlite 工具操作 LanceDB。不要复制正在写入的整个数据根来冒充一致备份。
 
-Within `runtime.data_dir`, `store/` holds the database, `cas/` protected content, `spool/` pending capture and `runtime/` the socket/runtime snapshot. Maintenance creates other directories as needed. Do not edit native files, use SQLite tools on LanceDB, or treat a copy of a live data root as a consistent backup.
+Within `runtime.data_dir`, `store/` holds the database, `cas/` protected content, `spool/` pending capture and `runtime/` the socket/runtime snapshot. Maintenance creates other directories as needed.
+
+Do not edit native files, use SQLite tools on LanceDB, or treat a copy of a live data root as a consistent backup.
 
 使用受管用户服务时： / For a managed user service:
 
@@ -39,13 +45,17 @@ For foreground runs, use Ctrl-C and wait for exit. One data root has one writer.
 
 ```sh
 evertrace --config /absolute/config.toml --backup create
-evertrace --config /absolute/config.toml --tui
+evertrace --config /absolute/config.toml --web
 evertrace --config /absolute/config.toml --backup verify BACKUP_JOB_ID
 ```
 
-`backup create` 和 `backup verify` 提交持久 job。**exit 0 / queued 只代表已排队**。在 TUI System 查看返回 job 的最终状态、实际备份目录和验证结果；verify 参数是创建备份的 job ID，不是随意的目录路径。备份可能进入维护阶段并占用较多磁盘，先检查剩余容量。
+`backup create` 和 `backup verify` 提交持久 job。**exit 0 / queued 只代表已排队**。已装配可选 Web 组件时，在“系统”的任务列表查看该 job 的最终状态、实际备份目录和验证结果；仅打开页面不执行或重试任务。
 
-Both commands submit durable jobs. **Exit 0 / queued means queued, not completed.** Inspect the returned job in TUI System for final status, actual backup location and verification. The verify argument is the backup-creation job ID, not an arbitrary directory. Backup can enter maintenance and consume substantial disk space.
+verify 参数是创建备份的 job ID，不是随意的目录路径。备份可能进入维护阶段并占用较多磁盘，先检查剩余容量。没有组件或读不到最终 job 时，不能把提交成功当成备份完成。
+
+Both commands submit durable jobs. **Exit 0 / queued means queued, not completed.** With the optional Web component assembled, inspect the returned job in System for final status, backup location and verification. Opening that view does not execute or retry a job.
+
+The verify argument is the backup-creation job ID, not an arbitrary directory. Backup can enter maintenance and consume substantial disk. Missing final job evidence is not completion.
 
 若提交后连接断开、结果 unknown，先查 System 和原 job，不要立即重复创建多份大备份。只把确认完成并验证过的备份另行保管；保留配置和必要密钥的安全恢复方案，但不要将密钥公开。恢复演练应使用单独实例，不能直接拿日常数据试错。
 
@@ -55,7 +65,9 @@ After an unknown submission outcome, inspect the original job before creating du
 
 恢复属于离线操作：先停止该实例的 daemon 与相关采集会话，使用同一版本、同目录的 CLI/Hook，保留原数据和足够空间。`restore` 会校验候选，不是无条件覆盖；若无法建立当前删除账本边界，可能只返回 `historical_only`，不能称为已经激活恢复。
 
-Restore is offline: stop the daemon and relevant capture sessions, use matching CLI/Hook binaries, and retain the original data with sufficient free space. Restore validates its candidate rather than blindly overwriting. Missing current deletion-ledger authority can result in `historical_only`, not an activated restore.
+Restore is offline: stop the daemon and relevant capture sessions, use matching CLI/Hook binaries, and retain the original data with sufficient free space.
+
+Restore validates its candidate rather than blindly overwriting. Missing current deletion-ledger authority can result in `historical_only`, not an activated restore.
 
 ```sh
 evertrace --config /absolute/config.toml --restore /absolute/verified-backup
@@ -83,7 +95,11 @@ evertrace --config /absolute/config.toml --upgrade /absolute/candidate-package -
 
 执行前停止原实例并阅读输出要求；candidate package 包含同一构建的四个 Rust 核心程序；这不代表可选 Python Web 已完成装配。独立 Web 正在迁移，后续须显式组装并校验同包版本，普通 Host 安装/升级不得暗中安装 Web 依赖或启动 Web。`--check` 不是零写入的轻量 dry-run，会准备与验证候选；不带 live host 的检查不能代替实际发布资格。包升级不是修改 Cargo 依赖或自动下载 GitHub release。真实宿主验证的费用和第三方副作用边界见[安装指南](getting-started.md)。
 
-Stop the existing instance and follow reported prerequisites. A core candidate package contains all four matching Rust binaries; this does not establish optional Python Web packaging. Web migration is in progress; its component must be explicitly assembled/version-checked, never silently installed or started by Host installation/upgrade. `--check` is not a zero-write cheap dry run; it prepares and verifies candidates. A check without live host cannot establish publication eligibility. Package upgrade is neither dependency editing nor automatic release downloading. See [live-host precautions](getting-started.md).
+Stop the existing instance and follow reported prerequisites. A core candidate package contains all four matching Rust binaries; this does not establish optional Python Web packaging.
+
+Web migration is in progress; explicitly assemble/version-check its component. Host installation/upgrade must not silently install or start Web.
+
+`--check` is not a zero-write cheap dry run; it prepares and verifies candidates. A check without live host cannot establish publication eligibility. Package upgrade is not dependency editing or automatic release downloading; see [live-host precautions](getting-started.md).
 
 ## Forget、purge、GC 与导出 / Forget, purge, GC and export
 
@@ -94,6 +110,14 @@ Stop the existing instance and follow reported prerequisites. A core candidate p
 | Repository purge | 高影响的仓库范围清理；先查看实际范围、预览和确认，不等同于 disable。 / High-impact scoped cleanup; inspect the actual scope/preview/confirmation, not just disable. |
 | GC | 清理符合条件的无引用内容；不是任意缓存删除，也不保证立即回收所有磁盘。 / Eligible unreferenced-content cleanup, not arbitrary cache removal or immediate total reclamation. |
 | Export | 创建所选当前对象的可携带副本；不是完整数据库备份。 / Portable copies of selected current objects, not a whole-database backup. |
+
+Object Forget 删除对象及专属派生，并在默认检索中隐藏其专属来源。共享原证可以保留。显式来源审计应带 `[FORGOTTEN OBJECT SOURCE RETAINED]` 标记；Web 的遗忘确认和该审计入口尚未接入。
+
+Strict source erasure 尚未开放。需要擦除原始来源时，不要用 Object Forget、repository purge 或 GC 代替。
+
+Object Forget removes the object and its exclusive derivatives, suppressing exclusive refs in default retrieval. Shared evidence can remain. Explicit audit requires `[FORGOTTEN OBJECT SOURCE RETAINED]`; Web confirmation and retained-source audit integration are pending.
+
+Strict source erasure is not available. Object Forget, repository purge and GC do not erase all original sources.
 
 这些操作不能保证擦除你另存的导出、历史备份、原始宿主记录、远端模型日志或磁盘介质残留。保留副本的生命周期需自行管理。恢复历史备份也不能用来绕过已经生效的遗忘边界。
 
@@ -109,9 +133,13 @@ Select 1–64 actual current objects. Inspect publication status and paths. Expo
 
 ## 工作区恢复与卸载 / Worktree recovery and uninstall
 
-RecoveryBundle 用于受支持且明确选中的工作区恢复，不是全盘备份。由 TUI 查看 bundle、目标、当前状态和可用动作，再显式发起操作。普通 Post Hook 看到命令结束不能证明恢复成功；`unknown` 或 `partially_applied` 不能当成 `applied`，不要强制改状态或重复应用。
+RecoveryBundle 用于选定工作区的恢复。先核 bundle、目标和当前状态；Web 恢复写动作尚未接入，旧终端入口仍在迁移中。
 
-A RecoveryBundle supports selected worktree recovery, not whole-disk backup. Inspect the bundle, target, current state and available actions in TUI before explicitly applying it. A Post Hook observing command completion does not prove success. Do not treat `unknown`/`partially_applied` as `applied`, edit state or blindly reapply.
+普通 Post Hook 看到命令结束不能证明恢复成功；`unknown` 或 `partially_applied` 不能当成 `applied`，不要强制改状态或重复应用。
+
+A RecoveryBundle restores a selected worktree. Check the bundle, target and current state first. Web recovery writes are pending; the old terminal entry remains during migration.
+
+A Post Hook observing command completion does not prove success. Do not treat `unknown`/`partially_applied` as `applied`, edit state or blindly reapply.
 
 ```sh
 evertrace --config /absolute/config.toml --uninstall
@@ -119,4 +147,6 @@ evertrace --config /absolute/config.toml --uninstall
 
 卸载移除受管接线并在可用时停止/禁用受管服务，保留数据根；它不代表删除所有配置、备份、密钥或自行添加的 systemd drop-in。若受管文件被外部修改，先审查冲突，不直接覆盖。需要删除保留数据时，应另外明确目标并做好备份，而不是执行宽泛的递归删除。
 
-Uninstall removes managed wiring and stops/disables the managed service when available, preserving data. It does not mean every configuration, backup, credential or custom drop-in is deleted. Review externally modified managed files instead of overwriting them. Any later data deletion should have an explicit narrow target and backup plan.
+Uninstall removes managed wiring and stops/disables the managed service when available, preserving data. It does not mean every configuration, backup, credential or custom drop-in is deleted.
+
+Review externally modified managed files instead of overwriting them. Any later data deletion should have an explicit narrow target and backup plan.

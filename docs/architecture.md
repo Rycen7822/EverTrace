@@ -2,9 +2,9 @@
 
 [文档目录 / Documentation](README.md) · [使用 / Usage](usage.md) · [开发 / Development](development.md)
 
-本文解释当前产品的组件和使用边界，不是开发进度日志，也不把设计目标当成已交付保证。
+本文说明当前组件、数据流和正在迁移的部分。
 
-This guide explains current components and user-visible boundaries. It is not a development journal, and design goals are not delivery guarantees.
+Current components, data flow and migration status.
 
 ## 数据流 / Data flow
 
@@ -16,10 +16,12 @@ Supported host events / permitted session records
       daemon ingestion -> authoritative journal
               |
        current objects / relations / search projections
-              |                         |
-     bounded background jobs      scoped MCP reads / TUI
-      |                |
-   summaries     method proposals -> independent review
+              |                   |                  |
+     bounded background jobs   scoped MCP      finite native reads
+      |                |                             |
+   summaries     method proposals             Python Web backend
+                       |                             |
+              independent review                local browser
 ```
 
 Hook 是同步、轻量的采集入口，不打开 LanceDB，不等待后台 LLM，也不向宿主注入记忆正文。daemon 负责摄入、状态解释、后台任务、权限判断和写入。用户入口通过同一 daemon 访问，不再各自直接写数据库。
@@ -28,7 +30,9 @@ The Hook is a synchronous capture entry point. It does not open LanceDB, wait fo
 
 后台模型复用 Engine 的单一 `SemanticProvider`，显式选择 Chat Completions、Responses 或 Messages 的 wire 格式；共用 HTTP、并发、预算和业务 JSON 校验。协议差异不进入领域对象、持久化 schema、Hook 或 MCP 操作面；不增加 SDK、模型路由器、自动提供方回退或远程会话。配置与兼容限制见[后台模型](configuration.md#后台模型--background-model)。
 
-Background models share the Engine's `SemanticProvider`: explicit Chat Completions, Responses or Messages wire formats, with common HTTP, concurrency, budgets and application validation. Protocol differences do not enter domain objects, storage schemas, Hook or MCP actions. No SDK, model router, automatic provider fallback or remote conversation is added; see the [configuration guide](configuration.md#后台模型--background-model).
+Background models share the Engine's `SemanticProvider`: explicit Chat Completions, Responses or Messages wire formats, with common HTTP, concurrency, budgets and application validation.
+
+Protocol differences do not enter domain objects, storage schemas, Hook or MCP actions. No SDK, model router, automatic provider fallback or remote conversation is added; see the [configuration guide](configuration.md#后台模型--background-model).
 
 ## 模块职责 / Component responsibilities
 
@@ -40,37 +44,50 @@ Background models share the Engine's `SemanticProvider`: explicit Chat Completio
 | `evertrace-store` | SQLite 权威 journal/current/runtime/relations、Lance 派生检索、CAS 与持久化维护。 / Authoritative SQLite state, derived Lance search, CAS and persistence maintenance. |
 | `evertrace-engine` | 业务编排、摄入/归一、后台合成与复核、权限、检索、恢复及治理服务。 / Runtime orchestration, ingestion, background synthesis/review, authorization and services. |
 | `evertrace-protocol` | 本地协议 framing、握手、请求/响应、MCP schema 和 DTO。 / Local transport, handshake, envelopes, MCP schema and DTOs. |
-| `evertrace-tui` | 终端界面和事件处理；不拥有第二套领域规则。 / Terminal UI, without a second domain implementation. |
+| `evertrace-tui` | 迁移期保留的旧终端消费者，不是管理功能的目标入口。 / Retained terminal consumer during migration, not the target management UI. |
 | `evertrace-hook` | 同步 Hook 可执行程序。 / Synchronous capture executable. |
 | `evertraced` | daemon 入口、信号与服务接线。 / Daemon entry point, signals and service wiring. |
-| `evertrace-cli` | `evertrace` 的 CLI、MCP stdio 与 TUI 启动入口。 / CLI, MCP stdio and TUI launcher. |
+| `evertrace-cli` | CLI、MCP stdio 和显式 `--web` 分派；旧 TUI 入口待退役。 / CLI, MCP stdio and explicit Web dispatch; the old TUI entry remains pending retirement. |
+| `webui/`（Python 包） | 按需管理应用后端、页面读模型、HTTP/会话、模板与静态资源。 / On-demand management backend, page read models, HTTP/sessions, templates and assets. |
 | `evertrace-testkit` | 集成测试及必要的测试支持，不是生产控制器。 / Integration tests/support, not a production controller. |
 
 ## Web 呈现边界（迁移中） / Web presentation boundary (migration)
 
-旧 `crates/evertrace-web/` 的 Rust HTTP/静态资源内嵌实现及未提交 G3 扩展已按用户确认回撤；当前产品代码保留 `cf4736a` 的正式 CLI，并已接入显式按需的 `--web` 启动链。独立 `webui/` Python 包已建立基础只读竖切（CLI exec/隔离组件装配已验证，完整迁移未完成），经受保护 UDS 调用原 Rust daemon；页面控制、模板、会话和窄 IPC 适配归 Python，领域规则、配置权威、数据权限与唯一 writer 留在 Rust。HTML/CSS/字体和必要 JavaScript 独立维护，修改 Web 不要求 Cargo。不把规划路径、接口通过或规范更新当成迁移交付。
+`evertrace --web` 显式启动匹配版本的独立 `webui/` Python 包。Python 不只是静态资源服务器：它组织管理页面的读模型、内容分段和导航，经受保护 UDS 调用 Rust 的有限数据读取。HTML/CSS/字体和必要 JavaScript 外置，修改 Python 或页面不要求 Cargo。
 
-The embedded Rust Web implementation and uncommitted G3 extensions have been rolled back. Product code retains the accepted flag-based CLI checkpoint, and now dispatches explicit `--web` to the matching isolated Python component. An independent Python package now has a basic read-only slice over the protected UDS, with verified CLI exec/assembly but unfinished complete migration; Rust retains business, configuration, authorization and the single writer. Templates/static assets and Python Web edits must not require Cargo. A target path, working backend interface or specification update is not a completed cutover.
+Rust 保留正常 Agent 使用所需的摄入、领域计算、权限/来源/删除门、检索、恢复及单 writer。分页字段、内容窗口与资格判定由原数据 owner 提供，Python 不直开 SQLite、LanceDB 或 CAS，也不另建业务真源。
 
-`--web` 仅按需启动版本匹配的 Python Web 组件，不自动安装依赖或启用服务。未启动时核心入口不导入 Web、不读页面/字体、不建立 Web worker/listener/session/timer/cache/poller；Web 组件缺失不影响普通 CLI、TUI、MCP、Hook 或 daemon。最小启动器和共享人类业务协议保留在 Rust，不等于加载 Web 运行时。当前基础只读竖切已有短窗口进程/PSS/RSS/CPU与退出回收证据，仍须随完整功能重做同量验收；不能从文件大小推算内存收益。
+Explicit `evertrace --web` starts the matching independent Python package. Python owns management read models, content navigation, HTTP/sessions and templates/assets, using finite native reads over the protected UDS. Web edits do not require Cargo.
 
-Only explicit `--web` starts the version-matched Python component, without implicit installation or a service. With Web absent/inactive, core modes must not import/preload it or create Web resources. Minimal Rust launch dispatch and shared human protocol are not a Web runtime. The basic read-only slice has short-window process/PSS/RSS/CPU/reclamation evidence; repeat full equal-work qualification as the remaining features are connected.
+Rust retains the normal Agent core, domain eligibility, authorization, source/deletion gates, recovery and the single writer. Python neither opens native storage nor becomes another authority.
+
+记忆、来源和多类工作/研究记录已接入只读路径。管理写动作、剩余 Rust 页面逻辑和 TUI 退役、完整打包及资源验收仍在进行。
+
+Read-only memory, source and multiple work/research paths are connected. Management writes, remaining Rust presentation/TUI retirement, packaging and resource acceptance are in progress.
+
+不运行 `--web` 时，不启动 Python Web 进程，也不加载页面资源或建立 Web 缓存、监听器和后台任务。核心入口可在没有 Web 组件的情况下运行。完整功能接入后的进程、内存和 CPU 三态测量仍待完成。
+
+Without `--web`, core modes run without Python Web processes, assets, caches, listeners or background tasks. Full before/during/after resource measurements remain pending.
 
 ## 持久化与身份 / Persistence and identity
 
-当前权威存储是嵌入式 SQLite：`evertrace.sqlite` 中的 `evertrace_journal` 保存唯一 append-only command/event journal，objects、runtime、relations 与必要索引由原单 writer 维护。`evertrace_search.lance/` 仅保存可重建的 exact/FTS/vector 检索派生投影。CAS 保存受保护 payload；不要求外部 Redis/数据库服务，不宣称 SQLite、Lance 与 CAS 之间存在通用跨存储原子事务，在线客户端也不能绕过 daemon 直开这些存储。
+`evertrace.sqlite` 保存权威 journal、current、runtime 和 relations，由单 writer 维护。`evertrace_search.lance/` 保存可重建的检索投影，CAS 保存受保护内容。客户端统一经 daemon 访问。
 
-Embedded SQLite is authoritative: `evertrace.sqlite` holds the sole append-only command/event journal and writer-owned objects/runtime/relations/indexes. `evertrace_search.lance/` contains rebuildable exact/FTS/vector search projections only; CAS holds protected payloads. No external Redis/database service or general cross-storage atomicity is claimed. Online clients access these stores through the daemon, not directly.
+Embedded SQLite is authoritative: `evertrace.sqlite` holds the sole append-only command/event journal and writer-owned objects/runtime/relations/indexes. `evertrace_search.lance/` contains rebuildable exact/FTS/vector search projections only; CAS holds protected payloads.
 
-逻辑对象使用真正的 UUIDv7，不以路径、文本或 digest 冒充身份。内容 digest 只用于具名的完整性/引用/去重消费者。revision 和历史证据保留，current 可推进；正常增量投影校验当前自洽和 delta，历史完整性复核需要相应 replay/rebuild，不等于每次读取扫描全部历史。
+Clients access storage through the daemon. No separate database service is required.
 
-Logical objects use genuine UUIDv7 IDs, not paths or content hashes masquerading as identity. Digests serve specific integrity/reference/deduplication consumers. Revisions/history are retained while current state advances. Incremental checks are not a claim that every read replays all history.
+Task、Workstream、Atom 等使用 UUIDv7，来源记录按各自的来源身份规则生成 ID。digest 用于内容校验和引用。状态通过 revision 推进，历史保留。
+
+Task, Workstream and Atom use UUIDv7 IDs; source records use their source-identity rules. Digests support content verification and references. Current state advances through revisions while history is retained.
 
 ## 记忆、方法与权限 / Memory, methods and authority
 
 来源摘要保存决策、经验、待办和结果，是有价值的记忆，不要求先变成正式 Atom/Procedure。基本来源摘要不需要前台补造 Task/Attempt。方法提议独立生成，后续根据新的相关来源复核；LLM 不能直接自授发布、删除或策略权限。
 
-Source summaries preserve decisions, lessons, open items and results as useful memory without first becoming formal Atom/Procedure assets. Basic source summaries do not require invented Task/Attempt state. Method proposals are generated independently and reviewed against new relevant sources; the model cannot grant publication, deletion or policy authority to itself.
+Source summaries preserve decisions, lessons, open items and results as useful memory without first becoming formal Atom/Procedure assets. Basic source summaries do not require invented Task/Attempt state.
+
+Method proposals are generated independently and reviewed against new relevant sources; the model cannot grant publication, deletion or policy authority to itself.
 
 区分这些结论： / Keep these conclusions separate:
 
@@ -80,7 +97,7 @@ Source summaries preserve decisions, lessons, open items and results as useful m
 - 原始记录、README、注释、普通指令文件和检索正文不能自授长期规范性权限。 / Source text and retrieved content cannot grant themselves long-term policy authority.
 - 删除、撤销、当前版本、信任和 scope 在读取时仍生效；旧摘要不是绕过这些边界的副本。 / Current deletion, revocation, version, trust and scope checks still apply to derived memory.
 
-## 哪些保证不能依赖 / Guarantees not established
+## 当前状态 / Current status
 
 | 能力 / Capability | 当前边界 / Current boundary |
 |---|---|
@@ -92,9 +109,9 @@ Source summaries preserve decisions, lessons, open items and results as useful m
 | 真实模型与检索质量 / Real model/retrieval quality | 确定性测试不证明自然环境效果；高级检索诊断算子不等于已经验收的生产配置。 / Deterministic tests and diagnostic operators are not real-world quality qualification. |
 | Recovery | 仅支持明确目标、合法输入和验证链；未知/部分结果必须保留。 / Only supported selected targets/inputs with verification; unknown/partial outcomes stay explicit. |
 
-当前普通生产检索使用基础 A 路径；B–E 高级组合及 F 方法效果层没有已测 release-quality 资格。不要把研究/诊断代码存在理解为用户可通过新增配置随意启用。公开指南不要求用户修改宿主源码或日常手动维护记忆。
+当前生产检索走 A 路径；B–E 与 F 效果层尚未完成发布验收。正常使用无需修改宿主源码或逐条手工整理记忆。
 
-Ordinary production retrieval uses the base A path. Advanced B–E combinations and the F method-effect layer lack measured release-quality qualification. Diagnostic code is not an invitation to invent configuration switches. These guides require neither host source patches nor routine manual memory bookkeeping.
+Production retrieval uses A. B–E and the F effect layer are not release-qualified. Normal use needs neither host source patches nor per-record memory bookkeeping.
 
 进一步实现定位见 [workspace](../Cargo.toml)、[Engine](../crates/evertrace-engine/src/lib.rs)、[Store](../crates/evertrace-store/src/lib.rs) 和 [MCP schema](../crates/evertrace-protocol/src/mcp.rs)。
 

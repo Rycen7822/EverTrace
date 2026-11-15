@@ -8,19 +8,25 @@ Rust 精确固定为 `1.97.1`，workspace edition 为 2024；不要用浮动 sta
 
 Rust is pinned to `1.97.1`, with workspace edition 2024. Do not substitute floating stable or a dependency's MSRV. Preserve Cargo.lock and use `--locked` for builds/checks/tests. See [build prerequisites](getting-started.md).
 
-源码按[架构职责](architecture.md)分包。改行为前阅读真正决定行为的调用方、实现和直接消费者；搜索只能帮助定位。优先修现有逻辑、复用现有抽象，只增加当前需求必需的局部逻辑。不为提高“完整度”新增 controller、schema、hash registry、配置层或相同逻辑的双轨实现。
+源码按[架构职责](architecture.md)分包。修改前读调用链和消费者，在原 owner 中修根因。保持代码精简可读，单行不超过 150 字符。
 
-Read the deciding caller, implementation and consumer before editing behavior. Search is navigation, not understanding. Prefer a root-cause fix in existing code; add only what a current requirement needs. Do not build controllers, schemas, hash registries, configuration layers or duplicate paths for theoretical completeness.
+Follow the caller and consumer, then fix the root cause in its existing owner. Keep code readable and lines within 150 characters.
 
 ## 独立 Web 工程（迁移中） / Independent Web component (migration)
 
-独立 Web 工程为 `webui/`：Python 3.12+ 负责 HTTP/session、页面控制/模板与窄 UDS 适配，HTML/CSS/字体和必要 JavaScript 外置。Rust 核心保留领域、配置、协议和单 writer；Python 不直开数据库/CAS，不加载 Engine/Store FFI。旧 Rust Web 与 G3 未提交实现已回撤，保留已验收 CLI；Python 包已建立并以真实 daemon/浏览器验证基础记忆/详情/状态竖切；正式 `--web` exec 与 wheel/editable 隔离组装已验证，完整生命周期/资源验收仍未完成，不把历史 G3 日志当成当前能力。
+`webui/` 是独立 Python 3.12+ 管理应用后端，负责页面读模型、HTTP/session、模板和窄 UDS 客户端，HTML/CSS/字体及必要 JavaScript 外置。Rust 保留正常 Agent 内核、领域资格、配置权威、权限/来源/删除门和单 writer；Python 不直开数据库/CAS，不加载 Engine/Store FFI。
 
-The independent `webui/` component owns Python HTTP/session/presentation and a narrow UDS client, with separate templates/static assets. Rust retains business, config, protocol and writer authority; no Python database/CAS access or Engine/Store FFI. The Rust Web implementation and uncommitted G3 work have been rolled back; the new package has a real daemon/browser-verified basic read-only slice. Formal CLI exec and wheel/editable isolated assembly are verified; complete lifecycle/resource acceptance remains unfinished; historical G3 logs are not current capabilities.
+The independent Python component owns management read models, HTTP/session, templates and a narrow UDS client. Rust retains the normal Agent core and data/command authority. Python does not open native storage or load Engine/Store FFI.
 
-Web 修改不应要求 Cargo。开发态 wheel 已验证：`conda run -n test uv build --project webui --wheel --out-dir .work/ui/cli-webui-integration/pyweb-dist`；依赖由 `webui/uv.lock` 锁定并以 `uv export --locked` 供安装命令消费。组件须用下面的显式组装步骤准备，不能把 wheel 构建当作安装或完整迁移验收。仓库 Python/uv/pytest 都在 Conda `test` 中运行，产品不依赖 Conda。仅显式 `--web` 启动一个前台 worker，无 reload/watch/preload；普通 Rust 入口不探测/导入 Web。覆盖未启动、等量真实工作、退出回收的进程与 PSS/RSS/CPU，不按二进制大小猜内存。
+Web 修改不应要求 Cargo。可在 Conda `test` 中构建 wheel，例如：
 
-Web edits must not require Cargo. The development wheel build above is verified; `uv export --locked` consumes the dependency lock for installation. Prepare the same-package isolated component explicitly as below; wheel build alone is not installation or complete migration acceptance. Repository Python/uv/pytest use Conda `test`, not a product Conda requirement. Production starts one worker only on explicit `--web`, without reload/watch/preload; ordinary modes never probe/import Web. Measure processes/PSS/RSS/CPU before, during equal work and after exit.
+```sh
+conda run -n test uv build --project webui --wheel --out-dir .work/build/webui-wheel
+```
+
+依赖使用 `webui/uv.lock`。构建后按下一步显式组装组件。仓库 Python/uv/pytest 使用 Conda `test`，产品运行不依赖 Conda。
+
+Web edits do not require Cargo. Build in Conda `test`, then assemble the component using its dependency lock. The product itself does not require Conda.
 
 可选组件初次组装（路径为占位参数，目标包需已有同版本 `bin/evertrace` 与 `bin/evertraced`）：
 
@@ -30,13 +36,25 @@ conda run --no-capture-output -n test python -B webui/assemble.py \
   --wheel /absolute/evertrace_web-0.0.0-py3-none-any.whl
 ```
 
-开发时用 `--editable` 替代 `--wheel ...`，指向本仓 `webui/` 源码。已存在的组件拒绝覆盖，不应对运行中或真实用户包直接重装；正式用户安装仍是单独授权步骤。环境位于 `<package>/webui/`，Rust 仅在 `--web` 用该环境的 `bin/python -I bin/evertrace-web`，不执行 shell，不查 PATH；pipe 传已解析上下文后 exec，改源码/模板后单独重启 Web。指定的基础 Python 3.12+ 必须继续存在；这不是跨机器自包含 Python 分发包。只有显式组装调用 uv/锁定依赖安装，核心/Host 安装与运行入口不调用本工具。
+开发时用 `--editable` 替代 `--wheel ...`，指向本仓 `webui/` 源码。已存在的组件拒绝覆盖，不应对运行中或真实用户包直接重装；正式用户安装仍是单独授权步骤。
 
-Initial optional assembly above requires matching native binaries and an explicit Python 3.12+ base. Use `--editable` for source development. Existing environments are not overwritten; this is not authorization to install/reconfigure a live user package. The base Python remains an explicit runtime prerequisite, not a Conda or self-contained/relocatable-Python claim. Runtime uses only the package's fixed isolated interpreter/managed entry, without shell, PATH search or dependency installation.
+环境位于 `<package>/webui/`，Rust 仅在 `--web` 用该环境的 `bin/python -I bin/evertrace-web`，不执行 shell，不查 PATH；pipe 传已解析上下文后 exec，改源码/模板后单独重启 Web。
 
-当前资格范围：真实 CLI/wheel/editable 装配和浏览器读链、bootstrap/空闲/绝对期限（私有故障时钟，不是墙钟跑八小时）、多标签退出、真实私有 X11 隐藏暂停、daemon 断连清空和兼容重启恢复已验证。三态资源仅覆盖 35 条记录、6,668 字符详情与六秒采样窗口；分别计入 Rust、Python、浏览器，退出无 owned Web 进程/listener，不能推算旧实现收益或冒完整功能/长时负载验收。当前来源权限也已沿实际目录/捕获/导入/writer、原生 Hook、CLI 与浏览器验证：无当前观测先拒绝、获得观测后可读、撤权立即拒绝并清旧正文、显式恢复后同固定修订重新可读。后续 G3–G7 仍需相应真实行为证明。
+指定的基础 Python 3.12+ 必须继续存在；这不是跨机器自包含 Python 分发包。只有显式组装调用 uv/锁定依赖安装，核心/Host 安装与运行入口不调用本工具。
 
-Qualification is scoped: current read-only fixtures and short resource windows, not an eight-hour soak, a Rust-versus-Python benchmark or complete feature acceptance. The current source-linked memory path also has native Hook/CLI/browser evidence for fail-closed absent observation, revocation and explicit restoration of the same immutable revision. Remaining product workflows still require their own real-consumer evidence.
+Initial optional assembly above requires matching native binaries and an explicit Python 3.12+ base.
+
+Use `--editable` for source development. Existing environments are not overwritten; this is not authorization to install/reconfigure a live user package. The base Python remains an explicit runtime prerequisite, not a Conda or self-contained/relocatable-Python claim.
+
+Runtime uses only the package's fixed isolated interpreter/managed entry, without shell, PATH search or dependency installation.
+
+仅显式 `--web` 启动一个前台 worker，无 reload/watch/preload；普通 Rust 入口不探测/导入 Web。以未启动、等量真实工作和退出回收三态分别计入 Rust、Python、浏览器的进程/PSS/CPU，不能按二进制大小猜内存。
+
+现有检查覆盖组件组装、只读页面、会话期限、隐藏暂停、断连及兼容重启。来源和独立工作范围有私有 Native/Hook、CLI、浏览器验证。普通宿主、完整负载与长时资源验收仍待完成；逐次结果记在实施笔记，不放本指南。
+
+Only explicit `--web` starts a worker, without reload/watch/preload. Measure Rust, Python and browser processes/PSS/CPU before, during equal completed work and after exit.
+
+Checks cover assembly, read paths, sessions and restart. Private source controls are available; ordinary Host, full-workload and long-run resource acceptance remain pending.
 
 临时互通、浏览器与内存探针留在 `.work/`，不复制进永久 suite。迁移时保留原检查所保护的安全/恢复义务，不为临时探针保留旧 Web fallback；永久测试只保护已接受且值得长期维护的行为。
 
@@ -63,7 +81,9 @@ systemd-run --user --scope -p CPUQuota=400% -p MemoryHigh=12G -p MemoryMax=16G -
 
 预留操作系统和其他任务的资源；碰到 OOM、exit 137 或 WSL 崩溃，先检查实测原因，不自动提高限额。CPU quota 是 CPU 时间配额，不是限制只能创建四个线程。命令 RSS 不代表整个进程组的峰值。无 systemd 时可保留串行策略并使用环境已有的资源约束，不为了跑检查随意改 WSL 全局设置。
 
-Leave headroom for the OS and other work. Investigate OOM/exit 137/WSL crashes before raising limits. CPU quota limits CPU time, not thread count. A command's RSS is not necessarily the process group's peak. Without systemd, retain serial execution and available platform controls; do not casually change global WSL settings.
+Leave headroom for the OS and other work. Investigate OOM/exit 137/WSL crashes before raising limits. CPU quota limits CPU time, not thread count.
+
+A command's RSS is not necessarily the process group's peak. Without systemd, retain serial execution and available platform controls; do not casually change global WSL settings.
 
 ### Linux 可选链接器：mold / Optional Linux linker: mold
 
@@ -73,7 +93,9 @@ mold is an opt-in local Linux development linker, not a compiler cache or a work
 
 可使用发行版的软件包，例如 Debian/Ubuntu 的 `sudo apt-get install mold`；也可从[官方 release](https://github.com/rui314/mold/releases)获取对应架构的预编译包，先核对发布的 SHA-256。发行版版本未必是下面实测的 3.0.0。安装后检查实际 Rust、驱动和链接器版本：
 
-Use your distribution's package, for example `sudo apt-get install mold` on Debian/Ubuntu, or an architecture-matched [official release](https://github.com/rui314/mold/releases), verifying its published SHA-256 before use. Distribution packages may differ from the measured 3.0.0. Check the actual Rust, driver and linker versions:
+Use your distribution's package, for example `sudo apt-get install mold` on Debian/Ubuntu, or an architecture-matched [official release](https://github.com/rui314/mold/releases), verifying its published SHA-256 before use.
+
+Distribution packages may differ from the measured 3.0.0. Check the actual Rust, driver and linker versions:
 
 ```sh
 rustc +1.97.1 -vV
@@ -84,7 +106,11 @@ command -v ld.mold
 
 下面仅用于本机 GNU/Linux 构建，要求 `cc` 是 GCC 12.1 或更新版本，且 `ld.mold` 可从 PATH 找到。旧 GCC、交叉编译或其他驱动需先按[上游说明](https://github.com/rui314/mold/tree/v3.0.0#how-to-use)核对，不直接套用。子 shell 退出即恢复原环境；保留已有 RUSTFLAGS，若设置了优先级更高的 `CARGO_ENCODED_RUSTFLAGS`，先停止并在原配置中正确合并，不清空它来绕过检查：
 
-The example is for native GNU/Linux with `cc` using GCC 12.1 or newer and `ld.mold` on PATH. Consult the [upstream instructions](https://github.com/rui314/mold/tree/v3.0.0#how-to-use) before using older GCC, cross-compilation or other drivers. The subshell restores the environment on exit and preserves existing RUSTFLAGS. If higher-priority `CARGO_ENCODED_RUSTFLAGS` is set, stop and merge the option correctly into that configuration rather than clearing it:
+The example is for native GNU/Linux with `cc` using GCC 12.1 or newer and `ld.mold` on PATH. Consult the [upstream instructions](https://github.com/rui314/mold/tree/v3.0.0#how-to-use) before using older GCC, cross-compilation or other drivers.
+
+The subshell restores the environment on exit and preserves existing RUSTFLAGS. If higher-priority `CARGO_ENCODED_RUSTFLAGS` is set, stop and merge the option correctly into that configuration rather than clearing it:
+
+
 
 ```sh
 (
@@ -100,7 +126,9 @@ The example is for native GNU/Linux with `cc` using GCC 12.1 or newer and `ld.mo
 
 首次更改 RUSTFLAGS 可能让 Cargo 重编依赖，不能拿这一轮与另一链接器的热构建比较。若依赖已准备齐，可加 `--offline`。从 Cargo 的 `Executable` 输出取得实际测试程序路径，再检查 `.comment` 中是否有 mold 标识；只看 `mold --version` 不能证明该程序由它链接：
 
-Changing RUSTFLAGS can rebuild dependencies; do not compare that first build against another linker's warm build. Add `--offline` if dependencies are already available. Take the actual test-executable path from Cargo's `Executable` output and inspect `.comment` for mold's identification; `mold --version` alone does not establish which linker produced a binary:
+Changing RUSTFLAGS can rebuild dependencies; do not compare that first build against another linker's warm build.
+
+Add `--offline` if dependencies are already available. Take the actual test-executable path from Cargo's `Executable` output and inspect `.comment` for mold's identification; `mold --version` alone does not establish which linker produced a binary:
 
 ```sh
 readelf -p .comment /absolute/path/to/test-executable
@@ -108,7 +136,9 @@ readelf -p .comment /absolute/path/to/test-executable
 
 **已知证据的范围。** [Issue #3](https://github.com/Rycen7822/EverTrace/issues/3) 报告了 `09589e2`、Linux x86_64、Rust 1.97.1、上述测试和默认 dev/test profile 下的观察，单 job、关闭增量、串行测试，每种链接器三次。以下是该 issue 的中位数，不是本机或当前提交重新测得的结果：
 
-**Evidence boundary.** [Issue #3](https://github.com/Rycen7822/EverTrace/issues/3) reports `09589e2` on Linux x86_64, Rust 1.97.1, this test and the default dev/test profile, with one build job, incremental compilation off, serial tests and three runs per linker. These are the issue's medians, not new measurements on this machine or commit:
+**Evidence boundary.** [Issue #3](https://github.com/Rycen7822/EverTrace/issues/3) reports `09589e2` on Linux x86_64, Rust 1.97.1, this test and the default dev/test profile, with one build job, incremental compilation off, serial tests and three runs per linker.
+
+These are the issue's medians, not new measurements on this machine or commit:
 
 | 测量 / Measurement | Bundled LLD 22.1.6 | mold 3.0.0 | 中位数缩短 / Median reduction |
 |---|---:|---:|---:|
@@ -117,11 +147,17 @@ readelf -p .comment /absolute/path/to/test-executable
 
 该实验冷 LLD 构建约 779 秒，最后链接约 2.86 秒；没有完整冷 mold 构建结果，因此不能宣称冷构建提速 33%/47%。全 workspace、release、Windows/MSVC、其他硬件及峰值内存收益均未证明，也不宣称程序运行更快；mold 默认 fork 时只统计父进程 RSS 尤其不完整。复测按 issue 固定 wrapper 路径与 RUSTFLAGS、只切换实际链接器、保留依赖并真实触发源码重编译，交错多次比较，不把 Cargo 无操作耗时当重构建。
 
-The cold LLD build took about 779 seconds, with about 2.86 seconds in the final link. No complete cold mold build was measured, so this is not a 33%/47% cold-build gain. Full workspace, release, Windows/MSVC, other hardware and peak-memory gains remain unproven; no runtime speedup is claimed. Parent-only RSS is especially incomplete with mold's default fork behavior. For comparisons, follow the issue's fixed wrapper path/RUSTFLAGS, switch only the actual linker, retain dependencies, force real source recompilation and interleave repeated runs; no-op Cargo timings are not rebuild measurements.
+The cold LLD build took about 779 seconds, with about 2.86 seconds in the final link. No complete cold mold build was measured, so this is not a 33%/47% cold-build gain.
+
+Full workspace, release, Windows/MSVC, other hardware and peak-memory gains remain unproven; no runtime speedup is claimed. Parent-only RSS is especially incomplete with mold's default fork behavior.
+
+For comparisons, follow the issue's fixed wrapper path/RUSTFLAGS, switch only the actual linker, retain dependencies, force real source recompilation and interleave repeated runs; no-op Cargo timings are not rebuild measurements.
 
 该 issue 的原始 LLD 及所有重链接测试程序均为 **6 过、1 失败**，失败项是 `corrupt_derived_probe_table_fails_open`，根因未确定；不能称整个目标全绿，也不能跳过或弱化断言来采用链接器。上面的 `--no-run` 只生成测试程序：实际验证时去掉它运行同一命令，检查测试结果和最终退出码。
 
-The issue's original LLD and all relinked test binaries reported **six passed, one failed**: `corrupt_derived_probe_table_fails_open`, with root cause unresolved. This is not a passing target, and adopting a linker must not skip or weaken the assertion. The example's `--no-run` only builds the test executable; remove it to run the same command and inspect the tests and final exit status.
+The issue's original LLD and all relinked test binaries reported **six passed, one failed**: `corrupt_derived_probe_table_fails_open`, with root cause unresolved.
+
+This is not a passing target, and adopting a linker must not skip or weaken the assertion. The example's `--no-run` only builds the test executable; remove it to run the same command and inspect the tests and final exit status.
 
 ## 最小充分验证 / Proportionate verification
 
@@ -147,9 +183,9 @@ CARGO_BUILD_JOBS=1 CARGO_INCREMENTAL=0 RUST_TEST_THREADS=1 cargo +1.97.1 test --
 
 Fault-injection tests may deliberately launch failing children, including corrupted Lance-manifest cases. Inspect the parent assertion, complete suite and Cargo exit status. A previously expected FAILED line does not make a new failure acceptable.
 
-不要全局添加 `--ignored`：保留旧 Hook 实物的测试和验收报告 collector 有明确前置条件。缺少旧二进制不能用新编译程序冒充；collector 消费已有验收材料，不是普通使用或编译所必需。公开源码的正常 Cargo 验证不应要求创建私有编排记录。
+运行 ignored 测试前，先准备其列明的输入，包括要求的旧 Hook 二进制。验收 collector 消费已有证据，不属于普通构建步骤。
 
-Do not indiscriminately use `--ignored`. Tests requiring retained old Hook artifacts and the acceptance collector have explicit prerequisites. A newly built binary is not a historical artifact; the collector consumes existing evidence and is not needed for normal use/builds. Public Cargo verification should not require private orchestration records.
+Run ignored tests only after preparing their stated inputs, including any required old Hook binary. The acceptance collector reads existing evidence and is separate from normal builds.
 
 ## 缓存与运行数据 / Caches versus runtime data
 
@@ -176,6 +212,8 @@ Public entry points are the English and Chinese READMEs and `docs/` guides. Keep
 
 Maintainers running Python repository tools use `conda run -n test ...`; users running binaries do not need Conda. Review the actual diff and staging before committing. Do not force-add private archives, credentials, runtime data or notes, and preserve unrelated work.
 
-新增测试应证明本次行为回归，优先一个聚焦正例和必要的关键失败路径。测试不能自行创造产品需求，也不应为一个局部行为建立更大的测试框架。报告中分开写本地修改、实际验证和提交/推送/发布状态，不将本地通过冒充真实宿主或模型质量验收。
+优先复用最近的现有检查。一次性探针放 `.work`；长期需要保护的行为才增加永久测试。交付时分开列出修改、验证、commit/push 与发布状态。
 
-Add focused regression tests for changed behavior, with critical negatives where needed. Tests must not invent requirements or justify a disproportionate framework. Separate local changes, actual verification, commit/push and release status; local passing tests do not qualify a real host or model quality.
+Reuse the closest existing checks. Keep one-off probes under `.work`; add permanent tests only for continuing behavior that needs protection.
+
+Report local changes, verification, commit/push and release separately.

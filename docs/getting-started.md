@@ -106,12 +106,11 @@ Confirm `llm.enabled = false`. The trial data directory is `~/.local/share/evert
 
 ```sh
 ./target/debug/evertrace --config "$HOME/.evertrace/config.toml" --doctor
-./target/debug/evertrace --config "$HOME/.evertrace/config.toml" --tui
 ```
 
-daemon 启动会创建本地运行数据。这一步没有接入宿主，空数据和 `host_canary=not_run` 是正常现象。TUI 的 `q` 只退出界面；在 daemon 所在终端按 Ctrl-C 才会请求关闭服务。不要同时为同一数据目录启动第二个 daemon。
+daemon 启动后，空数据和 `host_canary=not_run` 是正常现象，此时尚未接入宿主。在原终端按 Ctrl-C 停止 daemon；同一数据目录只运行一个 writer。
 
-Starting the daemon creates local runtime data. Host integration has not happened yet: an empty instance and `host_canary=not_run` are expected. `q` closes the TUI, not the daemon; Ctrl-C in the daemon terminal requests shutdown. Never start a second writer on the same data directory.
+An empty instance and `host_canary=not_run` are expected before host integration. Ctrl-C in the original terminal stops the daemon. Run one writer per data directory.
 
 Web 是可选组件，须先显式完成[同包隔离组装](development.md#独立-web-工程迁移中--independent-web-component-migration)，再运行以下入口。仅 Cargo build 不会安装 Python Web；缺组件会明确失败，不影响非 Web 模式。
 
@@ -123,43 +122,9 @@ Explicitly assemble the optional same-package Python component before this entry
 
 使用打印的一次性本机链接，不要分享该凭据。入口、安全边界和会话期限见[使用方法](usage.md#本机网页--local-webui)。
 
-Python 网页目前只读接入当前版本元数据列表、原生种类/Atom 状态轴筛选、录入顺序分页/计数及当前修订的原生事件/录入时间窗。原生 Task/Repository/Worktree 目录支持关联范围选择，global 需显式包含。计数不等于可读正文数量。
+网页已接入记忆、来源及多类工作记录的只读浏览、原修订分段和历史导航。来源正文每次重查权限，写操作和其余页面仍在接入。具体入口、分页和时间口径见[使用方法](usage.md#本机网页--local-webui)。
 
-可读条目展示经过权限检查的已有标题、短摘录和生成来源标记，并提供语义正文及原修订语义值分段。分段按钮按需读取，每段至多 8 KiB，并复验当前权限。没有后台模型，也能读取已有记忆。
-
-范围目录使用原生候选窗口和直接来源权限输入，不读取其它记忆正文。列表选页在原生 typed 记录上完成完整筛选和计数后才物化选中页。不过，摘录、历史和正文仍有全快照成本，完整资源资格尚待验收。
-
-详情可打开同对象的修订历史，每页 32 条。选版后按 exact revision 重新检查权限，不回退 current。还可沿原生精确引用阅读来源与直接关联，查看保护后的文本归档区间，再返回原修订；缺失字段和预览都明确标注，不作为全文。
-
-同一逻辑记忆可固定左侧修订，再从历史选右侧，由原生端重新检查两侧权限并逐字段比较，每页 8 项。缺失、null 和过大字段分别标明，完整值沿原分段入口读取。
-
-来源页只读原生已登记目录，分别展示同一 Session 的多个来源及其访问意图、导入状态、归档水位和 job。浏览不会扫描、批准或导入，也不把目录状态当作正文许可或整份导入完成。
-
-来源页也可选择保留的 exact 归档修订，分页读取原生记录、按序号区间定位，再沿精确引用打开受保护正文。返回恢复原记录页及视口；缺呈现字段不补预览，修订列表不表示正文许可，改写或原文件离线也不把旧归档替换成 current。
-
-记录的其它筛选、完整关联、完整范围/来源过滤、生成/来源消息等其它时间口径、搜索、非文本/捕获/制品区间及其余页面仍待闭合。
-
-Use the printed one-time local link and keep it private.
-
-The Python page currently reads Native metadata lists, kind/Atom-axis filters, recording-order pages/counts and current-revision native event/ingestion windows. The typed scope directory supports explicit associations and opt-in Global assets. A record count is not a readable-body count.
-
-Readable entries have permission-checked stored titles/excerpts, summary provenance and semantic details. Semantic ranges reopen the original revision, with at most 8 KiB returned per chunk. Existing memories remain readable without a background model.
-
-Scope-directory reads use finite candidate windows and direct permission facts, not all unrelated bodies.
-
-Memory-page selection filters/counts borrowed canonical records before materializing the selected page.
-
-Previews, history and content still have full-snapshot costs; final resource qualification remains pending.
-
-Details provide same-object history, exact-revision comparison, source/dependency references and protected textual source ranges. Their current access gates remain active, and returning restores the original revision and viewport. Missing presentation and previews remain explicitly missing.
-
-The source directory preserves separate source instances per logical session.
-
-It shows recorded access/import state, archive watermarks and the current job without scanning, approving or importing.
-
-Exact retained archive revisions lead to indexed record pages and protected content; source replacement or an offline original file does not substitute current content for an old archive.
-
-Further record filters, complete lineage/scope/source filtering, full search, non-text/capture/artifact ranges and the remaining pages are still unfinished. For entry points and security boundaries, see [Usage](usage.md#本机网页--local-webui).
+The Web component reads memories, sources and multiple work records, with exact-revision ranges and history navigation. Writes and remaining pages are in progress. See [Usage](usage.md#本机网页--local-webui) for filters, paging and content controls.
 
 ## 5. 启用后台模型 / Enable background model processing
 
@@ -230,7 +195,7 @@ A later session reuses the persisted version without relabeling an accepted draf
 
 1. 在一个非敏感、已按宿主正常流程信任的测试仓库中开启新会话，确认 EverTrace MCP 工具被发现。 / Start a new session in a non-sensitive repository trusted through the normal host workflow; confirm the EverTrace MCP tool is discovered.
 2. 正常讨论一个具体决策或失败经验，不需要额外 add/organize 记账。 / Discuss a concrete decision or lesson normally; no extra add/organize bookkeeping is required.
-3. 在 TUI Explorer/System 检查实际采集记录、会话正文许可和后台任务。来源格式、权限和归属不满足时，不会凭空生成摘要。 / Inspect captured records, body permission and jobs in Explorer/System. Unsupported, unauthorized or unscoped sources do not magically become summaries.
+3. 在 Web 的“来源”“记忆”“系统”查看记录、正文许可和后台任务。 / Inspect records, body permission and jobs in Web Sources, Memory and System.
 4. 若需导入历史会话，按[使用指南](usage.md)选择实际会话，而不是猜造 ID。 / If historical import is needed, select the actual session as described in [Usage](usage.md), rather than inventing an ID.
 5. 允许预算内后台任务完成，再在同仓库的新会话中检索该经验，检查返回内容及来源。 / Allow eligible background jobs to complete, then query the lesson in a new session in the same repository and inspect the source references.
 

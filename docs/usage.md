@@ -16,7 +16,7 @@ Summaries require supported records with body permission. Record existence, queu
 
 **当前状态：开发中。** 旧 Rust Web 已回撤，正式 `--web` exec 与显式隔离组件装配已通过真实 daemon/浏览器验证。使用前先装配匹配的可选组件。
 
-记忆与来源的只读能力见下文。生产搜索、治理/管理、完整关联、部分内容表示和最终功能/资源/桌面验收仍未闭合，不能用旧日志冒充新版本完成。
+已接入的只读功能见下文。生产搜索、管理写操作、完整关联、部分内容表示及最终资源/桌面验收尚未完成。
 
 **Current status: in development.** Rust Web was rolled back. Formal CLI exec, isolated assembly and basic Python reads have real daemon/browser evidence. Assemble the matching optional component first.
 
@@ -82,9 +82,9 @@ Core 规则摘录来自 membership 指定的原 Atom 修订。提案始终标为
 
 SourceReceipt/SourceObservation 的文本从 Native 受保护归档分段读取，不用 EvidenceSurface 或预览代替。每段复验来源和删除门，并校验 CAS、长度、呈现前缀、原观察指纹及脱敏关系；只返回保护后的字节，不恢复秘密。
 
-归档范围虽有 8 KiB 响应上限，当前每段仍需完整验证和解码归档，限额为编码 64 MiB、解码 128 MiB。这不是流式常量内存读取。非文本、CaptureReceipt 和制品区间仍未闭合。
+归档范围虽有 8 KiB 响应上限，当前每段仍需完整验证和解码归档，限额为编码 64 MiB、解码 128 MiB。这不是流式常量内存读取。非文本来源和制品的全部表示尚未闭合；CaptureReceipt 的结构化字段走工作记录读取，不冒原始来源文本。
 
-列表选页借用 canonical typed 记录，完成原删除/仓库规则、筛选、计数和 keyset 后，只物化选中页，不先为所有候选编码正文。不过，列表摘录、历史和分段等读面仍有完整快照成本，大库读取和资源资格尚未完成。
+列表选页借用 canonical typed 记录，完成原删除/仓库规则、筛选、计数和 keyset 后，只物化选中页，不先为所有候选编码正文。有界响应不代表所有内部读面已消除完整快照成本，大库读取和资源资格尚未完成。
 
 范围按钮可按名称、后端记录的路径或分支查找 Task、Repository 和 Worktree，也可查看下级。原生目录每次读取至多 64 个候选，只为该窗口准备直接来源和范围权限输入，不取全库记忆正文。冷校验与必要投影追平仍保留。
 
@@ -106,11 +106,17 @@ Task 视图列出该任务及其声明关联的仓库/工作树资产。仓库/�
 
 已有 Inline/Preview 只按原生保存字段显示至多 512 字节的 UTF-8 节选，并标明出处及截短。缺失仍缺失，不为了补预览读取 CAS 或调用模型。
 
-记录页每次重新检查来源、仓库、删除和抑制门。不可读时，不返回记录字段、预览或续页引用；即使请求区间原本为空，也不以零结果冒充。水位或条件改变时不拼旧游标，不回退当前来源修订。
+记录页每次检查来源、仓库、删除和检索抑制状态。无权读取时显示原因并清掉字段、预览及续页引用。水位或条件变化后重新选页，保留原修订。
 
 点击记录后，按 exact observation/receipt 进入原详情和受保护 CAS 分段入口。返回恢复原修订目录、记录页及视口，只保留身份和游标，不缓存正文。同源真实改写后的旧归档仍可按旧修订读取，当前原文件离线也不改用新正文。
 
-记录的时间/事件等其它筛选、任务/范围完整关联、记忆列表来源过滤、生成/来源消息等其它时间口径、搜索与其余业务页面仍待闭合。Wiki 历史与完整关联也未完成。旧 Rust Web 日志不作为这些能力的证明，未接入页面不会显示样例。
+工作页可按已知 ID 读取 Task、Workstream、Episode、Attempt、Operation、ExecutionLane 和 CaptureReceipt 等已开放记录。通道可选当前或编号历史修订，凭证按其精确 ID 读取；导航保留所选版本，不用 current 替换旧记录。缺终态、采用或验证证据仍显示未知，不把捕获完成或 exit code 当成工作完成。
+
+原证通过 SourceObservation/SourceReceipt 的精确 ID 读取。当前已知的物理范围仍在读取时复验；同一个 Native 会话跨多个仓库，不等于这些原证共享一个权限范围。撤权不交付此前暂存的正文，恢复须重新读取，不能复用旧预览。
+
+直接打开通道或覆盖凭证的正文会核其聚合来源范围。普通工作记录引用凭证，不等于读取该凭证的全部内容；一个仓库停用不应仅因同会话关联而关闭独立仓库的工作记录。
+
+工作状态编辑尚未开放。来源事件/时间筛选、完整关联、Wiki 历史、生产搜索和其余业务页面仍在接入，未接入页面不显示样例。
 
 正文按文本显示，不将记忆写入 localStorage、IndexedDB 或离线缓存。网页会话空闲 15 分钟或满 8 小时后失效，也可用侧栏按钮提前结束。这里是本机 HTTP，不提供 TLS，也不防护同一 OS 用户下的恶意进程。
 
@@ -132,7 +138,7 @@ Memory-page selection filters and counts borrowed canonical records before mater
 
 Cold validation and required projection catch-up remain intact.
 
-Previews, history and content still have full-snapshot costs. Large-corpus reads and resource use are not fully qualified.
+A bounded response does not establish that every internal read avoids whole snapshots. Large-corpus reads and resource use are not fully qualified.
 
 Same-object history pages bind continuations to the exact source and frontier.
 
@@ -172,7 +178,13 @@ Exact record references open the original detail/protected-content path, and ret
 
 The original JSONL need not remain present to read authorized retained archives. Hidden or unavailable pages clear old fields, references and counts; restoration rereads Native.
 
-Further source/time/event filters, complete scope associations, full search/governance/management, non-text/capture/artifact ranges and final functionality/resource/desktop acceptance remain unfinished. Old logs are not new acceptance, and unconnected pages do not show samples.
+The Work page supports known-ID reads of connected Task/Workstream/Episode/Attempt/Operation, ExecutionLane and CaptureReceipt records. Lane history uses numbered revisions; receipt reads use exact IDs. Navigation does not replace a selected old revision with current.
+
+Exact source records retain their own current physical-scope checks, even within a shared Native session. A direct lane/receipt body checks its aggregate sources; merely linking that receipt from an independent work record does not read the aggregate body.
+
+Missing execution, adoption or verification evidence stays unknown. Capture completion does not mark work complete. Work editing is not yet available.
+
+Further source/time/event filters, complete associations, Wiki history, full search/governance/management and all non-text/artifact representations remain unfinished. Full functionality/resource/desktop acceptance is also pending; unconnected pages do not show samples.
 
 The browser does not persist bodies in localStorage, IndexedDB or offline caches. A Web session expires after 15 idle minutes or eight hours total. This is local HTTP, not TLS, and it does not defend against a malicious process running as the same OS user.
 
@@ -249,9 +261,9 @@ Without a reliable current binding, use an actual repository/worktree ID or an e
 
 `@due` is reserved for active recall when a host cue and the independent gate/binding/permissions allow it. Do not use it as a general search test. Explicit-scope reads still require source access and trust; they are not a full-database bypass.
 
-`add`/`organize` 用于支持的显式声明或整理，不是“让记忆正常工作”所必需的日常动作。它们的内部载荷是受限格式；不要让 agent 自行发明 task、接受状态、效果证明或权限字段。人工治理优先在 TUI 查看当前对象和可用操作。
+`add`/`organize` 接受显式声明或整理提议，使用固定格式。人工接受和删除是单独操作，Web 写操作仍在接入。
 
-`add`/`organize` serve supported explicit declarations or organization, not mandatory daily bookkeeping. Their payloads are closed formats; do not invent task identities, acceptance states, effectiveness evidence or authority fields. Prefer TUI actions for human governance of current objects.
+`add`/`organize` accept explicit declarations or organization proposals in closed formats. Human acceptance and deletion remain separate; Web write actions are still being connected.
 
 ## 如何理解返回结果 / Interpret results
 
@@ -263,7 +275,11 @@ Without a reliable current binding, use an actual repository/worktree ID or an e
 | 规范性约束 / Normative constraint | 需要独立策略来源和权限验证；普通文本不能自授此身份。 / Requires separately verified policy source and authority. |
 | Warning/partial/unavailable | 阅读警告和来源缺项；不把缺证当成反证，也不忽略降级继续执行危险操作。 / Inspect missing evidence and warnings; absence is not proof, and degraded results are not permission for risky actions. |
 
-## 终端界面 / Terminal UI
+## 旧终端入口（待退役） / Terminal entry pending retirement
+
+管理入口正在统一到 `--web`。下列 TUI 功能仍有旧消费者，供迁移期间查阅；新功能不再往 TUI 扩展。
+
+Management is moving to `--web`. The following terminal functions remain during migration; new management work belongs in Web.
 
 ```sh
 evertrace --config /absolute/config.toml --tui
