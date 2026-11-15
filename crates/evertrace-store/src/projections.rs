@@ -7213,9 +7213,69 @@ impl JournalAdmissionState {
             else {
                 return Ok(Outcome::TooLarge);
             };
-            // A direct lane body uses its exact receipt's gate; a lane reference in Work is not its body.
-            if let JournalPayload::ExecutionLaneRecorded(lane) = payload {
-                refs.insert(lane.active_capture_receipt_revision_id.to_string());
+            // Direct lane/receipt bodies inherit known physical scopes without changing source identity.
+            // A lane reference in an ordinary Work read is not an aggregate lane body.
+            let scoped_lane = match &payload {
+                JournalPayload::ExecutionLaneRecorded(lane) => {
+                    refs.insert(lane.active_capture_receipt_revision_id.to_string());
+                    Some(lane.as_ref())
+                }
+                JournalPayload::CaptureReceiptRecorded(receipt) => {
+                    let mut selected = None;
+                    for (_, (lane, _)) in self
+                        .execution_lane_revisions
+                        .range(
+                            (receipt.execution_lane_id, 1)..=(receipt.execution_lane_id, u32::MAX),
+                        )
+                        .rev()
+                    {
+                        if cancelled.load(std::sync::atomic::Ordering::SeqCst) {
+                            return Err(StoreError::Io);
+                        }
+                        budget.references += 1;
+                        if std::time::Instant::now() >= deadline
+                            || budget.references >= READ_DEPENDENCY_LIMIT
+                        {
+                            return Ok(Outcome::TooLarge);
+                        }
+                        if lane.active_capture_receipt_revision_id
+                            == receipt.capture_receipt_revision_id
+                        {
+                            selected = Some(lane);
+                            break;
+                        }
+                    }
+                    Some(selected.ok_or(StoreError::StoreCorrupt)?)
+                }
+                _ => None,
+            };
+            if let Some(lane) = scoped_lane {
+                if lane.operation_ids.len() >= READ_DEPENDENCY_LIMIT {
+                    return Ok(Outcome::TooLarge);
+                }
+                for id in &lane.operation_ids {
+                    if let Some((operation, _)) = self.operations.get(id) {
+                        if refs.len() + operation.scope_effect_ids.len() >= READ_DEPENDENCY_LIMIT {
+                            return Ok(Outcome::TooLarge);
+                        }
+                        for id in &operation.scope_effect_ids {
+                            refs.insert(id.to_string());
+                            if let Some((effect, _)) = self.scope_effects.get(id) {
+                                refs.extend(effect.worktree_instance_id.map(|id| id.to_string()));
+                                refs.extend(
+                                    effect
+                                        .pre_snapshot_id
+                                        .into_iter()
+                                        .chain(effect.post_snapshot_id)
+                                        .map(|id| id.to_string()),
+                                );
+                            }
+                            if refs.len() >= READ_DEPENDENCY_LIMIT {
+                                return Ok(Outcome::TooLarge);
+                            }
+                        }
+                    }
+                }
             }
             refs
         };
@@ -7311,6 +7371,7 @@ impl JournalAdmissionState {
                 Some(
                     "worktree"
                     | "worktree_snapshot"
+                    | "scope_effect"
                     | "recovery_capture_request"
                     | "recovery_bundle"
                     | "recovery_application_revision",
@@ -7324,6 +7385,12 @@ impl JournalAdmissionState {
                     match payload {
                         JournalPayload::WorktreeInstanceRecorded(value) => {
                             value.repository_instance_id
+                        }
+                        JournalPayload::ScopeEffectDerived(value) => {
+                            let Some(repository) = value.repository_instance_id else {
+                                continue;
+                            };
+                            repository
                         }
                         JournalPayload::RecoveryCaptureRequestRecorded(value) => {
                             value.repository_instance_id
