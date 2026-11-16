@@ -134,12 +134,6 @@ impl BurstFeature {
 }
 
 #[derive(Clone, Debug)]
-struct RecentFeature {
-    feature: BurstFeature,
-    evidence_refs: Vec<SourceObservationId>,
-}
-
-#[derive(Clone, Debug)]
 struct Candidate {
     original_phase: PhaseKind,
     proposed_phase: Option<PhaseKind>,
@@ -157,7 +151,7 @@ pub(crate) struct SegmentationDetector {
     workstream_id: WorkstreamId,
     episode_id: WorkEpisodeId,
     phase_contract: PhaseContract,
-    rolling: VecDeque<RecentFeature>,
+    rolling: VecDeque<BurstFeature>,
     surprise_scores: VecDeque<u32>,
     last_sequence: u64,
     source_watermark: u64,
@@ -182,9 +176,19 @@ impl SegmentationDetector {
     pub(crate) fn restore(
         episode: &WorkEpisode,
         recent_bursts: &[evertrace_domain::work::OperationBurst],
+        boundary_bursts: &[evertrace_domain::work::OperationBurst],
     ) -> Result<Self, DetectorError> {
         episode.validate().map_err(|_| DetectorError::Ineligible)?;
-        if recent_bursts.len() > MAX_ROLLING_TOKENS
+        if boundary_bursts.len() > 2
+            || (episode.boundary_candidate.is_none() && !boundary_bursts.is_empty())
+            || boundary_bursts.iter().any(|burst| {
+                burst.validate().is_err()
+                    || burst.primary_binding.episode_id != Some(episode.episode_id)
+                    || !episode
+                        .operation_burst_refs
+                        .contains(&burst.operation_burst_id)
+            })
+            || recent_bursts.len() > MAX_ROLLING_TOKENS
             || recent_bursts
                 .iter()
                 .map(|burst| burst.operation_burst_id)
@@ -205,7 +209,7 @@ impl SegmentationDetector {
         }
         let mut detector = Self::empty(episode);
         for burst in recent_bursts {
-            detector.record_feature(burst)?;
+            detector.record_feature(burst);
             detector.last_sequence = burst
                 .members
                 .last()
@@ -222,25 +226,32 @@ impl SegmentationDetector {
             .boundary_candidate
             .as_ref()
             .map(|value| {
-                let index = recent_bursts
+                let anchor = boundary_bursts.last().ok_or(DetectorError::Ineligible)?;
+                let member = anchor
+                    .members
                     .iter()
-                    .position(|burst| {
-                        burst
-                            .members
-                            .iter()
-                            .any(|member| member.source_watermark == value.candidate_watermark)
-                    })
+                    .find(|member| member.source_watermark == value.candidate_watermark)
                     .ok_or(DetectorError::Ineligible)?;
-                let item = &detector.rolling[index];
+                let first = anchor.members.first().ok_or(DetectorError::Ineligible)?;
                 if value.candidate_watermark > episode.source_watermark
                     || episode.confirmation_watermark != 0
                     || value
                         .evidence_refs
                         .iter()
-                        .any(|id| item.evidence_refs.binary_search(id).is_err())
+                        .any(|id| member.source_observation_refs.binary_search(id).is_err())
+                    || (boundary_bursts.len() == 2
+                        && (boundary_bursts[0].source_watermark >= first.source_watermark
+                            || first.source_watermark != value.candidate_watermark))
                 {
                     return Err(DetectorError::Ineligible);
                 }
+                let left = if member.sequence != first.sequence {
+                    Some(anchor)
+                } else if boundary_bursts.len() == 2 {
+                    boundary_bursts.first()
+                } else {
+                    None
+                };
                 Ok(Candidate {
                     original_phase: episode.phase_contract.phase_kind,
                     proposed_phase: value.candidate_phase_kind,
@@ -248,11 +259,8 @@ impl SegmentationDetector {
                     evidence_refs: value.evidence_refs.clone(),
                     kind: value.kind,
                     observations: value.refinement_progress,
-                    feature: item.feature.clone(),
-                    left_feature: index
-                        .checked_sub(1)
-                        .and_then(|previous| detector.rolling.get(previous))
-                        .map(|item| item.feature.clone()),
+                    feature: BurstFeature::from_burst(anchor),
+                    left_feature: left.map(BurstFeature::from_burst),
                 })
             })
             .transpose()?;
@@ -339,6 +347,7 @@ impl SegmentationDetector {
                 candidate.evidence_refs = token.boundary_evidence_refs().to_vec();
                 candidate.observations = 0;
                 candidate.feature = feature.clone();
+                candidate.left_feature = self.rolling.back().cloned();
                 alignment = AlignmentOutcome::CandidatePhaseTransition;
             } else if candidate.kind == BoundaryCandidateKind::Objective
                 && token.source_watermark() > candidate.source_watermark
@@ -386,7 +395,7 @@ impl SegmentationDetector {
                 },
                 observations: 0,
                 feature: feature.clone(),
-                left_feature: self.rolling.back().map(|item| item.feature.clone()),
+                left_feature: self.rolling.back().cloned(),
             });
             self.boundary_status = BoundaryStatus::Candidate;
             if alignment != AlignmentOutcome::RecoverableDeviation {
@@ -398,7 +407,7 @@ impl SegmentationDetector {
         self.last_attempt_id = token.attempt_id();
         let update = self.update(&token, alignment, retracted, confirmation_evidence);
         if burst.started_new() {
-            self.record_feature(burst.current())?;
+            self.record_feature(burst.current());
         }
         Ok(update)
     }
@@ -414,7 +423,7 @@ impl SegmentationDetector {
         if self.surprise_scores.len() < 4 {
             return false;
         }
-        let score = previous.feature.distance(feature);
+        let score = previous.distance(feature);
         let count = u64::try_from(self.surprise_scores.len()).expect("rolling window is bounded");
         let sum = self
             .surprise_scores
@@ -439,33 +448,18 @@ impl SegmentationDetector {
         u64::from(score) > threshold
     }
 
-    fn record_feature(
-        &mut self,
-        burst: &evertrace_domain::work::OperationBurst,
-    ) -> Result<(), DetectorError> {
+    fn record_feature(&mut self, burst: &evertrace_domain::work::OperationBurst) {
         let feature = BurstFeature::from_burst(burst);
         if let Some(previous) = self.rolling.back() {
-            self.surprise_scores
-                .push_back(previous.feature.distance(&feature));
+            self.surprise_scores.push_back(previous.distance(&feature));
         }
-        let mut evidence_refs = burst
-            .members
-            .iter()
-            .flat_map(|member| member.source_observation_refs.iter().copied())
-            .collect::<Vec<_>>();
-        evidence_refs.sort();
-        evidence_refs.dedup();
-        self.rolling.push_back(RecentFeature {
-            feature,
-            evidence_refs,
-        });
+        self.rolling.push_back(feature);
         if self.rolling.len() > MAX_ROLLING_TOKENS {
             self.rolling.pop_front();
         }
         while self.surprise_scores.len() >= self.rolling.len() {
             self.surprise_scores.pop_front();
         }
-        Ok(())
     }
 
     fn update(

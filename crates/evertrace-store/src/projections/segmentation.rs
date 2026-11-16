@@ -161,6 +161,45 @@ pub struct SegmentationReadContext {
     pub repository_ids: std::collections::BTreeSet<evertrace_domain::ids::RepositoryId>,
 }
 
+fn boundary_context<'a>(
+    episode: &WorkEpisode,
+    bursts: impl Iterator<Item = &'a OperationBurst> + Clone,
+) -> Result<Vec<&'a OperationBurst>, StoreError> {
+    let Some(candidate) = &episode.boundary_candidate else {
+        return Ok(vec![]);
+    };
+    let owned = bursts.filter(|burst| {
+        burst.primary_binding.episode_id == Some(episode.episode_id)
+            && episode
+                .operation_burst_refs
+                .binary_search(&burst.operation_burst_id)
+                .is_ok()
+    });
+    let mut anchors = owned.clone().filter(|burst| {
+        burst
+            .members
+            .iter()
+            .any(|member| member.source_watermark == candidate.candidate_watermark)
+    });
+    let anchor = anchors.next().ok_or(StoreError::StoreCorrupt)?;
+    if anchors.next().is_some() {
+        return Err(StoreError::StoreCorrupt);
+    }
+    let first = anchor
+        .members
+        .first()
+        .ok_or(StoreError::StoreCorrupt)?
+        .source_watermark;
+    let left = (first == candidate.candidate_watermark)
+        .then(|| {
+            owned
+                .filter(|burst| burst.source_watermark < first)
+                .max_by_key(|burst| burst.source_watermark)
+        })
+        .flatten();
+    Ok(left.into_iter().chain(std::iter::once(anchor)).collect())
+}
+
 impl JournalAdmissionState {
     pub(crate) fn segmentation_current_context(
         &self,
@@ -320,6 +359,19 @@ impl JournalAdmissionState {
                 recent.pop_first();
             }
         }
+        let context = boundary_context(
+            episode,
+            episode
+                .operation_burst_refs
+                .iter()
+                .filter_map(|id| self.operation_bursts.get(id).map(|(burst, _)| burst)),
+        )?;
+        for burst in context {
+            for member in &burst.members {
+                source_refs.extend(member.source_observation_refs.iter().copied());
+            }
+            recent.insert((burst.source_watermark, burst.operation_burst_id), burst);
+        }
         let authority = SegmentationCurrentView {
             frontier: self.frontier,
             occurrences: BTreeMap::from([(occurrence.host_occurrence_id, occurrence.clone())]),
@@ -381,12 +433,28 @@ impl SegmentationCurrentState {
         match self.episode_window {
             None => self.bursts.recent_for_episode(episode),
             Some(id) if id == episode.episode_id => {
-                let mut bursts = self.bursts.bursts.values().cloned().collect::<Vec<_>>();
+                let mut bursts = self.bursts.bursts.values().collect::<Vec<_>>();
                 bursts.sort_by_key(|burst| burst.source_watermark);
-                Ok(bursts)
+                let start = bursts.len().saturating_sub(64);
+                Ok(bursts.into_iter().skip(start).cloned().collect())
             }
             Some(_) => Err(StoreError::StoreCorrupt),
         }
+    }
+
+    /// At most the candidate's left neighbor and anchor; separate from rolling statistics.
+    pub fn boundary_bursts(
+        &self,
+        episode: &WorkEpisode,
+    ) -> Result<Vec<OperationBurst>, StoreError> {
+        if self
+            .episode_window
+            .is_some_and(|id| id != episode.episode_id)
+        {
+            return Err(StoreError::StoreCorrupt);
+        }
+        boundary_context(episode, self.bursts.bursts.values())
+            .map(|bursts| bursts.into_iter().cloned().collect())
     }
 
     pub fn current_burst(&self, id: OperationBurstId) -> Option<&OperationBurst> {

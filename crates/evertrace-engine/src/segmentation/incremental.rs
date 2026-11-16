@@ -143,10 +143,13 @@ impl IncrementalSegmenter {
         let recent_bursts = current
             .recent_bursts(episode)
             .map_err(|_| DetectorError::Ineligible)?;
+        let boundary_bursts = current
+            .boundary_bursts(episode)
+            .map_err(|_| DetectorError::Ineligible)?;
         Ok(Self {
             episode_id,
             folder: OperationBurstFolder::restore(&recent_bursts)?,
-            detector: SegmentationDetector::restore(episode, &recent_bursts)?,
+            detector: SegmentationDetector::restore(episode, &recent_bursts, &boundary_bursts)?,
             pending: None,
             committed_episode_revision_id: episode.revision_id,
             committed_frontier: current.frontier(),
