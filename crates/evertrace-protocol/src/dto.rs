@@ -1215,8 +1215,6 @@ pub enum HumanSemanticContent {
     Atom(Box<evertrace_domain::semantic::Atom>),
     Procedure(Box<evertrace_domain::procedure::ProcedureRevision>),
     CoreMembership(Box<evertrace_domain::semantic::CoreMembership>),
-    WorkEpisode(Box<evertrace_domain::work::WorkEpisode>),
-    CaptureReceipt(Box<evertrace_domain::work::CaptureReceipt>),
 }
 
 pub use evertrace_domain::query::HumanContentState;
@@ -1305,20 +1303,6 @@ impl HumanSemanticDetail {
                     && self.object_ref.as_deref() == Some(value.procedure_id.to_string().as_str())
                     && self.revision_ref.as_deref() == Some(value.revision_id.to_string().as_str())
             }
-            HumanSemanticContent::CaptureReceipt(value) => {
-                value.validate().is_ok()
-                    && (self.object_ref.as_deref()
-                        == Some(value.capture_receipt_revision_id.to_string().as_str())
-                        || self.object_ref.as_deref()
-                            == Some(value.execution_lane_id.to_string().as_str()))
-                    && self.revision_ref.as_deref()
-                        == Some(value.capture_receipt_revision_id.to_string().as_str())
-            }
-            HumanSemanticContent::WorkEpisode(value) => {
-                value.validate().is_ok()
-                    && self.object_ref.as_deref() == Some(value.episode_id.to_string().as_str())
-                    && self.revision_ref.as_deref() == Some(value.revision_id.to_string().as_str())
-            }
             HumanSemanticContent::CoreMembership(value) => {
                 value.validate().is_ok()
                     && self.object_ref.as_deref()
@@ -1360,20 +1344,6 @@ impl HumanSnapshotItem {
                     HumanSemanticContent::Procedure(_) => self.object_kind == "procedure_revision",
                     HumanSemanticContent::CoreMembership(_) => {
                         self.object_kind == "core_membership"
-                    }
-                    HumanSemanticContent::WorkEpisode(_) => self.object_kind == "work_episode",
-                    HumanSemanticContent::CaptureReceipt(value) => {
-                        match self.object_kind.as_str() {
-                            "capture_receipt" => {
-                                self.object_ref.as_deref()
-                                    == Some(value.execution_lane_id.to_string().as_str())
-                            }
-                            "capture_receipt_revision" => {
-                                self.object_ref.as_deref()
-                                    == Some(value.capture_receipt_revision_id.to_string().as_str())
-                            }
-                            _ => false,
-                        }
                     }
                 })
         }) && self.proposal_base.as_ref().is_none_or(|detail| {

@@ -400,16 +400,6 @@ fn semantic_lines(
         }];
     };
     match content {
-        HumanSemanticContent::CaptureReceipt(_) => vec![crate::locale::format!(
-            language,
-            "Read capture receipt content in Web",
-            "请在 Web 中阅读采集覆盖凭证"
-        )],
-        HumanSemanticContent::WorkEpisode(_) => vec![crate::locale::format!(
-            language,
-            "Read work content in Web",
-            "请在 Web 中阅读工作记录内容"
-        )],
         HumanSemanticContent::Digest(digest) => {
             use evertrace_domain::semantic::{SemanticCompleteness, SemanticDigestStatus};
             let mut lines = vec![crate::locale::format!(
@@ -1156,7 +1146,10 @@ pub(crate) fn content_lines(
                         detail.terminal_result_ref
                     ),
                 ]);
-                if let Some(evertrace_protocol::dto::HumanNativeHistoryCleanupAvailability::ExternalReaderExclusionUnverified) = &detail.native_history_cleanup_availability {
+                if let Some(
+                    evertrace_protocol::dto::HumanNativeHistoryCleanupAvailability::ExternalReaderExclusionUnverified,
+                ) = &detail.native_history_cleanup_availability
+                {
                     lines.extend([
                         language.label("Native history cleanup: unavailable now").into(),
                         language.label("Product purge does not run this.").into(),
@@ -1231,10 +1224,21 @@ pub(crate) fn content_lines(
                             backup.objects.frontier
                         ),
                         crate::locale::format!(language, "backup relations/search: {} / {}", "备份关系／搜索：{} / {}",
-                            backup.relations.as_ref().map_or_else(|| "absent".into(), |table| format!("{}@{}", table.version.map_or_else(|| "n/a".into(), |version| format!("v{version}")), table.frontier)),
-                            backup.search.as_ref().map_or_else(|| "absent".into(), |table| format!("{}@{}", table.version.map_or_else(|| "n/a".into(), |version| format!("v{version}")), table.frontier))
+                            backup.relations.as_ref().map_or_else(|| "absent".into(), |table| format!(
+                                "{}@{}",
+                                table.version.map_or_else(|| "n/a".into(), |version| format!("v{version}")),
+                                table.frontier
+                            )),
+                            backup.search.as_ref().map_or_else(|| "absent".into(), |table| format!(
+                                "{}@{}",
+                                table.version.map_or_else(|| "n/a".into(), |version| format!("v{version}")),
+                                table.frontier
+                            ))
                         ),
-                        crate::locale::format!(language, "backup source/spool/cas: {}/{} watermarks; {} files/{} generations; {}/{} CAS", "备份来源／队列／CAS：水位 {}/{}；文件 {}／代次 {}；CAS {}/{}",
+                        crate::locale::format!(
+                            language,
+                            "backup source/spool/cas: {}/{} watermarks; {} files/{} generations; {}/{} CAS",
+                            "备份来源／队列／CAS：水位 {}/{}；文件 {}／代次 {}；CAS {}/{}",
                             backup.committed_source_watermark_count,
                             backup.spool_source_watermark_count,
                             backup.spool_file_count,
@@ -1248,7 +1252,10 @@ pub(crate) fn content_lines(
                             backup.emergency_gap_count,
                             backup.quarantine_count
                         ),
-                        crate::locale::format!(language, "backup runtime/outbox/index generation/compiler watermark: {} / {} / {} / {}", "备份运行／发件箱／索引代次／编译水位：{} / {} / {} / {}",
+                        crate::locale::format!(
+                            language,
+                            "backup runtime/outbox/index generation/compiler watermark: {} / {} / {} / {}",
+                            "备份运行／发件箱／索引代次／编译水位：{} / {} / {} / {}",
                             backup.runtime_generation,
                             backup.runtime_outbox_watermark,
                             backup.index_generation,
@@ -1328,11 +1335,26 @@ pub(crate) fn content_lines(
                 unknown_contract_count,
                 asset_names,
             } => {
-                lines.extend([crate::locale::format!(language, "inventory: {job_id}", "清单: {job_id}"),
-                    crate::locale::format!(language, "repository: {repository_id} revision {repository_revision}; worktree: {worktree_id}", "仓库: {repository_id} 修订 {repository_revision}; 工作树: {worktree_id}"),
-                    crate::locale::format!(language, "cwd: {cwd}", "工作目录: {cwd}"), crate::locale::format!(language, "state: {state}; sources: {source_count:?}; signatures: {signature_count:?}", "状态: {state}; 来源: {source_count:?}; 签名: {signature_count:?}"),
-                    crate::locale::format!(language, "unobserved sources: {unobserved_source_count:?}; unknown contracts: {unknown_contract_count:?}", "未观测来源: {unobserved_source_count:?}; 未知合同: {unknown_contract_count:?}"),
-                    language.label("Presence is not routing, adoption, or automatic Procedure coverage.").into()]);
+                lines.extend([
+                    crate::locale::format!(language, "inventory: {job_id}", "清单: {job_id}"),
+                    crate::locale::format!(
+                        language,
+                        "repository: {repository_id} revision {repository_revision}; worktree: {worktree_id}",
+                        "仓库: {repository_id} 修订 {repository_revision}; 工作树: {worktree_id}"
+                    ),
+                    crate::locale::format!(language, "cwd: {cwd}", "工作目录: {cwd}"),
+                    crate::locale::format!(
+                        language,
+                        "state: {state}; sources: {source_count:?}; signatures: {signature_count:?}",
+                        "状态: {state}; 来源: {source_count:?}; 签名: {signature_count:?}"
+                    ),
+                    crate::locale::format!(
+                        language,
+                        "unobserved sources: {unobserved_source_count:?}; unknown contracts: {unknown_contract_count:?}",
+                        "未观测来源: {unobserved_source_count:?}; 未知合同: {unknown_contract_count:?}"
+                    ),
+                    language.label("Presence is not routing, adoption, or automatic Procedure coverage.").into()
+                ]);
                 lines.extend(
                     asset_names.iter().map(|name| {
                         crate::locale::format!(language, "asset: {name}", "资料: {name}")

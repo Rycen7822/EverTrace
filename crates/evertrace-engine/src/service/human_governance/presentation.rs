@@ -12,8 +12,6 @@ pub enum HumanSemanticContent {
     Atom(Box<evertrace_domain::semantic::Atom>),
     Procedure(Box<evertrace_domain::procedure::ProcedureRevision>),
     CoreMembership(Box<evertrace_domain::semantic::CoreMembership>),
-    WorkEpisode(Box<evertrace_domain::work::WorkEpisode>),
-    CaptureReceipt(Box<evertrace_domain::work::CaptureReceipt>),
 }
 
 pub use evertrace_domain::query::HumanContentState;
@@ -71,9 +69,6 @@ impl HumanGovernanceService {
                     | "core_membership"
                     | "revision_proposal_revision"
                     | "semantic_digest"
-                    | "work_episode"
-                    | "capture_receipt"
-                    | "capture_receipt_revision"
             )
         }) {
             return Ok(());
@@ -93,9 +88,6 @@ impl HumanGovernanceService {
                         | "procedure_revision"
                         | "core_membership"
                         | "revision_proposal_revision"
-                        | "work_episode"
-                        | "capture_receipt"
-                        | "capture_receipt_revision"
                 )
             ) {
                 continue;
@@ -258,33 +250,6 @@ pub(super) fn semantic_value(
             let revision = value.membership_revision_id.to_string();
             (
                 HumanSemanticContent::CoreMembership(value),
-                None,
-                object,
-                revision,
-            )
-        }
-        JournalPayload::WorkEpisodeRecorded(value) => {
-            value.validate().map_err(|_| HumanGovernanceError::Store)?;
-            let preview = value.phase_contract.local_goal.chars().take(160).collect();
-            let object = value.episode_id.to_string();
-            let revision = value.revision_id.to_string();
-            (
-                HumanSemanticContent::WorkEpisode(value),
-                Some(preview),
-                object,
-                revision,
-            )
-        }
-        JournalPayload::CaptureReceiptRecorded(value) => {
-            value.validate().map_err(|_| HumanGovernanceError::Store)?;
-            let revision = value.capture_receipt_revision_id.to_string();
-            let object = if row.object_kind.as_deref() == Some("capture_receipt") {
-                value.execution_lane_id.to_string()
-            } else {
-                revision.clone()
-            };
-            (
-                HumanSemanticContent::CaptureReceipt(value),
                 None,
                 object,
                 revision,
