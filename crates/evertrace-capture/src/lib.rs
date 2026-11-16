@@ -5,6 +5,7 @@
 
 pub mod admission;
 pub mod cas;
+pub mod checkpoint_source;
 pub mod confined_read;
 pub mod execution_source;
 pub mod frame;

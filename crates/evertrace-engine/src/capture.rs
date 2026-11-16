@@ -157,6 +157,12 @@ pub(crate) fn verify_capture_frame_presented(
             ),
             evertrace_capture::host_events::ELIGIBLE_EVENTS,
         ))
+    } else if body.source_revision.as_str() == evertrace_capture::checkpoint_source::SOURCE_REVISION
+    {
+        Some((
+            evertrace_capture::checkpoint_source::ADAPTER_VERSION.into(),
+            evertrace_capture::checkpoint_source::ELIGIBLE_EVENTS,
+        ))
     } else if evertrace_capture::execution_source::is_source_revision(body.source_revision.as_str())
     {
         let format =
@@ -195,6 +201,10 @@ pub(crate) fn verify_capture_frame_presented(
             body.source_revision.as_str(),
         ) {
             evertrace_capture::execution_source::record_matches(&body, &protected, manifest)
+        } else if body.source_revision.as_str()
+            == evertrace_capture::checkpoint_source::SOURCE_REVISION
+        {
+            evertrace_capture::checkpoint_source::record_matches(&body, &protected, manifest)
         } else {
             evertrace_capture::host_events::record_matches(&body, &protected, manifest)
         };

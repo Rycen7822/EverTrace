@@ -86,12 +86,18 @@ fn run() -> Result<(), ()> {
             Ok((format, report.manifest().adapter_manifest_id.clone()))
         });
         let execution = execution.into_iter().collect::<Result<Vec<_>, ()>>()?;
+        let checkpoint = evertrace_codex::probe::HostProbeReport::unobserved_source_contract(
+            evertrace_capture::checkpoint_source::ADAPTER_VERSION,
+            evertrace_capture::checkpoint_source::ELIGIBLE_EVENTS,
+        )
+        .map_err(|_| ())?;
         let snapshot = RuntimeSnapshot::load(Path::new(&path)).map_err(|_| ())?;
         return evertrace_capture::host_events::relay(
             snapshot,
             Path::new(&endpoint),
             &contract.manifest().adapter_manifest_id,
             &execution,
+            &checkpoint.manifest().adapter_manifest_id,
         )
         .map_err(|_| ());
     }

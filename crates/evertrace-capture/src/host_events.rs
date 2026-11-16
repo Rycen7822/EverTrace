@@ -398,6 +398,7 @@ pub fn relay(
     endpoint: &Path,
     manifest: &str,
     execution_manifests: &[(crate::execution_source::Profile, String)],
+    checkpoint_manifest: &str,
 ) -> Result<()> {
     let deadline = Instant::now() + Duration::from_secs(3);
     let (stream, publisher) =
@@ -474,8 +475,18 @@ pub fn relay(
                             format.revision(),
                         )
                     });
-                    if let Some(observed) =
-                        execution.or_else(|| observation(&text, &instance, sequence, manifest))
+                    if let Some(observed) = execution
+                        .or_else(|| {
+                            publisher.execution_profile()?;
+                            crate::checkpoint_source::input(
+                                &text,
+                                &instance,
+                                sequence,
+                                checkpoint_manifest,
+                            )
+                            .map(Observation)
+                        })
+                        .or_else(|| observation(&text, &instance, sequence, manifest))
                     {
                         if publisher.revalidate().is_ok()
                             && let Some(runtime) = &mut runtime

@@ -619,6 +619,7 @@ fn reject_caller_source(input: &CaptureRecordInput) -> Result<(), CaptureError> 
     if crate::goal_source::is_source_revision(&input.source_revision)
         || crate::process_source::is_owned_revision(&input.source_revision)
         || input.source_revision == crate::host_events::SOURCE_REVISION
+        || input.source_revision == crate::checkpoint_source::SOURCE_REVISION
         || crate::execution_source::is_source_revision(&input.source_revision)
     {
         return Err(CaptureError::InvalidInput);
