@@ -9,13 +9,12 @@
   <dt>保留策略</dt><dd>{{ artifact.retention }}</dd>
   <dt>记录时间（微秒）</dt><dd>{{ artifact.created_at_us }}</dd>
 </dl>
-<p class="reading-note">载荷状态不是读取许可，也不表示生产操作已验证或结果已采用。这里只展示所选修订。</p>
 <p>范围：{{ artifact.scope.kind }} · 仓库：{{ artifact.scope.get('repository_instance_id') or '未记录' }}</p>
 <p>工作树：{{ artifact.scope.get('worktree_instance_id') or '未记录' }} · Task：{{ artifact.scope.get('task_id') or '未记录' }}</p>
 <p>产物：{{ value.work_artifact_id }} · 修订：{{ artifact.revision_id }}</p>
 <p>前序修订：{{ artifact.parent_revision_id or '未记录' }}</p>
 <p>载荷引用：{{ artifact.content_blob_ref or '未记录' }}</p>
-<p>外部引用：{{ artifact.external_reference or '未记录' }}（仅记录，不自动打开或读取）</p>
+<p>外部引用：{{ artifact.external_reference or '未记录' }}</p>
 {% for title, actors in [('生产者', artifact.produced_by_refs), ('消费者', artifact.consumed_by_refs)] %}
 <section class="semantic-section"><h3>{{ title }}</h3>
 {% if actors %}<ul>{% for actor in actors %}<li>{{ actor.kind }}：{{ actor.id }}</li>{% endfor %}</ul>
@@ -25,11 +24,11 @@
 {{ text_list('来源观察', artifact.source_observation_refs) }}
 {% if artifact.payload_status in ('available', 'degraded') and artifact.content_blob_ref %}
 {% if detail.payload_source %}
-<p>载荷与关联的受保护来源归档一致；可能包含采集信封，不将其冒充纯命令输出。</p>
-{% else %}<p>只读本修订记录的受保护载荷；不会打开外部引用，载荷存在性和格式仍需检查。</p>{% endif %}
+<p>此载荷取自来源归档。</p>
+{% endif %}
 <button class="button" type="button" data-content-open="text">分段读取受保护载荷</button>
 {% else %}
-<p>本修订没有可供读取的载荷；不回退到文件、外部引用或其他修订。</p>
+<p>此修订没有可读的载荷。</p>
 {% endif %}
 {% elif content.kind == 'execution_lane' %}
 <h2>执行通道</h2>
@@ -43,7 +42,7 @@
   <dt>终止类型</dt><dd>{{ value.terminal_kind or '未记录' }}</dd>
   <dt>来源水位</dt><dd>{{ value.event_watermark }}</dd>
 </dl>
-<p class="reading-note">这里显示所选修订，不证明目前仍在运行。开始、存活探测和终止是不同事实；缺终态不补成完成、成功或失败。</p>
+<p>本通道中的操作可能分属不同工作。</p>
 <p>reasoning 可见类型：{{ value.reasoning_visibility|join('、') or '未记录' }}；不提供 reasoning/CoT 原文。</p>
 <button class="button" type="button" data-link-key="{{ value.active_capture_receipt_revision_id }}"
   data-object="{{ value.active_capture_receipt_revision_id }}" data-revision="{{ value.active_capture_receipt_revision_id }}"
@@ -80,7 +79,6 @@
   <dt>尝试生命周期</dt><dd>{{ value.lifecycle_status }}</dd>
   <dt>结果是否已知</dt><dd>{{ value.outcome_state }}</dd>
 </dl>
-<p class="reading-note">完成执行不等于结果已采用或验证通过。中断不是验证失败；被替代也不等于策略失败。</p>
 <h3>记录的策略</h3>
 <p class="memory-prose">假设：{{ value.strategy_contract.hypothesis }}</p>
 <p class="memory-prose">干预：{{ value.strategy_contract.intervention }}</p>
@@ -102,10 +100,10 @@
   {{ text_list('组合自其他尝试', value.composed_from_attempt_ids) }}
   {{ text_list('显式放弃证据', value.explicit_abandon_refs) }}
 </section>
+{{ text_list('操作归属修订', value.work_binding_revision_refs, record_kind='work_binding', exact_revision=true) }}
 {{ text_list('局部结果证据', value.local_outcome_refs) }}
 {{ text_list('父级验证证据', value.parent_verification_refs) }}
 {{ text_list('结果引用', value.outcome_refs) }}
-<p class="muted">没有保存的命令、diff 或 verifier 不会由状态名称补造；相关记录在下方逐项读取。</p>
 {% elif content.kind == 'operation_burst' %}
 <h2>操作片段</h2>
 <p>类型：{{ value.operation_kind }} · 生命周期：{{ value.lifecycle }} · 来源水位：{{ value.source_watermark }}</p>
@@ -115,7 +113,7 @@
 <p>对象族：{{ value.target_family }} · 错误特征：{{ value.error_signature or '未记录' }}</p>
 <p>归属 Task：{{ value.primary_binding.task_id or '未记录' }} · 工作线：{{ value.primary_binding.workstream_id or '未记录' }}</p>
 <p>归属片段：{{ value.primary_binding.episode_id or '未记录' }} · 尝试：{{ value.primary_binding.attempt_id or '未记录' }}</p>
-<p class="reading-note">这是已保存的成员顺序，不是按时间或命令文本拼出的因果链；工作归属不改变物理身份。</p>
+<p>操作按记录顺序排列。</p>
 <h3>保存的操作成员</h3>
 {% for member in value.members %}
 <section class="semantic-section">
@@ -140,14 +138,13 @@
   {{ text_list('来源内配对的输入观测', value.source_local_pairing.intent_observation_refs) }}
   {{ text_list('来源内配对的结果观测', value.source_local_pairing.result_observation_refs) }}
   {{ text_list('命名空间见证', value.source_local_pairing.namespace_witness_refs) }}
-  <p class="reading-note">source_paired 仅是受见证来源中的配对，不升级为物理 Exact。conflicted 不按时间或文本强配。</p>
+  <p>来源内配对与物理配对状态分别记录。</p>
 </section>
-{% else %}<p>未记录来源内配对；相同请求名、命令或相邻时间都不补成一对。</p>{% endif %}
+{% else %}<p>未记录来源内配对。</p>{% endif %}
 {{ text_list('输入来源观测', value.input_source_observation_refs) }}
 {{ text_list('结果来源观测', value.result_source_observation_refs) }}
-{{ text_list('作用引用', value.scope_effect_ids) }}
+{{ text_list('作用引用', value.scope_effect_ids, record_kind='scope_effect', exact_revision=true) }}
 {{ text_list('产物引用', value.artifact_refs) }}
-<p class="reading-note">命令与响应若保存在来源正文中，可从下方关联读取受保护的原文；不回读原文件，也不把来源报告当已验证结果。</p>
 {% elif content.kind == 'host_occurrence' %}
 <h2>来源观测的物理归一化记录</h2>
 <p>关联强度：{{ value.correlation_strength }} · 归一化状态：{{ value.normalization_state }}</p>
@@ -163,7 +160,6 @@
   <p>{{ field.field }} ← {{ field.source_observation_ref }}</p>
 {% else %}<p>没有额外字段来源记录。</p>{% endfor %}
 </details>
-<p class="reading-note">unavailable、ambiguous 或 conflicted 不升级为 Exact；single_source 不证明跨来源身份，不按命令、CWD 或时间去重。</p>
 {% elif content.kind == 'scope_effect' %}
 <h2>作用与范围</h2>
 <p>记录的作用：{{ value.effect_role }} · Operation：{{ value.operation_id }}</p>
@@ -172,7 +168,6 @@
 {{ text_list('作用证据', value.evidence_refs) }}
 {{ text_list('实验运行', value.experiment_run_ids) }}
 {{ text_list('产物引用', value.artifact_refs) }}
-<p class="reading-note">范围、前后快照与产物分别读取；没有快照就不补造 diff，没有 verifier 就不声称验证通过。</p>
 {% elif content.kind == 'worktree' %}
 <h2>工作树实例</h2>
 <p>仓库：{{ value.repository_instance_id }} · 实例类型：{{ value.kind }}</p>
@@ -185,7 +180,6 @@
 {% for entry in value.path_history %}
 <p class="memory-prose">{{ entry.path }} · 首次记录：{{ entry.first_observed_at_us }} · 最后记录：{{ entry.last_observed_at_us }}</p>
 {% endfor %}
-<p class="reading-note">路径与 branch 不是实例身份；信任撤销与生命周期分别判断。此处保留所选修订，不用当前快照覆盖旧记录。</p>
 {% elif content.kind == 'worktree_snapshot' %}
 <h2>工作树快照</h2>
 <p>工作树：{{ value.worktree_instance_id }} · 捕获状态：{{ value.capture_status }}</p>
@@ -204,5 +198,4 @@
 {% for omission in value.omission_reasons %}<p>{{ omission.field }}：{{ omission.reason }}</p>
 {% else %}<p>没有记录额外缺项。</p>{% endfor %}
 {{ text_list('快照证据', value.evidence_refs) }}
-<p class="reading-note">这些是捕获时的状态收据，不是文件正文、可恢复副本或测试通过证明；缺失摘要不判定状态相同。</p>
 {% endif %}
