@@ -368,7 +368,8 @@ impl WorkEpisode {
             ids(&self.execution_lane_ids),
             ids(&self.attempt_ids),
             ids(&self.competing_attempt_group_ids),
-            ids(&self.operation_burst_refs),
+            // Historical membership is not the bounded segmentation work window.
+            strictly_ordered_unique(&self.operation_burst_refs),
             ids(&self.worktree_transition_refs),
             ids(&self.failed_attempt_ids),
             ids(&self.interrupted_attempt_ids),
@@ -380,7 +381,8 @@ impl WorkEpisode {
             refs(&self.selected_outcome_refs),
             refs(&self.verification_refs),
             refs(&self.open_loops),
-            refs(&self.checkpoint_refs),
+            self.checkpoint_refs.iter().all(|value| bounded(value))
+                && strictly_ordered_unique(&self.checkpoint_refs),
             refs(&self.semantic_digest_refs),
             ids(&self.capture_receipt_revision_ids),
             refs(&self.capture_gap_refs),

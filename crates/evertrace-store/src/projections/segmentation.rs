@@ -460,13 +460,10 @@ impl OperationBurstCurrentView {
         &self,
         episode: &WorkEpisode,
     ) -> Result<Vec<OperationBurst>, StoreError> {
-        if episode.operation_burst_refs.len() > 64 {
-            return Err(StoreError::StoreCorrupt);
-        }
         let mut values = episode
             .operation_burst_refs
             .iter()
-            .map(|id| self.bursts.get(id).cloned().ok_or(StoreError::StoreCorrupt))
+            .map(|id| self.bursts.get(id).ok_or(StoreError::StoreCorrupt))
             .collect::<Result<Vec<_>, _>>()?;
         values.sort_by_key(|burst| burst.source_watermark);
         if values
@@ -475,7 +472,8 @@ impl OperationBurstCurrentView {
         {
             return Err(StoreError::StoreCorrupt);
         }
-        Ok(values)
+        let start = values.len().saturating_sub(64);
+        Ok(values.into_iter().skip(start).cloned().collect())
     }
 }
 
