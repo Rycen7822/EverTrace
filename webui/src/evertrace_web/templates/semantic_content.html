@@ -1,11 +1,12 @@
-{% macro text_list(title, entries, ordered=false, record_kind=none) %}
+{% macro text_list(title, entries, ordered=false, record_kind=none, exact_revision=false) %}
 <section class="semantic-section">
   <h3>{{ title }}</h3>
   {% if entries %}
     {% if ordered %}<ol>{% else %}<ul>{% endif %}
-    {% for entry in entries %}<li class="memory-prose">
+    {% for entry in entries %}<li{% if not record_kind %} class="memory-prose"{% endif %}>
       {% if record_kind %}<button class="text-button" type="button" data-link-key="{{ entry }}"
-        data-object="{{ entry }}" data-kind="{{ record_kind }}">读取 {{ entry }}</button>
+        data-object="{{ entry }}" data-kind="{{ record_kind }}"
+        {% if exact_revision %}data-revision="{{ entry }}"{% endif %}>读取 {{ entry }}</button>
       {% else %}{{ entry }}{% endif %}
     </li>{% endfor %}
     {% if ordered %}</ol>{% else %}</ul>{% endif %}
@@ -214,6 +215,23 @@
   {% include 'recovery_application.html' %}
 {% elif content.kind in ('recovery_capture_request', 'recovery_bundle') %}
   {% include 'recovery_records.html' %}
+{% elif content.kind == 'segmentation_correction' %}
+  <h2>片段更正</h2>
+  <p>类型：{{ {
+    'split': '拆分', 'merge': '合并', 'retract': '撤回', 'relabel': '重新标注', 'capture_revision': '采集修订'
+  }.get(value.kind, value.kind) }}</p>
+  <p>更正修订：{{ value.correction_revision_id }} · 来源水位：{{ value.source_watermark }}</p>
+  {% if value.kind == 'capture_revision' %}
+  <p>片段保持原身份与关闭状态，只更新采集凭证；阶段、成员、采用和验证不变。</p>
+  {{ text_list('本次采集凭证', value.evidence_refs, record_kind='capture_receipt', exact_revision=true) }}
+  {% else %}{{ text_list('更正证据引用', value.evidence_refs) }}{% endif %}
+  {{ text_list('来源片段（当前修订）', value.source_episode_ids, record_kind='work_episode') }}
+  {{ text_list('更正后的片段（当前修订）', value.replacement_episode_ids, record_kind='work_episode') }}
+  {% if value.predecessor_revision_id %}
+  <button class="text-button" type="button" data-link-key="{{ value.predecessor_revision_id }}"
+    data-object="{{ value.predecessor_revision_id }}" data-revision="{{ value.predecessor_revision_id }}"
+    data-kind="segmentation_correction">读取前序更正</button>
+  {% endif %}
 {% elif content.kind == 'work_episode' %}
   <h2>工作片段</h2>
   <p class="muted">原片段记录仅作上下文和来源；目标、状态或结果引用不等于已验证结论，也不授予执行资格。</p>
@@ -237,7 +255,8 @@
   <details><summary>结果、摘要和验证的原始引用</summary>
     <p>这里只列已存引用；其内容与资格须在原记录中按权限查看。</p>
     {{ text_list('语义摘要', value.semantic_digest_refs) }}
-    {{ text_list('采集覆盖凭证', value.capture_receipt_revision_ids) }}
+    {{ text_list('采集覆盖凭证', value.capture_receipt_revision_ids, record_kind='capture_receipt', exact_revision=true) }}
+    {{ text_list('片段更正', value.segmentation_correction_refs, record_kind='segmentation_correction', exact_revision=true) }}
     {{ text_list('已完成结果', value.completed_outcome_refs) }}
     {{ text_list('已选结果', value.selected_outcome_refs) }}
     {{ text_list('验证', value.verification_refs) }}

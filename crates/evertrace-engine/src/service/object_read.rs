@@ -268,14 +268,14 @@ async fn fields_scope_access(
 ) -> Result<(), ErrorCode> {
     let root = context.selected.as_ref().ok_or(ErrorCode::StoreCorrupt)?;
     // Project only authorization coordinates; canonical rows, sources and suppression/coherence remain intact.
-    // A structural parent Task is not a child's ambient scope. Reading the Task itself still checks all its members.
+    // Work/correction reads inherit their actual member scopes, not structural Tasks' unrelated siblings.
     let scope_rows = context
         .rows
         .iter()
         .filter(|row| {
-            !(workstream_scoped_fields(root)
-                && row.object_kind.as_deref() == Some("task")
-                && row.object_id == root.task_id)
+            !(row.object_kind.as_deref() == Some("task")
+                && (root.object_kind.as_deref() == Some("segmentation_correction")
+                    || workstream_scoped_fields(root) && row.object_id == root.task_id))
         })
         .cloned()
         .map(|mut row| {
@@ -663,6 +663,7 @@ fn record_data(
         P::RecoveryApplicationRecorded(value) => semantic_record(&value, None, query, check),
         P::ExecutionLaneRecorded(value) => semantic_record(&value, None, query, check),
         P::CaptureReceiptRecorded(value) => semantic_record(&value, None, query, check),
+        P::SegmentationCorrectionRecorded(value) => semantic_record(&value, None, query, check),
         P::ExperimentRunRecorded(value) => semantic_record(&value, None, query, check),
         P::ResultEvidenceRecorded(value) => semantic_record(&value, None, query, check),
         P::ProcedureUsageRecorded(value) => semantic_record(&value, None, query, check),

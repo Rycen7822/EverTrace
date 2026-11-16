@@ -7115,6 +7115,7 @@ impl JournalAdmissionState {
                                 | "task"
                                 | "workstream"
                                 | "work_episode"
+                                | "segmentation_correction"
                                 | "source_receipt"
                                 | "source_observation"
                                 | "attempt"
@@ -7240,6 +7241,7 @@ impl JournalAdmissionState {
         };
         let root_id = root.row_id.clone();
         let lane_root = root.object_kind.as_deref() == Some("execution_lane");
+        let correction_root = root.object_kind.as_deref() == Some("segmentation_correction");
         let source_cohort = lane_root
             || matches!(
                 root.object_kind.as_deref(),
@@ -7376,15 +7378,21 @@ impl JournalAdmissionState {
                 .map_err(|_| StoreError::StoreCorrupt)?;
                 // Evidence reads use only their source cohort plus direct Task/Worktree scope facts.
                 // Following a Task's unrelated request roots would incorrectly inherit their revocation or suppression.
-                // A referenced coverage receipt is not its aggregate body; keep the root's exact source dependencies.
-                if !source_cohort && !matches!(&payload, JournalPayload::CaptureReceiptRecorded(_))
-                    || lane_root && matches!(&payload, JournalPayload::CaptureReceiptRecorded(_))
-                    || matches!(
-                        &payload,
-                        JournalPayload::SourceReceiptRecorded(_)
-                            | JournalPayload::SourceObservationRecorded(_)
-                            | JournalPayload::EvidenceSurfaceRecorded(_)
-                    )
+                // Correction parents supply immutable ownership, not an Episode's later receipts/members.
+                let structural_episode =
+                    correction_root && matches!(&payload, JournalPayload::WorkEpisodeRecorded(_));
+                let receipt_proof = (lane_root || correction_root)
+                    && matches!(&payload, JournalPayload::CaptureReceiptRecorded(_));
+                if !structural_episode
+                    && (!source_cohort
+                        && !matches!(&payload, JournalPayload::CaptureReceiptRecorded(_))
+                        || receipt_proof
+                        || matches!(
+                            &payload,
+                            JournalPayload::SourceReceiptRecorded(_)
+                                | JournalPayload::SourceObservationRecorded(_)
+                                | JournalPayload::EvidenceSurfaceRecorded(_)
+                        ))
                 {
                     let Some(dependencies) = self.stored_read_dependencies(
                         &row,
