@@ -1451,7 +1451,8 @@ impl HumanSnapshotItem {
                     && review.proposal.eligibility == summary.eligibility
                     && review.proposal.status == summary.status
                     && review.plain_accept_eligible
-                        == plain_accept_eligible(review.proposal.as_ref())
+                        == (review.reauthorization.is_none()
+                            && plain_accept_eligible(review.proposal.as_ref()))
                     && (!review.merge_and_accept_eligible
                         || (review.proposal.target_kind == ProposalTargetKind::Atom
                             && review.proposal.operation == ProposalOperation::Merge
