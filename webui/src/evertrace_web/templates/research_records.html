@@ -11,15 +11,16 @@
   <dt>来源</dt><dd>{{ value.origin }}</dd>
   <dt>外部系统</dt><dd>{{ value.external_system_id or '未记录' }} · {{ value.external_run_key or '未记录' }}</dd>
 </dl>
-<p class="reading-note">执行完成、合同有效和结果有效是不同事实。声明记录不是执行回执；缺少终态时不补成成功或失败。</p>
-<p>Workstream：{{ value.workstream_id }} · 代码快照：{{ value.code_snapshot_id }}</p>
+<p>工作线：{{ value.workstream_id }} · 代码快照：{{ value.code_snapshot_id }}</p>
+<button class="text-button" type="button" data-link-key="{{ value.workstream_id }}"
+  data-object="{{ value.workstream_id }}" data-kind="workstream">读取当前工作线</button>
 {% if value.attempt_id %}
 <button class="text-button" type="button" data-link-key="{{ value.attempt_id }}"
   data-object="{{ value.attempt_id }}" data-kind="attempt">读取所绑定 Attempt 的策略</button>
 {% endif %}
 <p>策略合同指纹：{{ fingerprint(value.strategy_contract_fingerprint) }}</p>
 <p>实验合同指纹：{{ fingerprint(value.experiment_contract_fingerprint) }}</p>
-<p>比较键：{{ fingerprint(value.comparison_key) }}。键相同不单独证明可比；请对照明确选择的结果，由原生比较器核对资格。</p>
+<p>比较键：{{ fingerprint(value.comparison_key) }}</p>
 <section class="semantic-section"><h3>实验条件</h3>
   <p class="memory-prose">数据指纹：{{ value.data_fingerprint }}</p>
   <p class="memory-prose">环境指纹：{{ value.environment_fingerprint }}</p>
@@ -48,7 +49,7 @@
     ('指标单位', 'metric_unit'), ('正向阈值', 'positive_delta_threshold'), ('负向阈值', 'negative_delta_threshold')
   ] %}<dt>{{ label }}</dt><dd>{{ binding[field] if binding[field] is not none else '未记录' }}</dd>{% endfor %}
 </dl>
-{% else %}<p class="muted">未记录。不从配置或指标数值推测绑定、阈值或方向。</p>{% endif %}
+{% else %}<p class="muted">未记录受控执行绑定。</p>{% endif %}
 </section>
 {{ text_list('来源回执', value.source_receipt_refs) }}
 {{ text_list('终态证据', value.terminal_evidence_refs) }}
@@ -83,12 +84,10 @@
   <dt>不确定度</dt><dd>{{ value.parsed_metric.uncertainty_decimal
     if value.parsed_metric.uncertainty_decimal is not none else '未记录' }}</dd>
 </dl>
-<p class="reading-note">按保存的十进制字符串显示，不转浮点或舍入。负数同样保留，不按正负推断方法是否有效。</p>
 </section>
-{% else %}<p>未保存可读指标，不用 0 代替。</p>{% endif %}
+{% else %}<p>未记录指标。</p>{% endif %}
 {% if value.failure %}<p>失败：{{ value.failure.kind }} · {{ value.failure.code }}</p>{% endif %}
-<p class="reading-note">局部结果不等于完整运行结果；解析与重解析验证不单独证明执行成功或具备比较资格。</p>
-<p>可对照两份精确结果；资格由原生比较器判定。不默认求平均、计算改善比例或判断胜出，也不生成 Result Atom 或 Claim。</p>
+<p>选择两份结果对照，可查看比较资格和差异原因。</p>
 <button class="text-button" type="button" data-result-base="{{ item.stable_key }}"
   data-revision="{{ item.revision_ref }}" data-object="{{ item.object_ref }}">将此结果固定为对照左侧</button>
 <button class="text-button" type="button" data-result-compare="{{ item.stable_key }}"

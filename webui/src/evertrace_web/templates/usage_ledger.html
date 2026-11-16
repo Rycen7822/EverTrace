@@ -17,7 +17,6 @@
   <dt>原 exposure Episode</dt><dd>{{ value.exposure_episode_revision_id }}</dd>
   <dt>原来源水位 / 时间</dt><dd>{{ value.source_watermark }} / {{ value.created_at_us }}</dd>
 </dl>
-<p>Routed 不是已返回；Returned 不是已执行，动作对齐也不是效果成功。本页没有重新路由或推进阶段。</p>
 {{ text_list('Attempt', value.attempt_ids) }}
 {{ text_list('动作 Episode', value.action_episode_revision_ids) }}
 {{ text_list('验证 Episode', value.verification_episode_revision_ids) }}
@@ -34,10 +33,9 @@
   <dt>原 expected effect</dt><dd class="memory-prose">{{ value.expected_effect }}</dd>
   <dt>原 level / 归因依据</dt><dd>{{ value.level }} / {{ value.attribution_basis }}</dd>
   <dt>原决策来源 / Session</dt><dd>{{ value.decision_source }} / {{ value.session_id }}</dd>
-  <dt>当前复核状态（另读，不改原事实）</dt><dd data-negative-review>{{ content.get('current_review') or '未提供' }}</dd>
+  <dt>当前复核状态</dt><dd data-negative-review>{{ content.get('current_review') or '未提供' }}</dd>
   <dt>Task / 原时间</dt><dd>{{ value.task_id }} / {{ value.created_at_us }}</dd>
 </dl>
-<p>Ineffective、SuspectedHarm、ConfirmedHarm 不等价；pending 也不是确认有害。本页不作复核决策。</p>
 {{ text_list('原 confounders', value.confounders) }}
 {% else %}
 <h2>负面复核 · 所选事件</h2>
@@ -48,7 +46,6 @@
   <dt>原时间</dt><dd>{{ value.created_at_us }}</dd>
   <dt>原后继 usage</dt><dd>{{ value.successor_usage_revision_id or '无' }}</dd>
 </dl>
-<p>这里只读所选复核事件，不把它冒成最新事件，也不发起采纳、驳回、恢复或确认有害。</p>
 {% endif %}
 {{ text_list('原证据引用', value.evidence_refs) }}
 {% if content.kind != 'procedure_effect' %}
@@ -58,7 +55,7 @@
 {% set now = content.get('procedure_now') %}
 {% if now %}
 <section class="semantic-section" data-procedure-now>
-  <h3>Procedure 当前元数据 · 与所选记录分开</h3>
+  <h3>Procedure 当前状态</h3>
   <p>读取状态：{{ now.state }}；记录中的修订：{{ now.recorded_revision or '未取得' }}。</p>
   {% if now.get('metadata') %}
   <p>当前修订：{{ now.metadata.current_revision_id or '未取得' }}；
@@ -68,8 +65,8 @@
     data-revision="{{ now.metadata.current_revision_id }}" data-object="{{ now.metadata.object_id }}"
     data-kind="procedure_revision">读取当前 Procedure 与效果关联</button>
   {% endif %}
-  <p>这些是本次 Native 读取的元数据，不是历史路由判定；不能把旧正结果转移给新修订或跳过 support pending。</p>
+  <p>以上为当前状态；所选历史记录保持原值。</p>
 </section>
 {% endif %}
-<p data-usage-trace="not_recorded">历史请求轨迹：本读源 not_recorded。保留原边界和证据引用，不从调用次数或备注推测 agent 看过什么。</p>
-<p>context-effect 可从 Procedure 的直接关联读取。未选投影不表示没有效果记录，也不按使用次数推断效果或 APPLY 资格。</p>
+<p data-usage-trace="not_recorded">历史请求轨迹：此读源未记录。</p>
+<p>效果记录可从 Procedure 的关联中查看。</p>
