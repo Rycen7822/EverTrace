@@ -278,6 +278,55 @@ pub fn save_segmentation_update(
     JournalCommand::new(context.command_id, events).map_err(Into::into)
 }
 
+/// Persist a newly pending candidate and its derived checkpoint as one journal command.
+pub fn save_candidate_checkpoint(
+    context: WorkCommandContext,
+    current: &WorkEpisode,
+    step: &crate::segmentation::IncrementalSegmentationStep,
+    receipts: &[evertrace_domain::work::CaptureReceipt],
+    attempts: &[Attempt],
+    snapshot: Option<&evertrace_domain::repository::WorktreeSnapshot>,
+) -> Result<JournalCommand, WorkIdentityError> {
+    if step.boundary_status() != BoundaryStatus::Candidate || step.candidate_watermark().is_none() {
+        return Err(WorkIdentityError::InvalidInput);
+    }
+    let update = save_segmentation_update(context, current, step, receipts)?;
+    let next = update
+        .events()
+        .iter()
+        .find_map(|event| match &event.payload {
+            JournalPayload::WorkEpisodeRecorded(value) => Some(value.as_ref()),
+            _ => None,
+        })
+        .ok_or(WorkIdentityError::InvalidInput)?;
+    let checkpoint = match crate::segmentation::build_checkpoint(
+        next,
+        attempts,
+        snapshot,
+        evertrace_domain::work::CheckpointReason::PhaseCandidate,
+        None,
+    )
+    .map_err(|_| WorkIdentityError::InvalidInput)?
+    {
+        crate::segmentation::CheckpointResolution::Checkpoint(value) => *value,
+        crate::segmentation::CheckpointResolution::NoDelta => {
+            return Err(WorkIdentityError::Conflict);
+        }
+    };
+    let saved =
+        save_checkpoint(context, next, checkpoint, None)?.ok_or(WorkIdentityError::Conflict)?;
+    JournalCommand::new(
+        context.command_id,
+        update
+            .events()
+            .iter()
+            .chain(saved.events())
+            .cloned()
+            .collect(),
+    )
+    .map_err(Into::into)
+}
+
 pub fn link_attempt_to_episode(
     current: &Attempt,
     episode: &WorkEpisode,

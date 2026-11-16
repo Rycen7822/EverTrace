@@ -159,6 +159,8 @@ pub struct SegmentationReadContext {
     pub root_refs: Vec<String>,
     pub source_refs: Vec<evertrace_domain::ids::SourceObservationId>,
     pub repository_ids: std::collections::BTreeSet<evertrace_domain::ids::RepositoryId>,
+    pub snapshot: Option<evertrace_domain::repository::WorktreeSnapshot>,
+    pub candidate_checkpointed: bool,
 }
 
 fn boundary_context<'a>(
@@ -326,7 +328,12 @@ impl JournalAdmissionState {
             scope_effects.insert(*id, effect.clone());
         }
         let mut attempts = BTreeMap::new();
-        if let Some(id) = binding.primary_binding.attempt_id {
+        for id in episode
+            .attempt_ids
+            .iter()
+            .copied()
+            .chain(binding.primary_binding.attempt_id)
+        {
             attempts.insert(
                 id,
                 self.attempts
@@ -385,6 +392,29 @@ impl JournalAdmissionState {
             episodes: BTreeMap::from([(episode.episode_id, episode.clone())]),
             workstreams: BTreeMap::from([(stream.workstream_id, stream.clone())]),
         };
+        let snapshot = episode
+            .worktree_instance_id
+            .and_then(|id| self.worktrees.get(&id))
+            .and_then(|(tree, _)| tree.current_snapshot_id)
+            .map(|id| {
+                self.worktree_snapshots
+                    .get(&id)
+                    .map(|(snapshot, _)| snapshot.clone())
+                    .ok_or(StoreError::StoreCorrupt)
+            })
+            .transpose()?;
+        let candidate_checkpointed = if let Some(candidate) = &episode.boundary_candidate {
+            let mut saved = false;
+            for key in &episode.checkpoint_refs {
+                let checkpoint = &self.checkpoints.get(key).ok_or(StoreError::StoreCorrupt)?.0;
+                saved |= checkpoint.created_reason
+                    == evertrace_domain::work::CheckpointReason::PhaseCandidate
+                    && checkpoint.source_watermark >= candidate.candidate_watermark;
+            }
+            saved
+        } else {
+            false
+        };
         Ok(Some(SegmentationReadContext {
             operation_id: operation.operation_id,
             sequence,
@@ -403,6 +433,8 @@ impl JournalAdmissionState {
             root_refs: task.request_root_refs.clone(),
             source_refs: source_refs.into_iter().collect(),
             repository_ids,
+            snapshot,
+            candidate_checkpointed,
         }))
     }
 }

@@ -308,17 +308,43 @@ pub(crate) async fn advance_activity(
             .ok()
             .and_then(|duration| i64::try_from(duration.as_micros()).ok())
             .ok_or(Error::Store)?;
-        let command = crate::work::episode::save_segmentation_update(
-            crate::work::WorkCommandContext {
-                command_id: evertrace_domain::ids::CommandId::new_v7(),
-                occurred_at_us,
-                effective_config_hash: runtime.effective_config_hash,
-                algorithm_revision: "incremental-segmentation-v1",
-            },
-            episode,
-            &step,
-            &receipts,
-        )
+        let context = crate::work::WorkCommandContext {
+            command_id: evertrace_domain::ids::CommandId::new_v7(),
+            occurred_at_us,
+            effective_config_hash: runtime.effective_config_hash,
+            algorithm_revision: "incremental-segmentation-v1",
+        };
+        let needs_checkpoint = step.candidate_watermark().is_some_and(|watermark| {
+            !selected.candidate_checkpointed
+                || episode
+                    .boundary_candidate
+                    .as_ref()
+                    .is_none_or(|candidate| candidate.candidate_watermark != watermark)
+        });
+        let command = if needs_checkpoint {
+            let attempts = episode
+                .attempt_ids
+                .iter()
+                .map(|id| {
+                    selected
+                        .state
+                        .authority()
+                        .attempt(*id)
+                        .cloned()
+                        .ok_or(Error::Store)
+                })
+                .collect::<Result<Vec<_>, _>>()?;
+            crate::work::episode::save_candidate_checkpoint(
+                context,
+                episode,
+                &step,
+                &receipts,
+                &attempts,
+                selected.snapshot.as_ref(),
+            )
+        } else {
+            crate::work::episode::save_segmentation_update(context, episode, &step, &receipts)
+        }
         .map_err(|_| Error::Store)?;
         match writer
             .commit_if_frontier(command, occurred_at_us, current.frontier())
