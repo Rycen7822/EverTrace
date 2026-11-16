@@ -387,14 +387,19 @@ impl JournalAdmissionState {
                     .values()
                     .map(|(stream, _)| (stream.task_id == task.task_id, stream.revision_id)),
             ),
-            Some(JournalPayload::WorkstreamRecorded(stream)) => {
-                Box::new(self.episodes.values().map(|(episode, _)| {
-                    (
-                        episode.workstream_id == stream.workstream_id,
-                        episode.revision_id,
-                    )
-                }))
-            }
+            Some(JournalPayload::WorkstreamRecorded(stream)) => Box::new(
+                self.episodes
+                    .values()
+                    .map(|(episode, _)| {
+                        (
+                            episode.workstream_id == stream.workstream_id,
+                            episode.revision_id,
+                        )
+                    })
+                    .chain(self.experiment_runs.values().map(|(run, _)| {
+                        (run.workstream_id == stream.workstream_id, run.revision_id)
+                    })),
+            ),
             Some(JournalPayload::RecoveryBundleRecorded(bundle)) => {
                 Box::new(self.recovery_applications.values().map(|(application, _)| {
                     (

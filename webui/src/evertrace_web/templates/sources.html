@@ -2,13 +2,13 @@
 <h2>来源与直接关联</h2>
 <button class="button" type="button" data-detail-open>返回所选修订详情</button>
 <button class="button" type="button" data-nav-back hidden>返回上一条记录</button>
-<p class="muted">这里列出原记录的直接引用。来源记录还可能列出包含其来源修订的采集覆盖凭证；各条仍独立检查权限。</p>
-<p class="muted">修订级关联不证明这条记录属于或已被该 lane 覆盖。显式修订保持原版；逻辑对象引用按本次读取水位定位当前修订。</p>
-<p class="muted">Task 的子工作线、Workstream 的子片段和 Procedure 的效果投影取本次水位；不是父修订当时的历史子树或路由记录。</p>
+<p class="muted">显式修订保持原版；逻辑对象打开本次水位的当前修订。</p>
+<p class="muted">来源修订可关联采集凭证，修订级关联不代表该记录的通道覆盖。</p>
+<p class="muted">任务的工作线、工作线的片段和实验、Procedure 效果显示当前关联，不是所选父修订当时的子树。</p>
 {% if matching_count is not none %}
-<p class="muted">共 {{ matching_count }} 个直接关联结果（含未能读取的引用），按当前水位计数；不是完整可读对象数量。</p>
+<p class="muted">共 {{ matching_count }} 条直接关联，含不可读项。</p>
 {% endif %}
-{% if status != 'ready' %}<p class="reading-note">所选记录当前状态：{{ status }}。没有保留旧关联条目。</p>{% endif %}
+{% if status != 'ready' %}<p class="reading-note">读取状态：{{ status }}。</p>{% endif %}
 {% for item in items %}
 <button class="memory-item linked-record" type="button" data-link-key="{{ item.stable_key }}"
         data-revision="{{ item.revision_ref or '' }}" data-object="{{ item.object_ref or '' }}"
@@ -22,10 +22,9 @@
 {% for entry in unavailable %}
 <div class="reading-note"><strong>{{ entry.state }}</strong>
 {% for reference in entry.references %}<p>{{ reference }}</p>{% endfor %}
-<p>未返回目标字段、正文或绕过读取权限的下载引用。</p>
 </div>
 {% endfor %}
-{% if status == 'ready' and not items and not unavailable %}<p class="muted">该记录没有已声明的直接来源或关联。</p>{% endif %}
+{% if status == 'ready' and not items and not unavailable %}<p class="muted">没有可列出的直接关联。</p>{% endif %}
 <div class="chunk-controls">
 <button class="button" type="button" data-sources-open>从头读取关联</button>
 <button class="button" type="button" data-sources-next>下一页关联</button>
