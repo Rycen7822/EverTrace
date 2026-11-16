@@ -2193,10 +2193,21 @@ fn collect_lane_episode_dependencies(
         let JournalPayload::WorkEpisodeRecorded(value) = &dependency.payload else {
             return Err(StoreError::StoreCorrupt);
         };
-        if value.lifecycle_status != evertrace_domain::work::EpisodeLifecycle::Open
-            || !value.execution_lane_ids.contains(&lane)
+        if !matches!(
+            value.lifecycle_status,
+            evertrace_domain::work::EpisodeLifecycle::Open
+                | evertrace_domain::work::EpisodeLifecycle::Closed
+        ) || !value.execution_lane_ids.contains(&lane)
         {
             continue;
+        }
+        for id in &value.segmentation_correction_refs {
+            let row_id = format!("object:work:segmentation_correction:{id}");
+            dependencies.insert(current_payload(
+                snapshot
+                    .other_row(&row_id)
+                    .ok_or(StoreError::StoreCorrupt)?,
+            )?)?;
         }
         for lane in &value.execution_lane_ids {
             let id = format!("object:evidence:capture_receipt:{lane}");

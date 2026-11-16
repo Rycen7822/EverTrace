@@ -1288,6 +1288,10 @@ struct CurrentCaptureState {
     execution_lane_event_seq: BTreeMap<ExecutionLaneId, u64>,
     attempts: BTreeMap<evertrace_domain::ids::AttemptId, evertrace_domain::work::Attempt>,
     episodes: BTreeMap<evertrace_domain::ids::WorkEpisodeId, evertrace_domain::work::WorkEpisode>,
+    corrections: BTreeMap<
+        evertrace_domain::revision::RevisionId,
+        (evertrace_domain::work::SegmentationCorrection, u64),
+    >,
     capture_receipts: BTreeMap<ExecutionLaneId, CaptureReceipt>,
     capture_gaps: BTreeMap<String, CaptureGapMarkerEvidence>,
     capture_outages: BTreeMap<CaptureOutageIntervalId, CaptureOutageInterval>,
@@ -1318,6 +1322,12 @@ impl CurrentCaptureState {
         dependency: NamedCurrentDependency,
     ) -> Result<(), ReconcileError> {
         match dependency.payload {
+            JournalPayload::SegmentationCorrectionRecorded(value) => {
+                self.corrections.insert(
+                    value.correction_revision_id,
+                    (*value, dependency.source_event_seq),
+                );
+            }
             JournalPayload::WorkEpisodeRecorded(value) => {
                 if self
                     .episodes
@@ -3011,11 +3021,14 @@ fn reconcile_episode_capture(
         })
         .collect::<BTreeSet<_>>();
     for episode in state.episodes.values().filter(|episode| {
-        episode.lifecycle_status == evertrace_domain::work::EpisodeLifecycle::Open
-            && episode
-                .execution_lane_ids
-                .iter()
-                .any(|lane| changed.contains(lane))
+        matches!(
+            episode.lifecycle_status,
+            evertrace_domain::work::EpisodeLifecycle::Open
+                | evertrace_domain::work::EpisodeLifecycle::Closed
+        ) && episode
+            .execution_lane_ids
+            .iter()
+            .any(|lane| changed.contains(lane))
     }) {
         let receipts = episode
             .execution_lane_ids
@@ -3028,8 +3041,33 @@ fn reconcile_episode_capture(
                     .ok_or(ReconcileError::Projection)
             })
             .collect::<Result<Vec<_>, _>>()?;
-        if let Some(next) = crate::work::episode::refresh_capture(episode, &receipts, watermark)
+        if episode.lifecycle_status == evertrace_domain::work::EpisodeLifecycle::Closed {
+            let predecessor = state
+                .corrections
+                .values()
+                .filter(|(correction, _)| {
+                    episode
+                        .segmentation_correction_refs
+                        .contains(&correction.correction_revision_id)
+                })
+                .max_by_key(|(_, sequence)| sequence)
+                .map(|(correction, _)| correction.correction_revision_id);
+            if let Some((correction, next)) = crate::work::episode::correct_closed_capture(
+                episode,
+                &receipts,
+                watermark,
+                predecessor,
+            )
             .map_err(|_| ReconcileError::Domain)?
+            {
+                payloads.push(JournalPayload::SegmentationCorrectionRecorded(Box::new(
+                    correction,
+                )));
+                payloads.push(JournalPayload::WorkEpisodeRecorded(Box::new(next)));
+            }
+        } else if let Some(next) =
+            crate::work::episode::refresh_capture(episode, &receipts, watermark)
+                .map_err(|_| ReconcileError::Domain)?
         {
             payloads.push(JournalPayload::WorkEpisodeRecorded(Box::new(next)));
         }

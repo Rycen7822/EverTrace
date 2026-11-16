@@ -943,6 +943,63 @@ pub(super) fn validate_episode_relations(
             return Err(StoreError::StoreCorrupt);
         }
     }
+    let mut capture_corrections = BTreeSet::new();
+    let needed_receipts = corrections
+        .values()
+        .filter(|(value, _)| value.kind == evertrace_domain::work::CorrectionKind::CaptureRevision)
+        .flat_map(|(value, _)| &value.evidence_refs)
+        .map(|id| {
+            id.parse::<evertrace_domain::ids::CaptureReceiptId>()
+                .map_err(|_| StoreError::StoreCorrupt)
+        })
+        .collect::<Result<BTreeSet<_>, _>>()?;
+    let mut receipt_successors = BTreeMap::new();
+    if !needed_receipts.is_empty() {
+        for (receipt, sequence) in receipt_revisions.values() {
+            if let Some(parent) = receipt
+                .predecessor_revision_id
+                .filter(|id| needed_receipts.contains(id))
+            {
+                receipt_successors
+                    .entry(parent)
+                    .and_modify(|old: &mut u64| *old = (*old).min(*sequence))
+                    .or_insert(*sequence);
+            }
+        }
+    }
+    for (episode, sequence) in episode_revisions.values() {
+        let Some((previous, _)) = episode
+            .predecessor_revision_id
+            .and_then(|id| episode_revisions.get(&id))
+        else {
+            continue;
+        };
+        if previous.lifecycle_status == evertrace_domain::work::EpisodeLifecycle::Closed
+            && episode.lifecycle_status == evertrace_domain::work::EpisodeLifecycle::Closed
+            && previous.segmentation_correction_refs != episode.segmentation_correction_refs
+        {
+            let added = episode
+                .segmentation_correction_refs
+                .iter()
+                .find(|id| !previous.segmentation_correction_refs.contains(id))
+                .ok_or(StoreError::StoreCorrupt)?;
+            let correction = &corrections.get(added).ok_or(StoreError::StoreCorrupt)?.0;
+            if correction.kind != evertrace_domain::work::CorrectionKind::CaptureRevision
+                || !capture_corrections.insert(*added)
+            {
+                return Err(StoreError::StoreCorrupt);
+            }
+            validate_capture_correction(
+                correction,
+                episode,
+                *sequence,
+                episode_revisions,
+                receipt_revisions,
+                corrections,
+                &receipt_successors,
+            )?;
+        }
+    }
     for (id, (correction, _)) in corrections {
         if id != &correction.correction_revision_id
             || correction
@@ -961,6 +1018,89 @@ pub(super) fn validate_episode_relations(
         {
             return Err(StoreError::StoreCorrupt);
         }
+        if correction.kind == evertrace_domain::work::CorrectionKind::CaptureRevision
+            && !capture_corrections.contains(id)
+        {
+            return Err(StoreError::StoreCorrupt);
+        }
+    }
+    Ok(())
+}
+
+fn validate_capture_correction(
+    correction: &SegmentationCorrection,
+    episode: &WorkEpisode,
+    sequence: u64,
+    episodes: &BTreeMap<evertrace_domain::revision::RevisionId, (WorkEpisode, u64)>,
+    receipts: &BTreeMap<evertrace_domain::ids::CaptureReceiptId, (CaptureReceipt, u64)>,
+    corrections: &BTreeMap<evertrace_domain::revision::RevisionId, (SegmentationCorrection, u64)>,
+    receipt_successors: &BTreeMap<evertrace_domain::ids::CaptureReceiptId, u64>,
+) -> Result<(), StoreError> {
+    let Some((previous, _)) = episode
+        .predecessor_revision_id
+        .and_then(|id| episodes.get(&id))
+    else {
+        return Err(StoreError::StoreCorrupt);
+    };
+    if previous
+        .segmentation_correction_refs
+        .contains(&correction.correction_revision_id)
+    {
+        return Err(StoreError::StoreCorrupt);
+    }
+    let predecessor = previous
+        .segmentation_correction_refs
+        .iter()
+        .filter_map(|id| corrections.get(id))
+        .max_by_key(|(_, sequence)| sequence)
+        .map(|(value, _)| value.correction_revision_id);
+    if correction.source_episode_ids != vec![episode.episode_id]
+        || correction.predecessor_revision_id != predecessor
+        || previous.lifecycle_status != evertrace_domain::work::EpisodeLifecycle::Closed
+        || episode.lifecycle_status != evertrace_domain::work::EpisodeLifecycle::Closed
+        || correction.source_watermark != episode.source_watermark
+    {
+        return Err(StoreError::StoreCorrupt);
+    }
+    previous
+        .validate_successor(episode)
+        .map_err(|_| StoreError::StoreCorrupt)?;
+    let mut evidence = Vec::new();
+    for id in episode
+        .capture_receipt_revision_ids
+        .iter()
+        .filter(|id| !previous.capture_receipt_revision_ids.contains(id))
+    {
+        let (receipt, receipt_seq) = receipts.get(id).ok_or(StoreError::StoreCorrupt)?;
+        if *receipt_seq > sequence
+            || receipt_successors
+                .get(id)
+                .is_some_and(|next| *next <= sequence)
+        {
+            return Err(StoreError::StoreCorrupt);
+        }
+        let mut ancestor = receipt;
+        while !previous
+            .capture_receipt_revision_ids
+            .contains(&ancestor.capture_receipt_revision_id)
+        {
+            ancestor = &receipts
+                .get(
+                    &ancestor
+                        .predecessor_revision_id
+                        .ok_or(StoreError::StoreCorrupt)?,
+                )
+                .ok_or(StoreError::StoreCorrupt)?
+                .0;
+            if ancestor.execution_lane_id != receipt.execution_lane_id {
+                return Err(StoreError::StoreCorrupt);
+            }
+        }
+        evidence.push(id.to_string());
+    }
+    evidence.sort();
+    if evidence.is_empty() || evidence != correction.evidence_refs {
+        return Err(StoreError::StoreCorrupt);
     }
     Ok(())
 }

@@ -437,6 +437,61 @@ pub(crate) fn refresh_capture(
     receipts: &[evertrace_domain::work::CaptureReceipt],
     source_watermark: u64,
 ) -> Result<Option<WorkEpisode>, WorkIdentityError> {
+    let Some(next) = capture_successor(current, receipts, source_watermark)? else {
+        return Ok(None);
+    };
+    current
+        .validate_successor(&next)
+        .map_err(|_| WorkIdentityError::InvalidInput)?;
+    Ok(Some(next))
+}
+
+pub(crate) fn correct_closed_capture(
+    current: &WorkEpisode,
+    receipts: &[evertrace_domain::work::CaptureReceipt],
+    source_watermark: u64,
+    predecessor: Option<RevisionId>,
+) -> Result<Option<(evertrace_domain::work::SegmentationCorrection, WorkEpisode)>, WorkIdentityError>
+{
+    if current.lifecycle_status != EpisodeLifecycle::Closed {
+        return Err(WorkIdentityError::InvalidInput);
+    }
+    let Some(mut next) = capture_successor(current, receipts, source_watermark)? else {
+        return Ok(None);
+    };
+    let mut evidence_refs = next
+        .capture_receipt_revision_ids
+        .iter()
+        .filter(|id| !current.capture_receipt_revision_ids.contains(id))
+        .map(ToString::to_string)
+        .collect::<Vec<_>>();
+    evidence_refs.sort();
+    let correction = evertrace_domain::work::SegmentationCorrection {
+        correction_revision_id: RevisionId::new_v7(),
+        predecessor_revision_id: predecessor,
+        kind: evertrace_domain::work::CorrectionKind::CaptureRevision,
+        source_episode_ids: vec![current.episode_id],
+        replacement_episode_ids: vec![current.episode_id],
+        evidence_refs,
+        source_watermark,
+    };
+    correction
+        .validate()
+        .map_err(|_| WorkIdentityError::InvalidInput)?;
+    next.segmentation_correction_refs
+        .push(correction.correction_revision_id);
+    next.segmentation_correction_refs.sort();
+    current
+        .validate_successor(&next)
+        .map_err(|_| WorkIdentityError::InvalidInput)?;
+    Ok(Some((correction, next)))
+}
+
+fn capture_successor(
+    current: &WorkEpisode,
+    receipts: &[evertrace_domain::work::CaptureReceipt],
+    source_watermark: u64,
+) -> Result<Option<WorkEpisode>, WorkIdentityError> {
     let mut lanes = receipts
         .iter()
         .map(|receipt| receipt.execution_lane_id)
@@ -464,9 +519,6 @@ pub(crate) fn refresh_capture(
         after_watermark: next.semantic_watermark,
         through_watermark: source_watermark,
     });
-    current
-        .validate_successor(&next)
-        .map_err(|_| WorkIdentityError::InvalidInput)?;
     Ok(Some(next))
 }
 

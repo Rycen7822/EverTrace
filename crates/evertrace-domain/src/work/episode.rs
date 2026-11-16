@@ -96,6 +96,7 @@ pub enum CorrectionKind {
     Split,
     Merge,
     Reattach,
+    CaptureRevision,
 }
 
 impl CorrectionKind {
@@ -105,6 +106,7 @@ impl CorrectionKind {
             Self::Split => "split",
             Self::Merge => "merge",
             Self::Reattach => "reattach",
+            Self::CaptureRevision => "capture_revision",
         }
     }
 }
@@ -136,6 +138,10 @@ impl SegmentationCorrection {
             CorrectionKind::Reattach => {
                 self.source_episode_ids.len() == 1 && self.replacement_episode_ids.len() == 1
             }
+            CorrectionKind::CaptureRevision => {
+                self.source_episode_ids.len() == 1
+                    && self.source_episode_ids == self.replacement_episode_ids
+            }
         };
         if self.source_watermark == 0
             || !ids(&self.source_episode_ids)
@@ -143,10 +149,11 @@ impl SegmentationCorrection {
             || !refs(&self.evidence_refs)
             || self.evidence_refs.is_empty()
             || !shape
-            || self
-                .source_episode_ids
-                .iter()
-                .any(|id| self.replacement_episode_ids.contains(id))
+            || (self.kind != CorrectionKind::CaptureRevision
+                && self
+                    .source_episode_ids
+                    .iter()
+                    .any(|id| self.replacement_episode_ids.contains(id)))
         {
             return Err(WorkError::InvalidWorkIdentity);
         }
@@ -420,6 +427,12 @@ impl WorkEpisode {
             .revision_generation
             .checked_add(1)
             .ok_or(WorkError::InvalidWorkIdentity)?;
+        if self.lifecycle_status == EpisodeLifecycle::Closed
+            && next.lifecycle_status == EpisodeLifecycle::Closed
+            && self.segmentation_correction_refs != next.segmentation_correction_refs
+        {
+            return self.validate_capture_successor(next, next_generation);
+        }
         if self.semantic_watermark != next.semantic_watermark
             || self.semantic_digest_refs != next.semantic_digest_refs
         {
@@ -490,6 +503,45 @@ impl WorkEpisode {
                 &self.segmentation_correction_refs,
                 &next.segmentation_correction_refs,
             )
+        {
+            return Err(WorkError::InvalidWorkIdentity);
+        }
+        Ok(())
+    }
+
+    fn validate_capture_successor(&self, next: &Self, generation: u64) -> Result<(), WorkError> {
+        let mut frozen = next.clone();
+        frozen.revision_id = self.revision_id;
+        frozen.predecessor_revision_id = self.predecessor_revision_id;
+        frozen.revision_generation = self.revision_generation;
+        frozen.source_watermark = self.source_watermark;
+        frozen.capture_receipt_revision_ids = self.capture_receipt_revision_ids.clone();
+        frozen.capture_gap_refs = self.capture_gap_refs.clone();
+        frozen.capture_outage_refs = self.capture_outage_refs.clone();
+        frozen.capture_watermark = self.capture_watermark;
+        frozen.capture_summary = self.capture_summary.clone();
+        frozen.pending_semantic_delta = self.pending_semantic_delta;
+        frozen.segmentation_correction_refs = self.segmentation_correction_refs.clone();
+        if frozen != *self
+            || next.revision_id == self.revision_id
+            || next.predecessor_revision_id != Some(self.revision_id)
+            || next.revision_generation != generation
+            || next.source_watermark <= self.source_watermark
+            || next.capture_watermark < self.capture_watermark
+            || next.capture_receipt_revision_ids == self.capture_receipt_revision_ids
+            || !retains(&self.capture_gap_refs, &next.capture_gap_refs)
+            || !retains(&self.capture_outage_refs, &next.capture_outage_refs)
+            || !retains(
+                &self.segmentation_correction_refs,
+                &next.segmentation_correction_refs,
+            )
+            || next.segmentation_correction_refs.len()
+                != self.segmentation_correction_refs.len() + 1
+            || next.pending_semantic_delta
+                != Some(PendingSemanticInterval {
+                    after_watermark: self.semantic_watermark,
+                    through_watermark: next.source_watermark,
+                })
         {
             return Err(WorkError::InvalidWorkIdentity);
         }
