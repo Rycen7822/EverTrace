@@ -56,6 +56,7 @@ function cancel() {
 }
 function notice(text) {
   $("notice").textContent = text;
+  $("notice").hidden = !text;
 }
 function closed(text, broadcast = false) {
   archive = null;
@@ -175,7 +176,7 @@ async function readComparison(comparison, controller, scroll = 0) {
   };
   const next = $("detail-body").querySelector("[data-compare-next]");
   if (next) next.disabled = !result.next_cursor;
-  if (comparison.research) notice("读取状态和比较资格见下方；此次对照未改变记录或生成结论。");
+  if (comparison.research) notice("");
   $("detail-ref").textContent =
     result.status === "ready"
       ? comparison.query.left.revision_ref + " / " + comparison.query.right.revision_ref
@@ -207,7 +208,7 @@ function compareResult(button, pin) {
   if (pin) {
     state.compareBase = current;
     navigationControls();
-    notice("已固定结果左侧；打开另一份结果后选择对照。资格由原生比较器判定。");
+    notice("已固定左侧结果，请打开另一份结果对照。");
     return;
   }
   const left = state.compareBase;
@@ -715,23 +716,19 @@ async function readWork(controller) {
     state.selected = { key: state.query.selection.task_id, kind: "task", revision: null, object: null, path: [] };
   }
   $("memory-items").textContent = usage
-    ? "读取 Recall、usage、负面事实、效果或支持记录。所选原事件与当前元数据分开显示，不调用 @due。"
+    ? "查看召回、使用、负面证据与效果记录。"
     : research
-    ? "读取已知 Run、ResultEvidence 或研究 Atom；从结果可回到其对应 Run 的精确条件。"
-    : "按精确工作记录读取。Task 的工作线、Workstream 的片段可从详情中的关联逐项展开。";
-  $("page-count").textContent = usage ? "精确使用证据 · 非请求总数"
-    : research ? "精确研究记录 · 非全局实验清单" : "精确工作 · 非任务总数";
+    ? "查看实验条件与结果，选择两份结果对照。"
+    : "从任务进入工作线，逐项查看工作片段、策略和操作。";
+  $("page-count").textContent = usage ? "所选使用记录"
+    : research ? "所选研究记录" : "所选工作记录";
   if (state.selected) await readSelection(state.selected, controller, scroll);
   else $("detail-body").textContent = usage
-    ? "输入已知记录 ID。未选或不可用不表示没有召回义务或负面证据，不填入示例状态。"
+    ? "输入记录 ID 查看使用证据。"
     : research
-    ? "输入已知研究记录 ID。未选记录不显示为空实验清单，也不填入示例结果。"
-    : "请从范围目录选择 Task，或输入已知工作 ID。没有把未选择工作显示成空列表。";
-  notice(usage
-    ? "只读已存状态，不 claim、不投递、不推进 usage，也不从检索记录推断 agent 已采用。"
-    : research
-    ? "只读原始条件和证据；不自动聚合、判断胜出或接受为长期结论。"
-    : "只读所选修订；目标、计划、来源关联和工作状态不等于执行、采用或验证完成。");
+    ? "输入研究记录 ID 查看实验或结果。"
+    : "请选择任务，或输入工作记录 ID。";
+  notice("");
 }
 async function readObservations(controller, health) {
   const system = state.route === "system";
@@ -1020,7 +1017,8 @@ function route(name) {
   $("work-record-label").textContent = name === "usage" ? "记录 ID（精确）"
     : name === "research" ? "研究记录 ID" : "工作记录 ID";
   $("work-record-id").setAttribute("aria-label", $("work-record-label").textContent);
-  $("work-record-submit").textContent = name === "usage" ? "读取使用证据" : "读取工作记录";
+  $("work-record-submit").textContent = name === "usage" ? "读取使用证据"
+    : name === "research" ? "读取研究记录" : "读取工作记录";
   for (const option of $("work-record-kind").options) {
     option.hidden = name === "usage" && !["recall_need", "procedure_usage_revision",
       "procedure_negative_evidence", "procedure_negative_review", "procedure_context_effect",
@@ -1028,10 +1026,10 @@ function route(name) {
     option.disabled = option.hidden;
   }
   $("work-record-help").textContent = name === "usage"
-    ? "usage 可选修订；复核/支持填原事件或合同 ID，effect 填原键。Need 修订不选择历史快照。"
+    ? "使用记录可指定修订；复核填事件 ID，支持填合同 ID，效果填原键。RecallNeed 显示当前状态。"
     : name === "research"
-    ? "选择 Run、ResultEvidence 或 Atom，输入精确 ID；修订留空只绑定原生当前版本。"
-    : "也可从范围目录选择 Task。这里只读所选工作及有界关联，不把全局范围当空任务列表。";
+    ? "选择记录类型并输入 ID；修订留空时读取当前版本。"
+    : "可从范围目录选择任务；修订留空时读取当前版本。";
   if (["work", "research", "usage"].includes(name)) {
     $("work-record-kind").value = name === "usage" ? "recall_need" : name === "research" ? "experiment_run" : "task";
     $("work-record-id").value = "";
@@ -1047,8 +1045,6 @@ function route(name) {
   $("breadcrumb").textContent = label;
   $("page-title").textContent = label;
   readingControls();
-  $("page-description").textContent =
-    "独立 Python Web，只读调用现有 daemon；未接入的页面不使用示例数据。";
   notice(
     connected ? "正在读取…"
       : "该页面尚未接入真实后端。",

@@ -67,7 +67,6 @@
             <span id="status-dot" class="status-dot gray"></span
             ><span id="connection-status">等待认证</span>
           </div>
-          <p>仅连接本机 daemon<br />当前为只读接入</p>
           <button id="logout" class="text-button">结束网页会话</button>
         </div>
         <div class="profile">
@@ -91,7 +90,7 @@
           >
             <circle cx="10.5" cy="10.5" r="6.5" />
             <path d="m16 16 4.5 4.5" /></svg
-          ><span>搜索记忆、来源和工作（未接入）</span>
+          ><span>搜索暂未开放</span>
         </button>
         <div class="top-actions"><span class="mode-label">本机连接 · 只读</span></div>
       </header>
@@ -99,7 +98,6 @@
         <div class="page-heading">
           <div>
             <h1 id="page-title">记忆</h1>
-            <p id="page-description">查看 daemon 中当前可读的记忆。暂未开放网页修改。</p>
           </div>
           <div class="page-actions">
             <button id="scope-open" class="button" type="button">范围：全部元数据</button
@@ -112,7 +110,7 @@
         <section id="system-panel" class="system-connection" aria-label="连接状态" hidden>
           <strong>连接状态</strong><span id="system-status"></span>
         </section>
-        <section id="reader" class="browser" aria-label="原生只读浏览器" hidden>
+        <section id="reader" class="browser" aria-label="记录阅读" hidden>
           <div class="browser-list">
             <div class="browser-list-head">
               <div class="toolbar">
@@ -188,7 +186,7 @@
                 <label>精确修订（可选）<input id="work-record-revision" type="text" maxlength="512"
                   autocomplete="off" spellcheck="false" aria-label="工作记录修订" /></label>
                 <button id="work-record-submit" class="text-button" type="submit">读取工作记录</button>
-                <p id="work-record-help" class="muted">也可从范围目录选择 Task。这里只读所选工作及有界关联，不把全局范围当空任务列表。</p>
+                <p id="work-record-help" class="muted">可从范围目录选择任务；修订留空时读取当前版本。</p>
               </form>
               <form id="job-lookup" class="time-filter" hidden>
                 <label
