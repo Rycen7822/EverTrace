@@ -241,6 +241,7 @@ impl JournalAdmissionState {
                     | "source_observation"
                     | "work_episode"
                     | "attempt"
+                    | "competing_attempt_group"
                     | "operation_burst"
                     | "operation"
                     | "host_occurrence"
