@@ -515,6 +515,7 @@ impl ProcessWorkDeclaration {
             && value.event == "work_started";
         ((fixed || work)
             && value.study_key == value.definition.study_key
+            && !value.study_key.trim().is_empty()
             && !value.source_epoch.is_empty()
             && receipt.source_sequence == 1
             && receipt.source_instance_id.as_str() == instance
@@ -1027,6 +1028,7 @@ fn process_work_refs(
     );
     let mut refs = BTreeSet::new();
     let mut causal = BTreeSet::new();
+    let mut prior = BTreeSet::new();
     let deadline = std::time::Instant::now() + std::time::Duration::from_millis(40);
     for (receipt, _) in current.source_receipts() {
         if std::time::Instant::now() >= deadline {
@@ -1037,6 +1039,17 @@ fn process_work_refs(
         {
             refs.insert(receipt.source_observation_id.to_string());
             causal.insert(receipt.source_observation_id);
+        }
+        if declaration.format == evertrace_capture::process_source::WORK_FORMAT
+            && evertrace_capture::process_source::is_work_revision(receipt.source_revision.as_str())
+            && let Some(SourceCandidate::WorkPlan(old)) =
+                source_candidate(current, receipt.source_observation_id)
+            && old.definition.study_key == declaration.definition.study_key
+            && old.definition.goal == declaration.definition.goal
+            && old.definition.scope == declaration.definition.scope
+            && old.definition.scope_kind == declaration.definition.scope_kind
+        {
+            prior.insert(receipt.source_observation_id.to_string());
         }
         if !receipt.source_instance_id.as_str().starts_with(&prefix) {
             continue;
@@ -1072,6 +1085,50 @@ fn process_work_refs(
             ]);
             refs.extend(scope.repository.map(|id| id.to_string()));
             refs.extend(scope.worktree.map(|id| id.to_string()));
+        }
+    }
+    let mut owners = BTreeSet::new();
+    for row in current
+        .other_data_rows()
+        .filter(|row| row.object_kind.as_deref() == Some("work_binding"))
+    {
+        if std::time::Instant::now() >= deadline {
+            return Err(AutoresearchError::SelectionDeferred);
+        }
+        let Some(JournalPayload::WorkBindingRecorded(binding)) = row
+            .payload_json
+            .as_deref()
+            .and_then(|json| serde_json::from_str(json).ok())
+        else {
+            continue;
+        };
+        let linked = binding
+            .evidence_refs
+            .iter()
+            .filter(|value| prior.contains(*value))
+            .filter_map(|reference| {
+                reference
+                    .parse::<SourceObservationId>()
+                    .ok()
+                    .and_then(|id| {
+                        current
+                            .source_observation(id)
+                            .map(|(_, seq)| (seq, reference))
+                    })
+            })
+            .min_by_key(|(seq, _)| *seq)
+            .map(|(_, reference)| reference);
+        if let (Some(reference), Some(owner)) = (linked, binding.primary_binding.workstream_id)
+            && owners.insert(owner)
+        {
+            if owners.len() > 2 {
+                return Err(AutoresearchError::EvidenceIncomplete);
+            }
+            refs.insert(reference.clone());
+            refs.insert(binding.operation_id.to_string());
+            refs.insert(owner.to_string());
+            refs.extend(binding.primary_binding.task_id.map(|id| id.to_string()));
+            refs.extend(binding.primary_binding.episode_id.map(|id| id.to_string()));
         }
     }
     let prefixes = causal
@@ -2029,6 +2086,41 @@ impl ControlledRunResolver {
             root_source: native,
             goal_source: goal,
         };
+        let mut continuation = BTreeSet::new();
+        if work {
+            for old in facts.receipts.values().filter(|receipt| {
+                receipt.source_observation_id != source
+                    && process_source::is_work_revision(receipt.source_revision.as_str())
+                    && receipt.source_sequence == 1
+            }) {
+                let reference = old.source_observation_id.to_string();
+                let owned = facts.bindings.values().any(|binding| {
+                    binding.primary_binding.task_id == Some(task.task_id)
+                        && binding.evidence_refs.contains(&reference)
+                });
+                if !owned {
+                    continue;
+                }
+                let raw = self.protected_source(facts, old.source_observation_id)?;
+                let prior = ProcessWorkDeclaration::decode(&raw, old)
+                    .ok_or(AutoresearchError::EvidenceIncomplete)?;
+                if prior.definition.study_key != declaration.definition.study_key
+                    || prior.definition.scope != declaration.definition.scope
+                    || prior.definition.goal != declaration.definition.goal
+                    || prior.definition.scope_kind != declaration.definition.scope_kind
+                {
+                    continue;
+                }
+                if !facts.bindings.values().any(|binding| {
+                    binding.assignment_status == AssignmentStatus::Resolved
+                        && binding.primary_binding.task_id == Some(task.task_id)
+                        && binding.evidence_refs.contains(&reference)
+                }) {
+                    return Err(AutoresearchError::EvidenceIncomplete);
+                }
+                continuation.insert(reference);
+            }
+        }
         let command = process_work_command(
             snapshot,
             facts,
@@ -2036,6 +2128,7 @@ impl ControlledRunResolver {
             task,
             &anchor,
             &declaration.definition,
+            &continuation,
             context,
         )?;
         Ok((
@@ -3786,6 +3879,7 @@ fn process_work_command(
     task: &Task,
     anchor: &ProcessWorkAnchor<'_>,
     plan: &ProcessWorkPlan,
+    continuation: &BTreeSet<String>,
     context: &AutoresearchCommandContext,
 ) -> Result<Option<JournalCommand>, AutoresearchError> {
     use crate::work::{WorkCommandContext, attempt, episode, workstream};
@@ -3813,7 +3907,7 @@ fn process_work_command(
         .as_ref()
         .map(|receipt| receipt.execution_lane_id);
     let source_ref = source.to_string();
-    let sources = vec![
+    let mut sources = vec![
         source_ref.clone(),
         anchor.root_source.to_string(),
         anchor.goal_source.to_string(),
@@ -3826,10 +3920,23 @@ fn process_work_command(
             stream.worktree_lineage_refs.contains(&source_ref)
                 || current_binding
                     .is_some_and(|binding| source_owns_stream(binding, stream, &source_ref))
+                || facts.bindings.values().any(|binding| {
+                    continuation
+                        .iter()
+                        .any(|source| source_owns_stream(binding, stream, source))
+                })
         })
         .collect::<Vec<_>>();
     let map_error = |_| AutoresearchError::ImmutableConflict;
     if let [stream] = streams.as_slice() {
+        if let Some(prior) = continuation.iter().find(|reference| {
+            facts
+                .bindings
+                .values()
+                .any(|binding| source_owns_stream(binding, stream, reference))
+        }) {
+            sources.push(prior.clone());
+        }
         if stream.task_id != task.task_id
             || stream.repository_instance_id != repository
             || stream.worktree_instance_ids != worktree.into_iter().collect::<Vec<_>>()
@@ -3847,7 +3954,20 @@ fn process_work_command(
                 .and_then(|revision| facts.episodes.get(revision))
                 .ok_or(AutoresearchError::EvidenceIncomplete)?;
             let mut events = Vec::new();
-            if phase.phase_contract == plan.phase && !phase.execution_lane_ids.is_empty() {
+            if root_lane.is_some_and(|lane| !phase.execution_lane_ids.contains(&lane)) {
+                return Ok(None);
+            }
+            if phase.phase_contract != plan.phase
+                || !phase.attempt_ids.iter().any(|id| {
+                    facts
+                        .attempts
+                        .get(id)
+                        .is_some_and(|attempt| attempt.strategy_contract == plan.strategy)
+                })
+            {
+                return Err(AutoresearchError::ImmutableConflict);
+            }
+            if !phase.execution_lane_ids.is_empty() {
                 let receipts = phase
                     .execution_lane_ids
                     .iter()
@@ -3878,7 +3998,19 @@ fn process_work_command(
             )
             .map_err(map_error)?
             .into_revision();
-            if let Some(binding) = binding {
+            if let Some(mut binding) = binding {
+                if binding.primary_binding.episode_id.is_none() {
+                    let linked =
+                        episode::link_binding_to_episode(&binding, phase).map_err(map_error)?;
+                    events.extend(
+                        crate::work::binding::record_binding(context, binding)
+                            .map_err(map_error)?
+                            .events()
+                            .iter()
+                            .cloned(),
+                    );
+                    binding = linked;
+                }
                 events.extend(
                     crate::work::binding::record_binding(context, binding)
                         .map_err(map_error)?
