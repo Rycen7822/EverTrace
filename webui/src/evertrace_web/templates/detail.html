@@ -10,7 +10,7 @@
 {% set research = item.object_kind in ('experiment_run', 'result_evidence') %}
 {% set typed_fact = item.object_kind in (
   'procedure_context_effect', 'global_support_contract', 'global_support_validation', 'recovery_application_revision',
-  'work_binding', 'worktree_transition', 'integration_event'
+  'work_binding', 'worktree_transition', 'integration_event', 'competing_attempt_group'
 ) %}
 <div class="detail-title">
   {% if not research and not typed_fact %}<div class="badges">
@@ -95,7 +95,7 @@
 {% if item.object_kind in (
   'atom_revision', 'procedure_revision', 'core_membership', 'revision_proposal_revision',
   'semantic_digest', 'source_receipt', 'source_observation', 'work_episode',
-  'attempt', 'operation_burst', 'operation', 'task', 'workstream', 'host_occurrence', 'scope_effect',
+  'attempt', 'competing_attempt_group', 'operation_burst', 'operation', 'task', 'workstream', 'host_occurrence', 'scope_effect',
   'worktree', 'worktree_snapshot', 'work_binding', 'worktree_transition', 'integration_event',
   'recovery_capture_request', 'recovery_bundle', 'recovery_application_revision', 'work_artifact',
   'experiment_run', 'result_evidence', 'procedure_usage_revision', 'procedure_negative_evidence',

@@ -2806,6 +2806,7 @@ impl ExactRecordQuery {
                     || key.parse::<crate::ids::TaskId>().is_ok()
                     || key.parse::<crate::ids::WorkstreamId>().is_ok()
                     || key.parse::<crate::ids::AttemptId>().is_ok()
+                    || key.parse::<crate::ids::CompetingAttemptGroupId>().is_ok()
                     || key.parse::<crate::ids::OperationBurstId>().is_ok()
                     || key.parse::<crate::ids::OperationId>().is_ok()
                     || key.parse::<ExecutionLaneId>().is_ok()

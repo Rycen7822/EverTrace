@@ -200,7 +200,7 @@
     data-link-key="{{ value.predecessor_revision_id }}" data-revision="{{ value.predecessor_revision_id }}"
     data-object="{{ value.predecessor_revision_id }}" data-kind="capture_receipt">读取原前序凭证</button>{% endif %}
 {% elif content.kind in (
-  'execution_lane', 'attempt', 'operation_burst', 'operation', 'host_occurrence', 'scope_effect',
+  'execution_lane', 'attempt', 'competing_attempt_group', 'operation_burst', 'operation', 'host_occurrence', 'scope_effect',
   'worktree', 'worktree_snapshot', 'work_artifact'
 ) %}
   {% include 'work_records.html' %}
@@ -240,6 +240,7 @@
     <h3>预期状态变化</h3><div class="memory-prose">{{ value.phase_contract.expected_state_transition }}</div>
   </section>
   {{ text_list('关联尝试（当前修订）', value.attempt_ids, record_kind='attempt') }}
+  {{ text_list('候选路线组（当前修订）', value.competing_attempt_group_ids, record_kind='competing_attempt_group') }}
   {{ text_list('执行通道（当前修订）', value.execution_lane_ids, record_kind='execution_lane') }}
   {{ text_list('操作片段（当前修订）', value.operation_burst_refs, record_kind='operation_burst') }}
   {{ text_list('未解决事项', value.open_loops) }}

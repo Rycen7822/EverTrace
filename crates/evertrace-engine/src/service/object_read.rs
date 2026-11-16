@@ -223,12 +223,13 @@ fn fields_metadata(
     })
 }
 
-fn workstream_scoped_fields(row: &ObjectRow) -> bool {
-    row.workstream_id.is_some()
-        && matches!(
-            row.object_kind.as_deref(),
-            Some("workstream" | "work_episode" | "attempt" | "work_binding")
-        )
+fn member_scoped_fields(row: &ObjectRow) -> bool {
+    row.object_kind.as_deref() == Some("competing_attempt_group")
+        || row.workstream_id.is_some()
+            && matches!(
+                row.object_kind.as_deref(),
+                Some("workstream" | "work_episode" | "attempt" | "work_binding")
+            )
 }
 
 async fn fields_access(
@@ -275,11 +276,11 @@ async fn fields_scope_access(
         .filter(|row| {
             !(row.object_kind.as_deref() == Some("task")
                 && (root.object_kind.as_deref() == Some("segmentation_correction")
-                    || workstream_scoped_fields(root) && row.object_id == root.task_id))
+                    || member_scoped_fields(root) && row.object_id == root.task_id))
         })
         .cloned()
         .map(|mut row| {
-            if workstream_scoped_fields(&row) {
+            if member_scoped_fields(&row) {
                 row.task_id = None;
             }
             row
@@ -649,6 +650,7 @@ fn record_data(
         P::SemanticDigestRecorded(value) => semantic_record(&value, None, query, check),
         P::RevisionProposalRecorded(value) => semantic_record(&value, None, query, check),
         P::AttemptRecorded(value) => semantic_record(&value, None, query, check),
+        P::CompetingAttemptGroupRecorded(value) => semantic_record(&value, None, query, check),
         P::OperationBurstRecorded(value) => semantic_record(&value, None, query, check),
         P::OperationDerived(value) => semantic_record(&value, None, query, check),
         P::HostOccurrenceNormalized(value) => semantic_record(&value, None, query, check),

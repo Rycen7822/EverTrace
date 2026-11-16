@@ -3998,6 +3998,20 @@ pub fn read_dependencies_for(row: &ObjectRow, payload: &JournalPayload) -> BTree
                     .map(ToString::to_string),
             );
         }
+        JournalPayload::CompetingAttemptGroupRecorded(value) => {
+            refs.extend(value.origin_workstream_id.map(|id| id.to_string()));
+            refs.extend(value.member_workstream_ids.iter().map(ToString::to_string));
+            refs.extend(value.member_attempt_ids.iter().map(ToString::to_string));
+            refs.extend(
+                value
+                    .candidate_snapshot_refs
+                    .iter()
+                    .map(|member| member.snapshot_id.to_string()),
+            );
+            refs.insert(value.decision_boundary_ref.clone());
+            refs.extend(value.comparison_contract_ref.iter().cloned());
+            refs.extend(value.resolution_evidence_refs.iter().cloned());
+        }
         JournalPayload::AttemptRecorded(value) => {
             refs.insert(value.workstream_id.to_string());
             refs.extend(
@@ -6796,6 +6810,10 @@ impl JournalAdmissionState {
                 self.attempts
                     .get(&id)
                     .map(|(value, _)| value.revision_id.to_string())
+            } else if let Ok(id) = reference.parse::<CompetingAttemptGroupId>() {
+                self.competing_groups
+                    .get(&id)
+                    .map(|(value, _)| value.revision_id.to_string())
             } else if let Ok(id) = reference.parse::<OperationBurstId>() {
                 self.operation_bursts
                     .get(&id)
@@ -7119,6 +7137,7 @@ impl JournalAdmissionState {
                                 | "source_receipt"
                                 | "source_observation"
                                 | "attempt"
+                                | "competing_attempt_group"
                                 | "operation_burst"
                                 | "operation"
                                 | "host_occurrence"

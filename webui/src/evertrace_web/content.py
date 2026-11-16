@@ -106,7 +106,7 @@ DETAIL_KINDS = {"atom_revision": "atom", "procedure_revision": "procedure", "cor
                 "semantic_digest": "digest", "revision_proposal_revision": None,
                 "work_episode": "work_episode", "execution_lane": "execution_lane", "capture_receipt": "capture_receipt",
                 "segmentation_correction": "segmentation_correction",
-                "task": "task", "workstream": "workstream",
+                "task": "task", "workstream": "workstream", "competing_attempt_group": "competing_attempt_group",
                 "attempt": "attempt", "operation_burst": "operation_burst", "operation": "operation",
                 "host_occurrence": "host_occurrence", "scope_effect": "scope_effect",
                 "worktree": "worktree", "worktree_snapshot": "worktree_snapshot",
@@ -119,7 +119,7 @@ DETAIL_KINDS = {"atom_revision": "atom", "procedure_revision": "procedure", "cor
                 "procedure_context_effect": "procedure_effect", "global_support_contract": "support_contract",
                 "global_support_validation": "support_validation"}
 NATIVE_DETAIL_KINDS = {"task", "workstream", "work_episode", "execution_lane", "capture_receipt", "segmentation_correction",
-                     "attempt", "operation_burst", "operation",
+                     "attempt", "competing_attempt_group", "operation_burst", "operation",
                      "host_occurrence", "scope_effect", "worktree", "worktree_snapshot",
                      "work_binding", "worktree_transition", "integration_event",
                      "recovery_capture_request", "recovery_bundle", "recovery_application_revision",

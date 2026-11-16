@@ -91,6 +91,7 @@
 <p>Task：{{ value.task_id }} · Workstream：{{ value.workstream_id }}</p>
 <p>Episode：{{ value.episode_id or '未记录' }} · 来源水位：{{ value.source_watermark }}</p>
 {{ text_list('执行通道', value.execution_lane_ids, record_kind='execution_lane') }}
+{{ text_list('候选路线组（当前修订）', value.competing_group_ids, record_kind='competing_attempt_group') }}
 <section class="semantic-section"><h3>中断与恢复</h3>
   <p>中断原因：{{ value.interruption_reason or '未记录' }}</p>
   {{ text_list('中断证据', value.interruption_refs) }}
@@ -104,6 +105,38 @@
 {{ text_list('局部结果证据', value.local_outcome_refs) }}
 {{ text_list('父级验证证据', value.parent_verification_refs) }}
 {{ text_list('结果引用', value.outcome_refs) }}
+{% elif content.kind == 'competing_attempt_group' %}
+<h2>候选路线组</h2>
+<dl class="semantic-fields">
+  <dt>组编号</dt><dd>{{ value.competing_group_id }}</dd>
+  <dt>修订</dt><dd>{{ value.revision_id }} · 第 {{ value.revision_generation }} 代</dd>
+  <dt>解决状态</dt><dd>{{ value.resolution_status }}</dd>
+  <dt>冲突类型</dt><dd>{{ value.conflict_kind }}</dd>
+  <dt>决策边界</dt><dd class="memory-prose">{{ value.decision_boundary_ref }}</dd>
+  <dt>比较合同</dt><dd>{{ value.comparison_contract_ref or '未记录' }}</dd>
+  <dt>Task</dt><dd>{{ value.task_id }}</dd>
+  <dt>创建工作线</dt><dd>{{ value.origin_workstream_id or '未记录' }}</dd>
+  <dt>创建片段</dt><dd>{{ value.origin_episode_id or '未记录' }}</dd>
+  <dt>来源水位</dt><dd>{{ value.source_watermark }}</dd>
+</dl>
+{{ text_list('候选尝试（当前修订）', value.member_attempt_ids, record_kind='attempt') }}
+{{ text_list('关联工作线（当前修订）', value.member_workstream_ids, record_kind='workstream') }}
+{{ text_list('比较对象', value.target_refs) }}
+<p>选定尝试：{{ value.selected_attempt_id or '未选定' }}</p>
+{{ text_list('部分集成的尝试（当前修订）', value.partially_integrated_attempt_ids, record_kind='attempt') }}
+<h3>候选快照</h3>
+{% for member in value.candidate_snapshot_refs %}
+<p>Attempt：{{ member.attempt_id }} · 工作线：{{ member.workstream_id }}</p>
+<button class="text-button" type="button" data-link-key="{{ member.snapshot_id }}"
+  data-object="{{ member.snapshot_id }}" data-revision="{{ member.snapshot_id }}"
+  data-kind="worktree_snapshot">读取快照 {{ member.snapshot_id }}</button>
+{% else %}<p class="muted">未记录。</p>{% endfor %}
+{{ text_list('决策证据', value.resolution_evidence_refs) }}
+{% if value.predecessor_revision_id %}
+<button class="text-button" type="button" data-link-key="{{ value.competing_group_id }}"
+  data-object="{{ value.competing_group_id }}" data-revision="{{ value.predecessor_revision_id }}"
+  data-kind="competing_attempt_group">读取前序修订</button>
+{% endif %}
 {% elif content.kind == 'operation_burst' %}
 <h2>操作片段</h2>
 <p>类型：{{ value.operation_kind }} · 生命周期：{{ value.lifecycle }} · 来源水位：{{ value.source_watermark }}</p>
