@@ -1383,7 +1383,7 @@ async fn scheduler_reconciles_owned_artifact_and_replays_retained_carrier_withou
 }
 
 #[tokio::test]
-async fn capture_frontier_is_targeted_and_terminal_preserves_unresolved_dirty() {
+async fn capture_frontier_completes_bounded_work_and_retains_waiting_inputs() {
     let temp = TempDir::new().unwrap();
     DeviceKeyStore::new(temp.path().join("keys"))
         .load_or_create()
@@ -1423,6 +1423,7 @@ async fn capture_frontier_is_targeted_and_terminal_preserves_unresolved_dirty() 
         .jobs
         .iter()
         .filter(|job| job.target_revision == observation)
+        .cloned()
         .collect::<Vec<_>>();
     let [capture_job] = capture_jobs.as_slice() else {
         panic!("expected one coalesced targeted capture job")
@@ -1432,12 +1433,39 @@ async fn capture_frontier_is_targeted_and_terminal_preserves_unresolved_dirty() 
         .reconciliation_frontier_for_observations(&[observation.parse().unwrap()])
         .unwrap()
         .items;
-    assert_eq!(capture_job.state, JobStatus::Failed);
-    assert!(!remaining.is_empty());
+    assert_eq!(capture_job.state, JobStatus::Succeeded);
+    assert!(remaining.is_empty());
     assert_eq!(
         capture_job.terminal.as_deref().map(|audit| audit.reason),
-        Some(JobTerminalReason::SourceUnavailable)
+        Some(JobTerminalReason::Completed)
     );
+    let receipts = projected
+        .data_rows()
+        .filter_map(|row| row.payload_json.as_deref())
+        .filter_map(
+            |json| match serde_json::from_str::<JournalPayload>(json).unwrap() {
+                JournalPayload::CaptureReceiptRecorded(receipt) => Some(receipt),
+                _ => None,
+            },
+        )
+        .collect::<Vec<_>>();
+    let [receipt] = receipts.as_slice() else {
+        panic!("expected one bounded capture receipt")
+    };
+    assert_eq!(
+        receipt.coverage_level,
+        evertrace_domain::work::CoverageLevel::Opaque
+    );
+    assert_eq!(
+        receipt.source_coverage,
+        evertrace_domain::work::SourceCoverage::Open
+    );
+    assert_eq!(
+        receipt.pairing_integrity,
+        evertrace_domain::work::PairingIntegrity::Unavailable
+    );
+    assert!(!receipt.finalized);
+    assert!(receipt.terminal_event_kind.is_none());
     assert_eq!(scheduler.run_once().await.unwrap().completed, 0);
     let unchanged = RuntimeSchedulerView::from_snapshot(&handle.project().await.unwrap()).unwrap();
     let unchanged = unchanged
@@ -1484,23 +1512,11 @@ async fn capture_frontier_is_targeted_and_terminal_preserves_unresolved_dirty() 
         target_watermark: second_item.source_event_seq,
         target_generation: second_item.source_event_seq.max(1),
         kind: kind.into(),
-        algorithm_revision: "capture-reconciliation-v1".into(),
-        model_id: None,
-        priority: 0,
         state: JobStatus::Queued,
         attempt: 1,
-        backoff_until_us: None,
-        config_hash: CONFIG,
-        budget: JobBudget {
-            max_items: 1,
-            max_bytes: None,
-            max_input_tokens: None,
-            max_output_tokens: None,
-            max_calls: None,
-            max_wall_time_ms: 250,
-        },
         terminal: None,
         lease_until_us: None,
+        ..capture_job.clone()
     };
     let pending_id = pending.job_id;
     handle
@@ -1528,6 +1544,16 @@ async fn capture_frontier_is_targeted_and_terminal_preserves_unresolved_dirty() 
         .find(|job| job.job_id == pending_id)
         .unwrap();
     assert_eq!((missing.state, missing.attempt), (JobStatus::Queued, 1));
+    assert!(
+        !handle
+            .project()
+            .await
+            .unwrap()
+            .reconciliation_frontier_for_observations(&[second_item.target_id.parse().unwrap()])
+            .unwrap()
+            .items
+            .is_empty()
+    );
     *report.write().await = Some(saved_report);
     scheduler.run_once().await.unwrap();
     let resolved = RuntimeSchedulerView::from_snapshot(&handle.project().await.unwrap()).unwrap();
@@ -1538,7 +1564,17 @@ async fn capture_frontier_is_targeted_and_terminal_preserves_unresolved_dirty() 
         .collect::<Vec<_>>();
     assert_eq!(matching.len(), 1);
     assert_eq!(matching[0].attempt, 2);
-    assert_eq!(matching[0].state, JobStatus::Failed);
+    assert_eq!(matching[0].state, JobStatus::Succeeded);
+    assert!(
+        handle
+            .project()
+            .await
+            .unwrap()
+            .reconciliation_frontier_for_observations(&[second_item.target_id.parse().unwrap()])
+            .unwrap()
+            .items
+            .is_empty()
+    );
 
     let mut third_input = {
         let guard = report.read().await;
@@ -1577,23 +1613,11 @@ async fn capture_frontier_is_targeted_and_terminal_preserves_unresolved_dirty() 
         target_watermark: physical_item.source_event_seq,
         target_generation: physical_item.source_event_seq.max(1),
         kind: "physical_normalization".into(),
-        algorithm_revision: "capture-reconciliation-v1".into(),
-        model_id: None,
-        priority: 0,
         state: JobStatus::Queued,
         attempt: 1,
-        backoff_until_us: None,
-        config_hash: CONFIG,
-        budget: JobBudget {
-            max_items: 1,
-            max_bytes: None,
-            max_input_tokens: None,
-            max_output_tokens: None,
-            max_calls: None,
-            max_wall_time_ms: 250,
-        },
         terminal: None,
         lease_until_us: None,
+        ..capture_job.clone()
     };
     let queued_after_dirty_id = queued_after_dirty.job_id;
     handle
@@ -1622,7 +1646,7 @@ async fn capture_frontier_is_targeted_and_terminal_preserves_unresolved_dirty() 
             reconciled_outages: Vec::new(),
             independent_source_reconciliations: Vec::new(),
             effective_config_hash: CONFIG,
-            algorithm_revision: "capture-reconciliation-v1".into(),
+            algorithm_revision: capture_job.algorithm_revision.clone(),
             occurred_at_us: 41,
             max_items: 1,
         },
