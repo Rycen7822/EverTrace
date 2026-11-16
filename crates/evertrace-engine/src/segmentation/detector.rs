@@ -215,7 +215,8 @@ impl SegmentationDetector {
             detector.source_watermark = burst.source_watermark;
             detector.last_attempt_id = burst.attempt_id;
         }
-        detector.source_watermark = episode.source_watermark.max(detector.source_watermark);
+        // Capture can advance the Episode before these operations reach segmentation.
+        // Only persisted bursts establish how far this detector has consumed the source.
         detector.boundary_status = episode.boundary_status;
         detector.confirmation_watermark = episode.confirmation_watermark;
         detector.candidate = episode

@@ -556,12 +556,14 @@ fn fold_lane_revisions(
         .into_iter()
         .map(|(id, mut revisions)| {
             revisions.sort_by_key(|value| value.lane_revision);
-            if revisions.first().is_none_or(|value| {
-                value.lane_revision != 1 || value.predecessor_revision.is_some()
-            }) || revisions.windows(2).any(|pair| {
-                pair[0].lane_revision.checked_add(1) != Some(pair[1].lane_revision)
-                    || pair[1].predecessor_revision != Some(pair[0].lane_revision)
-            }) {
+            // Projection rows retain the current lane, not its full journal history.
+            // Each row is validated above; any supplied adjacent revisions must still agree.
+            if revisions.is_empty()
+                || revisions.windows(2).any(|pair| {
+                    pair[0].lane_revision.checked_add(1) != Some(pair[1].lane_revision)
+                        || pair[1].predecessor_revision != Some(pair[0].lane_revision)
+                })
+            {
                 return Err(StoreError::StoreCorrupt);
             }
             Ok((id, revisions.pop().ok_or(StoreError::StoreCorrupt)?))
