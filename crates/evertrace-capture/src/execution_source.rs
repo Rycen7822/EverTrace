@@ -605,6 +605,27 @@ pub fn execution_directory(
     ))
 }
 
+/// A physical exit measurement, not a verifier result, Agent terminal or Phase boundary.
+pub fn execution_exit_code(
+    observation: &SourceObservation,
+    receipt: &SourceReceipt,
+    protected: &[u8],
+) -> Option<i32> {
+    if !is_execution(observation, receipt) {
+        return None;
+    }
+    let event = Event::decode(protected)?;
+    if !event.accepts(Profile::from_revision(receipt.parser_revision)?)
+        || event.reference() != receipt.source_ref
+        || event.identity() != receipt.source_record_identity.as_str()
+        || event.role() != receipt.observation_role
+        || request_id(&event.params.call_id) != observation.correlation.native_request_id.as_deref()
+    {
+        return None;
+    }
+    event.params.exit_code
+}
+
 /// Canonical observations may retain a namespace admitted by the original ingestion command.
 pub fn is_execution(observation: &SourceObservation, receipt: &SourceReceipt) -> bool {
     let Some(format) = Profile::from_revision(receipt.parser_revision) else {

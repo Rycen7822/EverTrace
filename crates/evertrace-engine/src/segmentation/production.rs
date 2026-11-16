@@ -68,8 +68,60 @@ async fn source_policy(
     .map_err(|_| AutoresearchError::EvidenceIncomplete)?
 }
 
-/// Canonical physical activity is observed; it does not itself prove a verifier or semantic boundary.
-fn derive_activity(selected: &SegmentationReadContext) -> Result<SegmentOutcome, DetectorError> {
+async fn physical_exit(
+    current: &CurrentFacts,
+    selected: &SegmentationReadContext,
+    runtime: &evertrace_capture::RuntimeSnapshot,
+) -> Result<Option<i32>, evertrace_capture::CasError> {
+    use evertrace_capture::CasError as Error;
+    let operation = selected
+        .state
+        .authority()
+        .operation(selected.operation_id)
+        .ok_or(Error::StoreCorrupt)?;
+    let records = operation
+        .result_source_observation_refs
+        .iter()
+        .filter_map(|id| {
+            let (observation, _) = current.source_observation(*id)?;
+            let receipt = current.source_receipt(observation.source_receipt_ref)?.0;
+            (evertrace_capture::execution_source::is_execution(observation, receipt)
+                && receipt.protected_length <= 128 * 1024)
+                .then(|| (observation.clone(), receipt.clone()))
+        })
+        .collect::<Vec<_>>();
+    if records.is_empty() {
+        return Ok(None);
+    }
+    let cas_dir = runtime.cas_dir.clone();
+    tokio::task::spawn_blocking(move || {
+        let cas = evertrace_capture::CasStore::open_existing(cas_dir)?;
+        let mut exits = std::collections::BTreeSet::new();
+        for (observation, receipt) in records {
+            let digest = receipt.cas_ref.parse::<evertrace_capture::CasDigest>()?;
+            let (bytes, _) = cas.read_bounded(&digest, 128 * 1024, 128 * 1024)?;
+            if bytes.len() as u64 != receipt.protected_length {
+                return Err(Error::StoreCorrupt);
+            }
+            if let Some(code) = evertrace_capture::execution_source::execution_exit_code(
+                &observation,
+                &receipt,
+                &bytes,
+            ) {
+                exits.insert(code);
+            }
+        }
+        Ok((exits.len() == 1).then(|| *exits.first().expect("one physical result")))
+    })
+    .await
+    .map_err(|_| Error::Io)?
+}
+
+/// A nonzero physical exit is an operation failure, not a verifier result or semantic boundary.
+fn derive_activity(
+    selected: &SegmentationReadContext,
+    exit: Option<i32>,
+) -> Result<SegmentOutcome, DetectorError> {
     let state = &selected.state;
     let episode = state
         .episode(selected.episode_id)
@@ -86,8 +138,14 @@ fn derive_activity(selected: &SegmentationReadContext) -> Result<SegmentOutcome,
         sequence: selected.sequence,
         source_watermark: state.frontier(),
         target_family: scope,
-        state_delta: super::StateDeltaKind::Observed,
-        error_signature: None,
+        state_delta: if exit.is_some_and(|code| code != 0) {
+            super::StateDeltaKind::Failed
+        } else {
+            super::StateDeltaKind::Observed
+        },
+        error_signature: exit
+            .filter(|code| *code != 0)
+            .map(|code| format!("process_exit:{code}")),
         verifier_transition: super::VerifierTransition::None,
         observed_phase_kind: None,
         boundary_evidence: BoundaryEvidence::None,
@@ -199,7 +257,23 @@ pub(crate) async fn advance_activity(
         if blocked || std::time::Instant::now() >= deadline {
             continue;
         }
-        let step = match derive_activity(&selected) {
+        let exit = match physical_exit(current, &selected, runtime).await {
+            Ok(exit) => exit,
+            Err(error) => {
+                let changed =
+                    writer.sync_frontier().await.map_err(|_| Error::Writer)? != current.frontier();
+                if changed || matches!(error, evertrace_capture::CasError::LockBusy) {
+                    *after = previous;
+                    progress.retryable = true;
+                    return Ok(progress);
+                }
+                return Err(Error::Store);
+            }
+        };
+        if std::time::Instant::now() >= deadline {
+            continue;
+        }
+        let step = match derive_activity(&selected, exit) {
             Ok(SegmentOutcome::Delta(step)) => step,
             Ok(SegmentOutcome::NoDelta) | Err(DetectorError::Ineligible) => continue,
             Err(_) => return Err(Error::Store),
