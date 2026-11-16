@@ -135,7 +135,6 @@ impl BurstFeature {
 
 #[derive(Clone, Debug)]
 struct RecentFeature {
-    source_watermark: u64,
     feature: BurstFeature,
     evidence_refs: Vec<SourceObservationId>,
 }
@@ -223,10 +222,14 @@ impl SegmentationDetector {
             .boundary_candidate
             .as_ref()
             .map(|value| {
-                let index = detector
-                    .rolling
+                let index = recent_bursts
                     .iter()
-                    .position(|item| item.source_watermark == value.candidate_watermark)
+                    .position(|burst| {
+                        burst
+                            .members
+                            .iter()
+                            .any(|member| member.source_watermark == value.candidate_watermark)
+                    })
                     .ok_or(DetectorError::Ineligible)?;
                 let item = &detector.rolling[index];
                 if value.candidate_watermark > episode.source_watermark
@@ -453,7 +456,6 @@ impl SegmentationDetector {
         evidence_refs.sort();
         evidence_refs.dedup();
         self.rolling.push_back(RecentFeature {
-            source_watermark: burst.source_watermark,
             feature,
             evidence_refs,
         });
