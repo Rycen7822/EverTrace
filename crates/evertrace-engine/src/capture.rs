@@ -3003,11 +3003,13 @@ fn reconcile_attempt_lanes(
         })
         .collect::<BTreeSet<_>>();
     for attempt in state.attempts.values().filter(|attempt| {
-        attempt.execution_status == AttemptExecutionStatus::Active
-            && attempt
-                .execution_lane_ids
-                .iter()
-                .any(|id| changed.contains(id))
+        matches!(
+            attempt.execution_status,
+            AttemptExecutionStatus::Active | AttemptExecutionStatus::Interrupted
+        ) && attempt
+            .execution_lane_ids
+            .iter()
+            .any(|id| changed.contains(id))
     }) {
         let related = attempt
             .execution_lane_ids

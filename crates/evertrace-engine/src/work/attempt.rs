@@ -206,7 +206,9 @@ pub fn revise_execution(
                 | AttemptExecutionStatus::Abandoned
         ) | (
             AttemptExecutionStatus::Interrupted,
-            AttemptExecutionStatus::Completed | AttemptExecutionStatus::Abandoned
+            AttemptExecutionStatus::Interrupted
+                | AttemptExecutionStatus::Completed
+                | AttemptExecutionStatus::Abandoned
         )
     );
     if !allowed {
@@ -238,7 +240,10 @@ pub(crate) fn reconcile_execution_lanes(
     lanes: &[&ExecutionLane],
     watermark: u64,
 ) -> Result<AttemptResolution<Attempt>, WorkIdentityError> {
-    if current.execution_status != AttemptExecutionStatus::Active {
+    if !matches!(
+        current.execution_status,
+        AttemptExecutionStatus::Active | AttemptExecutionStatus::Interrupted
+    ) {
         return Ok(AttemptResolution::NoDelta);
     }
     let mut ids = lanes

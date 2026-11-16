@@ -2191,8 +2191,10 @@ fn collect_lane_attempt_dependencies(
         let JournalPayload::AttemptRecorded(value) = &dependency.payload else {
             unreachable!()
         };
-        if value.execution_status != AttemptExecutionStatus::Active
-            || !value.execution_lane_ids.contains(&lane)
+        if !matches!(
+            value.execution_status,
+            AttemptExecutionStatus::Active | AttemptExecutionStatus::Interrupted
+        ) || !value.execution_lane_ids.contains(&lane)
         {
             continue;
         }
