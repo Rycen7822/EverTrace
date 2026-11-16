@@ -3965,6 +3965,12 @@ pub fn read_dependencies_for(row: &ObjectRow, payload: &JournalPayload) -> BTree
             );
         }
         JournalPayload::OperationBurstRecorded(value) => {
+            refs.extend(
+                value
+                    .members
+                    .iter()
+                    .map(|member| member.work_binding_revision_id.to_string()),
+            );
             refs.extend(value.primary_binding.task_id.map(|id| id.to_string()));
             refs.extend(value.primary_binding.workstream_id.map(|id| id.to_string()));
             refs.extend(

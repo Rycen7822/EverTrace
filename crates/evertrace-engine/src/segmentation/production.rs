@@ -68,50 +68,95 @@ async fn source_policy(
     .map_err(|_| AutoresearchError::EvidenceIncomplete)?
 }
 
-async fn physical_exit(
+async fn source_activity(
     current: &CurrentFacts,
     selected: &SegmentationReadContext,
     runtime: &evertrace_capture::RuntimeSnapshot,
-) -> Result<Option<i32>, evertrace_capture::CasError> {
+) -> Result<(Option<i32>, Option<evertrace_domain::work::PhaseKind>), evertrace_capture::CasError> {
     use evertrace_capture::CasError as Error;
     let operation = selected
         .state
         .authority()
         .operation(selected.operation_id)
         .ok_or(Error::StoreCorrupt)?;
-    let records = operation
-        .result_source_observation_refs
+    let binding = selected
+        .state
+        .authority()
+        .binding(selected.operation_id)
+        .ok_or(Error::StoreCorrupt)?;
+    let inputs = operation.input_source_observation_refs.clone();
+    let results = operation.result_source_observation_refs.clone();
+    let references = inputs
+        .iter()
+        .chain(&results)
+        .copied()
+        .chain(
+            binding
+                .evidence_refs
+                .iter()
+                .filter_map(|value| value.parse().ok()),
+        )
+        .collect::<std::collections::BTreeSet<SourceObservationId>>();
+    let records = references
         .iter()
         .filter_map(|id| {
             let (observation, _) = current.source_observation(*id)?;
             let receipt = current.source_receipt(observation.source_receipt_ref)?.0;
-            (evertrace_capture::execution_source::is_execution(observation, receipt)
+            ((evertrace_capture::execution_source::is_execution(observation, receipt)
+                || evertrace_capture::process_source::is_work_revision(
+                    receipt.source_revision.as_str(),
+                ))
                 && receipt.protected_length <= 128 * 1024)
                 .then(|| (observation.clone(), receipt.clone()))
         })
         .collect::<Vec<_>>();
     if records.is_empty() {
-        return Ok(None);
+        return Ok((None, None));
     }
     let cas_dir = runtime.cas_dir.clone();
     tokio::task::spawn_blocking(move || {
         let cas = evertrace_capture::CasStore::open_existing(cas_dir)?;
-        let mut exits = std::collections::BTreeSet::new();
+        let mut protected = Vec::new();
         for (observation, receipt) in records {
             let digest = receipt.cas_ref.parse::<evertrace_capture::CasDigest>()?;
             let (bytes, _) = cas.read_bounded(&digest, 128 * 1024, 128 * 1024)?;
             if bytes.len() as u64 != receipt.protected_length {
                 return Err(Error::StoreCorrupt);
             }
-            if let Some(code) = evertrace_capture::execution_source::execution_exit_code(
-                &observation,
-                &receipt,
-                &bytes,
-            ) {
-                exits.insert(code);
+            protected.push((observation, receipt, bytes));
+        }
+        let mut exits = std::collections::BTreeSet::new();
+        let mut phases = Vec::new();
+        for (observation, receipt, bytes) in &protected {
+            if results.contains(&observation.source_observation_id) {
+                if let Some(code) = evertrace_capture::execution_source::execution_exit_code(
+                    observation,
+                    receipt,
+                    bytes,
+                ) {
+                    exits.insert(code);
+                }
+            }
+            for (native, native_receipt, native_bytes) in &protected {
+                if inputs.contains(&native.source_observation_id) {
+                    if let Some(phase) = crate::autoresearch::declared_work_phase(
+                        receipt,
+                        bytes,
+                        native,
+                        native_receipt,
+                        native_bytes,
+                    ) {
+                        if !phases.contains(&phase) {
+                            phases.push(phase);
+                        }
+                    }
+                }
             }
         }
-        Ok((exits.len() == 1).then(|| *exits.first().expect("one physical result")))
+        Ok((
+            (exits.len() == 1).then(|| *exits.first().expect("one physical result")),
+            (phases.len() == 1).then(|| phases[0]),
+        ))
     })
     .await
     .map_err(|_| Error::Io)?
@@ -121,6 +166,7 @@ async fn physical_exit(
 fn derive_activity(
     selected: &SegmentationReadContext,
     exit: Option<i32>,
+    declared_phase: Option<evertrace_domain::work::PhaseKind>,
 ) -> Result<SegmentOutcome, DetectorError> {
     let state = &selected.state;
     let episode = state
@@ -147,7 +193,8 @@ fn derive_activity(
             .filter(|code| *code != 0)
             .map(|code| format!("process_exit:{code}")),
         verifier_transition: super::VerifierTransition::None,
-        observed_phase_kind: None,
+        // A protected declaration supplies a structured hint, never objective boundary evidence.
+        observed_phase_kind: declared_phase,
         boundary_evidence: BoundaryEvidence::None,
         evidence_refs: operation
             .input_source_observation_refs
@@ -257,8 +304,8 @@ pub(crate) async fn advance_activity(
         if blocked || std::time::Instant::now() >= deadline {
             continue;
         }
-        let exit = match physical_exit(current, &selected, runtime).await {
-            Ok(exit) => exit,
+        let (exit, declared_phase) = match source_activity(current, &selected, runtime).await {
+            Ok(activity) => activity,
             Err(error) => {
                 let changed =
                     writer.sync_frontier().await.map_err(|_| Error::Writer)? != current.frontier();
@@ -273,7 +320,7 @@ pub(crate) async fn advance_activity(
         if std::time::Instant::now() >= deadline {
             continue;
         }
-        let step = match derive_activity(&selected, exit) {
+        let step = match derive_activity(&selected, exit, declared_phase) {
             Ok(SegmentOutcome::Delta(step)) => step,
             Ok(SegmentOutcome::NoDelta) | Err(DetectorError::Ineligible) => continue,
             Err(_) => return Err(Error::Store),

@@ -525,6 +525,31 @@ impl ProcessWorkDeclaration {
     }
 }
 
+/// A source-owned declaration is only a phase hint; it never proves a boundary or verifier result.
+pub(crate) fn declared_work_phase(
+    receipt: &SourceReceipt,
+    bytes: &[u8],
+    native: &SourceObservation,
+    native_receipt: &SourceReceipt,
+    native_bytes: &[u8],
+) -> Option<evertrace_domain::work::PhaseKind> {
+    if !evertrace_capture::process_source::is_work_revision(receipt.source_revision.as_str()) {
+        return None;
+    }
+    let declaration = ProcessWorkDeclaration::decode(bytes, receipt)?;
+    (declaration.format == evertrace_capture::process_source::WORK_FORMAT
+        && evertrace_capture::execution_source::execution_directory(
+            native,
+            native_receipt,
+            native_bytes,
+        ) == Some((
+            declaration.definition.scope.clone(),
+            declaration.controller.pid,
+            declaration.controller.start_ticks,
+        )))
+    .then_some(declaration.definition.phase.phase_kind)
+}
+
 #[derive(Deserialize)]
 struct ProcessTrialDeclaration {
     format: String,
@@ -3929,18 +3954,19 @@ fn process_work_command(
         .collect::<Vec<_>>();
     let map_error = |_| AutoresearchError::ImmutableConflict;
     if let [stream] = streams.as_slice() {
-        if let Some(prior) = continuation.iter().find(|reference| {
+        let prior = continuation.iter().find(|reference| {
             facts
                 .bindings
                 .values()
                 .any(|binding| source_owns_stream(binding, stream, reference))
-        }) {
-            sources.push(prior.clone());
+        });
+        if let Some(reference) = prior {
+            sources.push(reference.clone());
         }
         if stream.task_id != task.task_id
             || stream.repository_instance_id != repository
             || stream.worktree_instance_ids != worktree.into_iter().collect::<Vec<_>>()
-            || stream.phase_contract != plan.phase
+            || (prior.is_none() && stream.phase_contract != plan.phase)
         {
             return Err(AutoresearchError::ImmutableConflict);
         }
@@ -3957,7 +3983,7 @@ fn process_work_command(
             if root_lane.is_some_and(|lane| !phase.execution_lane_ids.contains(&lane)) {
                 return Ok(None);
             }
-            if phase.phase_contract != plan.phase
+            if (prior.is_none() && phase.phase_contract != plan.phase)
                 || !phase.attempt_ids.iter().any(|id| {
                     facts
                         .attempts

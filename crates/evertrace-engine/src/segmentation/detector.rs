@@ -388,7 +388,7 @@ impl SegmentationDetector {
                 } else {
                     token.boundary_evidence_refs().to_vec()
                 },
-                kind: if token.boundary_evidence().objective() || phase_change {
+                kind: if token.boundary_evidence().objective() {
                     BoundaryCandidateKind::Objective
                 } else {
                     BoundaryCandidateKind::StructuredSurprise

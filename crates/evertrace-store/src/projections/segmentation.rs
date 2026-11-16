@@ -354,6 +354,13 @@ impl JournalAdmissionState {
                     .clone(),
             );
         }
+        source_refs.extend(
+            binding
+                .evidence_refs
+                .iter()
+                .filter_map(|reference| reference.parse::<SourceObservationId>().ok())
+                .filter(|id| self.source_observations.contains_key(id)),
+        );
         let mut recent = BTreeMap::new();
         for id in &episode.operation_burst_refs {
             let burst = &self
