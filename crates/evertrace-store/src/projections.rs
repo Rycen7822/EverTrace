@@ -2108,8 +2108,11 @@ fn collect_capture_dependencies(
         }
         dependencies.insert(lane_dependency)?;
     }
-    if terminal_observed && let Some((lane, _, _)) = &current_lane {
-        collect_lane_attempt_dependencies(snapshot, *lane, dependencies)?;
+    if let Some((lane, _, _)) = &current_lane {
+        if terminal_observed {
+            collect_lane_attempt_dependencies(snapshot, *lane, dependencies)?;
+        }
+        collect_lane_episode_dependencies(snapshot, *lane, dependencies)?;
     }
     // Source import can precede physical normalization. Materialized or unlinked
     // operations must wake this target without another source event.
@@ -2161,6 +2164,49 @@ fn collect_capture_dependencies(
         .map(|(_, (_, sequence, _))| *sequence)
         .max();
     Ok((import_watermark, has_current_lane_receipt, pending))
+}
+
+fn collect_lane_episode_dependencies(
+    snapshot: &CurrentFacts,
+    lane: ExecutionLaneId,
+    dependencies: &mut DependencyCollector,
+) -> Result<(), StoreError> {
+    let needle = serde_json::to_string(&lane.to_string()).map_err(|_| StoreError::InvalidInput)?;
+    let mut episodes = BTreeMap::new();
+    for row in snapshot.other_data_rows().filter(|row| {
+        row.object_kind.as_deref() == Some("work_episode")
+            && row
+                .payload_json
+                .as_deref()
+                .is_some_and(|json| json.contains(&needle))
+    }) {
+        let id = row.object_id.as_deref().ok_or(StoreError::StoreCorrupt)?;
+        if episodes
+            .get(id)
+            .is_none_or(|current: &&ObjectRow| current.source_event_seq < row.source_event_seq)
+        {
+            episodes.insert(id, row);
+        }
+    }
+    for row in episodes.into_values() {
+        let dependency = current_payload(row)?;
+        let JournalPayload::WorkEpisodeRecorded(value) = &dependency.payload else {
+            return Err(StoreError::StoreCorrupt);
+        };
+        if value.lifecycle_status != evertrace_domain::work::EpisodeLifecycle::Open
+            || !value.execution_lane_ids.contains(&lane)
+        {
+            continue;
+        }
+        for lane in &value.execution_lane_ids {
+            let id = format!("object:evidence:capture_receipt:{lane}");
+            dependencies.insert(current_payload(
+                snapshot.other_row(&id).ok_or(StoreError::StoreCorrupt)?,
+            )?)?;
+        }
+        dependencies.insert(dependency)?;
+    }
+    Ok(())
 }
 
 fn collect_lane_attempt_dependencies(
