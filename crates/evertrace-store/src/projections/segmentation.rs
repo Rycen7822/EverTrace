@@ -146,6 +146,213 @@ pub struct OperationBurstCurrentView {
 pub struct SegmentationCurrentState {
     authority: SegmentationCurrentView,
     bursts: OperationBurstCurrentView,
+    episode_window: Option<WorkEpisodeId>,
+}
+
+/// One pending canonical activity and its bounded, single-frontier authority.
+#[derive(Clone, Debug)]
+pub struct SegmentationReadContext {
+    pub operation_id: OperationId,
+    pub sequence: u64,
+    pub episode_id: WorkEpisodeId,
+    pub state: SegmentationCurrentState,
+    pub root_refs: Vec<String>,
+    pub source_refs: Vec<evertrace_domain::ids::SourceObservationId>,
+    pub repository_ids: std::collections::BTreeSet<evertrace_domain::ids::RepositoryId>,
+}
+
+impl JournalAdmissionState {
+    pub(crate) fn segmentation_current_context(
+        &self,
+        after: u64,
+    ) -> Result<Option<SegmentationReadContext>, StoreError> {
+        use evertrace_domain::{evidence::CorrelationStrength, work::AssignmentStatus};
+        let mut bindings = BTreeMap::<OperationId, (&WorkBindingRevision, u64)>::new();
+        for (binding, sequence) in self.work_bindings.values() {
+            let current = bindings
+                .entry(binding.operation_id)
+                .or_insert((binding, *sequence));
+            if binding.revision_generation > current.0.revision_generation {
+                *current = (binding, *sequence);
+            }
+        }
+        let mut selected: Option<(&Operation, &WorkBindingRevision, u64, &WorkEpisode)> = None;
+        for (operation, operation_sequence) in self.operations.values() {
+            let Some((binding, binding_sequence)) = bindings
+                .get(&operation.operation_id)
+                .filter(|(binding, _)| binding.assignment_status == AssignmentStatus::Resolved)
+            else {
+                continue;
+            };
+            let sequence = (*operation_sequence).max(*binding_sequence);
+            if sequence <= after {
+                continue;
+            };
+            let Some((episode, _)) = binding
+                .primary_binding
+                .episode_id
+                .and_then(|id| self.episodes.get(&id))
+            else {
+                continue;
+            };
+            if episode.lifecycle_status != evertrace_domain::work::EpisodeLifecycle::Open
+                || binding.primary_binding.task_id != Some(episode.task_id)
+                || binding.primary_binding.workstream_id != Some(episode.workstream_id)
+                || self.workstreams.get(&episode.workstream_id).is_none_or(|(stream, _)| {
+                    stream.active_episode_id != Some(episode.episode_id)
+                })
+                || self.host_occurrences.get(&operation.host_occurrence_id).is_none_or(|(occurrence, _)| {
+                    occurrence.correlation_strength != CorrelationStrength::Exact
+                        || occurrence.normalization_state == evertrace_domain::evidence::NormalizationState::NormalizationConflicted
+                        || occurrence.possible_duplicate_group_id.is_some()
+                })
+                || operation.execution_lane_id.is_none()
+            {
+                continue;
+            }
+            let mut consumed = false;
+            for id in &episode.operation_burst_refs {
+                let (burst, _) = self
+                    .operation_bursts
+                    .get(id)
+                    .ok_or(StoreError::StoreCorrupt)?;
+                consumed |= burst.members.iter().any(|member| {
+                    member.operation_id == operation.operation_id
+                        && member.operation_revision == operation.operation_revision
+                });
+            }
+            if !consumed && selected.is_none_or(|(_, _, previous, _)| sequence < previous) {
+                selected = Some((operation, *binding, sequence, episode));
+            }
+        }
+        let Some((operation, binding, sequence, episode)) = selected else {
+            return Ok(None);
+        };
+        let occurrence = &self
+            .host_occurrences
+            .get(&operation.host_occurrence_id)
+            .ok_or(StoreError::StoreCorrupt)?
+            .0;
+        let stream = &self
+            .workstreams
+            .get(&episode.workstream_id)
+            .ok_or(StoreError::StoreCorrupt)?
+            .0;
+        let task = &self
+            .tasks
+            .get(&episode.task_id)
+            .ok_or(StoreError::StoreCorrupt)?
+            .0;
+        let mut lanes = BTreeMap::new();
+        let mut receipts = BTreeMap::new();
+        for id in episode
+            .execution_lane_ids
+            .iter()
+            .copied()
+            .chain(operation.execution_lane_id)
+        {
+            let lane = &self
+                .execution_lanes
+                .get(&id)
+                .ok_or(StoreError::StoreCorrupt)?
+                .0;
+            let receipt = &self
+                .capture_receipt_revisions
+                .get(&lane.active_capture_receipt_revision_id)
+                .ok_or(StoreError::StoreCorrupt)?
+                .0;
+            lanes.insert(id, lane.clone());
+            receipts.insert(receipt.capture_receipt_revision_id, receipt.clone());
+        }
+        let mut scope_effects = BTreeMap::new();
+        let mut source_refs = occurrence
+            .source_observation_refs
+            .iter()
+            .copied()
+            .collect::<BTreeSet<_>>();
+        source_refs.extend(operation.input_source_observation_refs.iter().copied());
+        source_refs.extend(operation.result_source_observation_refs.iter().copied());
+        let mut repository_ids = stream
+            .repository_instance_id
+            .into_iter()
+            .collect::<BTreeSet<_>>();
+        for id in &operation.scope_effect_ids {
+            let effect = &self
+                .scope_effects
+                .get(id)
+                .ok_or(StoreError::StoreCorrupt)?
+                .0;
+            source_refs.extend(effect.evidence_refs.iter().copied());
+            repository_ids.extend(effect.repository_instance_id);
+            scope_effects.insert(*id, effect.clone());
+        }
+        let mut attempts = BTreeMap::new();
+        if let Some(id) = binding.primary_binding.attempt_id {
+            attempts.insert(
+                id,
+                self.attempts
+                    .get(&id)
+                    .ok_or(StoreError::StoreCorrupt)?
+                    .0
+                    .clone(),
+            );
+        }
+        let mut groups = BTreeMap::new();
+        if let Some(id) = binding.primary_binding.competing_group_id {
+            groups.insert(
+                id,
+                self.competing_groups
+                    .get(&id)
+                    .ok_or(StoreError::StoreCorrupt)?
+                    .0
+                    .clone(),
+            );
+        }
+        let mut recent = BTreeMap::new();
+        for id in &episode.operation_burst_refs {
+            let burst = &self
+                .operation_bursts
+                .get(id)
+                .ok_or(StoreError::StoreCorrupt)?
+                .0;
+            recent.insert((burst.source_watermark, *id), burst);
+            if recent.len() > 64 {
+                recent.pop_first();
+            }
+        }
+        let authority = SegmentationCurrentView {
+            frontier: self.frontier,
+            occurrences: BTreeMap::from([(occurrence.host_occurrence_id, occurrence.clone())]),
+            operations: BTreeMap::from([(operation.operation_id, operation.clone())]),
+            bindings: BTreeMap::from([(operation.operation_id, binding.clone())]),
+            lanes,
+            receipts,
+            scope_effects,
+            attempts,
+            groups,
+            episodes: BTreeMap::from([(episode.episode_id, episode.clone())]),
+            workstreams: BTreeMap::from([(stream.workstream_id, stream.clone())]),
+        };
+        Ok(Some(SegmentationReadContext {
+            operation_id: operation.operation_id,
+            sequence,
+            episode_id: episode.episode_id,
+            state: SegmentationCurrentState {
+                authority,
+                bursts: OperationBurstCurrentView {
+                    frontier: self.frontier,
+                    bursts: recent
+                        .into_values()
+                        .map(|burst| (burst.operation_burst_id, burst.clone()))
+                        .collect(),
+                },
+                episode_window: Some(episode.episode_id),
+            },
+            root_refs: task.request_root_refs.clone(),
+            source_refs: source_refs.into_iter().collect(),
+            repository_ids,
+        }))
+    }
 }
 
 impl SegmentationCurrentState {
@@ -155,7 +362,11 @@ impl SegmentationCurrentState {
         if authority.frontier() != bursts.frontier() {
             return Err(StoreError::StoreCorrupt);
         }
-        Ok(Self { authority, bursts })
+        Ok(Self {
+            authority,
+            bursts,
+            episode_window: None,
+        })
     }
 
     pub const fn frontier(&self) -> u64 {
@@ -167,7 +378,15 @@ impl SegmentationCurrentState {
     }
 
     pub fn recent_bursts(&self, episode: &WorkEpisode) -> Result<Vec<OperationBurst>, StoreError> {
-        self.bursts.recent_for_episode(episode)
+        match self.episode_window {
+            None => self.bursts.recent_for_episode(episode),
+            Some(id) if id == episode.episode_id => {
+                let mut bursts = self.bursts.bursts.values().cloned().collect::<Vec<_>>();
+                bursts.sort_by_key(|burst| burst.source_watermark);
+                Ok(bursts)
+            }
+            Some(_) => Err(StoreError::StoreCorrupt),
+        }
     }
 
     pub fn current_burst(&self, id: OperationBurstId) -> Option<&OperationBurst> {
@@ -584,8 +803,9 @@ pub(super) fn validate_episode_relations(
     competing_groups: &BTreeMap<CompetingAttemptGroupId, (CompetingAttemptGroup, u64)>,
     bindings: &BTreeMap<WorkBindingRevisionId, (WorkBindingRevision, u64)>,
     operation_bursts: &BTreeMap<OperationBurstId, (OperationBurst, u64)>,
+    burst_revisions: &BTreeMap<evertrace_domain::revision::RevisionId, (OperationBurst, u64)>,
     operation_revisions: &BTreeMap<(OperationId, u32), (Operation, u64)>,
-    host_occurrences: &BTreeMap<HostOccurrenceId, (HostOccurrence, u64)>,
+    occurrence_revisions: &BTreeMap<(HostOccurrenceId, u32), (HostOccurrence, u64)>,
     source_observations: &super::SourceObservationFacts,
     scope_effects: &BTreeMap<ScopeEffectId, (ScopeEffect, u64)>,
     lanes: &BTreeMap<ExecutionLaneId, (ExecutionLane, u64)>,
@@ -712,6 +932,7 @@ pub(super) fn validate_episode_relations(
                 .get(burst_id)
                 .ok_or(StoreError::StoreCorrupt)?
                 .0;
+            let member_cuts = burst_member_cuts(burst, burst_revisions)?;
             if burst_owners.insert(*burst_id, *episode_id).is_some()
                 || !episode
                     .execution_lane_ids
@@ -739,7 +960,7 @@ pub(super) fn validate_episode_relations(
                             .is_none_or(|attempt| !group.member_attempt_ids.contains(&attempt))
                     })
                 })
-                || burst.members.iter().any(|member| {
+                || burst.members.iter().enumerate().any(|(index, member)| {
                     if episode_operation_revisions
                         .insert((member.operation_id, member.operation_revision), *burst_id)
                         .is_some()
@@ -751,7 +972,12 @@ pub(super) fn validate_episode_relations(
                     else {
                         return true;
                     };
-                    let Some((occurrence, _)) = host_occurrences.get(&member.host_occurrence_id)
+                    let Some((_, (occurrence, _))) = occurrence_revisions
+                        .range(
+                            (member.host_occurrence_id, 0)..=(member.host_occurrence_id, u32::MAX),
+                        )
+                        .rev()
+                        .find(|(_, (_, sequence))| *sequence <= member_cuts[index])
                     else {
                         return true;
                     };
@@ -1105,6 +1331,27 @@ fn validate_capture_correction(
         return Err(StoreError::StoreCorrupt);
     }
     Ok(())
+}
+
+/// A retained member keeps the occurrence closure that existed when it first entered this burst.
+/// Later normalization may add sources without rewriting that immutable member.
+fn burst_member_cuts(
+    burst: &OperationBurst,
+    revisions: &BTreeMap<evertrace_domain::revision::RevisionId, (OperationBurst, u64)>,
+) -> Result<Vec<u64>, StoreError> {
+    let (_, sequence) = revisions
+        .get(&burst.revision_id)
+        .ok_or(StoreError::StoreCorrupt)?;
+    let mut cuts = vec![*sequence; burst.members.len()];
+    let mut previous = burst.predecessor_revision_id;
+    while let Some(id) = previous {
+        let (revision, sequence) = revisions.get(&id).ok_or(StoreError::StoreCorrupt)?;
+        for cut in cuts.iter_mut().take(revision.members.len()) {
+            *cut = *sequence;
+        }
+        previous = revision.predecessor_revision_id;
+    }
+    Ok(cuts)
 }
 
 fn member_has_exact_physical_provenance(

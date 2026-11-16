@@ -98,7 +98,7 @@ pub use overview::{MemoryOverviewRun, MemoryOverviewWorkContext};
 pub use recovery::{RecoveryCurrentState, RecoveryCurrentView};
 pub use segmentation::{
     EpisodeCurrentView, OperationBurstCurrentView, SegmentationCurrentState,
-    SegmentationCurrentView,
+    SegmentationCurrentView, SegmentationReadContext,
 };
 use segmentation::{
     record_checkpoint, record_correction, record_episode, record_operation_burst,
@@ -14243,8 +14243,9 @@ impl JournalAdmissionState {
             &self.competing_groups,
             &self.work_bindings,
             &self.operation_bursts,
+            &self.operation_burst_revisions,
             &self.operation_revisions,
-            &self.host_occurrences,
+            &self.host_occurrence_revisions,
             &self.source_observations,
             &self.scope_effects,
             &self.execution_lanes,
@@ -18627,8 +18628,9 @@ impl ReducerState {
             &self.competing_groups,
             &self.work_bindings,
             &self.operation_bursts,
+            &self.operation_burst_revisions,
             &self.operation_revisions,
-            &self.host_occurrences,
+            &self.host_occurrence_revisions,
             &self.source_observations,
             &self.scope_effects,
             &self.execution_lanes,

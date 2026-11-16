@@ -48,6 +48,12 @@ enum WriterRequest {
         condition: WriterCommitCondition,
         reply: oneshot::Sender<Result<CommitOutcome, WriterActorError>>,
     },
+    SegmentationCurrent {
+        after: u64,
+        reply: oneshot::Sender<
+            Result<Option<evertrace_store::SegmentationReadContext>, WriterActorError>,
+        >,
+    },
     ScopeCurrent {
         request: evertrace_store::ScopeCurrentRequest,
         reply: oneshot::Sender<Result<evertrace_store::ScopeCurrentContext, WriterActorError>>,
@@ -754,6 +760,18 @@ impl WriterHandle {
             .await
             .map_err(|_| WriterActorError::Stopped)?;
         response.await.map_err(|_| WriterActorError::Stopped)
+    }
+
+    pub(crate) async fn segmentation_current_context(
+        &self,
+        after: u64,
+    ) -> Result<Option<evertrace_store::SegmentationReadContext>, WriterActorError> {
+        let (reply, response) = oneshot::channel();
+        self.sender
+            .send(WriterRequest::SegmentationCurrent { after, reply })
+            .await
+            .map_err(|_| WriterActorError::Stopped)?;
+        response.await.map_err(|_| WriterActorError::Stopped)?
     }
 
     pub(crate) async fn scope_current_context(
@@ -1741,6 +1759,22 @@ async fn run_writer(
                             .ok_or(WriterActorError::Stopped)?
                             .queued_gc_jobs();
                         let _ = reply.send(jobs);
+                    }
+                }
+                WriterRequest::SegmentationCurrent { after, reply } => {
+                    if reply.is_closed() {
+                        continue;
+                    }
+                    let result = writer
+                        .as_ref()
+                        .ok_or(WriterActorError::Stopped)?
+                        .segmentation_current_context(after)
+                        .await
+                        .map_err(map_store_error);
+                    let fatal = result.is_err();
+                    let _ = reply.send(result);
+                    if fatal {
+                        return Err(WriterActorError::Store);
                     }
                 }
                 WriterRequest::ScopeCurrent { request, reply } => {

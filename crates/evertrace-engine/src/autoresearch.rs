@@ -3053,26 +3053,14 @@ impl ControlledRunResolver {
         Ok(bindings)
     }
 
-    fn resolve_root_goal(
+    pub(crate) fn verified_root_goal(
         &self,
-        snapshot: &ProjectionSnapshot,
-        facts: &ControlledFacts,
-        source: SourceObservationId,
-        context: &AutoresearchCommandContext,
+        receipt: &SourceReceipt,
+        observation: &SourceObservation,
         key_dir: Option<&std::path::Path>,
-    ) -> Result<
-        (
-            ControlledRunCommand,
-            Option<crate::repository::SourcePolicy>,
-        ),
-        AutoresearchError,
-    > {
+    ) -> Result<evertrace_capture::goal_source::RootGoal, AutoresearchError> {
         use evertrace_capture::goal_source;
-        let receipt = facts.receipt(source)?;
-        let observation = facts
-            .observations
-            .get(&source)
-            .ok_or(AutoresearchError::EvidenceIncomplete)?;
+        let source = observation.source_observation_id;
         let report = evertrace_codex::probe::HostProbeReport::unobserved_source_contract(
             &goal_source::adapter_version(receipt.source_revision.as_str())
                 .map_err(|_| AutoresearchError::UntrustedRunEvidence)?,
@@ -3112,8 +3100,32 @@ impl ControlledRunResolver {
         )
         .load()
         .map_err(|_| AutoresearchError::EvidenceIncomplete)?;
-        let root = goal_source::revalidate(receipt, observation, &bytes, &key)
-            .map_err(|_| AutoresearchError::UntrustedRunEvidence)?;
+        goal_source::revalidate(receipt, observation, &bytes, &key)
+            .map_err(|_| AutoresearchError::UntrustedRunEvidence)
+    }
+
+    fn resolve_root_goal(
+        &self,
+        snapshot: &ProjectionSnapshot,
+        facts: &ControlledFacts,
+        source: SourceObservationId,
+        context: &AutoresearchCommandContext,
+        key_dir: Option<&std::path::Path>,
+    ) -> Result<
+        (
+            ControlledRunCommand,
+            Option<crate::repository::SourcePolicy>,
+        ),
+        AutoresearchError,
+    > {
+        let root = self.verified_root_goal(
+            facts.receipt(source)?,
+            facts
+                .observations
+                .get(&source)
+                .ok_or(AutoresearchError::EvidenceIncomplete)?,
+            key_dir,
+        )?;
         let policy = crate::repository::SourcePolicy::from_goal(&root);
         let source_ref = source.to_string();
         let watermark = snapshot

@@ -2292,6 +2292,14 @@ impl JournalWriter {
         .await
     }
 
+    pub async fn segmentation_current_context(
+        &self,
+        after: u64,
+    ) -> Result<Option<crate::SegmentationReadContext>, StoreError> {
+        self.validated_current_read(|state, _| state.segmentation_current_context(after))
+            .await
+    }
+
     pub async fn scope_current_context(
         &self,
         request: &crate::projections::ScopeCurrentRequest,

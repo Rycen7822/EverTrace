@@ -1707,6 +1707,7 @@ pub struct BackgroundScheduler {
     dreaming: DreamingConfig,
     capture_cursor: Arc<tokio::sync::Mutex<CaptureScan>>,
     controlled_cursor: Arc<tokio::sync::Mutex<crate::autoresearch::ControlledSourceScan>>,
+    segmentation_after: Arc<tokio::sync::Mutex<u64>>,
     artifact_scan: Arc<tokio::sync::Mutex<(tokio::time::Instant, u64, bool)>>,
     dispatch: Option<Arc<RwLock<()>>>,
     repository_purge_plans: Arc<std::sync::Mutex<BTreeMap<JobId, Vec<String>>>>,
@@ -1740,6 +1741,7 @@ impl BackgroundScheduler {
             dreaming,
             capture_cursor: Arc::new(tokio::sync::Mutex::new(CaptureScan::default())),
             controlled_cursor: Arc::default(),
+            segmentation_after: Arc::default(),
             artifact_scan: Arc::new(tokio::sync::Mutex::new((
                 tokio::time::Instant::now(),
                 0,
@@ -2110,6 +2112,25 @@ impl BackgroundScheduler {
             retryable |= controlled.retryable;
             completed += controlled.completed;
             if controlled.completed != 0 {
+                snapshot = self
+                    .writer
+                    .project_current(true)
+                    .await
+                    .map_err(map_writer)?;
+            }
+        }
+        if optional_allowed {
+            let mut after = self.segmentation_after.lock().await;
+            let segmentation = crate::segmentation::advance_activity(
+                &self.writer,
+                &snapshot,
+                &self.runtime,
+                &mut after,
+            )
+            .await?;
+            retryable |= segmentation.retryable;
+            completed += segmentation.completed;
+            if segmentation.completed != 0 {
                 snapshot = self
                     .writer
                     .project_current(true)
