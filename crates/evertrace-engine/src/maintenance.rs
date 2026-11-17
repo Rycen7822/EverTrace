@@ -1485,6 +1485,10 @@ fn job_target_is_current(
         crate::jobs::procedure::KIND => {
             job.config_hash == config_hash && crate::jobs::procedure::is_current(snapshot, job)
         }
+        crate::segmentation::refinement::KIND => {
+            job.config_hash == config_hash
+                && crate::segmentation::refinement::current_episode(snapshot, job).is_some()
+        }
         PROCEDURE_USAGE_JOB_KIND => {
             job.config_hash == config_hash
                 && job.algorithm_revision == job.kind
@@ -2233,6 +2237,7 @@ impl BackgroundScheduler {
                             PROCEDURE_PROMOTION_JOB_KIND
                                 | PROCEDURE_USAGE_JOB_KIND
                                 | crate::jobs::procedure::KIND
+                                | crate::segmentation::refinement::KIND
                         ) && job.state == JobStatus::Queued
                             && job.config_hash != self.runtime.effective_config_hash
                         || job.kind == "semantic_synthesis_v1"
@@ -2933,6 +2938,31 @@ impl BackgroundScheduler {
                 .map_err(|_| BackgroundSchedulerError::Store)?,
             );
         }
+        if self.dreaming.idle_enabled
+            && self.dreaming.max_llm_tasks_per_run != 0
+            && self.synthesis.llm.enabled
+            && self.synthesis.provider.is_some()
+        {
+            synthesis_candidates.extend(
+                crate::segmentation::refinement::jobs(
+                    &self.writer,
+                    &snapshot,
+                    idle.episodes.values().filter(|episode| {
+                        episode.boundary_status == evertrace_domain::work::BoundaryStatus::Candidate
+                            && idle
+                                .delay(episode, &self.dreaming, selection_time)
+                                .is_some_and(|delay| delay.is_zero())
+                    }),
+                    &self.synthesis,
+                    &self.runtime,
+                    &view,
+                    max_synthesis_wall_time,
+                    selection_time,
+                    PER_LANE_LIMIT,
+                )
+                .await?,
+            );
+        }
         if !synthesis_candidates.is_empty() {
             let occurred_at_us = now_us()?;
             let events = synthesis_candidates
@@ -2986,6 +3016,7 @@ impl BackgroundScheduler {
                         | "session_import_v1"
                         | "semantic_synthesis_v1"
                         | crate::jobs::procedure::KIND
+                        | crate::segmentation::refinement::KIND
                         | PROCEDURE_PROMOTION_JOB_KIND
                         | PROCEDURE_USAGE_JOB_KIND
                         | evertrace_store::REPOSITORY_SCOPE_PURGE_JOB_KIND
@@ -3211,6 +3242,14 @@ impl BackgroundScheduler {
                     continue;
                 };
                 let job_wall_time = Duration::from_millis(claimed.job.budget.max_wall_time_ms);
+                if claimed.job.kind == crate::segmentation::refinement::KIND {
+                    let progress = self
+                        .run_phase_refinement(claimed, remaining_wall_time)
+                        .await?;
+                    completed += progress.completed;
+                    retryable |= progress.retryable;
+                    continue;
+                }
                 if claimed.job.kind == crate::jobs::procedure::KIND {
                     let progress = self
                         .run_procedure_review(claimed, remaining_wall_time)
@@ -3360,6 +3399,105 @@ impl BackgroundScheduler {
                 retryable,
             },
             next_wake_at,
+        })
+    }
+
+    async fn run_phase_refinement(
+        &self,
+        claimed: ClaimedJob,
+        remaining: Duration,
+    ) -> Result<BackgroundProgress, BackgroundSchedulerError> {
+        let job = claimed.job;
+        let execution = crate::segmentation::refinement::execute(
+            &self.writer,
+            &claimed.current,
+            &job,
+            &self.synthesis,
+            &self.runtime,
+            now_us()?,
+        );
+        let command = match tokio::time::timeout(
+            remaining.min(Duration::from_millis(job.budget.max_wall_time_ms)),
+            execution,
+        )
+        .await
+        {
+            Ok(Ok(command)) => command,
+            _ => {
+                return self
+                    .finish_job(
+                        &job,
+                        0,
+                        JobTerminalOutcome::Failed,
+                        JobTerminalReason::SourceUnavailable,
+                    )
+                    .await;
+            }
+        };
+        let expected = command
+            .events()
+            .iter()
+            .map(|event| event.payload.clone())
+            .collect::<Vec<_>>();
+        for _ in 0..16 {
+            let snapshot = self
+                .writer
+                .project_current(true)
+                .await
+                .map_err(map_writer)?;
+            if crate::segmentation::refinement::allowed(
+                &self.writer,
+                &snapshot,
+                &job,
+                &self.runtime,
+            )
+            .await?
+            .is_none()
+            {
+                if self.writer.sync_frontier().await.map_err(map_writer)? != snapshot.frontier() {
+                    continue;
+                }
+                return self
+                    .finish_job(
+                        &job,
+                        0,
+                        JobTerminalOutcome::Failed,
+                        JobTerminalReason::StaleGeneration,
+                    )
+                    .await;
+            }
+            match self
+                .writer
+                .commit_if_frontier(command.clone(), now_us()?, snapshot.frontier())
+                .await
+            {
+                Ok(_) => {
+                    return Ok(BackgroundProgress {
+                        completed: 1,
+                        retryable: false,
+                    });
+                }
+                Err(WriterActorError::StaleFrontier) => continue,
+                Err(error) => {
+                    if self
+                        .writer
+                        .committed_command(command.command_id())
+                        .await
+                        .map_err(map_writer)?
+                        .is_some_and(|committed| committed.payloads == expected)
+                    {
+                        return Ok(BackgroundProgress {
+                            completed: 1,
+                            retryable: false,
+                        });
+                    }
+                    return Err(map_writer(error));
+                }
+            }
+        }
+        Ok(BackgroundProgress {
+            completed: 0,
+            retryable: true,
         })
     }
 
@@ -4052,7 +4190,9 @@ impl BackgroundScheduler {
                 (is_capture_job(job)
                     || matches!(
                         job.kind.as_str(),
-                        "semantic_synthesis_v1" | crate::jobs::procedure::KIND
+                        "semantic_synthesis_v1"
+                            | crate::jobs::procedure::KIND
+                            | crate::segmentation::refinement::KIND
                     ))
                     && matches!(job.state, JobStatus::Queued | JobStatus::Failed)
             })
@@ -4918,7 +5058,9 @@ impl BackgroundScheduler {
         }
         if matches!(
             current.kind.as_str(),
-            "semantic_synthesis_v1" | crate::jobs::procedure::KIND
+            "semantic_synthesis_v1"
+                | crate::jobs::procedure::KIND
+                | crate::segmentation::refinement::KIND
         ) {
             let mut fresh = SynthesisIdle::default();
             let idle = idle.unwrap_or(&mut fresh);
@@ -4960,7 +5102,9 @@ impl BackgroundScheduler {
         let occurred_at_us = now_us()?;
         let llm_job = matches!(
             current.kind.as_str(),
-            "semantic_synthesis_v1" | crate::jobs::procedure::KIND
+            "semantic_synthesis_v1"
+                | crate::jobs::procedure::KIND
+                | crate::segmentation::refinement::KIND
         );
         if llm_job
             && current
@@ -5517,7 +5661,9 @@ async fn fail_exhausted_llm_job(
         || current.terminal.is_some()
         || !matches!(
             current.kind.as_str(),
-            "semantic_synthesis_v1" | crate::jobs::procedure::KIND
+            "semantic_synthesis_v1"
+                | crate::jobs::procedure::KIND
+                | crate::segmentation::refinement::KIND
         )
     {
         return Err(BackgroundSchedulerError::Store);
@@ -5613,7 +5759,9 @@ fn select_jobs_from<'a>(
         job.state == JobStatus::Queued
             && (!matches!(
                 job.kind.as_str(),
-                "semantic_synthesis_v1" | crate::jobs::procedure::KIND
+                "semantic_synthesis_v1"
+                    | crate::jobs::procedure::KIND
+                    | crate::segmentation::refinement::KIND
             ) || job.backoff_until_us.is_none_or(|deadline| deadline <= now))
             && executable_job(job)
     }) {
@@ -5674,6 +5822,7 @@ fn executable_job(job: &DurableJob) -> bool {
             | "capability_inventory_v1"
             | "semantic_synthesis_v1"
             | crate::jobs::procedure::KIND
+            | crate::segmentation::refinement::KIND
             | PROCEDURE_PROMOTION_JOB_KIND
             | PROCEDURE_USAGE_JOB_KIND
             | QUIESCED_BACKUP_CREATE_JOB_KIND
@@ -5692,7 +5841,9 @@ fn job_lane(job: &DurableJob) -> BackgroundLane {
         | PROCEDURE_PROMOTION_JOB_KIND
         | PROCEDURE_USAGE_JOB_KIND => BackgroundLane::Deterministic,
         "session_import_v1" => BackgroundLane::Import,
-        "semantic_synthesis_v1" | crate::jobs::procedure::KIND => BackgroundLane::Synthesis,
+        "semantic_synthesis_v1"
+        | crate::jobs::procedure::KIND
+        | crate::segmentation::refinement::KIND => BackgroundLane::Synthesis,
         _ => BackgroundLane::Maintenance,
     }
 }
@@ -6099,6 +6250,14 @@ impl SynthesisIdle {
         config: &evertrace_domain::config::DreamingConfig,
         now: i64,
     ) -> bool {
+        if job.kind == crate::segmentation::refinement::KIND {
+            return self
+                .episodes
+                .values()
+                .find(|episode| episode.revision_id.to_string() == job.target_revision)
+                .and_then(|episode| self.delay(episode, config, now))
+                .is_some_and(|delay| delay.is_zero());
+        }
         if job.kind == crate::jobs::procedure::KIND {
             if !config.idle_enabled {
                 return false;
@@ -6214,7 +6373,9 @@ impl SynthesisIdle {
             // from a missing clock. Current busy targets consume no lane slot.
             if !matches!(
                 job.kind.as_str(),
-                "semantic_synthesis_v1" | crate::jobs::procedure::KIND
+                "semantic_synthesis_v1"
+                    | crate::jobs::procedure::KIND
+                    | crate::segmentation::refinement::KIND
             ) || self.job_ready(snapshot, job, config, now)
                 || (config.idle_enabled
                     && !target_present

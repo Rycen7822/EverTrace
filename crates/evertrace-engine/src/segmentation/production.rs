@@ -45,7 +45,7 @@ async fn source_policy(
     .map_err(|_| crate::autoresearch::AutoresearchError::EvidenceIncomplete)
 }
 
-async fn source_activity(
+pub(super) async fn source_activity(
     current: &CurrentFacts,
     selected: &SegmentationReadContext,
     runtime: &evertrace_capture::RuntimeSnapshot,

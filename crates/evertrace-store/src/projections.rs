@@ -11206,6 +11206,10 @@ fn job_targets_repository(
                     || observation_ids.contains(&last_observation_id)
             }
         }),
+        crate::command::PHASE_REFINEMENT_JOB_KIND => job
+            .target_revision
+            .parse::<RevisionId>()
+            .is_ok_and(|id| episode_revision_ids.contains(&id)),
         "procedure_review_v1" => job
             .target_revision
             .strip_prefix("procedure_source_v1|")
@@ -15338,7 +15342,9 @@ fn validate_job_successor(
             expected.backoff_until_us = next.backoff_until_us;
             matches!(
                 current.kind.as_str(),
-                "semantic_synthesis_v1" | "procedure_review_v1"
+                "semantic_synthesis_v1"
+                    | "procedure_review_v1"
+                    | crate::command::PHASE_REFINEMENT_JOB_KIND
             ) && next == &expected
                 && current.lease_until_us.is_none()
                 && current.terminal.is_none()

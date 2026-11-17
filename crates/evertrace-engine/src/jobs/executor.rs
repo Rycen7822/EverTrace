@@ -62,6 +62,12 @@ enum WriterRequest {
             Result<Option<evertrace_store::SegmentationReadContext>, WriterActorError>,
         >,
     },
+    PhaseRefinementCurrent {
+        episode: evertrace_domain::ids::WorkEpisodeId,
+        reply: oneshot::Sender<
+            Result<Option<evertrace_store::SegmentationReadContext>, WriterActorError>,
+        >,
+    },
     SegmentationCurrent {
         after: u64,
         reply: oneshot::Sender<
@@ -802,6 +808,18 @@ impl WriterHandle {
         let (reply, response) = oneshot::channel();
         self.sender
             .send(WriterRequest::IdleCheckpointCurrent { episodes, reply })
+            .await
+            .map_err(|_| WriterActorError::Stopped)?;
+        response.await.map_err(|_| WriterActorError::Stopped)?
+    }
+
+    pub(crate) async fn phase_refinement_current_context(
+        &self,
+        episode: evertrace_domain::ids::WorkEpisodeId,
+    ) -> Result<Option<evertrace_store::SegmentationReadContext>, WriterActorError> {
+        let (reply, response) = oneshot::channel();
+        self.sender
+            .send(WriterRequest::PhaseRefinementCurrent { episode, reply })
             .await
             .map_err(|_| WriterActorError::Stopped)?;
         response.await.map_err(|_| WriterActorError::Stopped)?
@@ -1835,6 +1853,22 @@ async fn run_writer(
                         .as_ref()
                         .ok_or(WriterActorError::Stopped)?
                         .idle_checkpoint_current_context(episodes)
+                        .await
+                        .map_err(map_store_error);
+                    let fatal = result.is_err();
+                    let _ = reply.send(result);
+                    if fatal {
+                        return Err(WriterActorError::Store);
+                    }
+                }
+                WriterRequest::PhaseRefinementCurrent { episode, reply } => {
+                    if reply.is_closed() {
+                        continue;
+                    }
+                    let result = writer
+                        .as_ref()
+                        .ok_or(WriterActorError::Stopped)?
+                        .phase_refinement_current_context(episode)
                         .await
                         .map_err(map_store_error);
                     let fatal = result.is_err();

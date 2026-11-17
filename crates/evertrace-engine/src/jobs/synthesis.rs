@@ -1427,7 +1427,9 @@ impl<'a> DailyLlmUsage<'a> {
                     job.model_id.is_some()
                         && matches!(
                             job.kind.as_str(),
-                            "semantic_synthesis_v1" | super::procedure::KIND
+                            "semantic_synthesis_v1"
+                                | super::procedure::KIND
+                                | crate::segmentation::refinement::KIND
                         )
                 })
                 .map(|job| (job.job_id, job))

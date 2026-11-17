@@ -5,6 +5,7 @@ mod checkpoint;
 mod detector;
 mod incremental;
 mod production;
+pub(crate) mod refinement;
 mod token;
 
 pub(crate) use burst::{BurstFoldUpdate, OperationBurstFolder, close_burst};

@@ -2314,6 +2314,14 @@ impl JournalWriter {
             .await
     }
 
+    pub async fn phase_refinement_current_context(
+        &self,
+        episode: evertrace_domain::ids::WorkEpisodeId,
+    ) -> Result<Option<crate::SegmentationReadContext>, StoreError> {
+        self.validated_current_read(|state, _| state.phase_refinement_current_context(episode))
+            .await
+    }
+
     pub async fn segmentation_current_context(
         &self,
         after: u64,

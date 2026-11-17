@@ -270,6 +270,8 @@ pub struct OutboxEntry {
     pub dirty: DirtyTarget,
 }
 
+pub const PHASE_REFINEMENT_JOB_KIND: &str = "phase_refinement_v1";
+
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct DurableJob {
@@ -2122,8 +2124,10 @@ fn validate_job(value: &DurableJob) -> Result<(), StoreError> {
             .as_ref()
             .and_then(|terminal| terminal.result_ref.as_deref()),
     )?;
-    let synthesis = value.kind == "semantic_synthesis_v1"
-        || value.kind == "procedure_review_v1" && value.model_id.is_some();
+    let synthesis = matches!(
+        value.kind.as_str(),
+        "semantic_synthesis_v1" | PHASE_REFINEMENT_JOB_KIND
+    ) || value.kind == "procedure_review_v1" && value.model_id.is_some();
     let import = value.kind == "session_import_v1";
     if value.target_generation == 0
         || value.attempt == 0

@@ -203,19 +203,21 @@ fn boundary_context<'a>(
 }
 
 #[derive(Clone, Copy)]
-enum CheckpointTarget<'a> {
+enum ActivityTarget<'a> {
     Source(
         &'a BTreeSet<SourceObservationId>,
         evertrace_domain::work::CheckpointReason,
     ),
     Idle(&'a BTreeSet<WorkEpisodeId>),
+    Refinement(WorkEpisodeId),
 }
 
-impl CheckpointTarget<'_> {
-    fn reason(self) -> evertrace_domain::work::CheckpointReason {
+impl ActivityTarget<'_> {
+    fn reason(self) -> Option<evertrace_domain::work::CheckpointReason> {
         match self {
-            Self::Source(_, reason) => reason,
-            Self::Idle(_) => evertrace_domain::work::CheckpointReason::Idle,
+            Self::Source(_, reason) => Some(reason),
+            Self::Idle(_) => Some(evertrace_domain::work::CheckpointReason::Idle),
+            Self::Refinement(_) => None,
         }
     }
 
@@ -225,6 +227,7 @@ impl CheckpointTarget<'_> {
                 .input_source_observation_refs
                 .iter()
                 .any(|id| sources.contains(id)),
+            Self::Refinement(episode) => binding.primary_binding.episode_id == Some(episode),
             Self::Idle(episodes) => binding
                 .primary_binding
                 .episode_id
@@ -281,7 +284,7 @@ impl JournalAdmissionState {
         };
         self.activity_context(
             0,
-            Some(CheckpointTarget::Source(sources, reason)),
+            Some(ActivityTarget::Source(sources, reason)),
             &mut completed,
         )
     }
@@ -290,7 +293,14 @@ impl JournalAdmissionState {
         &self,
         episodes: &BTreeSet<WorkEpisodeId>,
     ) -> Result<Option<SegmentationReadContext>, StoreError> {
-        self.activity_context(0, Some(CheckpointTarget::Idle(episodes)), &mut |_| {
+        self.activity_context(0, Some(ActivityTarget::Idle(episodes)), &mut |_| Ok(false))
+    }
+
+    pub(crate) fn phase_refinement_current_context(
+        &self,
+        episode: WorkEpisodeId,
+    ) -> Result<Option<SegmentationReadContext>, StoreError> {
+        self.activity_context(0, Some(ActivityTarget::Refinement(episode)), &mut |_| {
             Ok(false)
         })
     }
@@ -298,7 +308,7 @@ impl JournalAdmissionState {
     fn activity_context(
         &self,
         after: u64,
-        checkpoint: Option<CheckpointTarget<'_>>,
+        checkpoint: Option<ActivityTarget<'_>>,
         completed: &mut dyn FnMut(WorkEpisodeId) -> Result<bool, StoreError>,
     ) -> Result<Option<SegmentationReadContext>, StoreError> {
         use evertrace_domain::{evidence::CorrelationStrength, work::AssignmentStatus};
@@ -348,8 +358,7 @@ impl JournalAdmissionState {
             {
                 continue;
             }
-            if let Some(target) = checkpoint {
-                let reason = target.reason();
+            if let Some(reason) = checkpoint.and_then(ActivityTarget::reason) {
                 let saved = episode.checkpoint_refs.iter().any(|key| {
                     self.checkpoints.get(key).is_some_and(|(value, _)| {
                         value.created_reason == reason
@@ -372,7 +381,13 @@ impl JournalAdmissionState {
                 });
             }
             if consumed == checkpoint.is_some()
-                && selected.is_none_or(|(_, _, previous, _)| sequence < previous)
+                && selected.is_none_or(|(_, _, previous, _)| {
+                    if matches!(checkpoint, Some(ActivityTarget::Refinement(_))) {
+                        sequence > previous
+                    } else {
+                        sequence < previous
+                    }
+                })
             {
                 selected = Some((operation, *binding, sequence, episode));
             }
