@@ -382,7 +382,10 @@ impl JournalAdmissionState {
             }
             if consumed == checkpoint.is_some()
                 && selected.is_none_or(|(_, _, previous, _)| {
-                    if matches!(checkpoint, Some(ActivityTarget::Refinement(_))) {
+                    if matches!(
+                        checkpoint,
+                        Some(ActivityTarget::Refinement(_) | ActivityTarget::Idle(_))
+                    ) {
                         sequence > previous
                     } else {
                         sequence < previous

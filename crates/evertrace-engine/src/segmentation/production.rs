@@ -211,7 +211,7 @@ fn derive_activity(
     segmenter.observe_declared(state, selected.operation_id, facts, declared_phase.as_ref())
 }
 
-fn tool_request_sources(
+pub(super) fn tool_request_sources(
     current: &CurrentFacts,
     selected: &SegmentationReadContext,
     episode: &evertrace_domain::work::WorkEpisode,
@@ -261,7 +261,7 @@ fn tool_request_sources(
     Ok(result)
 }
 
-async fn tool_request_artifacts(
+pub(super) async fn tool_request_artifacts(
     current: &CurrentFacts,
     episode: &evertrace_domain::work::WorkEpisode,
     runtime: &evertrace_capture::RuntimeSnapshot,

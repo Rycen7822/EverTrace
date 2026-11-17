@@ -117,7 +117,7 @@ pub(crate) async fn advance_checkpoints(
             writer,
             current,
             runtime,
-            &selected,
+            selected,
             request.reason(),
             Some(observation.source_observation_id),
         )
@@ -148,7 +148,7 @@ pub(crate) async fn advance_idle_checkpoints(
             writer,
             current,
             runtime,
-            &selected,
+            selected,
             CheckpointReason::Idle,
             None,
         )
@@ -167,7 +167,7 @@ async fn save_selected_checkpoint(
     writer: &crate::WriterHandle,
     current: &evertrace_store::CurrentFacts,
     runtime: &evertrace_capture::RuntimeSnapshot,
-    selected: &evertrace_store::SegmentationReadContext,
+    mut selected: evertrace_store::SegmentationReadContext,
     reason: CheckpointReason,
     cause: Option<evertrace_domain::ids::SourceObservationId>,
 ) -> Result<BackgroundProgress, Error> {
@@ -177,8 +177,8 @@ async fn save_selected_checkpoint(
             retryable: true,
         });
     }
-    let Some(deadline) =
-        super::production::readable_context(writer, current, selected, runtime).await?
+    let Some(mut deadline) =
+        super::production::readable_context(writer, current, &selected, runtime).await?
     else {
         return Ok(BackgroundProgress {
             completed: 0,
@@ -221,6 +221,37 @@ async fn save_selected_checkpoint(
         effective_config_hash: runtime.effective_config_hash,
         algorithm_revision: "work-checkpoint-v1",
     };
+    let artifacts = if reason == CheckpointReason::Idle
+        && episode.phase_contract.phase_kind == evertrace_domain::work::PhaseKind::Unknown
+    {
+        let sources = super::production::tool_request_sources(current, &selected, episode)?;
+        selected.source_refs.extend(sources.iter().copied());
+        selected.source_refs.sort();
+        selected.source_refs.dedup();
+        if super::production::readable_context(writer, current, &selected, runtime)
+            .await?
+            .is_none()
+        {
+            return Ok(BackgroundProgress::default());
+        }
+        let artifacts = super::production::tool_request_artifacts(
+            current,
+            episode,
+            runtime,
+            occurred_at_us,
+            &sources,
+        )
+        .await?;
+        let Some(allowed_until) =
+            super::production::readable_context(writer, current, &selected, runtime).await?
+        else {
+            return Ok(BackgroundProgress::default());
+        };
+        deadline = allowed_until;
+        artifacts
+    } else {
+        Vec::new()
+    };
     let Some(command) = crate::work::episode::save_checkpoint(context, episode, *checkpoint, None)
         .map_err(|_| Error::Store)?
     else {
@@ -236,6 +267,14 @@ async fn save_selected_checkpoint(
         });
     }
     let mut events = command.events().to_vec();
+    events.extend(artifacts.into_iter().map(|artifact| {
+        evertrace_store::JournalEventDraft::runtime(
+            occurred_at_us,
+            runtime.effective_config_hash,
+            "tool_request_v1",
+            evertrace_store::JournalPayload::WorkArtifactRecorded(Box::new(artifact)),
+        )
+    }));
     for event in &mut events {
         event.causation_id = cause.map(|id| id.to_string());
     }

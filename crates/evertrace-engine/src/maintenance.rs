@@ -2948,10 +2948,8 @@ impl BackgroundScheduler {
                     &self.writer,
                     &snapshot,
                     idle.episodes.values().filter(|episode| {
-                        episode.boundary_status == evertrace_domain::work::BoundaryStatus::Candidate
-                            && idle
-                                .delay(episode, &self.dreaming, selection_time)
-                                .is_some_and(|delay| delay.is_zero())
+                        idle.delay(episode, &self.dreaming, selection_time)
+                            .is_some_and(|delay| delay.is_zero())
                     }),
                     &self.synthesis,
                     &self.runtime,
