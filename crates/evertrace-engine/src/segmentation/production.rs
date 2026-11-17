@@ -185,28 +185,71 @@ fn derive_activity(
     segmenter.observe_declared(state, selected.operation_id, facts, declared_phase.as_ref())
 }
 
-async fn tool_request_artifact(
+fn tool_request_sources(
     current: &CurrentFacts,
     selected: &SegmentationReadContext,
     episode: &evertrace_domain::work::WorkEpisode,
-    runtime: &evertrace_capture::RuntimeSnapshot,
-    now_us: i64,
-) -> Result<
-    Option<evertrace_domain::work::WorkArtifact>,
-    crate::maintenance::BackgroundSchedulerError,
-> {
+) -> Result<Vec<SourceObservationId>, crate::maintenance::BackgroundSchedulerError> {
     use crate::maintenance::BackgroundSchedulerError as Error;
-    use evertrace_domain::work::{
-        ArtifactActor, ArtifactDerivability, ArtifactPayloadStatus, ArtifactRetention,
-        ArtifactRevision, ArtifactScope, WorkArtifactKind,
-    };
     let operation = selected
         .state
         .authority()
         .operation(selected.operation_id)
         .ok_or(Error::Store)?;
+    let recent = selected
+        .state
+        .recent_bursts(episode)
+        .map_err(|_| Error::Store)?;
+    let left = recent
+        .iter()
+        .rev()
+        .flat_map(|burst| burst.members.iter().rev())
+        .find(|member| member.operation_id != selected.operation_id);
+    let mut result = Vec::new();
+    for refs in left
+        .map(|member| member.source_observation_refs.as_slice())
+        .into_iter()
+        .chain([operation.input_source_observation_refs.as_slice()])
+    {
+        let mut physical = Vec::new();
+        for id in refs {
+            let (observation, _) = current.source_observation(*id).ok_or(Error::Store)?;
+            let receipt = current
+                .source_receipt(observation.source_receipt_ref)
+                .ok_or(Error::Store)?
+                .0;
+            if observation.observation_role == evertrace_domain::evidence::ObservationRole::Intent
+                && evertrace_capture::execution_source::is_execution(observation, receipt)
+            {
+                physical.push(*id);
+            }
+        }
+        physical.sort();
+        physical.dedup();
+        if let [id] = physical.as_slice()
+            && !result.contains(id)
+        {
+            result.push(*id);
+        }
+    }
+    Ok(result)
+}
+
+async fn tool_request_artifacts(
+    current: &CurrentFacts,
+    episode: &evertrace_domain::work::WorkEpisode,
+    runtime: &evertrace_capture::RuntimeSnapshot,
+    now_us: i64,
+    sources: &[SourceObservationId],
+) -> Result<Vec<evertrace_domain::work::WorkArtifact>, crate::maintenance::BackgroundSchedulerError>
+{
+    use crate::maintenance::BackgroundSchedulerError as Error;
+    use evertrace_domain::work::{
+        ArtifactActor, ArtifactDerivability, ArtifactPayloadStatus, ArtifactRetention,
+        ArtifactRevision, ArtifactScope, WorkArtifactKind,
+    };
     let mut candidates = Vec::new();
-    for id in &operation.input_source_observation_refs {
+    for id in sources {
         let (observation, _) = current.source_observation(*id).ok_or(Error::Store)?;
         let receipt = current
             .source_receipt(observation.source_receipt_ref)
@@ -216,11 +259,9 @@ async fn tool_request_artifact(
             candidates.push((observation.clone(), receipt.clone()));
         }
     }
-    let [(observation, receipt)] = candidates.as_slice() else {
-        return Ok(None);
-    };
-    let observation = observation.clone();
-    let receipt = receipt.clone();
+    if candidates.is_empty() {
+        return Ok(Vec::new());
+    }
     let runtime = runtime.clone();
     let scope = match (episode.repository_instance_id, episode.worktree_instance_id) {
         (Some(repository_instance_id), Some(worktree_instance_id)) => ArtifactScope::Worktree {
@@ -236,45 +277,52 @@ async fn tool_request_artifact(
     tokio::task::spawn_blocking(move || {
         let cas = evertrace_capture::CasStore::open_existing(&runtime.cas_dir)
             .map_err(|_| Error::Store)?;
-        let digest = receipt.cas_ref.parse().map_err(|_| Error::Store)?;
-        let (protected, _) = cas
-            .read_bounded(&digest, 131_072, 131_072)
-            .map_err(|_| Error::Store)?;
-        if protected.len() as u64 != receipt.protected_length {
-            return Err(Error::Store);
-        }
-        let Ok(raw) =
-            evertrace_capture::goal_source::read_tool_request(&observation, &receipt, &protected)
-        else {
-            return Ok(None);
-        };
         let key = evertrace_capture::DeviceKeyStore::new(runtime.device_key_dir)
             .load()
             .map_err(|_| Error::Store)?;
-        let payload = evertrace_capture::protect(&raw, &key).map_err(|_| Error::Store)?;
-        let digest = cas.put(&payload).map_err(|_| Error::Store)?;
-        let blob = evertrace_domain::ids::CasId::from_digest(*digest.as_bytes());
-        crate::autoresearch::ArtifactService::new(cas)
-            .create(ArtifactRevision {
-                revision_id: evertrace_domain::revision::RevisionId::new_v7(),
-                parent_revision_id: None,
-                kind: WorkArtifactKind::Log,
-                logical_name: "工具请求".into(),
-                scope,
-                media_type: "application/json".into(),
-                content_blob_ref: Some(blob),
-                external_reference: None,
-                content_fingerprint: Some(blob),
-                payload_status: ArtifactPayloadStatus::Available,
-                produced_by_refs: vec![ArtifactActor::WorkEpisode(episode_id)],
-                consumed_by_refs: Vec::new(),
-                source_observation_refs: vec![observation.source_observation_id],
-                derivability: ArtifactDerivability::Original,
-                retention: ArtifactRetention::Task,
-                created_at_us: now_us,
-            })
-            .map(Some)
-            .map_err(|_| Error::Store)
+        let mut artifacts = Vec::new();
+        for (observation, receipt) in candidates {
+            let digest = receipt.cas_ref.parse().map_err(|_| Error::Store)?;
+            let (protected, _) = cas
+                .read_bounded(&digest, 131_072, 131_072)
+                .map_err(|_| Error::Store)?;
+            if protected.len() as u64 != receipt.protected_length {
+                return Err(Error::Store);
+            }
+            let Ok(raw) = evertrace_capture::goal_source::read_tool_request(
+                &observation,
+                &receipt,
+                &protected,
+            ) else {
+                continue;
+            };
+            let payload = evertrace_capture::protect(&raw, &key).map_err(|_| Error::Store)?;
+            let digest = cas.put(&payload).map_err(|_| Error::Store)?;
+            let blob = evertrace_domain::ids::CasId::from_digest(*digest.as_bytes());
+            artifacts.push(
+                crate::autoresearch::ArtifactService::new(cas.clone())
+                    .create(ArtifactRevision {
+                        revision_id: evertrace_domain::revision::RevisionId::new_v7(),
+                        parent_revision_id: None,
+                        kind: WorkArtifactKind::Log,
+                        logical_name: "工具请求".into(),
+                        scope,
+                        media_type: "application/json".into(),
+                        content_blob_ref: Some(blob),
+                        external_reference: None,
+                        content_fingerprint: Some(blob),
+                        payload_status: ArtifactPayloadStatus::Available,
+                        produced_by_refs: vec![ArtifactActor::WorkEpisode(episode_id)],
+                        consumed_by_refs: Vec::new(),
+                        source_observation_refs: vec![observation.source_observation_id],
+                        derivability: ArtifactDerivability::Original,
+                        retention: ArtifactRetention::Task,
+                        created_at_us: now_us,
+                    })
+                    .map_err(|_| Error::Store)?,
+            );
+        }
+        Ok(artifacts)
     })
     .await
     .map_err(|_| Error::Store)?
@@ -374,7 +422,7 @@ pub(crate) async fn advance_activity(
     };
     for _ in 0..8 {
         let previous = *after;
-        let Some(selected) = writer
+        let Some(mut selected) = writer
             .segmentation_current_context(*after)
             .await
             .map_err(|_| Error::Writer)?
@@ -454,10 +502,22 @@ pub(crate) async fn advance_activity(
                     .as_ref()
                     .is_none_or(|candidate| candidate.candidate_watermark != watermark)
         });
-        let artifact = if needs_checkpoint {
-            tool_request_artifact(current, &selected, episode, runtime, occurred_at_us).await?
+        let artifacts = if needs_checkpoint {
+            let sources = tool_request_sources(current, &selected, episode)?;
+            selected.source_refs.extend(sources.iter().copied());
+            selected.source_refs.sort();
+            selected.source_refs.dedup();
+            if readable_context(writer, current, &selected, runtime)
+                .await?
+                .is_none()
+            {
+                *after = previous;
+                progress.retryable = true;
+                return Ok(progress);
+            }
+            tool_request_artifacts(current, episode, runtime, occurred_at_us, &sources).await?
         } else {
-            None
+            Vec::new()
         };
         if needs_checkpoint
             && readable_context(writer, current, &selected, runtime)
@@ -493,14 +553,16 @@ pub(crate) async fn advance_activity(
             crate::work::episode::save_segmentation_update(context, episode, &step, &receipts)
         }
         .map_err(|_| Error::Store)?;
-        let command = if let Some(artifact) = artifact {
+        let command = if !artifacts.is_empty() {
             let mut events = command.events().to_vec();
-            events.push(evertrace_store::JournalEventDraft::runtime(
-                occurred_at_us,
-                runtime.effective_config_hash,
-                "tool_request_v1",
-                evertrace_store::JournalPayload::WorkArtifactRecorded(Box::new(artifact)),
-            ));
+            for artifact in artifacts {
+                events.push(evertrace_store::JournalEventDraft::runtime(
+                    occurred_at_us,
+                    runtime.effective_config_hash,
+                    "tool_request_v1",
+                    evertrace_store::JournalPayload::WorkArtifactRecorded(Box::new(artifact)),
+                ));
+            }
             evertrace_store::JournalCommand::new(command.command_id(), events)
                 .map_err(|_| Error::Store)?
         } else {
