@@ -353,6 +353,10 @@ impl SegmentationDetector {
                 && token.source_watermark() > candidate.source_watermark
                 && observed == candidate.proposed_phase
                 && token.boundary_evidence().objective()
+                && token
+                    .boundary_evidence_refs()
+                    .iter()
+                    .any(|reference| !candidate.evidence_refs.contains(reference))
             {
                 self.boundary_status = BoundaryStatus::Confirmed;
                 self.confirmation_watermark = token.source_watermark();
