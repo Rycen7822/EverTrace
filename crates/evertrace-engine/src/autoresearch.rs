@@ -535,7 +535,10 @@ pub(crate) fn declared_work_contract(
     native: &SourceObservation,
     native_receipt: &SourceReceipt,
     native_bytes: &[u8],
-) -> Option<evertrace_domain::work::PhaseContract> {
+) -> Option<(
+    evertrace_domain::work::PhaseContract,
+    evertrace_domain::work::StrategyContract,
+)> {
     if !evertrace_capture::process_source::is_work_revision(receipt.source_revision.as_str()) {
         return None;
     }
@@ -550,7 +553,10 @@ pub(crate) fn declared_work_contract(
             declaration.controller.pid,
             declaration.controller.start_ticks,
         )))
-    .then_some(declaration.definition.phase)
+    .then_some((
+        declaration.definition.phase,
+        declaration.definition.strategy,
+    ))
 }
 
 #[derive(Deserialize)]

@@ -141,6 +141,17 @@ pub(crate) fn current_episode(snapshot: &CurrentFacts, job: &DurableJob) -> Opti
     Some(episode)
 }
 
+fn contract_delta<T: Serialize>(base: &T, declared: &T) -> Result<serde_json::Value, Error> {
+    let base = serde_json::to_value(base).map_err(|_| Error::Store)?;
+    let serde_json::Value::Object(mut delta) =
+        serde_json::to_value(declared).map_err(|_| Error::Store)?
+    else {
+        return Err(Error::Store);
+    };
+    delta.retain(|key, value| base.get(key) != Some(value));
+    Ok(serde_json::Value::Object(delta))
+}
+
 pub(crate) async fn input(
     writer: &WriterHandle,
     snapshot: &CurrentFacts,
@@ -247,16 +258,80 @@ pub(crate) async fn input(
     {
         return Ok(None);
     }
-    let (_, plan) = super::production::source_activity(snapshot, &selected, runtime)
+    let activity = super::production::source_activity(snapshot, &selected, runtime)
         .await
         .map_err(|_| Error::Store)?;
+    if activity
+        .declaration_refs
+        .iter()
+        .chain(&activity.exit_refs)
+        .any(|id| !selected.source_refs.contains(id))
+    {
+        return Ok(None);
+    }
+    let authority = selected.state.authority();
+    let binding = authority
+        .binding(selected.operation_id)
+        .ok_or(Error::Store)?;
+    let primary_attempt = binding.primary_binding.attempt_id;
+    let mut recent_attempts = BTreeMap::new();
+    let limit = if primary_attempt.is_some() { 3 } else { 4 };
+    for id in &episode.attempt_ids {
+        let attempt = authority.attempt(*id).ok_or(Error::Store)?;
+        if Some(*id) != primary_attempt {
+            recent_attempts.insert((attempt.source_watermark, *id), attempt);
+            if recent_attempts.len() > limit {
+                recent_attempts.pop_first();
+            }
+        }
+    }
+    let primary = primary_attempt
+        .map(|id| authority.attempt(id).ok_or(Error::Store))
+        .transpose()?;
+    let attempts = primary
+        .into_iter()
+        .chain(recent_attempts.into_values())
+        .collect::<Vec<_>>();
+    let phase_delta = activity
+        .phase
+        .as_ref()
+        .map(|phase| contract_delta(&episode.phase_contract, phase))
+        .transpose()?;
+    let strategy_base = attempts
+        .last()
+        .copied()
+        .filter(|_| activity.strategy.is_some());
+    let strategy_delta = activity
+        .strategy
+        .as_ref()
+        .map(|strategy| {
+            strategy_base.map_or_else(
+                || serde_json::to_value(strategy).map_err(|_| Error::Store),
+                |base| contract_delta(&base.strategy_contract, strategy),
+            )
+        })
+        .transpose()?;
     let cas =
         evertrace_capture::CasStore::open_existing(&runtime.cas_dir).map_err(|_| Error::Store)?;
     let mut rationale = Vec::new();
     let mut evidence = source_refs
         .iter()
+        .chain(&activity.declaration_refs)
+        .chain(&activity.exit_refs)
         .map(ToString::to_string)
         .collect::<BTreeSet<_>>();
+    evidence.extend(
+        attempts
+            .iter()
+            .map(|attempt| attempt.revision_id.to_string()),
+    );
+    let attempts = attempts.iter().map(|attempt| serde_json::json!({
+        "attempt_id":attempt.attempt_id,"revision_id":attempt.revision_id,
+        "execution_status":attempt.execution_status,"adoption_status":attempt.adoption_status,
+        "verification":attempt.verification,"outcome_state":attempt.outcome_state,
+        "outcome_refs":attempt.outcome_refs.iter().take(4).collect::<Vec<_>>(),
+        "strategy_contract":attempt.strategy_contract
+    })).collect::<Vec<_>>();
     for (_, artifact) in artifacts.into_values() {
         let revision = &artifact.revision;
         if revision.kind != WorkArtifactKind::Log
@@ -307,7 +382,12 @@ pub(crate) async fn input(
     }
     let json = serde_json::to_string(&serde_json::json!({"phase_contract":episode.phase_contract,
         "candidate":{"watermark":candidate.candidate_watermark,"kind":candidate.kind},
-        "bursts":summaries,"plan_delta":plan.filter(|value| value != &episode.phase_contract),
+        "bursts":summaries,"primary_attempt_id":primary_attempt,"attempts":attempts,
+        "plan_delta":{"phase_contract":phase_delta,"strategy_contract":strategy_delta,
+            "strategy_base_revision":strategy_base.map(|attempt| attempt.revision_id),
+            "source_refs":activity.declaration_refs},
+        "physical_result":activity.exit_code.map(|exit| serde_json::json!({
+            "operation_id":selected.operation_id,"exit_code":exit,"source_refs":activity.exit_refs})),
         "rationale":rationale,"evidence_refs":evidence}))
     .map_err(|_| Error::Store)?;
     if json.len() > 16384 {
@@ -421,12 +501,21 @@ pub(crate) async fn jobs(
     Ok(jobs)
 }
 
+pub(crate) fn lease_current(snapshot: &CurrentFacts, job: &DurableJob) -> Result<bool, Error> {
+    let view = RuntimeSchedulerView::from_rows(snapshot.frontier(), snapshot.other_rows())
+        .map_err(|_| Error::Store)?;
+    Ok(job.state == JobStatus::Leased && view.jobs.iter().any(|current| current == job))
+}
+
 pub(crate) async fn allowed(
     writer: &WriterHandle,
     snapshot: &CurrentFacts,
     job: &DurableJob,
     runtime: &evertrace_capture::RuntimeSnapshot,
 ) -> Result<Option<Input>, Error> {
+    if !lease_current(snapshot, job)? {
+        return Ok(None);
+    }
     let Some(episode) = current_episode(snapshot, job) else {
         return Ok(None);
     };

@@ -45,12 +45,20 @@ async fn source_policy(
     .map_err(|_| crate::autoresearch::AutoresearchError::EvidenceIncomplete)
 }
 
+#[derive(Default)]
+pub(super) struct SourceActivity {
+    pub exit_code: Option<i32>,
+    pub exit_refs: Vec<SourceObservationId>,
+    pub phase: Option<evertrace_domain::work::PhaseContract>,
+    pub strategy: Option<evertrace_domain::work::StrategyContract>,
+    pub declaration_refs: Vec<SourceObservationId>,
+}
+
 pub(super) async fn source_activity(
     current: &CurrentFacts,
     selected: &SegmentationReadContext,
     runtime: &evertrace_capture::RuntimeSnapshot,
-) -> Result<(Option<i32>, Option<evertrace_domain::work::PhaseContract>), evertrace_capture::CasError>
-{
+) -> Result<SourceActivity, evertrace_capture::CasError> {
     use evertrace_capture::CasError as Error;
     let operation = selected
         .state
@@ -89,7 +97,7 @@ pub(super) async fn source_activity(
         })
         .collect::<Vec<_>>();
     if records.is_empty() {
-        return Ok((None, None));
+        return Ok(SourceActivity::default());
     }
     let cas_dir = runtime.cas_dir.clone();
     tokio::task::spawn_blocking(move || {
@@ -104,7 +112,10 @@ pub(super) async fn source_activity(
             protected.push((observation, receipt, bytes));
         }
         let mut exits = std::collections::BTreeSet::new();
+        let mut exit_refs = std::collections::BTreeSet::new();
         let mut phases = Vec::new();
+        let mut strategies = Vec::new();
+        let mut declaration_refs = std::collections::BTreeSet::new();
         for (observation, receipt, bytes) in &protected {
             if results.contains(&observation.source_observation_id) {
                 if let Some(code) = evertrace_capture::execution_source::execution_exit_code(
@@ -113,11 +124,12 @@ pub(super) async fn source_activity(
                     bytes,
                 ) {
                     exits.insert(code);
+                    exit_refs.insert(observation.source_observation_id);
                 }
             }
             for (native, native_receipt, native_bytes) in &protected {
                 if inputs.contains(&native.source_observation_id) {
-                    if let Some(phase) = crate::autoresearch::declared_work_contract(
+                    if let Some((phase, strategy)) = crate::autoresearch::declared_work_contract(
                         receipt,
                         bytes,
                         native,
@@ -127,14 +139,28 @@ pub(super) async fn source_activity(
                         if !phases.contains(&phase) {
                             phases.push(phase);
                         }
+                        if !strategies.contains(&strategy) {
+                            strategies.push(strategy);
+                        }
+                        declaration_refs.extend([
+                            observation.source_observation_id,
+                            native.source_observation_id,
+                        ]);
                     }
                 }
             }
         }
-        Ok((
-            (exits.len() == 1).then(|| *exits.first().expect("one physical result")),
-            (phases.len() == 1).then(|| phases.remove(0)),
-        ))
+        Ok(SourceActivity {
+            exit_code: (exits.len() == 1).then(|| *exits.first().expect("one physical result")),
+            exit_refs: if exits.len() == 1 {
+                exit_refs.into_iter().collect()
+            } else {
+                Vec::new()
+            },
+            phase: (phases.len() == 1).then(|| phases.remove(0)),
+            strategy: (strategies.len() == 1).then(|| strategies.remove(0)),
+            declaration_refs: declaration_refs.into_iter().collect(),
+        })
     })
     .await
     .map_err(|_| Error::Io)?
@@ -438,7 +464,7 @@ pub(crate) async fn advance_activity(
         let Some(deadline) = readable_context(writer, current, &selected, runtime).await? else {
             continue;
         };
-        let (exit, declared_phase) = match source_activity(current, &selected, runtime).await {
+        let activity = match source_activity(current, &selected, runtime).await {
             Ok(activity) => activity,
             Err(error) => {
                 let changed =
@@ -454,7 +480,7 @@ pub(crate) async fn advance_activity(
         if std::time::Instant::now() >= deadline {
             continue;
         }
-        let step = match derive_activity(&selected, exit, declared_phase) {
+        let step = match derive_activity(&selected, activity.exit_code, activity.phase) {
             Ok(SegmentOutcome::Delta(step)) => step,
             Ok(SegmentOutcome::NoDelta) | Err(DetectorError::Ineligible) => continue,
             Err(_) => return Err(Error::Store),

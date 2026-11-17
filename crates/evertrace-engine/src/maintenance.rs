@@ -3416,35 +3416,36 @@ impl BackgroundScheduler {
             &self.runtime,
             now_us()?,
         );
-        let command = match tokio::time::timeout(
+        let command = tokio::time::timeout(
             remaining.min(Duration::from_millis(job.budget.max_wall_time_ms)),
             execution,
         )
         .await
-        {
-            Ok(Ok(command)) => command,
-            _ => {
-                return self
-                    .finish_job(
-                        &job,
-                        0,
-                        JobTerminalOutcome::Failed,
-                        JobTerminalReason::SourceUnavailable,
-                    )
-                    .await;
-            }
-        };
-        let expected = command
-            .events()
-            .iter()
-            .map(|event| event.payload.clone())
-            .collect::<Vec<_>>();
+        .ok()
+        .and_then(Result::ok);
         for _ in 0..16 {
             let snapshot = self
                 .writer
                 .project_current(true)
                 .await
                 .map_err(map_writer)?;
+            if !crate::segmentation::refinement::lease_current(&snapshot, &job)? {
+                return Ok(BackgroundProgress::default());
+            }
+            let Some(command) = &command else {
+                let progress = self
+                    .finish_job(
+                        &job,
+                        snapshot.frontier(),
+                        JobTerminalOutcome::Failed,
+                        JobTerminalReason::SourceUnavailable,
+                    )
+                    .await?;
+                if progress.retryable {
+                    continue;
+                }
+                return Ok(progress);
+            };
             if crate::segmentation::refinement::allowed(
                 &self.writer,
                 &snapshot,
@@ -3457,14 +3458,18 @@ impl BackgroundScheduler {
                 if self.writer.sync_frontier().await.map_err(map_writer)? != snapshot.frontier() {
                     continue;
                 }
-                return self
+                let progress = self
                     .finish_job(
                         &job,
-                        0,
+                        snapshot.frontier(),
                         JobTerminalOutcome::Failed,
                         JobTerminalReason::StaleGeneration,
                     )
-                    .await;
+                    .await?;
+                if progress.retryable {
+                    continue;
+                }
+                return Ok(progress);
             }
             match self
                 .writer
@@ -3484,7 +3489,12 @@ impl BackgroundScheduler {
                         .committed_command(command.command_id())
                         .await
                         .map_err(map_writer)?
-                        .is_some_and(|committed| committed.payloads == expected)
+                        .is_some_and(|committed| {
+                            committed
+                                .payloads
+                                .iter()
+                                .eq(command.events().iter().map(|event| &event.payload))
+                        })
                     {
                         return Ok(BackgroundProgress {
                             completed: 1,
