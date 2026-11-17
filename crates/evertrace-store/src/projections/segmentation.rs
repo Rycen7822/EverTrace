@@ -202,6 +202,37 @@ fn boundary_context<'a>(
     Ok(left.into_iter().chain(std::iter::once(anchor)).collect())
 }
 
+#[derive(Clone, Copy)]
+enum CheckpointTarget<'a> {
+    Source(
+        &'a BTreeSet<SourceObservationId>,
+        evertrace_domain::work::CheckpointReason,
+    ),
+    Idle(&'a BTreeSet<WorkEpisodeId>),
+}
+
+impl CheckpointTarget<'_> {
+    fn reason(self) -> evertrace_domain::work::CheckpointReason {
+        match self {
+            Self::Source(_, reason) => reason,
+            Self::Idle(_) => evertrace_domain::work::CheckpointReason::Idle,
+        }
+    }
+
+    fn matches(self, operation: &Operation, binding: &WorkBindingRevision) -> bool {
+        match self {
+            Self::Source(sources, _) => operation
+                .input_source_observation_refs
+                .iter()
+                .any(|id| sources.contains(id)),
+            Self::Idle(episodes) => binding
+                .primary_binding
+                .episode_id
+                .is_some_and(|id| episodes.contains(&id)),
+        }
+    }
+}
+
 impl JournalAdmissionState {
     pub(crate) fn segmentation_current_context(
         &self,
@@ -248,16 +279,26 @@ impl JournalAdmissionState {
             checked.insert(episode_id, found);
             Ok(found)
         };
-        self.activity_context(0, Some((sources, reason)), &mut completed)
+        self.activity_context(
+            0,
+            Some(CheckpointTarget::Source(sources, reason)),
+            &mut completed,
+        )
+    }
+
+    pub(crate) fn idle_checkpoint_current_context(
+        &self,
+        episodes: &BTreeSet<WorkEpisodeId>,
+    ) -> Result<Option<SegmentationReadContext>, StoreError> {
+        self.activity_context(0, Some(CheckpointTarget::Idle(episodes)), &mut |_| {
+            Ok(false)
+        })
     }
 
     fn activity_context(
         &self,
         after: u64,
-        checkpoint: Option<(
-            &BTreeSet<SourceObservationId>,
-            evertrace_domain::work::CheckpointReason,
-        )>,
+        checkpoint: Option<CheckpointTarget<'_>>,
         completed: &mut dyn FnMut(WorkEpisodeId) -> Result<bool, StoreError>,
     ) -> Result<Option<SegmentationReadContext>, StoreError> {
         use evertrace_domain::{evidence::CorrelationStrength, work::AssignmentStatus};
@@ -280,12 +321,7 @@ impl JournalAdmissionState {
             };
             let sequence = (*operation_sequence).max(*binding_sequence);
             if sequence <= after
-                || checkpoint.is_some_and(|(sources, _)| {
-                    !operation
-                        .input_source_observation_refs
-                        .iter()
-                        .any(|id| sources.contains(id))
-                })
+                || checkpoint.is_some_and(|target| !target.matches(operation, binding))
             {
                 continue;
             };
@@ -312,7 +348,8 @@ impl JournalAdmissionState {
             {
                 continue;
             }
-            if let Some((_, reason)) = checkpoint {
+            if let Some(target) = checkpoint {
+                let reason = target.reason();
                 let saved = episode.checkpoint_refs.iter().any(|key| {
                     self.checkpoints.get(key).is_some_and(|(value, _)| {
                         value.created_reason == reason

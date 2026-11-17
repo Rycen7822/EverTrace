@@ -1,3 +1,4 @@
+use crate::maintenance::{BackgroundProgress, BackgroundSchedulerError as Error};
 use evertrace_domain::{
     repository::WorktreeSnapshot,
     work::{
@@ -36,7 +37,6 @@ pub(crate) async fn advance_checkpoints(
     current: &evertrace_store::CurrentFacts,
     runtime: &evertrace_capture::RuntimeSnapshot,
 ) -> Result<crate::maintenance::BackgroundProgress, crate::maintenance::BackgroundSchedulerError> {
-    use crate::maintenance::{BackgroundProgress, BackgroundSchedulerError as Error};
     use evertrace_capture::{CasDigest, CasStore, checkpoint_source};
     let idle = BackgroundProgress {
         completed: 0,
@@ -110,93 +110,155 @@ pub(crate) async fn advance_checkpoints(
         else {
             continue;
         };
-        if selected.state.frontier() != current.frontier() {
+        selected.source_refs.push(observation.source_observation_id);
+        selected.source_refs.sort();
+        selected.source_refs.dedup();
+        let progress = save_selected_checkpoint(
+            writer,
+            current,
+            runtime,
+            &selected,
+            request.reason(),
+            Some(observation.source_observation_id),
+        )
+        .await?;
+        if progress.completed != 0 || progress.retryable {
+            return Ok(progress);
+        }
+    }
+    Ok(idle)
+}
+
+pub(crate) async fn advance_idle_checkpoints(
+    writer: &crate::WriterHandle,
+    current: &evertrace_store::CurrentFacts,
+    runtime: &evertrace_capture::RuntimeSnapshot,
+    mut episodes: std::collections::BTreeSet<evertrace_domain::ids::WorkEpisodeId>,
+) -> Result<BackgroundProgress, Error> {
+    while !episodes.is_empty() {
+        let Some(selected) = writer
+            .idle_checkpoint_current_context(episodes.clone())
+            .await
+            .map_err(|_| Error::Writer)?
+        else {
+            break;
+        };
+        episodes.remove(&selected.episode_id);
+        let progress = save_selected_checkpoint(
+            writer,
+            current,
+            runtime,
+            &selected,
+            CheckpointReason::Idle,
+            None,
+        )
+        .await?;
+        if progress.completed != 0 || progress.retryable {
+            return Ok(progress);
+        }
+    }
+    Ok(BackgroundProgress {
+        completed: 0,
+        retryable: false,
+    })
+}
+
+async fn save_selected_checkpoint(
+    writer: &crate::WriterHandle,
+    current: &evertrace_store::CurrentFacts,
+    runtime: &evertrace_capture::RuntimeSnapshot,
+    selected: &evertrace_store::SegmentationReadContext,
+    reason: CheckpointReason,
+    cause: Option<evertrace_domain::ids::SourceObservationId>,
+) -> Result<BackgroundProgress, Error> {
+    if selected.state.frontier() != current.frontier() {
+        return Ok(BackgroundProgress {
+            completed: 0,
+            retryable: true,
+        });
+    }
+    let Some(deadline) =
+        super::production::readable_context(writer, current, selected, runtime).await?
+    else {
+        return Ok(BackgroundProgress {
+            completed: 0,
+            retryable: false,
+        });
+    };
+    let episode = selected
+        .state
+        .episode(selected.episode_id)
+        .ok_or(Error::Store)?;
+    let attempts = episode
+        .attempt_ids
+        .iter()
+        .map(|id| {
+            selected
+                .state
+                .authority()
+                .attempt(*id)
+                .cloned()
+                .ok_or(Error::Store)
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    let CheckpointResolution::Checkpoint(checkpoint) =
+        build_checkpoint(episode, &attempts, selected.snapshot.as_ref(), reason, None)
+            .map_err(|_| Error::Store)?
+    else {
+        return Ok(BackgroundProgress {
+            completed: 0,
+            retryable: false,
+        });
+    };
+    let occurred_at_us = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .ok()
+        .and_then(|time| i64::try_from(time.as_micros()).ok())
+        .ok_or(Error::Store)?;
+    let context = crate::work::WorkCommandContext {
+        command_id: evertrace_domain::ids::CommandId::new_v7(),
+        occurred_at_us,
+        effective_config_hash: runtime.effective_config_hash,
+        algorithm_revision: "work-checkpoint-v1",
+    };
+    let Some(command) = crate::work::episode::save_checkpoint(context, episode, *checkpoint, None)
+        .map_err(|_| Error::Store)?
+    else {
+        return Ok(BackgroundProgress {
+            completed: 0,
+            retryable: false,
+        });
+    };
+    if std::time::Instant::now() >= deadline {
+        return Ok(BackgroundProgress {
+            completed: 0,
+            retryable: false,
+        });
+    }
+    let mut events = command.events().to_vec();
+    for event in &mut events {
+        event.causation_id = cause.map(|id| id.to_string());
+    }
+    let command = evertrace_store::JournalCommand::new(command.command_id(), events)
+        .map_err(|_| Error::Store)?;
+    match writer
+        .commit_if_frontier(command, occurred_at_us, current.frontier())
+        .await
+    {
+        Ok(_) => {
+            return Ok(BackgroundProgress {
+                completed: 1,
+                retryable: true,
+            });
+        }
+        Err(crate::WriterActorError::StaleFrontier { .. }) => {
             return Ok(BackgroundProgress {
                 completed: 0,
                 retryable: true,
             });
         }
-        selected.source_refs.push(observation.source_observation_id);
-        selected.source_refs.sort();
-        selected.source_refs.dedup();
-        let Some(deadline) =
-            super::production::readable_context(writer, current, &selected, runtime).await?
-        else {
-            continue;
-        };
-        let episode = selected
-            .state
-            .episode(selected.episode_id)
-            .ok_or(Error::Store)?;
-        let attempts = episode
-            .attempt_ids
-            .iter()
-            .map(|id| {
-                selected
-                    .state
-                    .authority()
-                    .attempt(*id)
-                    .cloned()
-                    .ok_or(Error::Store)
-            })
-            .collect::<Result<Vec<_>, _>>()?;
-        let CheckpointResolution::Checkpoint(checkpoint) = build_checkpoint(
-            episode,
-            &attempts,
-            selected.snapshot.as_ref(),
-            request.reason(),
-            None,
-        )
-        .map_err(|_| Error::Store)?
-        else {
-            continue;
-        };
-        let occurred_at_us = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .ok()
-            .and_then(|time| i64::try_from(time.as_micros()).ok())
-            .ok_or(Error::Store)?;
-        let context = crate::work::WorkCommandContext {
-            command_id: evertrace_domain::ids::CommandId::new_v7(),
-            occurred_at_us,
-            effective_config_hash: runtime.effective_config_hash,
-            algorithm_revision: "host-checkpoint-v1",
-        };
-        let Some(command) =
-            crate::work::episode::save_checkpoint(context, episode, *checkpoint, None)
-                .map_err(|_| Error::Store)?
-        else {
-            continue;
-        };
-        if std::time::Instant::now() >= deadline {
-            continue;
-        }
-        let mut events = command.events().to_vec();
-        for event in &mut events {
-            event.causation_id = Some(observation.source_observation_id.to_string());
-        }
-        let command = evertrace_store::JournalCommand::new(command.command_id(), events)
-            .map_err(|_| Error::Store)?;
-        match writer
-            .commit_if_frontier(command, occurred_at_us, current.frontier())
-            .await
-        {
-            Ok(_) => {
-                return Ok(BackgroundProgress {
-                    completed: 1,
-                    retryable: true,
-                });
-            }
-            Err(crate::WriterActorError::StaleFrontier { .. }) => {
-                return Ok(BackgroundProgress {
-                    completed: 0,
-                    retryable: true,
-                });
-            }
-            Err(_) => return Err(Error::Writer),
-        }
+        Err(_) => return Err(Error::Writer),
     }
-    Ok(idle)
 }
 
 pub fn capture_summary(

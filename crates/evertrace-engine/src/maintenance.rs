@@ -2820,6 +2820,28 @@ impl BackgroundScheduler {
         }
         let mut idle = SynthesisIdle::default();
         idle.refresh(&snapshot, &view)?;
+        if optional_allowed && self.dreaming.idle_enabled {
+            let ready = idle.ready_episode_ids(&self.dreaming, now_us()?).collect();
+            let checkpoint = crate::segmentation::advance_idle_checkpoints(
+                &self.writer,
+                &snapshot,
+                &self.runtime,
+                ready,
+            )
+            .await?;
+            retryable |= checkpoint.retryable;
+            completed += checkpoint.completed;
+            if checkpoint.completed != 0 {
+                snapshot = self
+                    .writer
+                    .project_current(true)
+                    .await
+                    .map_err(map_writer)?;
+                view = RuntimeSchedulerView::from_rows(snapshot.frontier(), snapshot.other_rows())
+                    .map_err(|_| BackgroundSchedulerError::Store)?;
+                idle.refresh(&snapshot, &view)?;
+            }
+        }
         let selection_time = now_us()?;
         let mut synthesis_candidates = if self.dreaming.max_llm_tasks_per_run == 0 {
             Vec::new()
@@ -4001,7 +4023,11 @@ impl BackgroundScheduler {
         if let Some(idle_delay) = idle
             .episodes
             .values()
-            .filter(|episode| crate::jobs::synthesis::synthesis_trigger(episode).is_some())
+            .filter(|episode| {
+                crate::jobs::synthesis::synthesis_trigger(episode).is_some()
+                    || episode.lifecycle_status == evertrace_domain::work::EpisodeLifecycle::Open
+                        && episode.source_watermark != 0
+            })
             .filter_map(|episode| idle.delay(episode, dreaming, now))
             .filter(|delay| !delay.is_zero())
             .min()
@@ -6130,6 +6156,23 @@ impl SynthesisIdle {
                     .is_some_and(|delay| delay.is_zero())
             })
             .cloned()
+    }
+
+    fn ready_episode_ids<'a>(
+        &'a self,
+        config: &'a DreamingConfig,
+        now: i64,
+    ) -> impl Iterator<Item = evertrace_domain::ids::WorkEpisodeId> + 'a {
+        self.episodes
+            .values()
+            .filter(move |episode| {
+                episode.lifecycle_status == evertrace_domain::work::EpisodeLifecycle::Open
+                    && episode.source_watermark != 0
+                    && self
+                        .delay(episode, config, now)
+                        .is_some_and(|delay| delay.is_zero())
+            })
+            .map(|episode| episode.episode_id)
     }
 
     fn select(

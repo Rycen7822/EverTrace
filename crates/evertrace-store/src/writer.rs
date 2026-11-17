@@ -2306,6 +2306,14 @@ impl JournalWriter {
         .await
     }
 
+    pub async fn idle_checkpoint_current_context(
+        &self,
+        episodes: std::collections::BTreeSet<evertrace_domain::ids::WorkEpisodeId>,
+    ) -> Result<Option<crate::SegmentationReadContext>, StoreError> {
+        self.validated_current_read(|state, _| state.idle_checkpoint_current_context(&episodes))
+            .await
+    }
+
     pub async fn segmentation_current_context(
         &self,
         after: u64,

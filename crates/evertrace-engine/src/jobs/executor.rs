@@ -56,6 +56,12 @@ enum WriterRequest {
             Result<Option<evertrace_store::SegmentationReadContext>, WriterActorError>,
         >,
     },
+    IdleCheckpointCurrent {
+        episodes: std::collections::BTreeSet<evertrace_domain::ids::WorkEpisodeId>,
+        reply: oneshot::Sender<
+            Result<Option<evertrace_store::SegmentationReadContext>, WriterActorError>,
+        >,
+    },
     SegmentationCurrent {
         after: u64,
         reply: oneshot::Sender<
@@ -784,6 +790,18 @@ impl WriterHandle {
                 reason,
                 reply,
             })
+            .await
+            .map_err(|_| WriterActorError::Stopped)?;
+        response.await.map_err(|_| WriterActorError::Stopped)?
+    }
+
+    pub(crate) async fn idle_checkpoint_current_context(
+        &self,
+        episodes: std::collections::BTreeSet<evertrace_domain::ids::WorkEpisodeId>,
+    ) -> Result<Option<evertrace_store::SegmentationReadContext>, WriterActorError> {
+        let (reply, response) = oneshot::channel();
+        self.sender
+            .send(WriterRequest::IdleCheckpointCurrent { episodes, reply })
             .await
             .map_err(|_| WriterActorError::Stopped)?;
         response.await.map_err(|_| WriterActorError::Stopped)?
@@ -1801,6 +1819,22 @@ async fn run_writer(
                         .as_ref()
                         .ok_or(WriterActorError::Stopped)?
                         .checkpoint_current_context(sources, trigger, reason)
+                        .await
+                        .map_err(map_store_error);
+                    let fatal = result.is_err();
+                    let _ = reply.send(result);
+                    if fatal {
+                        return Err(WriterActorError::Store);
+                    }
+                }
+                WriterRequest::IdleCheckpointCurrent { episodes, reply } => {
+                    if reply.is_closed() {
+                        continue;
+                    }
+                    let result = writer
+                        .as_ref()
+                        .ok_or(WriterActorError::Stopped)?
+                        .idle_checkpoint_current_context(episodes)
                         .await
                         .map_err(map_store_error);
                     let fatal = result.is_err();
