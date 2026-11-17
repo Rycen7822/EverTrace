@@ -2292,6 +2292,20 @@ impl JournalWriter {
         .await
     }
 
+    pub async fn checkpoint_current_context(
+        &self,
+        sources: std::collections::BTreeSet<evertrace_domain::ids::SourceObservationId>,
+        trigger: evertrace_domain::ids::SourceObservationId,
+        reason: evertrace_domain::work::CheckpointReason,
+    ) -> Result<Option<crate::SegmentationReadContext>, StoreError> {
+        self.validated_current_read(|state, _| {
+            self.lock_sqlite()?.with_checkpoint_causation(|causation| {
+                state.checkpoint_current_context(&sources, trigger, reason, causation)
+            })
+        })
+        .await
+    }
+
     pub async fn segmentation_current_context(
         &self,
         after: u64,

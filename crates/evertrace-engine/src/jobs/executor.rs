@@ -48,6 +48,14 @@ enum WriterRequest {
         condition: WriterCommitCondition,
         reply: oneshot::Sender<Result<CommitOutcome, WriterActorError>>,
     },
+    CheckpointCurrent {
+        sources: std::collections::BTreeSet<evertrace_domain::ids::SourceObservationId>,
+        trigger: evertrace_domain::ids::SourceObservationId,
+        reason: evertrace_domain::work::CheckpointReason,
+        reply: oneshot::Sender<
+            Result<Option<evertrace_store::SegmentationReadContext>, WriterActorError>,
+        >,
+    },
     SegmentationCurrent {
         after: u64,
         reply: oneshot::Sender<
@@ -760,6 +768,25 @@ impl WriterHandle {
             .await
             .map_err(|_| WriterActorError::Stopped)?;
         response.await.map_err(|_| WriterActorError::Stopped)
+    }
+
+    pub(crate) async fn checkpoint_current_context(
+        &self,
+        sources: std::collections::BTreeSet<evertrace_domain::ids::SourceObservationId>,
+        trigger: evertrace_domain::ids::SourceObservationId,
+        reason: evertrace_domain::work::CheckpointReason,
+    ) -> Result<Option<evertrace_store::SegmentationReadContext>, WriterActorError> {
+        let (reply, response) = oneshot::channel();
+        self.sender
+            .send(WriterRequest::CheckpointCurrent {
+                sources,
+                trigger,
+                reason,
+                reply,
+            })
+            .await
+            .map_err(|_| WriterActorError::Stopped)?;
+        response.await.map_err(|_| WriterActorError::Stopped)?
     }
 
     pub(crate) async fn segmentation_current_context(
@@ -1759,6 +1786,27 @@ async fn run_writer(
                             .ok_or(WriterActorError::Stopped)?
                             .queued_gc_jobs();
                         let _ = reply.send(jobs);
+                    }
+                }
+                WriterRequest::CheckpointCurrent {
+                    sources,
+                    trigger,
+                    reason,
+                    reply,
+                } => {
+                    if reply.is_closed() {
+                        continue;
+                    }
+                    let result = writer
+                        .as_ref()
+                        .ok_or(WriterActorError::Stopped)?
+                        .checkpoint_current_context(sources, trigger, reason)
+                        .await
+                        .map_err(map_store_error);
+                    let fatal = result.is_err();
+                    let _ = reply.send(result);
+                    if fatal {
+                        return Err(WriterActorError::Store);
                     }
                 }
                 WriterRequest::SegmentationCurrent { after, reply } => {

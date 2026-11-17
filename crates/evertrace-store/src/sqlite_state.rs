@@ -520,6 +520,23 @@ impl SqliteState {
         self.with_connection(read_all_rows)
     }
 
+    pub(crate) fn with_checkpoint_causation<T>(
+        &self,
+        read: impl FnOnce(
+            &mut dyn FnMut(u64) -> Result<Option<String>, StoreError>,
+        ) -> Result<T, StoreError>,
+    ) -> Result<T, StoreError> {
+        self.with_connection(|connection| {
+            let mut statement = connection.prepare(
+                "SELECT causation_id FROM journal_events WHERE seq=?1 AND event_type='work_checkpoint_recorded_v1'",
+            ).map_err(|_| StoreError::StoreCorrupt)?;
+            read(&mut |seq| {
+                statement.query_row(params![seq.to_be_bytes().as_slice()], |row| row.get(0))
+                    .map_err(|_| StoreError::StoreCorrupt)
+            })
+        })
+    }
+
     /// One prepared seq-primary-key reader for request-local memory filtering.
     /// The caller stays within validated_current_read's pre/post stamp. Neither
     /// event payloads nor a persistent/header cache are constructed here.

@@ -187,6 +187,33 @@ fn execution_peer_matches(instance: &str, thread: &str, receipt: &SourceReceipt)
             == Some(crate::execution_source::Profile::Context)
 }
 
+/// Current publisher identity for configuration read authority only; not a live goal designation.
+pub fn policy_publisher(receipt: &SourceReceipt) -> Result<(u32, String, (u64, u64))> {
+    if !is_source_revision(receipt.source_revision.as_str())
+        || receipt.identity_domain != IDENTITY_DOMAIN
+    {
+        return Err(GoalSourceError);
+    }
+    let pid = receipt
+        .source_instance_id
+        .as_str()
+        .split(':')
+        .nth(3)
+        .and_then(|value| value.parse::<u32>().ok())
+        .ok_or(GoalSourceError)?;
+    let peer = peer(pid)?;
+    let (_, publisher) =
+        connect_publisher(&peer.endpoint, Instant::now() + Duration::from_secs(3))?;
+    let instance = publisher.instance("host-goal")?;
+    if instance != receipt.source_instance_id.as_str()
+        || publisher_revision(publisher.fingerprint) != receipt.source_revision.as_str()
+    {
+        return Err(GoalSourceError);
+    }
+    publisher.revalidate()?;
+    Ok((pid, instance, peer.executable))
+}
+
 /// Re-read the actual publisher, not a claimed role, profile label or copied historical payload.
 pub fn revalidate(
     receipt: &SourceReceipt,

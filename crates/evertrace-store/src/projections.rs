@@ -4004,6 +4004,22 @@ pub fn read_dependencies_for(row: &ObjectRow, payload: &JournalPayload) -> BTree
                     .map(ToString::to_string),
             );
         }
+        JournalPayload::WorkCheckpointRecorded(value) => {
+            refs.insert(value.episode_revision_id.to_string());
+            refs.extend(
+                value
+                    .attempt_revision_refs
+                    .iter()
+                    .map(|reference| reference.revision_id.to_string()),
+            );
+            refs.extend(value.current_worktree_snapshot_id.map(|id| id.to_string()));
+            refs.extend(
+                value
+                    .capture_receipt_revision_ids
+                    .iter()
+                    .map(ToString::to_string),
+            );
+        }
         JournalPayload::CompetingAttemptGroupRecorded(value) => {
             refs.extend(value.origin_workstream_id.map(|id| id.to_string()));
             refs.extend(value.member_workstream_ids.iter().map(ToString::to_string));
@@ -6759,6 +6775,23 @@ impl JournalAdmissionState {
                 .stable_key
                 .strip_prefix("runtime:recall_need:")
                 .unwrap_or(&record.reference.stable_key);
+            if let Some((checkpoint, seq)) = self.checkpoints.get(key) {
+                if record
+                    .reference
+                    .revision_ref
+                    .as_ref()
+                    .is_some_and(|revision| *revision != checkpoint.episode_revision_id.to_string())
+                {
+                    return Ok(evertrace_domain::query::MetadataReadOutcome::Conflict(
+                        state.frontier,
+                    ));
+                }
+                let row = self.scope_fact_row(
+                    &JournalPayload::WorkCheckpointRecorded(Box::new(checkpoint.clone())),
+                    *seq,
+                )?;
+                return self.stored_fields_context_for_row(row, state, cancelled, deadline, budget);
+            }
             if let Ok(id) = key.parse::<evertrace_domain::ids::RecallNeedId>() {
                 let row = self.recall_ledger.current_row(id, PROJECTION_GENERATION)?;
                 if row.as_ref().is_some_and(|row| {

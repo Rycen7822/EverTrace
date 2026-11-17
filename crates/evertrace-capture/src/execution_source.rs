@@ -296,6 +296,28 @@ fn source_coordinates(
     Some((format!("{observer}:context:{context}"), sequence))
 }
 
+pub(crate) fn checkpoint_coordinates(receipt: &SourceReceipt) -> Option<(&str, &str, &str)> {
+    if receipt.source_revision.as_str() != Profile::Context.source_revision()
+        || receipt.parser_revision != Profile::Context.revision()
+    {
+        return None;
+    }
+    let value = coordinates(&receipt.source_ref, receipt.parser_revision)?;
+    if value.phase != "started" {
+        return None;
+    }
+    let (context, _) = value.context?;
+    let observer = receipt
+        .source_instance_id
+        .as_str()
+        .strip_suffix(&format!(":context:{context}"))?;
+    Some((
+        host_events::peer_instance(observer)?,
+        value.thread,
+        value.turn,
+    ))
+}
+
 fn lane_key(coordinates: &Coordinates<'_>) -> String {
     let base = format!("native-thread:{}", coordinates.thread);
     match coordinates.context {

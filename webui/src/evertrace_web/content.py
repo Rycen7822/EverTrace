@@ -104,7 +104,8 @@ async def read_source_content(backend, reference, frontier, revision, after=None
 
 DETAIL_KINDS = {"atom_revision": "atom", "procedure_revision": "procedure", "core_membership": "core_membership",
                 "semantic_digest": "digest", "revision_proposal_revision": None,
-                "work_episode": "work_episode", "execution_lane": "execution_lane", "capture_receipt": "capture_receipt",
+                "work_episode": "work_episode", "work_checkpoint": "work_checkpoint",
+                "execution_lane": "execution_lane", "capture_receipt": "capture_receipt",
                 "segmentation_correction": "segmentation_correction",
                 "task": "task", "workstream": "workstream", "competing_attempt_group": "competing_attempt_group",
                 "attempt": "attempt", "operation_burst": "operation_burst", "operation": "operation",
@@ -118,7 +119,8 @@ DETAIL_KINDS = {"atom_revision": "atom", "procedure_revision": "procedure", "cor
                 "procedure_negative_evidence": "procedure_negative", "procedure_negative_review": "procedure_negative_review",
                 "procedure_context_effect": "procedure_effect", "global_support_contract": "support_contract",
                 "global_support_validation": "support_validation"}
-NATIVE_DETAIL_KINDS = {"task", "workstream", "work_episode", "execution_lane", "capture_receipt", "segmentation_correction",
+NATIVE_DETAIL_KINDS = {"task", "workstream", "work_episode", "work_checkpoint",
+                     "execution_lane", "capture_receipt", "segmentation_correction",
                      "attempt", "competing_attempt_group", "operation_burst", "operation",
                      "host_occurrence", "scope_effect", "worktree", "worktree_snapshot",
                      "work_binding", "worktree_transition", "integration_event",

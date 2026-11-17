@@ -10,22 +10,15 @@ use super::{
 async fn source_policy(
     current: &CurrentFacts,
     selected: &SegmentationReadContext,
-    runtime: &evertrace_capture::RuntimeSnapshot,
 ) -> Result<Option<crate::repository::SourcePolicy>, crate::autoresearch::AutoresearchError> {
-    use crate::autoresearch::{AutoresearchError, ControlledRunResolver};
     let roots = selected
         .root_refs
         .iter()
         .filter_map(|reference| {
-            let id = reference.parse::<SourceObservationId>().ok()?;
-            let (observation, _) = current.source_observation(id)?;
-            if !evertrace_capture::goal_source::is_source_revision(
-                observation.source_revision.as_str(),
-            ) {
-                return None;
-            }
+            let (observation, _) = current.source_observation(reference.parse().ok()?)?;
             let receipt = current.source_receipt(observation.source_receipt_ref)?.0;
-            Some((observation.clone(), receipt.clone()))
+            evertrace_capture::goal_source::is_source_revision(receipt.source_revision.as_str())
+                .then(|| receipt.clone())
         })
         .collect::<Vec<_>>();
     let executions = selected
@@ -38,34 +31,18 @@ async fn source_policy(
                 .then(|| receipt.clone())
         })
         .collect::<Vec<_>>();
-    if roots.is_empty() || executions.is_empty() {
-        return Ok(None);
-    }
-    let cas_dir = runtime.cas_dir.clone();
-    let key_dir = runtime.device_key_dir.clone();
     tokio::task::spawn_blocking(move || {
-        let cas = evertrace_capture::CasStore::open_existing(cas_dir)
-            .map_err(|_| AutoresearchError::Cas)?;
-        let resolver = ControlledRunResolver::new(cas);
-        for (observation, receipt) in roots {
-            let root = match resolver.verified_root_goal(&receipt, &observation, Some(&key_dir)) {
-                Ok(root) => root,
-                Err(
-                    AutoresearchError::EvidenceIncomplete | AutoresearchError::UntrustedRunEvidence,
-                ) => continue,
-                Err(error) => return Err(error),
-            };
-            if executions
-                .iter()
-                .any(|receipt| root.matches_execution(receipt))
-            {
-                return Ok(crate::repository::SourcePolicy::from_goal(&root));
-            }
-        }
-        Ok(None)
+        roots
+            .iter()
+            .filter(|root| {
+                executions.iter().any(|execution| {
+                    evertrace_capture::goal_source::same_execution_context(root, execution)
+                })
+            })
+            .find_map(|root| crate::repository::SourcePolicy::from_recorded_goal(root))
     })
     .await
-    .map_err(|_| AutoresearchError::EvidenceIncomplete)?
+    .map_err(|_| crate::autoresearch::AutoresearchError::EvidenceIncomplete)
 }
 
 async fn source_activity(
@@ -207,6 +184,87 @@ fn derive_activity(
     segmenter.observe(state, selected.operation_id, facts)
 }
 
+pub(super) async fn readable_context(
+    writer: &crate::WriterHandle,
+    current: &CurrentFacts,
+    selected: &SegmentationReadContext,
+    runtime: &evertrace_capture::RuntimeSnapshot,
+) -> Result<Option<std::time::Instant>, crate::maintenance::BackgroundSchedulerError> {
+    use crate::maintenance::BackgroundSchedulerError as Error;
+    // Existing canonical Work and physical evidence do not require the publisher to stay alive.
+    // Only code access needs its current source-owned repository policy; there is no HOME fallback.
+    let policy = if selected.repository_ids.is_empty() {
+        None
+    } else {
+        source_policy(current, &selected)
+            .await
+            .map_err(|_| Error::Store)?
+    };
+    let authority = policy.as_ref().map_or(
+        crate::repository::RepositoryReadAuthority::Unavailable,
+        crate::repository::RepositoryReadAuthority::Source,
+    );
+    let deadline = std::time::Instant::now() + std::time::Duration::from_millis(250);
+    let refs = selected
+        .source_refs
+        .iter()
+        .copied()
+        .chain(
+            selected
+                .root_refs
+                .iter()
+                .filter_map(|reference| reference.parse::<SourceObservationId>().ok()),
+        )
+        .map(|id| id.to_string())
+        .collect::<std::collections::BTreeSet<_>>()
+        .into_iter()
+        .collect::<Vec<_>>();
+    let mut blocked = false;
+    let mut revoked = Vec::new();
+    for chunk in refs.chunks(64) {
+        if std::time::Instant::now() >= deadline {
+            blocked = true;
+            break;
+        }
+        match crate::session_import::source_observations_read_assessment(
+            writer, &authority, current, chunk,
+        )
+        .await
+        {
+            Ok((denied, observations)) => {
+                blocked |= !denied.is_empty();
+                revoked.extend(observations);
+            }
+            Err(crate::session_import::SessionImportServiceError::Unavailable) => {
+                blocked = true;
+                break;
+            }
+            Err(_) => return Err(Error::Store),
+        }
+    }
+    if !blocked && std::time::Instant::now() < deadline {
+        let (denied, observations) = crate::repository::repository_read_assessment(
+            writer,
+            selected.repository_ids.iter().copied().collect(),
+            &authority,
+            deadline,
+        )
+        .await
+        .map_err(|_| Error::Store)?;
+        blocked |= !denied.is_empty();
+        revoked.extend(observations);
+    } else {
+        blocked = true;
+    }
+    crate::repository::record_trust_revocations(writer, revoked, runtime.effective_config_hash)
+        .await
+        .map_err(|_| Error::Store)?;
+    if blocked || std::time::Instant::now() >= deadline {
+        return Ok(None);
+    }
+    Ok(Some(deadline))
+}
+
 pub(crate) async fn advance_activity(
     writer: &crate::WriterHandle,
     current: &CurrentFacts,
@@ -233,77 +291,9 @@ pub(crate) async fn advance_activity(
             return Ok(progress);
         }
         *after = selected.sequence;
-        // Existing canonical Work and physical evidence do not require the publisher to stay alive.
-        // Only code access needs its current source-owned repository policy; there is no HOME fallback.
-        let policy = if selected.repository_ids.is_empty() {
-            None
-        } else {
-            source_policy(current, &selected, runtime)
-                .await
-                .map_err(|_| Error::Store)?
-        };
-        let authority = policy.as_ref().map_or(
-            crate::repository::RepositoryReadAuthority::Unavailable,
-            crate::repository::RepositoryReadAuthority::Source,
-        );
-        let deadline = std::time::Instant::now() + std::time::Duration::from_millis(250);
-        let refs = selected
-            .source_refs
-            .iter()
-            .copied()
-            .chain(
-                selected
-                    .root_refs
-                    .iter()
-                    .filter_map(|reference| reference.parse::<SourceObservationId>().ok()),
-            )
-            .map(|id| id.to_string())
-            .collect::<std::collections::BTreeSet<_>>()
-            .into_iter()
-            .collect::<Vec<_>>();
-        let mut blocked = false;
-        let mut revoked = Vec::new();
-        for chunk in refs.chunks(64) {
-            if std::time::Instant::now() >= deadline {
-                blocked = true;
-                break;
-            }
-            match crate::session_import::source_observations_read_assessment(
-                writer, &authority, current, chunk,
-            )
-            .await
-            {
-                Ok((denied, observations)) => {
-                    blocked |= !denied.is_empty();
-                    revoked.extend(observations);
-                }
-                Err(crate::session_import::SessionImportServiceError::Unavailable) => {
-                    blocked = true;
-                    break;
-                }
-                Err(_) => return Err(Error::Store),
-            }
-        }
-        if !blocked && std::time::Instant::now() < deadline {
-            let (denied, observations) = crate::repository::repository_read_assessment(
-                writer,
-                selected.repository_ids.iter().copied().collect(),
-                &authority,
-                deadline,
-            )
-            .await
-            .map_err(|_| Error::Store)?;
-            blocked |= !denied.is_empty();
-            revoked.extend(observations);
-        } else {
-            blocked = true;
-        }
-        crate::repository::record_trust_revocations(writer, revoked, runtime.effective_config_hash)
-            .await
-            .map_err(|_| Error::Store)?;
-        if blocked || std::time::Instant::now() >= deadline {
+        let Some(deadline) = readable_context(writer, current, &selected, runtime).await? else {
             continue;
-        }
+        };
         let (exit, declared_phase) = match source_activity(current, &selected, runtime).await {
             Ok(activity) => activity,
             Err(error) => {

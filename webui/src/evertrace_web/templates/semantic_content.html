@@ -264,6 +264,29 @@
     {{ text_list('中断', value.interruption_refs) }}
     {{ text_list('检查点', value.checkpoint_refs) }}
   </details>
+{% elif content.kind == 'work_checkpoint' %}
+  <h2>工作检查点</h2>
+  <p>原因：{{ value.created_reason }} · 来源水位：{{ value.source_watermark }}</p>
+  <p>验证：{{ value.verifier_state }} · 待续接：{{ '是' if value.continuation_candidate else '否' }}</p>
+  <p>原片段：{{ value.episode_id }} · 冻结修订：{{ value.episode_revision_id }}</p>
+  <button class="text-button" type="button" data-link-key="{{ value.episode_id }}"
+    data-object="{{ value.episode_id }}" data-revision="{{ value.episode_revision_id }}" data-kind="work_episode">读取原片段修订</button>
+  <h3>阶段合同</h3><pre>{{ value.phase_contract|pretty }}</pre>
+  {{ text_list('活跃尝试', value.active_attempt_ids, record_kind='attempt') }}
+  <h3>冻结的尝试修订</h3>
+  <ul>{% for ref in value.attempt_revision_refs %}<li>
+    <button class="text-button" type="button" data-link-key="{{ ref.attempt_id }}"
+      data-object="{{ ref.attempt_id }}" data-revision="{{ ref.revision_id }}" data-kind="attempt">{{ ref.revision_id }}</button>
+  </li>{% endfor %}</ul>
+  {{ text_list('未解决事项', value.open_loops) }}
+  {{ text_list('验证引用', value.verifier_refs) }}
+  <p>工作树快照：{{ value.current_worktree_snapshot_id or '未记录' }}</p>
+  <h3>待整理增量</h3><pre>{{ value.pending_delta_stats|pretty }}</pre>
+  {{ text_list('状态谱系', value.active_lineage_refs) }}
+  {{ text_list('采集凭证', value.capture_receipt_revision_ids, record_kind='capture_receipt', exact_revision=true) }}
+  {{ text_list('采集缺口', value.capture_gap_refs) }}
+  {{ text_list('采集中断', value.capture_outage_refs) }}
+  <p>算法版本：{{ value.algorithm_revision }}</p>
 {% elif content.kind == 'digest' %}
   <h2>{{ '来源摘要' if value.get('source_target') else '工作摘要' }}</h2>
   <p>整理方式：{{ {

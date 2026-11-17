@@ -8,6 +8,7 @@ mod production;
 mod token;
 
 pub(crate) use burst::{BurstFoldUpdate, OperationBurstFolder, close_burst};
+pub(crate) use checkpoint::advance_checkpoints;
 pub use checkpoint::{CheckpointResolution, build_checkpoint, capture_summary};
 pub use detector::{AlignmentOutcome, DetectorError, GrayZoneDisposition};
 pub(crate) use detector::{DetectorUpdate, SegmentationDetector};

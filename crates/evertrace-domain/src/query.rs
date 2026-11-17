@@ -2803,6 +2803,7 @@ impl ExactRecordQuery {
                     || key.parse::<crate::ids::RevisionProposalId>().is_ok()
                     || key.parse::<crate::ids::SemanticDigestId>().is_ok()
                     || key.parse::<crate::ids::WorkEpisodeId>().is_ok()
+                    || crate::work::WorkCheckpoint::is_stable_key(key)
                     || key.parse::<crate::ids::TaskId>().is_ok()
                     || key.parse::<crate::ids::WorkstreamId>().is_ok()
                     || key.parse::<crate::ids::AttemptId>().is_ok()

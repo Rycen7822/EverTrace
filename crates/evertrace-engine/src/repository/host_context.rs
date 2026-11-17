@@ -348,6 +348,32 @@ impl SourcePolicy {
         Self::observe(source, &mut budget)
     }
 
+    pub(crate) fn from_recorded_goal(
+        receipt: &evertrace_domain::evidence::SourceReceipt,
+    ) -> Option<Self> {
+        let (pid, instance, executable) =
+            evertrace_capture::goal_source::policy_publisher(receipt).ok()?;
+        let mut budget = ReadBudget::new();
+        let source = NativeProcess::open(pid, &mut budget)?;
+        let current = NativeProcess::open(std::process::id(), &mut budget)?;
+        let boot = budget.read(Path::new("/proc/sys/kernel/random/boot_id"))?;
+        let namespace = fs::metadata(source.path("ns/pid")).ok()?.ino();
+        let actual = format!(
+            "host-goal:{}:{namespace}:{}:{}",
+            std::str::from_utf8(&boot).ok()?.trim(),
+            source.pid,
+            source.start_time
+        );
+        if source.owner != current.owner
+            || source.namespaces != current.namespaces
+            || actual != instance
+            || (source.executable.device, source.executable.inode) != executable
+        {
+            return None;
+        }
+        Self::observe(source, &mut budget)
+    }
+
     fn revalidate(&self, budget: &mut ReadBudget) -> Option<()> {
         self.source.revalidate(budget)?;
         let file =

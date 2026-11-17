@@ -658,6 +658,27 @@ pub struct WorkCheckpoint {
 }
 
 impl WorkCheckpoint {
+    pub fn is_stable_key(key: &str) -> bool {
+        let Some((rest, algorithm)) = key.rsplit_once(':') else {
+            return false;
+        };
+        let Some((rest, reason)) = rest.rsplit_once(':') else {
+            return false;
+        };
+        let Some((episode, watermark)) = rest.rsplit_once(':') else {
+            return false;
+        };
+        episode.parse::<WorkEpisodeId>().is_ok()
+            && watermark
+                .parse::<u64>()
+                .is_ok_and(|value| value > 0 && value.to_string() == watermark)
+            && algorithm
+                .parse::<u32>()
+                .is_ok_and(|value| value > 0 && value.to_string() == algorithm)
+            && serde_json::from_value::<CheckpointReason>(serde_json::Value::String(reason.into()))
+                .is_ok()
+    }
+
     pub fn stable_key(&self) -> String {
         format!(
             "{}:{}:{}:{}",

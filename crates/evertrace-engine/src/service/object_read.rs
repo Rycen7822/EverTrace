@@ -268,6 +268,18 @@ async fn fields_scope_access(
     deadline: Instant,
 ) -> Result<(), ErrorCode> {
     let root = context.selected.as_ref().ok_or(ErrorCode::StoreCorrupt)?;
+    let root = if root.object_kind.as_deref() == Some("work_checkpoint") {
+        context
+            .rows
+            .iter()
+            .find(|row| {
+                row.object_kind.as_deref() == Some("work_episode")
+                    && row.current_revision_id == root.current_revision_id
+            })
+            .ok_or(ErrorCode::StoreCorrupt)?
+    } else {
+        root
+    };
     // Project only authorization coordinates; canonical rows, sources and suppression/coherence remain intact.
     // Work/correction reads inherit their actual member scopes, not structural Tasks' unrelated siblings.
     let scope_rows = context
@@ -649,6 +661,7 @@ fn record_data(
         P::GlobalSupportValidationRecorded(value) => semantic_record(&value, None, query, check),
         P::SemanticDigestRecorded(value) => semantic_record(&value, None, query, check),
         P::RevisionProposalRecorded(value) => semantic_record(&value, None, query, check),
+        P::WorkCheckpointRecorded(value) => semantic_record(&value, None, query, check),
         P::AttemptRecorded(value) => semantic_record(&value, None, query, check),
         P::CompetingAttemptGroupRecorded(value) => semantic_record(&value, None, query, check),
         P::OperationBurstRecorded(value) => semantic_record(&value, None, query, check),

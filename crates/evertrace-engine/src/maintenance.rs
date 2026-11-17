@@ -2138,6 +2138,20 @@ impl BackgroundScheduler {
                     .map_err(map_writer)?;
             }
         }
+        if optional_allowed {
+            let checkpoints =
+                crate::segmentation::advance_checkpoints(&self.writer, &snapshot, &self.runtime)
+                    .await?;
+            retryable |= checkpoints.retryable;
+            completed += checkpoints.completed;
+            if checkpoints.completed != 0 {
+                snapshot = self
+                    .writer
+                    .project_current(true)
+                    .await
+                    .map_err(map_writer)?;
+            }
+        }
         let recovery_now_us = now_us()?;
         let recovery = expired_leases(snapshot.other_rows(), recovery_now_us, snapshot.frontier())
             .map_err(|_| BackgroundSchedulerError::Store)?;

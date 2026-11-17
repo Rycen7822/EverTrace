@@ -207,6 +207,59 @@ impl JournalAdmissionState {
         &self,
         after: u64,
     ) -> Result<Option<SegmentationReadContext>, StoreError> {
+        self.activity_context(after, None, &mut |_| Ok(false))
+    }
+
+    pub(crate) fn checkpoint_current_context(
+        &self,
+        sources: &BTreeSet<SourceObservationId>,
+        trigger: SourceObservationId,
+        reason: evertrace_domain::work::CheckpointReason,
+        causation: &mut dyn FnMut(u64) -> Result<Option<String>, StoreError>,
+    ) -> Result<Option<SegmentationReadContext>, StoreError> {
+        let trigger_seq = self
+            .source_observations
+            .get(&trigger)
+            .ok_or(StoreError::InvalidInput)?
+            .1;
+        let trigger = trigger.to_string();
+        let mut checked = BTreeMap::new();
+        let mut completed = |episode_id| {
+            if let Some(value) = checked.get(&episode_id) {
+                return Ok(*value);
+            }
+            let episode = &self
+                .episodes
+                .get(&episode_id)
+                .ok_or(StoreError::StoreCorrupt)?
+                .0;
+            let mut found = false;
+            for key in &episode.checkpoint_refs {
+                let (checkpoint, seq) =
+                    self.checkpoints.get(key).ok_or(StoreError::StoreCorrupt)?;
+                if *seq > trigger_seq
+                    && checkpoint.created_reason == reason
+                    && causation(*seq)?.as_deref() == Some(trigger.as_str())
+                {
+                    found = true;
+                    break;
+                }
+            }
+            checked.insert(episode_id, found);
+            Ok(found)
+        };
+        self.activity_context(0, Some((sources, reason)), &mut completed)
+    }
+
+    fn activity_context(
+        &self,
+        after: u64,
+        checkpoint: Option<(
+            &BTreeSet<SourceObservationId>,
+            evertrace_domain::work::CheckpointReason,
+        )>,
+        completed: &mut dyn FnMut(WorkEpisodeId) -> Result<bool, StoreError>,
+    ) -> Result<Option<SegmentationReadContext>, StoreError> {
         use evertrace_domain::{evidence::CorrelationStrength, work::AssignmentStatus};
         let mut bindings = BTreeMap::<OperationId, (&WorkBindingRevision, u64)>::new();
         for (binding, sequence) in self.work_bindings.values() {
@@ -226,7 +279,14 @@ impl JournalAdmissionState {
                 continue;
             };
             let sequence = (*operation_sequence).max(*binding_sequence);
-            if sequence <= after {
+            if sequence <= after
+                || checkpoint.is_some_and(|(sources, _)| {
+                    !operation
+                        .input_source_observation_refs
+                        .iter()
+                        .any(|id| sources.contains(id))
+                })
+            {
                 continue;
             };
             let Some((episode, _)) = binding
@@ -248,8 +308,20 @@ impl JournalAdmissionState {
                         || occurrence.possible_duplicate_group_id.is_some()
                 })
                 || operation.execution_lane_id.is_none()
+                || completed(episode.episode_id)?
             {
                 continue;
+            }
+            if let Some((_, reason)) = checkpoint {
+                let saved = episode.checkpoint_refs.iter().any(|key| {
+                    self.checkpoints.get(key).is_some_and(|(value, _)| {
+                        value.created_reason == reason
+                            && value.source_watermark == episode.source_watermark
+                    })
+                });
+                if saved {
+                    continue;
+                }
             }
             let mut consumed = false;
             for id in &episode.operation_burst_refs {
@@ -262,7 +334,9 @@ impl JournalAdmissionState {
                         && member.operation_revision == operation.operation_revision
                 });
             }
-            if !consumed && selected.is_none_or(|(_, _, previous, _)| sequence < previous) {
+            if consumed == checkpoint.is_some()
+                && selected.is_none_or(|(_, _, previous, _)| sequence < previous)
+            {
                 selected = Some((operation, *binding, sequence, episode));
             }
         }

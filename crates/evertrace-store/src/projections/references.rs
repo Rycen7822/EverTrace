@@ -10,6 +10,8 @@ pub fn select_object_row_rows<'a>(
     let mut exact = rows
         .iter()
         .filter(eligible)
+        // A checkpoint borrows its frozen Episode revision; it is not that revision's owner.
+        .filter(|row| row.object_kind.as_deref() != Some("work_checkpoint"))
         .filter(|row| row.current_revision_id.as_deref() == Some(identifier));
     if let Some(row) = exact.next() {
         if exact.next().is_some() {
@@ -240,6 +242,7 @@ impl JournalAdmissionState {
                     | "source_receipt"
                     | "source_observation"
                     | "work_episode"
+                    | "work_checkpoint"
                     | "attempt"
                     | "competing_attempt_group"
                     | "operation_burst"

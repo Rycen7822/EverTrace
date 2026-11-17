@@ -48,13 +48,36 @@ struct Run {
 /// Observer metadata only. No hook output, message text, source path or caller-provided truth.
 #[derive(Debug, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
-struct Header {
+pub struct Header {
     thread_id: String,
     turn_id: Option<String>,
     kind: Kind,
 }
 
 impl Header {
+    pub fn reason(&self) -> evertrace_domain::work::CheckpointReason {
+        use evertrace_domain::work::CheckpointReason;
+        match self.kind {
+            Kind::Stop => CheckpointReason::Stop,
+            Kind::SessionEnd => CheckpointReason::SessionEnd,
+            Kind::PreCompact | Kind::PostCompact => CheckpointReason::Compact,
+        }
+    }
+
+    pub fn targets(
+        &self,
+        trigger: &evertrace_domain::evidence::SourceReceipt,
+        physical: &evertrace_domain::evidence::SourceReceipt,
+    ) -> bool {
+        crate::execution_source::checkpoint_coordinates(physical).is_some_and(
+            |(peer, thread, turn)| {
+                crate::host_events::peer_instance(trigger.source_instance_id.as_str()) == Some(peer)
+                    && self.thread_id == thread
+                    && (self.kind == Kind::SessionEnd || self.turn_id.as_deref() == Some(turn))
+            },
+        )
+    }
+
     fn valid(&self) -> bool {
         uuid::Uuid::parse_str(&self.thread_id)
             .is_ok_and(|id| !id.is_nil() && id.to_string() == self.thread_id)
@@ -161,6 +184,23 @@ pub(crate) fn input(
         event_time_provenance: None,
         raw_payload: payload,
     })
+}
+
+pub fn observed_request(
+    observation: &evertrace_domain::evidence::SourceObservation,
+    receipt: &evertrace_domain::evidence::SourceReceipt,
+    protected: &[u8],
+) -> Option<Header> {
+    let header: Header = serde_json::from_slice(protected).ok()?;
+    (header.valid()
+        && receipt.source_revision.as_str() == SOURCE_REVISION
+        && observation.source_receipt_ref == receipt.source_receipt_id
+        && observation.source_revision == receipt.source_revision
+        && receipt.source_ref == reference(&header, receipt.source_sequence)
+        && observation.observation_role == ObservationRole::Lifecycle
+        && receipt.lifecycle.is_none()
+        && receipt.protected_length == protected.len() as u64)
+        .then_some(header)
 }
 
 pub fn record_matches(body: &CaptureRecordBody, protected: &[u8], manifest: &str) -> bool {
