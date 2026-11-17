@@ -346,6 +346,9 @@ fn source_resolved(
                             }),
                             Some(JournalPayload::WorkBindingRecorded(binding))
                                 if source_owns_stream(&binding, &value, &reference)
+                                    && (value.status.is_terminal()
+                                        || (binding.primary_binding.episode_id.is_some()
+                                            && binding.primary_binding.episode_id == value.active_episode_id))
                         )
                     });
                 (value.worktree_lineage_refs.contains(&reference) || bound)
@@ -4076,16 +4079,105 @@ fn process_work_command(
             if root_lane.is_some_and(|lane| !phase.execution_lane_ids.contains(&lane)) {
                 return Ok(None);
             }
-            if (prior.is_none() && phase.phase_contract != plan.phase)
-                || !phase.attempt_ids.iter().any(|id| {
-                    facts
-                        .attempts
-                        .get(id)
-                        .is_some_and(|attempt| attempt.strategy_contract == plan.strategy)
-                })
-            {
+            let known_strategy = phase.attempt_ids.iter().any(|id| {
+                facts
+                    .attempts
+                    .get(id)
+                    .is_some_and(|attempt| attempt.strategy_contract == plan.strategy)
+            });
+            if prior.is_none() && (phase.phase_contract != plan.phase || !known_strategy) {
                 return Err(AutoresearchError::ImmutableConflict);
             }
+            let view = evertrace_store::WorkIdentityCurrentView::from_snapshot(snapshot)?;
+            let current_binding = facts.bindings.get(&anchor.effect.operation_id);
+            let binding = crate::work::binding::source_root_workstream(
+                &view,
+                stream,
+                anchor.effect.operation_id,
+                anchor.effect.scope_effect_id,
+                current_binding,
+                &sources,
+            )
+            .map_err(map_error)?
+            .into_revision();
+            let owned = binding.as_ref().or_else(|| {
+                current_binding.filter(|binding| {
+                    binding.assignment_status == evertrace_domain::work::AssignmentStatus::Resolved
+                        && binding.primary_binding.task_id == Some(stream.task_id)
+                        && binding.primary_binding.workstream_id == Some(stream.workstream_id)
+                })
+            });
+            if owned.is_none() {
+                return Ok(None);
+            }
+            let mut proposal = None;
+            if !known_strategy && phase.phase_contract == plan.phase {
+                let pending = facts
+                    .attempts
+                    .values()
+                    .filter(|attempt| {
+                        attempt.task_id == task.task_id
+                            && attempt.workstream_id == stream.workstream_id
+                            && attempt.episode_id.is_none()
+                            && attempt.repository_instance_id == repository
+                            && attempt.worktree_instance_ids == stream.worktree_instance_ids
+                            && attempt.strategy_contract == plan.strategy
+                            && attempt.execution_status
+                                == evertrace_domain::work::AttemptExecutionStatus::Proposed
+                            && attempt.lifecycle_status
+                                == evertrace_domain::work::AttemptLifecycleStatus::Active
+                            && attempt.experiment_run_ids.is_empty()
+                            && attempt.competing_group_ids.is_empty()
+                    })
+                    .take(2)
+                    .collect::<Vec<_>>();
+                match pending.as_slice() {
+                    [] => {
+                        // Persist the proposal first. Linking uses the later actual journal
+                        // frontier, not a fabricated watermark to bypass the successor gate.
+                        let proposed = attempt::new_attempt(
+                            task.task_id,
+                            stream.workstream_id,
+                            repository,
+                            stream.worktree_instance_ids.clone(),
+                            vec![],
+                            plan.strategy.clone(),
+                            snapshot.frontier,
+                        )
+                        .map_err(map_error)?;
+                        let declared =
+                            attempt::create_attempt(context, proposed).map_err(map_error)?;
+                        let mut events = declared.events().to_vec();
+                        if let Some(binding) = binding {
+                            events.extend(
+                                crate::work::binding::record_binding(context, binding)
+                                    .map_err(map_error)?
+                                    .events()
+                                    .iter()
+                                    .cloned(),
+                            );
+                        }
+                        return JournalCommand::new(context.command_id, events)
+                            .map(Some)
+                            .map_err(AutoresearchError::Store);
+                    }
+                    [proposed] => {
+                        let linked =
+                            episode::link_attempt_to_episode(proposed, phase, snapshot.frontier)
+                                .map_err(map_error)?;
+                        proposal = Some(linked.attempt_id);
+                        events.extend(
+                            attempt::record_attempt_revision(context, proposed, linked)
+                                .map_err(map_error)?
+                                .events()
+                                .iter()
+                                .cloned(),
+                        );
+                    }
+                    _ => {} // Preserve Work ownership without choosing an ambiguous strategy.
+                }
+            }
+            let mut refreshed = None;
             if !phase.execution_lane_ids.is_empty() {
                 let receipts = phase
                     .execution_lane_ids
@@ -4095,43 +4187,43 @@ fn process_work_command(
                             .ok_or(AutoresearchError::EvidenceIncomplete)
                     })
                     .collect::<Result<Vec<_>, _>>()?;
-                if let Some(next) = episode::refresh_capture(phase, &receipts, snapshot.frontier)
-                    .map_err(map_error)?
-                {
-                    events.push(JournalEventDraft::runtime(
-                        context.occurred_at_us,
-                        context.effective_config_hash,
-                        context.algorithm_revision,
-                        JournalPayload::WorkEpisodeRecorded(Box::new(next)),
-                    ));
-                }
+                refreshed = episode::refresh_capture(phase, &receipts, snapshot.frontier)
+                    .map_err(map_error)?;
             }
-            let view = evertrace_store::WorkIdentityCurrentView::from_snapshot(snapshot)?;
-            let binding = crate::work::binding::source_root_workstream(
-                &view,
-                stream,
-                anchor.effect.operation_id,
-                anchor.effect.scope_effect_id,
-                facts.bindings.get(&anchor.effect.operation_id),
-                &sources,
-            )
-            .map_err(map_error)?
-            .into_revision();
-            if let Some(mut binding) = binding {
-                if binding.primary_binding.episode_id.is_none() {
-                    let linked =
-                        episode::link_binding_to_episode(&binding, phase).map_err(map_error)?;
-                    events.extend(
-                        crate::work::binding::record_binding(context, binding)
-                            .map_err(map_error)?
-                            .events()
-                            .iter()
-                            .cloned(),
-                    );
-                    binding = linked;
+            if let Some(proposed) = proposal {
+                let mut next = refreshed.take().unwrap_or_else(|| phase.clone());
+                if next.revision_id == phase.revision_id {
+                    next.revision_id = RevisionId::new_v7();
+                    next.predecessor_revision_id = Some(phase.revision_id);
+                    next.revision_generation = phase
+                        .revision_generation
+                        .checked_add(1)
+                        .ok_or(AutoresearchError::InvalidInput)?;
                 }
+                next.attempt_ids.push(proposed);
+                next.attempt_ids.sort();
+                next.attempt_ids.dedup();
+                phase
+                    .validate_successor(&next)
+                    .map_err(|_| AutoresearchError::ImmutableConflict)?;
+                refreshed = Some(next);
+            }
+            if let Some(next) = refreshed {
+                events.push(JournalEventDraft::runtime(
+                    context.occurred_at_us,
+                    context.effective_config_hash,
+                    context.algorithm_revision,
+                    JournalPayload::WorkEpisodeRecorded(Box::new(next)),
+                ));
+            }
+            let linked = owned
+                .filter(|binding| binding.primary_binding.episode_id.is_none())
+                .map(|binding| episode::link_binding_to_episode(binding, phase))
+                .transpose()
+                .map_err(map_error)?;
+            for revision in binding.into_iter().chain(linked) {
                 events.extend(
-                    crate::work::binding::record_binding(context, binding)
+                    crate::work::binding::record_binding(context, revision)
                         .map_err(map_error)?
                         .events()
                         .iter()
