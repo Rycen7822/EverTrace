@@ -9969,11 +9969,32 @@ fn derive_repository_scope_purge_preview(
                 .then_some(snapshot.worktree_snapshot_id)
         })
         .collect::<BTreeSet<_>>();
+    // Observed operation scope can be learned after admission of unscoped physical sources.
+    let mut scoped_operation_sources = BTreeSet::new();
+    for (effect, _) in inputs.scope_effects.values().filter(|(effect, _)| {
+        effect.repository_instance_id == Some(repository_id)
+            || effect
+                .worktree_instance_id
+                .is_some_and(|id| worktree_ids.contains(&id))
+    }) {
+        let (operation, _) = inputs
+            .operations
+            .get(&effect.operation_id)
+            .ok_or(StoreError::StoreCorrupt)?;
+        scoped_operation_sources.extend(
+            operation
+                .input_source_observation_refs
+                .iter()
+                .chain(&operation.result_source_observation_refs)
+                .copied(),
+        );
+    }
     let target_receipts = inputs
         .source_receipts
         .values()
         .filter_map(|(receipt, _)| {
             (receipt.repository_instance_id == Some(repository_id)
+                || scoped_operation_sources.contains(&receipt.source_observation_id)
                 || target_source_instances.contains(receipt.source_instance_id.as_str())
                 || receipt
                     .worktree_instance_id
@@ -10197,6 +10218,28 @@ fn derive_repository_scope_purge_preview(
             .then_some(episode.episode_id)
         })
         .collect::<BTreeSet<_>>();
+    // Shared source references must not pull another Work scope into this repository's deletion.
+    if inputs.work_bindings.values().any(|(binding, _)| {
+        target_operation_ids.contains(&binding.operation_id)
+            && (binding
+                .primary_binding
+                .task_id
+                .is_some_and(|id| !target_task_ids.contains(&id))
+                || binding
+                    .primary_binding
+                    .workstream_id
+                    .is_some_and(|id| !target_workstreams.contains(&id))
+                || binding
+                    .primary_binding
+                    .episode_id
+                    .is_some_and(|id| !target_episodes.contains(&id))
+                || binding
+                    .primary_binding
+                    .attempt_id
+                    .is_some_and(|id| !target_attempts.contains(&id)))
+    }) {
+        cross_scope_dependency = true;
+    }
     let target_episode_revision_ids = inputs
         .episode_revisions
         .values()
