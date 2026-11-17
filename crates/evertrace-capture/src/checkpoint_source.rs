@@ -73,7 +73,8 @@ impl Header {
             |(peer, thread, turn)| {
                 crate::host_events::peer_instance(trigger.source_instance_id.as_str()) == Some(peer)
                     && self.thread_id == thread
-                    && (self.kind == Kind::SessionEnd || self.turn_id.as_deref() == Some(turn))
+                    // Compaction runs in its own turn; it requests a snapshot of existing thread-bound Work.
+                    && (self.kind != Kind::Stop || self.turn_id.as_deref() == Some(turn))
             },
         )
     }
