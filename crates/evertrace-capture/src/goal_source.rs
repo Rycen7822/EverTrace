@@ -121,10 +121,16 @@ pub fn observed_goal(raw: &[u8]) -> Result<Option<(String, String)>> {
     Ok(decode(raw)?.map(|goal| (goal.root_ref(), goal.objective)))
 }
 
+/// Candidate state only; historical provenance must be established by its canonical binding.
+pub fn observed_completion_intent(raw: &[u8]) -> Result<Option<bool>> {
+    Ok(decode(raw)?.map(|goal| goal.status == "complete"))
+}
+
 /// A current publisher and the protected original bytes have independently agreed on this root.
 pub struct RootGoal {
     reference: String,
     objective: String,
+    completion_intent: bool,
     publisher_instance: String,
     publisher_executable: (u64, u64),
     thread: String,
@@ -137,6 +143,11 @@ impl RootGoal {
 
     pub fn objective(&self) -> &str {
         &self.objective
+    }
+
+    /// Native goal intent only; not a verifier result or a Task/Episode lifecycle transition.
+    pub const fn completion_intent(&self) -> bool {
+        self.completion_intent
     }
 
     pub fn publisher_pid(&self) -> u32 {
@@ -293,6 +304,7 @@ pub fn revalidate(
         reference: goal.root_ref(),
         objective: String::from_utf8(objective.protected_bytes().to_vec())
             .map_err(|_| GoalSourceError)?,
+        completion_intent: goal.status == "complete",
         publisher_instance: receipt.source_instance_id.as_str().to_owned(),
         publisher_executable: publisher.executable,
         thread: receipt.source_session_ref.clone(),

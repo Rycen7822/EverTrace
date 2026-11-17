@@ -157,6 +157,7 @@ pub struct SegmentationReadContext {
     pub episode_id: WorkEpisodeId,
     pub state: SegmentationCurrentState,
     pub root_refs: Vec<String>,
+    pub boundary_operation: Option<(Operation, WorkBindingRevision)>,
     pub source_refs: Vec<evertrace_domain::ids::SourceObservationId>,
     pub repository_ids: std::collections::BTreeSet<evertrace_domain::ids::RepositoryId>,
     pub snapshot: Option<evertrace_domain::repository::WorktreeSnapshot>,
@@ -509,9 +510,34 @@ impl JournalAdmissionState {
                 .iter()
                 .filter_map(|id| self.operation_bursts.get(id).map(|(burst, _)| burst)),
         )?;
+        let mut boundary_operation = None;
         for burst in context {
             for member in &burst.members {
                 source_refs.extend(member.source_observation_refs.iter().copied());
+                if let Some((binding, _)) = self.work_bindings.get(&member.work_binding_revision_id)
+                {
+                    source_refs.extend(
+                        binding
+                            .evidence_refs
+                            .iter()
+                            .filter_map(|reference| reference.parse::<SourceObservationId>().ok()),
+                    );
+                    if member.operation_id != operation.operation_id
+                        && episode
+                            .boundary_candidate
+                            .as_ref()
+                            .is_some_and(|candidate| {
+                                candidate.candidate_watermark == member.source_watermark
+                            })
+                    {
+                        let anchor = &self
+                            .operations
+                            .get(&member.operation_id)
+                            .ok_or(StoreError::StoreCorrupt)?
+                            .0;
+                        boundary_operation = Some((anchor.clone(), binding.clone()));
+                    }
+                }
             }
             recent.insert((burst.source_watermark, burst.operation_burst_id), burst);
         }
@@ -567,6 +593,7 @@ impl JournalAdmissionState {
                 episode_window: Some(episode.episode_id),
             },
             root_refs: task.request_root_refs.clone(),
+            boundary_operation,
             source_refs: source_refs.into_iter().collect(),
             repository_ids,
             snapshot,

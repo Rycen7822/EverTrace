@@ -681,10 +681,15 @@ pub fn close_episode_and_optionally_open(
                 return Err(WorkIdentityError::InvalidInput);
             }
             let mut values = step.closed_burst().cloned().into_iter().collect::<Vec<_>>();
-            values.push(
-                crate::segmentation::close_burst(burst.clone())
-                    .map_err(|_| WorkIdentityError::InvalidInput)?,
-            );
+            let mut closed = burst.clone();
+            if step.burst().no_delta() {
+                closed = crate::segmentation::close_burst(closed)
+                    .map_err(|_| WorkIdentityError::InvalidInput)?;
+            } else {
+                // This step's revision has not been stored; publish it closed without a phantom predecessor.
+                closed.lifecycle = evertrace_domain::work::OperationBurstLifecycle::Closed;
+            }
+            values.push(closed);
             Ok(values)
         })
         .transpose()?

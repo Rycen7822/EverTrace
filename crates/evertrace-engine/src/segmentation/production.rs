@@ -59,17 +59,32 @@ pub(super) async fn source_activity(
     selected: &SegmentationReadContext,
     runtime: &evertrace_capture::RuntimeSnapshot,
 ) -> Result<SourceActivity, evertrace_capture::CasError> {
+    source_operation_activity(current, selected, selected.operation_id, runtime).await
+}
+
+async fn source_operation_activity(
+    current: &CurrentFacts,
+    selected: &SegmentationReadContext,
+    operation_id: evertrace_domain::ids::OperationId,
+    runtime: &evertrace_capture::RuntimeSnapshot,
+) -> Result<SourceActivity, evertrace_capture::CasError> {
     use evertrace_capture::CasError as Error;
-    let operation = selected
-        .state
-        .authority()
-        .operation(selected.operation_id)
-        .ok_or(Error::StoreCorrupt)?;
-    let binding = selected
-        .state
-        .authority()
-        .binding(selected.operation_id)
-        .ok_or(Error::StoreCorrupt)?;
+    let (operation, binding) = if operation_id == selected.operation_id {
+        let view = selected.state.authority();
+        (
+            view.operation(operation_id).ok_or(Error::StoreCorrupt)?,
+            view.binding(operation_id).ok_or(Error::StoreCorrupt)?,
+        )
+    } else {
+        let (operation, binding) = selected
+            .boundary_operation
+            .as_ref()
+            .ok_or(Error::StoreCorrupt)?;
+        if operation.operation_id != operation_id {
+            return Err(Error::StoreCorrupt);
+        }
+        (operation, binding)
+    };
     let inputs = operation.input_source_observation_refs.clone();
     let results = operation.result_source_observation_refs.clone();
     let references = inputs
@@ -166,11 +181,169 @@ pub(super) async fn source_activity(
     .map_err(|_| Error::Io)?
 }
 
+/// A current native completion can name this Phase only when its exact goal is the root goal.
+/// It still needs a preceding candidate, a full new contract and later distinct compatible work.
+async fn phase_completion(
+    current: &CurrentFacts,
+    selected: &SegmentationReadContext,
+    runtime: &evertrace_capture::RuntimeSnapshot,
+    phase: Option<&evertrace_domain::work::PhaseContract>,
+) -> Result<Option<SourceObservationId>, evertrace_capture::CasError> {
+    use evertrace_domain::work::BoundaryCandidateKind;
+    let state = &selected.state;
+    let Some(episode) = state.episode(selected.episode_id) else {
+        return Ok(None);
+    };
+    let Some(candidate) = &episode.boundary_candidate else {
+        return Ok(None);
+    };
+    let Some(phase) = phase.filter(|phase| phase.local_goal != episode.phase_contract.local_goal)
+    else {
+        return Ok(None);
+    };
+    // A new code Phase needs a fresh entry anchor; retaining the old Phase's entry is not such proof.
+    if episode.repository_instance_id.is_some() {
+        return Ok(None);
+    }
+    let Some(stream) = state.authority().workstream(episode.workstream_id) else {
+        return Ok(None);
+    };
+    if stream.root_goal != episode.phase_contract.local_goal
+        || candidate.candidate_phase_kind != Some(phase.phase_kind)
+    {
+        return Ok(None);
+    }
+    let bursts = state
+        .boundary_bursts(episode)
+        .map_err(|_| evertrace_capture::CasError::StoreCorrupt)?;
+    let Some(anchor) = bursts
+        .iter()
+        .flat_map(|burst| &burst.members)
+        .find(|member| member.source_watermark == candidate.candidate_watermark)
+    else {
+        return Ok(None);
+    };
+    if anchor.operation_id == selected.operation_id {
+        return Ok(None);
+    }
+    let Some((_, anchor_binding)) =
+        selected
+            .boundary_operation
+            .as_ref()
+            .filter(|(operation, binding)| {
+                operation.operation_id == anchor.operation_id
+                    && binding.work_binding_revision_id == anchor.work_binding_revision_id
+            })
+    else {
+        return Ok(None);
+    };
+    let Some(binding) = state.authority().binding(selected.operation_id) else {
+        return Ok(None);
+    };
+    let roots = binding
+        .evidence_refs
+        .iter()
+        .filter_map(|reference| {
+            let id = reference.parse().ok()?;
+            let (observation, seq) = current.source_observation(id)?;
+            let receipt = current.source_receipt(observation.source_receipt_ref)?.0;
+            let after_phase_input = bursts
+                .iter()
+                .flat_map(|burst| &burst.members)
+                .flat_map(|member| &member.source_observation_refs)
+                .any(|id| {
+                    current
+                        .source_observation(*id)
+                        .is_some_and(|(input, input_seq)| {
+                            input_seq < seq
+                                && input.observation_role
+                                    == evertrace_domain::evidence::ObservationRole::Intent
+                                && current
+                                    .source_receipt(input.source_receipt_ref)
+                                    .is_some_and(|(receipt, _)| {
+                                        evertrace_capture::execution_source::is_execution(
+                                            input, receipt,
+                                        )
+                                    })
+                        })
+                });
+            (evertrace_capture::goal_source::is_source_revision(receipt.source_revision.as_str())
+                && selected.root_refs.contains(&receipt.source_ref)
+                && (after_phase_input
+                    || (candidate.kind == BoundaryCandidateKind::Objective
+                        && anchor_binding.evidence_refs.contains(reference))))
+            .then(|| (observation.clone(), receipt.clone(), seq))
+        })
+        .collect::<Vec<_>>();
+    if roots.is_empty() {
+        return Ok(None);
+    }
+    let previous =
+        source_operation_activity(current, selected, anchor.operation_id, runtime).await?;
+    if previous.phase.as_ref() != Some(phase) {
+        return Ok(None);
+    }
+    let prior = selected
+        .source_refs
+        .iter()
+        .filter_map(|id| {
+            let (observation, seq) = current.source_observation(*id)?;
+            let receipt = current.source_receipt(observation.source_receipt_ref)?.0;
+            evertrace_capture::goal_source::is_source_revision(receipt.source_revision.as_str())
+                .then(|| (receipt.clone(), seq))
+        })
+        .collect::<Vec<_>>();
+    let objective_candidate = candidate.kind == BoundaryCandidateKind::Objective;
+    let candidate_watermark = candidate.candidate_watermark;
+    let anchor_roots = anchor_binding.evidence_refs.clone();
+    let cas_dir = runtime.cas_dir.clone();
+    let key_dir = runtime.device_key_dir.clone();
+    let goal = stream.root_goal.clone();
+    tokio::task::spawn_blocking(move || {
+        let cas = evertrace_capture::CasStore::open_existing(cas_dir)?;
+        let resolver = crate::autoresearch::ControlledRunResolver::new(cas.clone());
+        let mut completed = Vec::new();
+        for (observation, receipt, current_sequence) in roots {
+            let Ok(root) = resolver.verified_root_goal(&receipt, &observation, Some(&key_dir))
+            else {
+                continue;
+            };
+            if root.objective() != goal || !root.completion_intent() {
+                continue;
+            }
+            let already_grounded = objective_candidate
+                && (current_sequence > candidate_watermark
+                    || anchor_roots.contains(&receipt.source_observation_id.to_string()));
+            let was_open = already_grounded || prior.iter().any(|(old, seq)| {
+                if old.source_ref != receipt.source_ref || *seq >= current_sequence {
+                    return false;
+                }
+                let Some(bytes) = old.cas_ref.parse::<evertrace_capture::CasDigest>().ok()
+                    .and_then(|digest| cas.read_bounded(&digest, 128 * 1024, 128 * 1024).ok())
+                    .map(|(bytes, _)| bytes)
+                else {
+                    return false;
+                };
+                matches!(evertrace_capture::goal_source::observed_goal(&bytes),
+                    Ok(Some((reference, objective))) if reference == root.source_ref() && objective == goal)
+                    && matches!(evertrace_capture::goal_source::observed_completion_intent(&bytes), Ok(Some(false)))
+            });
+            if was_open {
+                completed.push(observation.source_observation_id);
+            }
+        }
+        Ok((completed.len() == 1).then(|| completed[0]))
+    })
+    .await
+    .map_err(|_| evertrace_capture::CasError::Io)?
+}
+
 /// A nonzero physical exit is an operation failure, not a verifier result or semantic boundary.
 fn derive_activity(
     selected: &SegmentationReadContext,
     exit: Option<i32>,
-    declared_phase: Option<evertrace_domain::work::PhaseContract>,
+    declared_phase: Option<&evertrace_domain::work::PhaseContract>,
+    completion: Option<SourceObservationId>,
 ) -> Result<SegmentOutcome, DetectorError> {
     let state = &selected.state;
     let episode = state
@@ -197,9 +370,10 @@ fn derive_activity(
             .filter(|code| *code != 0)
             .map(|code| format!("process_exit:{code}")),
         verifier_transition: super::VerifierTransition::None,
-        // A protected declaration supplies a structured hint, never objective boundary evidence.
         observed_phase_kind: declared_phase.as_ref().map(|phase| phase.phase_kind),
-        boundary_evidence: BoundaryEvidence::None,
+        boundary_evidence: completion.map_or(BoundaryEvidence::None, |_| {
+            BoundaryEvidence::ExplicitPhaseComplete
+        }),
         evidence_refs: operation
             .input_source_observation_refs
             .iter()
@@ -208,7 +382,7 @@ fn derive_activity(
             .collect(),
     };
     let mut segmenter = IncrementalSegmenter::restore(state, selected.episode_id)?;
-    segmenter.observe_declared(state, selected.operation_id, facts, declared_phase.as_ref())
+    segmenter.observe_declared(state, selected.operation_id, facts, declared_phase)
 }
 
 pub(super) fn tool_request_sources(
@@ -480,7 +654,24 @@ pub(crate) async fn advance_activity(
         if std::time::Instant::now() >= deadline {
             continue;
         }
-        let step = match derive_activity(&selected, activity.exit_code, activity.phase) {
+        let completion = phase_completion(current, &selected, runtime, activity.phase.as_ref())
+            .await
+            .map_err(|_| Error::Store)?;
+        if completion.is_some()
+            && readable_context(writer, current, &selected, runtime)
+                .await?
+                .is_none()
+        {
+            *after = previous;
+            progress.retryable = true;
+            return Ok(progress);
+        }
+        let step = match derive_activity(
+            &selected,
+            activity.exit_code,
+            activity.phase.as_ref(),
+            completion,
+        ) {
             Ok(SegmentOutcome::Delta(step)) => step,
             Ok(SegmentOutcome::NoDelta) | Err(DetectorError::Ineligible) => continue,
             Err(_) => return Err(Error::Store),
@@ -554,7 +745,36 @@ pub(crate) async fn advance_activity(
             progress.retryable = true;
             return Ok(progress);
         }
-        let command = if needs_checkpoint {
+        let command = if step.detector().boundary_status()
+            == evertrace_domain::work::BoundaryStatus::Confirmed
+        {
+            let stream = selected
+                .state
+                .authority()
+                .workstream(episode.workstream_id)
+                .ok_or(Error::Store)?;
+            let closed =
+                crate::work::episode::confirm_episode_boundary(episode, &step, None, &receipts)
+                    .map_err(|_| Error::Store)?;
+            let next = crate::work::episode::next_episode(
+                stream,
+                episode,
+                activity.phase.ok_or(Error::Store)?,
+                None,
+                closed.source_watermark,
+            )
+            .map_err(|_| Error::Store)?;
+            crate::work::episode::close_episode_and_optionally_open(
+                context,
+                stream,
+                episode,
+                closed,
+                Some(&step),
+                Some(next),
+                vec![],
+                vec![],
+            )
+        } else if needs_checkpoint {
             let attempts = episode
                 .attempt_ids
                 .iter()

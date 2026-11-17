@@ -175,9 +175,10 @@ fn lane_capture_receipt<'a>(
     .transpose()
 }
 
-fn phase_capture_current(
+fn source_phase_settled(
     current: &evertrace_store::CurrentFacts,
     id: evertrace_domain::ids::WorkEpisodeId,
+    active: Option<evertrace_domain::ids::WorkEpisodeId>,
     deadline: std::time::Instant,
 ) -> bool {
     let id = id.to_string();
@@ -193,6 +194,12 @@ fn phase_capture_current(
     let Some(JournalPayload::WorkEpisodeRecorded(episode)) = episode else {
         return false;
     };
+    if episode.lifecycle_status == evertrace_domain::work::EpisodeLifecycle::Closed {
+        return true;
+    }
+    if active != Some(episode.episode_id) {
+        return false;
+    }
     episode.execution_lane_ids.iter().all(|lane| {
         matches!(lane_capture_receipt(current.other_data_rows()
             .take_while(|_| std::time::Instant::now() < deadline), *lane), Ok(Some(receipt))
@@ -347,16 +354,12 @@ fn source_resolved(
                             Some(JournalPayload::WorkBindingRecorded(binding))
                                 if source_owns_stream(&binding, &value, &reference)
                                     && (value.status.is_terminal()
-                                        || (binding.primary_binding.episode_id.is_some()
-                                            && binding.primary_binding.episode_id == value.active_episode_id))
+                                        || binding.primary_binding.episode_id.is_some_and(|episode| {
+                                            source_phase_settled(current, episode, value.active_episode_id, deadline)
+                                        }))
                         )
                     });
-                (value.worktree_lineage_refs.contains(&reference) || bound)
-                    && (value.status.is_terminal()
-                        || (bound
-                            && value.active_episode_id.is_some_and(|episode| {
-                                phase_capture_current(current, episode, deadline)
-                            })))
+                bound || (value.status.is_terminal() && value.worktree_lineage_refs.contains(&reference))
             });
     }
     if let SourceCandidate::TestResult(event) = envelope {
@@ -1565,6 +1568,9 @@ pub(crate) fn controlled_source_snapshot(
             }
             refs.extend(row.object_id.iter().cloned());
             refs.extend(row.current_revision_id.iter().cloned());
+            if ordinary_work && let JournalPayload::WorkstreamRecorded(stream) = &payload {
+                refs.extend(stream.active_episode_id.map(|id| id.to_string()));
+            }
             match &payload {
                 JournalPayload::TaskRecorded(task) if !root_refs.is_empty() => {
                     refs.extend(
@@ -4075,6 +4081,21 @@ fn process_work_command(
         if stream.status.is_terminal() {
             return Ok(None);
         }
+        if current_binding.is_some_and(|binding| {
+            binding.evidence_refs.contains(&source_ref)
+                && binding.primary_binding.episode_id.is_some_and(|id| {
+                    facts
+                        .current_episodes
+                        .get(&id)
+                        .and_then(|revision| facts.episodes.get(revision))
+                        .is_some_and(|phase| {
+                            phase.lifecycle_status
+                                == evertrace_domain::work::EpisodeLifecycle::Closed
+                        })
+                })
+        }) {
+            return Ok(None);
+        }
         if let Some(episode_id) = stream.active_episode_id {
             let phase = facts
                 .current_episodes
@@ -4082,7 +4103,9 @@ fn process_work_command(
                 .and_then(|revision| facts.episodes.get(revision))
                 .ok_or(AutoresearchError::EvidenceIncomplete)?;
             let mut events = Vec::new();
-            if root_lane.is_some_and(|lane| !phase.execution_lane_ids.contains(&lane)) {
+            if root_lane.is_some_and(|lane| {
+                !phase.execution_lane_ids.is_empty() && !phase.execution_lane_ids.contains(&lane)
+            }) {
                 return Ok(None);
             }
             let known_strategy = phase.attempt_ids.iter().any(|id| {
