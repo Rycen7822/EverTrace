@@ -49,7 +49,8 @@ async fn source_activity(
     current: &CurrentFacts,
     selected: &SegmentationReadContext,
     runtime: &evertrace_capture::RuntimeSnapshot,
-) -> Result<(Option<i32>, Option<evertrace_domain::work::PhaseKind>), evertrace_capture::CasError> {
+) -> Result<(Option<i32>, Option<evertrace_domain::work::PhaseContract>), evertrace_capture::CasError>
+{
     use evertrace_capture::CasError as Error;
     let operation = selected
         .state
@@ -116,7 +117,7 @@ async fn source_activity(
             }
             for (native, native_receipt, native_bytes) in &protected {
                 if inputs.contains(&native.source_observation_id) {
-                    if let Some(phase) = crate::autoresearch::declared_work_phase(
+                    if let Some(phase) = crate::autoresearch::declared_work_contract(
                         receipt,
                         bytes,
                         native,
@@ -132,7 +133,7 @@ async fn source_activity(
         }
         Ok((
             (exits.len() == 1).then(|| *exits.first().expect("one physical result")),
-            (phases.len() == 1).then(|| phases[0]),
+            (phases.len() == 1).then(|| phases.remove(0)),
         ))
     })
     .await
@@ -143,7 +144,7 @@ async fn source_activity(
 fn derive_activity(
     selected: &SegmentationReadContext,
     exit: Option<i32>,
-    declared_phase: Option<evertrace_domain::work::PhaseKind>,
+    declared_phase: Option<evertrace_domain::work::PhaseContract>,
 ) -> Result<SegmentOutcome, DetectorError> {
     let state = &selected.state;
     let episode = state
@@ -171,7 +172,7 @@ fn derive_activity(
             .map(|code| format!("process_exit:{code}")),
         verifier_transition: super::VerifierTransition::None,
         // A protected declaration supplies a structured hint, never objective boundary evidence.
-        observed_phase_kind: declared_phase,
+        observed_phase_kind: declared_phase.as_ref().map(|phase| phase.phase_kind),
         boundary_evidence: BoundaryEvidence::None,
         evidence_refs: operation
             .input_source_observation_refs
@@ -181,7 +182,7 @@ fn derive_activity(
             .collect(),
     };
     let mut segmenter = IncrementalSegmenter::restore(state, selected.episode_id)?;
-    segmenter.observe(state, selected.operation_id, facts)
+    segmenter.observe_declared(state, selected.operation_id, facts, declared_phase.as_ref())
 }
 
 pub(super) async fn readable_context(

@@ -525,14 +525,14 @@ impl ProcessWorkDeclaration {
     }
 }
 
-/// A source-owned declaration is only a phase hint; it never proves a boundary or verifier result.
-pub(crate) fn declared_work_phase(
+/// A source-owned declaration supplies a contract, never a completed boundary or verifier result.
+pub(crate) fn declared_work_contract(
     receipt: &SourceReceipt,
     bytes: &[u8],
     native: &SourceObservation,
     native_receipt: &SourceReceipt,
     native_bytes: &[u8],
-) -> Option<evertrace_domain::work::PhaseKind> {
+) -> Option<evertrace_domain::work::PhaseContract> {
     if !evertrace_capture::process_source::is_work_revision(receipt.source_revision.as_str()) {
         return None;
     }
@@ -547,7 +547,7 @@ pub(crate) fn declared_work_phase(
             declaration.controller.pid,
             declaration.controller.start_ticks,
         )))
-    .then_some(declaration.definition.phase.phase_kind)
+    .then_some(declaration.definition.phase)
 }
 
 #[derive(Deserialize)]
@@ -1276,6 +1276,8 @@ pub(crate) fn controlled_source_snapshot(
         }
         return Ok(Some(snapshot));
     }
+    let ordinary_work = matches!(&envelope, SourceCandidate::WorkPlan(plan)
+        if plan.format == evertrace_capture::process_source::WORK_FORMAT);
     let process_refs = match &envelope {
         SourceCandidate::WorkPlan(declaration) => {
             process_work_refs(current, id, declaration, &resolver.cas)?
@@ -1407,6 +1409,7 @@ pub(crate) fn controlled_source_snapshot(
     let mut selected = BTreeSet::new();
     let mut rows = Vec::new();
     let mut bytes = 0_usize;
+    let mut episode_heads = BTreeMap::new();
     let deadline = std::time::Instant::now() + std::time::Duration::from_millis(40);
     loop {
         let before = selected.len();
@@ -1470,6 +1473,35 @@ pub(crate) fn controlled_source_snapshot(
             };
             let payload: JournalPayload = serde_json::from_str(json)
                 .map_err(|_| AutoresearchError::Store(evertrace_store::StoreError::StoreCorrupt))?;
+            if ordinary_work && let JournalPayload::WorkEpisodeRecorded(phase) = &payload {
+                let head = if let Some(head) = episode_heads.get(&phase.episode_id) {
+                    *head
+                } else {
+                    let mut latest = (phase.revision_generation, phase.revision_id);
+                    let key = phase.episode_id.to_string();
+                    for candidate in current.other_data_rows().filter(|row| {
+                        row.object_kind.as_deref() == Some("work_episode")
+                            && row.object_id.as_deref() == Some(key.as_str())
+                    }) {
+                        if std::time::Instant::now() >= deadline {
+                            return Err(AutoresearchError::SelectionDeferred);
+                        }
+                        if let Some(JournalPayload::WorkEpisodeRecorded(value)) = candidate
+                            .payload_json
+                            .as_deref()
+                            .and_then(|json| serde_json::from_str(json).ok())
+                            && value.revision_generation > latest.0
+                        {
+                            latest = (value.revision_generation, value.revision_id);
+                        }
+                    }
+                    episode_heads.insert(phase.episode_id, latest.1);
+                    latest.1
+                };
+                if phase.revision_id != head {
+                    continue;
+                }
+            }
             let inverse = match &payload {
                 JournalPayload::TaskRecorded(task) => task
                     .request_root_refs
@@ -1504,9 +1536,24 @@ pub(crate) fn controlled_source_snapshot(
             if !direct && !inverse {
                 continue;
             }
-            refs.extend(evertrace_store::projections::read_dependencies_for(
-                row, &payload,
-            ));
+            if ordinary_work && let JournalPayload::WorkEpisodeRecorded(phase) = &payload {
+                // Work namespace continuation needs the current Phase/capture/entry, not
+                // its full burst/member history. Segmentation owns that separate window.
+                refs.extend([phase.task_id.to_string(), phase.workstream_id.to_string()]);
+                refs.extend(phase.entry_worktree_snapshot_id.map(|id| id.to_string()));
+                refs.extend(phase.attempt_ids.iter().map(ToString::to_string));
+                refs.extend(phase.execution_lane_ids.iter().map(ToString::to_string));
+                refs.extend(
+                    phase
+                        .capture_receipt_revision_ids
+                        .iter()
+                        .map(ToString::to_string),
+                );
+            } else {
+                refs.extend(evertrace_store::projections::read_dependencies_for(
+                    row, &payload,
+                ));
+            }
             refs.extend(row.object_id.iter().cloned());
             refs.extend(row.current_revision_id.iter().cloned());
             match &payload {
@@ -2011,6 +2058,41 @@ impl ControlledRunResolver {
         let [task] = tasks.as_slice() else {
             return Ok((ControlledRunCommand::NoDelta, Some(policy)));
         };
+        let mut continuation = BTreeSet::new();
+        if work {
+            for old in facts.receipts.values().filter(|receipt| {
+                receipt.source_observation_id != source
+                    && process_source::is_work_revision(receipt.source_revision.as_str())
+                    && receipt.source_sequence == 1
+            }) {
+                let reference = old.source_observation_id.to_string();
+                let owned = facts.bindings.values().any(|binding| {
+                    binding.primary_binding.task_id == Some(task.task_id)
+                        && binding.evidence_refs.contains(&reference)
+                });
+                if !owned {
+                    continue;
+                }
+                let raw = self.protected_source(facts, old.source_observation_id)?;
+                let prior = ProcessWorkDeclaration::decode(&raw, old)
+                    .ok_or(AutoresearchError::EvidenceIncomplete)?;
+                if prior.definition.study_key != declaration.definition.study_key
+                    || prior.definition.scope != declaration.definition.scope
+                    || prior.definition.goal != declaration.definition.goal
+                    || prior.definition.scope_kind != declaration.definition.scope_kind
+                {
+                    continue;
+                }
+                if !facts.bindings.values().any(|binding| {
+                    binding.assignment_status == AssignmentStatus::Resolved
+                        && binding.primary_binding.task_id == Some(task.task_id)
+                        && binding.evidence_refs.contains(&reference)
+                }) {
+                    return Err(AutoresearchError::EvidenceIncomplete);
+                }
+                continuation.insert(reference);
+            }
+        }
         let code = if declaration.definition.scope_kind == ProcessWorkScope::NonRepository {
             None
         } else if work {
@@ -2033,10 +2115,56 @@ impl ControlledRunResolver {
                             .any(|reference| reference.starts_with(&prefix))
                 })
                 .collect::<Vec<_>>();
-            let [anchor] = anchors.as_slice() else {
+            let anchor = match anchors.as_slice() {
+                [anchor] => Some(*anchor),
+                [] => {
+                    // Continuation keeps the open Phase's original entry anchor. This does not
+                    // claim a fresh filesystem state or permit a new Work birth without one.
+                    let phases = facts
+                        .workstreams
+                        .values()
+                        .filter(|stream| {
+                            stream.task_id == task.task_id
+                                && stream.repository_instance_id == Some(repository)
+                                && stream.active_worktree_instance_id == effect.worktree_instance_id
+                                && !stream.status.is_terminal()
+                                && continuation.iter().any(|source| {
+                                    facts
+                                        .bindings
+                                        .values()
+                                        .any(|binding| source_owns_stream(binding, stream, source))
+                                })
+                        })
+                        .filter_map(|stream| {
+                            stream
+                                .active_episode_id
+                                .and_then(|id| facts.current_episodes.get(&id))
+                                .and_then(|revision| facts.episodes.get(revision))
+                        })
+                        .filter(|phase| {
+                            phase.lifecycle_status == evertrace_domain::work::EpisodeLifecycle::Open
+                                && phase.repository_instance_id == Some(repository)
+                                && phase.worktree_instance_id == effect.worktree_instance_id
+                        })
+                        .collect::<Vec<_>>();
+                    match phases.as_slice() {
+                        [phase] => phase
+                            .entry_worktree_snapshot_id
+                            .and_then(|id| facts.snapshots.get(&id))
+                            .filter(|entry| {
+                                Some(entry.worktree_instance_id) == effect.worktree_instance_id
+                                && entry.capture_status
+                                    == evertrace_domain::repository::SnapshotCaptureStatus::Complete
+                            }),
+                        _ => None,
+                    }
+                }
+                _ => None,
+            };
+            let Some(anchor) = anchor else {
                 return Ok((ControlledRunCommand::NoDelta, Some(policy)));
             };
-            Some((repository, *anchor))
+            Some((repository, anchor))
         } else {
             let (Some(repository), Some(worktree)) =
                 (effect.repository_instance_id, effect.worktree_instance_id)
@@ -2111,41 +2239,6 @@ impl ControlledRunResolver {
             root_source: native,
             goal_source: goal,
         };
-        let mut continuation = BTreeSet::new();
-        if work {
-            for old in facts.receipts.values().filter(|receipt| {
-                receipt.source_observation_id != source
-                    && process_source::is_work_revision(receipt.source_revision.as_str())
-                    && receipt.source_sequence == 1
-            }) {
-                let reference = old.source_observation_id.to_string();
-                let owned = facts.bindings.values().any(|binding| {
-                    binding.primary_binding.task_id == Some(task.task_id)
-                        && binding.evidence_refs.contains(&reference)
-                });
-                if !owned {
-                    continue;
-                }
-                let raw = self.protected_source(facts, old.source_observation_id)?;
-                let prior = ProcessWorkDeclaration::decode(&raw, old)
-                    .ok_or(AutoresearchError::EvidenceIncomplete)?;
-                if prior.definition.study_key != declaration.definition.study_key
-                    || prior.definition.scope != declaration.definition.scope
-                    || prior.definition.goal != declaration.definition.goal
-                    || prior.definition.scope_kind != declaration.definition.scope_kind
-                {
-                    continue;
-                }
-                if !facts.bindings.values().any(|binding| {
-                    binding.assignment_status == AssignmentStatus::Resolved
-                        && binding.primary_binding.task_id == Some(task.task_id)
-                        && binding.evidence_refs.contains(&reference)
-                }) {
-                    return Err(AutoresearchError::EvidenceIncomplete);
-                }
-                continuation.insert(reference);
-            }
-        }
         let command = process_work_command(
             snapshot,
             facts,

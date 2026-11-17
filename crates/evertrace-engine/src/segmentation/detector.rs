@@ -334,7 +334,9 @@ impl SegmentationDetector {
                 .left_feature
                 .as_ref()
                 .is_some_and(|left| left.distance(&feature) < candidate.feature.distance(&feature));
-            if observed == Some(candidate.original_phase) || returned_left {
+            if (observed == Some(candidate.original_phase) && !token.declared_contract_changed())
+                || returned_left
+            {
                 self.candidate = None;
                 self.boundary_status = BoundaryStatus::Provisional;
                 retracted = true;
@@ -364,7 +366,8 @@ impl SegmentationDetector {
                 self.candidate = None;
             }
         }
-        let phase_change = observed.is_some_and(|phase| phase != expected);
+        let phase_change =
+            observed.is_some_and(|phase| phase != expected) || token.declared_contract_changed();
         let structured_surprise = burst.started_new()
             && token.boundary_evidence() == BoundaryEvidence::None
             && !phase_change

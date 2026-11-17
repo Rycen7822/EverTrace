@@ -90,6 +90,7 @@ pub(crate) struct ActivityToken {
     error_signature: Option<String>,
     verifier_transition: VerifierTransition,
     observed_phase_kind: Option<PhaseKind>,
+    declared_contract_changed: bool,
     boundary_evidence: BoundaryEvidence,
     boundary_evidence_refs: Vec<SourceObservationId>,
     session_id: String,
@@ -265,11 +266,34 @@ impl ActivityToken {
             error_signature: facts.error_signature,
             verifier_transition: facts.verifier_transition,
             observed_phase_kind: facts.observed_phase_kind,
+            declared_contract_changed: false,
             boundary_evidence: facts.boundary_evidence,
             boundary_evidence_refs: evidence_refs,
             session_id: lane.host_session_id.clone(),
             capture_receipt: receipt.clone(),
         })
+    }
+
+    pub(super) fn with_declaration(
+        mut self,
+        current: &evertrace_domain::work::PhaseContract,
+        declared: Option<&evertrace_domain::work::PhaseContract>,
+    ) -> Result<Self, DetectorError> {
+        if let Some(declared) = declared {
+            declared.validate().map_err(|_| DetectorError::Ineligible)?;
+            if self.observed_phase_kind != Some(declared.phase_kind) {
+                return Err(DetectorError::Ineligible);
+            }
+            // Goal/acceptance deltas are hints. Labels and target spelling do not prove a new target family.
+            self.declared_contract_changed = declared.local_goal != current.local_goal
+                || declared.acceptance_boundary != current.acceptance_boundary
+                || declared.expected_state_transition != current.expected_state_transition;
+        }
+        Ok(self)
+    }
+
+    pub(super) const fn declared_contract_changed(&self) -> bool {
+        self.declared_contract_changed
     }
 
     pub const fn sequence(&self) -> u64 {

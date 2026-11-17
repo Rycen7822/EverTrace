@@ -163,6 +163,16 @@ impl IncrementalSegmenter {
         operation_id: OperationId,
         facts: SegmentationFacts,
     ) -> Result<SegmentOutcome, DetectorError> {
+        self.observe_declared(current, operation_id, facts, None)
+    }
+
+    pub(crate) fn observe_declared(
+        &mut self,
+        current: &SegmentationCurrentState,
+        operation_id: OperationId,
+        facts: SegmentationFacts,
+        declared: Option<&evertrace_domain::work::PhaseContract>,
+    ) -> Result<SegmentOutcome, DetectorError> {
         if self.closed || current.frontier() < self.committed_frontier {
             return Err(DetectorError::Ineligible);
         }
@@ -185,7 +195,8 @@ impl IncrementalSegmenter {
             operation_id,
             self.episode_id,
             facts,
-        )?;
+        )?
+        .with_declaration(&episode.phase_contract, declared)?;
         if let Some(pending) = &self.pending {
             return if pending.step.token == token {
                 Ok(SegmentOutcome::Delta(Box::new(pending.step.clone())))
