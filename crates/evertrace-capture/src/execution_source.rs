@@ -627,6 +627,32 @@ pub fn execution_directory(
     ))
 }
 
+/// The logical request behind this measured attempt, not its argv or semantic outcome.
+pub(crate) fn tool_request(
+    observation: &SourceObservation,
+    receipt: &SourceReceipt,
+    protected: &[u8],
+) -> Option<(String, String, String)> {
+    if !is_execution(observation, receipt) {
+        return None;
+    }
+    let event = Event::decode(protected)?;
+    if !event.accepts(Profile::from_revision(receipt.parser_revision)?)
+        || event.reference() != receipt.source_ref
+        || event.identity() != receipt.source_record_identity.as_str()
+        || event.role() != receipt.observation_role
+        || request_id(&event.params.call_id) != observation.correlation.native_request_id.as_deref()
+    {
+        return None;
+    }
+    request_id(&event.params.call_id)?;
+    Some((
+        event.params.thread_id,
+        event.params.turn_id,
+        event.params.call_id,
+    ))
+}
+
 /// A physical exit measurement, not a verifier result, Agent terminal or Phase boundary.
 pub fn execution_exit_code(
     observation: &SourceObservation,

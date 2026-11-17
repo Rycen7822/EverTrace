@@ -556,13 +556,7 @@ fn response(socket: &mut WebSocket<UnixStream>, id: u64, deadline: Instant) -> R
     Err(GoalSourceError)
 }
 
-/// One bounded, read-only exchange with the actual supported publisher. Never spawn or poll a host.
-pub fn read(path: &Path, thread: &str) -> Result<Option<Observation>> {
-    let deadline = Instant::now() + Duration::from_secs(3);
-    let selected = uuid::Uuid::parse_str(thread).map_err(|_| GoalSourceError)?;
-    if selected.is_nil() || selected.hyphenated().to_string() != thread {
-        return Err(GoalSourceError);
-    }
+fn connect_client(path: &Path, deadline: Instant) -> Result<(WebSocket<UnixStream>, Publisher)> {
     let (stream, publisher) = connect_publisher(path, deadline)?;
     let config = WebSocketConfig::default()
         .read_buffer_size(4096)
@@ -585,6 +579,17 @@ pub fn read(path: &Path, thread: &str) -> Result<Option<Observation>> {
     socket
         .send(Message::text(r#"{"method":"initialized","params":{}}"#))
         .map_err(|_| GoalSourceError)?;
+    Ok((socket, publisher))
+}
+
+/// One bounded, read-only exchange with the actual supported publisher. Never spawn or poll a host.
+pub fn read(path: &Path, thread: &str) -> Result<Option<Observation>> {
+    let deadline = Instant::now() + Duration::from_secs(3);
+    let selected = uuid::Uuid::parse_str(thread).map_err(|_| GoalSourceError)?;
+    if selected.is_nil() || selected.hyphenated().to_string() != thread {
+        return Err(GoalSourceError);
+    }
+    let (mut socket, publisher) = connect_client(path, deadline)?;
     let request =
         serde_json::json!({"id":2,"method":"thread/goal/get","params":{"threadId":thread}});
     socket
@@ -627,6 +632,56 @@ pub fn read(path: &Path, thread: &str) -> Result<Option<Observation>> {
         reference: goal.root_ref(),
         thread: goal.thread_id,
     }))
+}
+
+/// Read one persisted logical tool request from its measured attempt's actual publisher.
+/// This returns source material, never physical argv, verifier or Phase authority.
+pub fn read_tool_request(
+    observation: &SourceObservation,
+    receipt: &SourceReceipt,
+    protected: &[u8],
+) -> Result<Vec<u8>> {
+    let (thread, turn, call) =
+        crate::execution_source::tool_request(observation, receipt, protected)
+            .ok_or(GoalSourceError)?;
+    let pid = observation
+        .correlation
+        .host_instance_id
+        .as_deref()
+        .and_then(|instance| instance.split(':').nth(3))
+        .and_then(|value| value.parse::<u32>().ok())
+        .ok_or(GoalSourceError)?;
+    let peer = peer(pid)?;
+    let deadline = Instant::now() + Duration::from_secs(3);
+    let (mut socket, publisher) = connect_client(&peer.endpoint, deadline)?;
+    if !execution_peer_matches(&publisher.instance("host-goal")?, &thread, receipt) {
+        return Err(GoalSourceError);
+    }
+    let request = serde_json::json!({"id":2,"method":"thread/items/read",
+        "params":{"threadId":thread,"turnId":turn,"itemIds":[call]}});
+    socket
+        .send(Message::text(request.to_string()))
+        .map_err(|_| GoalSourceError)?;
+    let raw = response(&mut socket, 2, deadline)?;
+    let reply: serde_json::Value = serde_json::from_slice(&raw).map_err(|_| GoalSourceError)?;
+    let entries = reply
+        .pointer("/result/data")
+        .and_then(serde_json::Value::as_array)
+        .filter(|rows| rows.len() == 1)
+        .ok_or(GoalSourceError)?;
+    let entry = &entries[0];
+    let item = &entry["item"];
+    if entry["turnId"].as_str() != Some(turn.as_str())
+        || item["id"].as_str() != Some(call.as_str())
+        || item["type"].as_str() != Some("commandExecution")
+        || item["command"]
+            .as_str()
+            .is_none_or(|value| value.is_empty() || value.len() > 8192)
+    {
+        return Err(GoalSourceError);
+    }
+    publisher.revalidate()?;
+    Ok(raw)
 }
 
 impl Observation {
