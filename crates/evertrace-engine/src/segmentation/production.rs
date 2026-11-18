@@ -189,7 +189,7 @@ async fn phase_completion(
     runtime: &evertrace_capture::RuntimeSnapshot,
     phase: Option<&evertrace_domain::work::PhaseContract>,
 ) -> Result<Option<SourceObservationId>, evertrace_capture::CasError> {
-    use evertrace_domain::work::BoundaryCandidateKind;
+    use evertrace_domain::work::{BoundaryCandidateKind, PhaseKind};
     let state = &selected.state;
     let Some(episode) = state.episode(selected.episode_id) else {
         return Ok(None);
@@ -197,8 +197,11 @@ async fn phase_completion(
     let Some(candidate) = &episode.boundary_candidate else {
         return Ok(None);
     };
-    let Some(phase) = phase.filter(|phase| phase.local_goal != episode.phase_contract.local_goal)
-    else {
+    let Some(phase) = phase.filter(|phase| {
+        phase.local_goal != episode.phase_contract.local_goal
+            || (phase.phase_kind != PhaseKind::Unknown
+                && phase.phase_kind != episode.phase_contract.phase_kind)
+    }) else {
         return Ok(None);
     };
     let Some(stream) = state.authority().workstream(episode.workstream_id) else {
