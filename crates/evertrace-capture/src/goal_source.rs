@@ -121,16 +121,12 @@ pub fn observed_goal(raw: &[u8]) -> Result<Option<(String, String)>> {
     Ok(decode(raw)?.map(|goal| (goal.root_ref(), goal.objective)))
 }
 
-/// Candidate state only; historical provenance must be established by its canonical binding.
-pub fn observed_completion_intent(raw: &[u8]) -> Result<Option<bool>> {
-    Ok(decode(raw)?.map(|goal| goal.status == "complete"))
-}
-
 /// A current publisher and the protected original bytes have independently agreed on this root.
 pub struct RootGoal {
     reference: String,
     objective: String,
     completion_intent: bool,
+    created_at: i64,
     publisher_instance: String,
     publisher_executable: (u64, u64),
     thread: String,
@@ -148,6 +144,18 @@ impl RootGoal {
     /// Native goal intent only; not a verifier result or a Task/Episode lifecycle transition.
     pub const fn completion_intent(&self) -> bool {
         self.completion_intent
+    }
+
+    /// Compare only the state of an already bound observation. This ABI exposes creation time in seconds, not a goal ID.
+    pub fn matches_bound_state(&self, protected: &[u8], complete: bool) -> bool {
+        decode(protected).is_ok_and(|goal| {
+            goal.is_some_and(|goal| {
+                goal.thread_id == self.thread
+                    && goal.objective == self.objective
+                    && goal.created_at == self.created_at
+                    && (goal.status == "complete") == complete
+            })
+        })
     }
 
     pub fn publisher_pid(&self) -> u32 {
@@ -305,6 +313,7 @@ pub fn revalidate(
         objective: String::from_utf8(objective.protected_bytes().to_vec())
             .map_err(|_| GoalSourceError)?,
         completion_intent: goal.status == "complete",
+        created_at: goal.created_at,
         publisher_instance: receipt.source_instance_id.as_str().to_owned(),
         publisher_executable: publisher.executable,
         thread: receipt.source_session_ref.clone(),

@@ -290,7 +290,6 @@ async fn phase_completion(
         })
         .collect::<Vec<_>>();
     let objective_candidate = candidate.kind == BoundaryCandidateKind::Objective;
-    let candidate_watermark = candidate.candidate_watermark;
     let anchor_roots = anchor_binding.evidence_refs.clone();
     let cas_dir = runtime.cas_dir.clone();
     let key_dir = runtime.device_key_dir.clone();
@@ -307,24 +306,25 @@ async fn phase_completion(
             if root.objective() != goal || !root.completion_intent() {
                 continue;
             }
-            let already_grounded = objective_candidate
-                && (current_sequence > candidate_watermark
-                    || anchor_roots.contains(&receipt.source_observation_id.to_string()));
-            let was_open = already_grounded || prior.iter().any(|(old, seq)| {
-                if old.source_ref != receipt.source_ref || *seq >= current_sequence {
+            let grounded = prior.iter().any(|(old, seq)| {
+                if old.source_ref != receipt.source_ref || *seq > current_sequence {
                     return false;
                 }
-                let Some(bytes) = old.cas_ref.parse::<evertrace_capture::CasDigest>().ok()
-                    .and_then(|digest| cas.read_bounded(&digest, 128 * 1024, 128 * 1024).ok())
-                    .map(|(bytes, _)| bytes)
-                else {
-                    return false;
-                };
-                matches!(evertrace_capture::goal_source::observed_goal(&bytes),
-                    Ok(Some((reference, objective))) if reference == root.source_ref() && objective == goal)
-                    && matches!(evertrace_capture::goal_source::observed_completion_intent(&bytes), Ok(Some(false)))
+                let carried_completion = objective_candidate
+                    && anchor_roots.contains(&old.source_observation_id.to_string());
+                if old.source_observation_id == observation.source_observation_id {
+                    return carried_completion;
+                }
+                old.cas_ref
+                    .parse::<evertrace_capture::CasDigest>()
+                    .ok()
+                    .and_then(|digest| cas.read_bounded(&digest, 65_536, 65_536).ok())
+                    .is_some_and(|(bytes, _)| {
+                        root.matches_bound_state(&bytes, false)
+                            || (carried_completion && root.matches_bound_state(&bytes, true))
+                    })
             });
-            if was_open {
+            if grounded {
                 completed.push(observation.source_observation_id);
             }
         }
