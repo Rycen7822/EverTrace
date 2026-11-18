@@ -334,6 +334,30 @@ async fn phase_completion(
     .map_err(|_| evertrace_capture::CasError::Io)?
 }
 
+/// Recheck the exact archived witness after the potentially slow worktree probe, not just publisher trust.
+async fn completion_is_current(
+    current: &CurrentFacts,
+    source: SourceObservationId,
+    runtime: &evertrace_capture::RuntimeSnapshot,
+) -> Result<bool, crate::maintenance::BackgroundSchedulerError> {
+    use crate::maintenance::BackgroundSchedulerError as Error;
+    let (observation, _) = current.source_observation(source).ok_or(Error::Store)?;
+    let (receipt, _) = current
+        .source_receipt(observation.source_receipt_ref)
+        .ok_or(Error::Store)?;
+    let (observation, receipt) = (observation.clone(), receipt.clone());
+    let (cas_dir, key_dir) = (runtime.cas_dir.clone(), runtime.device_key_dir.clone());
+    tokio::task::spawn_blocking(move || {
+        let cas = evertrace_capture::CasStore::open_existing(cas_dir).map_err(|_| Error::Store)?;
+        let resolver = crate::autoresearch::ControlledRunResolver::new(cas);
+        Ok(resolver
+            .verified_root_goal(&receipt, &observation, Some(&key_dir))
+            .is_ok_and(|root| root.completion_intent()))
+    })
+    .await
+    .map_err(|_| Error::Store)?
+}
+
 struct CodeBoundarySnapshot {
     id: evertrace_domain::ids::WorktreeSnapshotId,
     payloads: Vec<evertrace_store::JournalPayload>,
@@ -927,9 +951,14 @@ pub(crate) async fn advance_activity(
             progress.retryable = true;
             return Ok(progress);
         }
-        let command = if step.detector().boundary_status()
-            == evertrace_domain::work::BoundaryStatus::Confirmed
-        {
+        let confirmed =
+            step.detector().boundary_status() == evertrace_domain::work::BoundaryStatus::Confirmed;
+        let cause = if confirmed {
+            Some(completion.ok_or(Error::Store)?)
+        } else {
+            None
+        };
+        let command = if confirmed {
             let stream = selected
                 .state
                 .authority()
@@ -985,7 +1014,7 @@ pub(crate) async fn advance_activity(
             crate::work::episode::save_segmentation_update(context, episode, &step, &receipts)
         }
         .map_err(|_| Error::Store)?;
-        let command = if !artifacts.is_empty() || boundary_snapshot.is_some() {
+        let command = if !artifacts.is_empty() || boundary_snapshot.is_some() || cause.is_some() {
             let mut events = boundary_snapshot
                 .into_iter()
                 .flat_map(|snapshot| snapshot.payloads)
@@ -999,6 +1028,12 @@ pub(crate) async fn advance_activity(
                 })
                 .collect::<Vec<_>>();
             events.extend_from_slice(command.events());
+            if let Some(source) = cause {
+                let cause = source.to_string();
+                for event in &mut events {
+                    event.causation_id = Some(cause.clone());
+                }
+            }
             for artifact in artifacts {
                 events.push(evertrace_store::JournalEventDraft::runtime(
                     occurred_at_us,
@@ -1012,6 +1047,13 @@ pub(crate) async fn advance_activity(
         } else {
             command
         };
+        if let Some(source) = cause
+            && !completion_is_current(current, source, runtime).await?
+        {
+            *after = previous;
+            progress.retryable = true;
+            return Ok(progress);
+        }
         match writer
             .commit_if_frontier(command, occurred_at_us, current.frontier())
             .await
