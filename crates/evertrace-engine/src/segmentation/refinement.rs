@@ -8,8 +8,8 @@ use evertrace_domain::{
     revision::RevisionId,
     work::{
         ArtifactActor, ArtifactDerivability, ArtifactPayloadStatus, ArtifactRetention,
-        ArtifactRevision, ArtifactScope, BoundaryCandidateKind, BoundaryStatus, CheckpointReason,
-        EpisodeLifecycle, PhaseKind, WorkArtifactKind, WorkEpisode,
+        ArtifactRevision, ArtifactScope, BoundaryCandidateKind, BoundaryStatus, EpisodeLifecycle,
+        PhaseKind, WorkArtifactKind, WorkEpisode,
     },
 };
 use evertrace_store::{
@@ -83,46 +83,14 @@ fn attempt_boundary_candidate(episode: &WorkEpisode) -> bool {
             })
 }
 
-fn gray_checkpoint_ready(snapshot: &CurrentFacts, episode: &WorkEpisode) -> Result<bool, Error> {
-    let unknown = episode.phase_contract.phase_kind == PhaseKind::Unknown
-        && episode.boundary_status == BoundaryStatus::Provisional;
-    if episode.lifecycle_status != EpisodeLifecycle::Open
-        || (!unknown && episode.boundary_status != BoundaryStatus::Candidate)
-    {
-        return Ok(false);
-    }
-    let minimum = episode
-        .boundary_candidate
-        .as_ref()
-        .map_or(episode.source_watermark, |candidate| {
-            candidate.candidate_watermark
-        });
-    let deadline = Instant::now() + Duration::from_millis(40);
-    for row in snapshot
-        .other_data_rows()
-        .filter(|row| row.object_kind.as_deref() == Some("work_checkpoint"))
-    {
-        if Instant::now() >= deadline {
-            return Ok(false);
-        }
-        if let Some(JournalPayload::WorkCheckpointRecorded(value)) = row
-            .payload_json
-            .as_deref()
-            .map(serde_json::from_str)
-            .transpose()
-            .map_err(|_| Error::Store)?
-            && value.episode_id == episode.episode_id
-            && value.source_watermark >= minimum
-            && if unknown {
-                value.created_reason == CheckpointReason::Idle
-            } else {
-                value.created_reason != CheckpointReason::PhaseCandidate
-            }
-        {
-            return Ok(true);
-        }
-    }
-    Ok(false)
+// Cheap scheduling hint only. The single-frontier Store selection verifies exact checkpoint readiness.
+fn gray_zone_possible(episode: &WorkEpisode) -> bool {
+    attempt_boundary_candidate(episode)
+        || (episode.lifecycle_status == EpisodeLifecycle::Open
+            && !episode.checkpoint_refs.is_empty()
+            && (episode.boundary_status == BoundaryStatus::Candidate
+                || (episode.boundary_status == BoundaryStatus::Provisional
+                    && episode.phase_contract.phase_kind == PhaseKind::Unknown)))
 }
 
 pub(crate) fn current_episode(snapshot: &CurrentFacts, job: &DurableJob) -> Option<WorkEpisode> {
@@ -146,8 +114,7 @@ pub(crate) fn current_episode(snapshot: &CurrentFacts, job: &DurableJob) -> Opti
     if episode.lifecycle_status != EpisodeLifecycle::Open
         || episode.revision_generation != job.target_generation
         || episode.source_watermark != job.target_watermark
-        || (!attempt_boundary_candidate(&episode)
-            && !gray_checkpoint_ready(snapshot, &episode).ok()?)
+        || !gray_zone_possible(&episode)
     {
         return None;
     }
@@ -201,7 +168,7 @@ pub(crate) async fn input(
         .ok_or(Error::Store)?
         .clone();
     let attempt_candidate = attempt_boundary_candidate(&episode);
-    let checkpoint_ready = gray_checkpoint_ready(snapshot, &episode)?;
+    let checkpoint_ready = selected.refinement_checkpoint_ready;
     if !attempt_candidate && !checkpoint_ready {
         return Ok(None);
     }
@@ -526,7 +493,7 @@ pub(crate) async fn jobs(
         if jobs.len() >= limit {
             break;
         }
-        if !attempt_boundary_candidate(episode) && !gray_checkpoint_ready(snapshot, episode)? {
+        if !gray_zone_possible(episode) {
             continue;
         }
         let Some(input) = input(writer, snapshot, episode.episode_id, runtime).await? else {

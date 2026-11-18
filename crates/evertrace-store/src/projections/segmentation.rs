@@ -163,6 +163,7 @@ pub struct SegmentationReadContext {
     pub repository_ids: std::collections::BTreeSet<evertrace_domain::ids::RepositoryId>,
     pub snapshot: Option<evertrace_domain::repository::WorktreeSnapshot>,
     pub candidate_checkpointed: bool,
+    pub refinement_checkpoint_ready: bool,
 }
 
 fn boundary_context<'a>(
@@ -593,6 +594,12 @@ impl JournalAdmissionState {
         } else {
             false
         };
+        let refinement_checkpoint_ready =
+            if matches!(checkpoint, Some(ActivityTarget::Refinement(_))) {
+                self.refinement_checkpoint_ready(episode)?
+            } else {
+                false
+            };
         Ok(Some(SegmentationReadContext {
             operation_id: operation.operation_id,
             sequence,
@@ -615,7 +622,46 @@ impl JournalAdmissionState {
             repository_ids,
             snapshot,
             candidate_checkpointed,
+            refinement_checkpoint_ready,
         }))
+    }
+
+    fn refinement_checkpoint_ready(&self, episode: &WorkEpisode) -> Result<bool, StoreError> {
+        use evertrace_domain::work::{BoundaryStatus, CheckpointReason, PhaseKind};
+        let candidate = match episode.boundary_status {
+            BoundaryStatus::Candidate => Some(
+                episode
+                    .boundary_candidate
+                    .as_ref()
+                    .ok_or(StoreError::StoreCorrupt)?,
+            ),
+            BoundaryStatus::Provisional
+                if episode.phase_contract.phase_kind == PhaseKind::Unknown =>
+            {
+                None
+            }
+            _ => return Ok(false),
+        };
+        for key in &episode.checkpoint_refs {
+            let checkpoint = &self.checkpoints.get(key).ok_or(StoreError::StoreCorrupt)?.0;
+            if checkpoint.episode_id != episode.episode_id {
+                return Err(StoreError::StoreCorrupt);
+            }
+            let ready = match candidate {
+                Some(candidate) => {
+                    checkpoint.created_reason != CheckpointReason::PhaseCandidate
+                        && checkpoint.source_watermark >= candidate.candidate_watermark
+                }
+                None => {
+                    checkpoint.created_reason == CheckpointReason::Idle
+                        && checkpoint.source_watermark == episode.source_watermark
+                }
+            };
+            if ready {
+                return Ok(true);
+            }
+        }
+        Ok(false)
     }
 }
 
