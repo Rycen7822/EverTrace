@@ -151,11 +151,17 @@
 {% for member in value.members %}
 <section class="semantic-section">
   <p>顺序：{{ member.sequence }} · 来源水位：{{ member.source_watermark }}</p>
-  <p>Operation：{{ member.operation_id }} · 精确操作版本：{{ member.operation_revision }}</p>
-  <p>HostOccurrence：{{ member.host_occurrence_id }} · 归属修订：{{ member.work_binding_revision_id }}</p>
+  {% set operation_revision = member.operation_id ~ '@' ~ member.operation_revision %}
+  <button class="text-button" type="button" data-link-key="{{ member.operation_id }}"
+    data-object="{{ member.operation_id }}" data-revision="{{ operation_revision }}"
+    data-kind="operation">读取保存的操作修订 {{ operation_revision }}</button>
+  <p>HostOccurrence：{{ member.host_occurrence_id }}</p>
+  <button class="text-button" type="button" data-link-key="{{ member.work_binding_revision_id }}"
+    data-object="{{ member.work_binding_revision_id }}" data-revision="{{ member.work_binding_revision_id }}"
+    data-kind="work_binding">读取保存的归属修订 {{ member.work_binding_revision_id }}</button>
   <p>Attempt 修订：{{ member.attempt_revision_id or '未记录' }}</p>
   {{ text_list('成员来源观测', member.source_observation_refs) }}
-  {{ text_list('作用引用', member.scope_effect_refs) }}
+  {{ text_list('保存的作用', member.scope_effect_refs, record_kind='scope_effect', exact_revision=true) }}
   {{ text_list('产物引用', member.artifact_refs) }}
 </section>
 {% endfor %}
