@@ -541,8 +541,8 @@ impl JournalAdmissionState {
                             })
                     {
                         let anchor = &self
-                            .operations
-                            .get(&member.operation_id)
+                            .operation_revisions
+                            .get(&(member.operation_id, member.operation_revision))
                             .ok_or(StoreError::StoreCorrupt)?
                             .0;
                         boundary_operation = Some((anchor.clone(), binding.clone()));

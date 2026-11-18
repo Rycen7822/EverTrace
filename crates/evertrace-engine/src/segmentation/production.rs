@@ -62,7 +62,7 @@ pub(super) async fn source_activity(
     source_operation_activity(current, selected, selected.operation_id, runtime).await
 }
 
-async fn source_operation_activity(
+pub(super) async fn source_operation_activity(
     current: &CurrentFacts,
     selected: &SegmentationReadContext,
     operation_id: evertrace_domain::ids::OperationId,

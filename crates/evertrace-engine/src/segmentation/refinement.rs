@@ -8,8 +8,8 @@ use evertrace_domain::{
     revision::RevisionId,
     work::{
         ArtifactActor, ArtifactDerivability, ArtifactPayloadStatus, ArtifactRetention,
-        ArtifactRevision, ArtifactScope, BoundaryStatus, CheckpointReason, EpisodeLifecycle,
-        PhaseKind, WorkArtifactKind, WorkEpisode,
+        ArtifactRevision, ArtifactScope, BoundaryCandidateKind, BoundaryStatus, CheckpointReason,
+        EpisodeLifecycle, PhaseKind, WorkArtifactKind, WorkEpisode,
     },
 };
 use evertrace_store::{
@@ -68,6 +68,19 @@ pub(crate) struct Input {
     json: String,
     key: String,
     evidence: BTreeSet<String>,
+}
+
+fn attempt_boundary_candidate(episode: &WorkEpisode) -> bool {
+    episode.lifecycle_status == EpisodeLifecycle::Open
+        && episode
+            .boundary_candidate
+            .as_ref()
+            .is_some_and(|candidate| {
+                candidate.kind == BoundaryCandidateKind::StructuredSurprise
+                    && episode.phase_contract.phase_kind != PhaseKind::Unknown
+                    && candidate.candidate_phase_kind == Some(episode.phase_contract.phase_kind)
+                    && candidate.refinement_progress > 0
+            })
 }
 
 fn gray_checkpoint_ready(snapshot: &CurrentFacts, episode: &WorkEpisode) -> Result<bool, Error> {
@@ -133,7 +146,8 @@ pub(crate) fn current_episode(snapshot: &CurrentFacts, job: &DurableJob) -> Opti
     if episode.lifecycle_status != EpisodeLifecycle::Open
         || episode.revision_generation != job.target_generation
         || episode.source_watermark != job.target_watermark
-        || !gray_checkpoint_ready(snapshot, &episode).ok()?
+        || (!attempt_boundary_candidate(&episode)
+            && !gray_checkpoint_ready(snapshot, &episode).ok()?)
     {
         return None;
     }
@@ -186,7 +200,9 @@ pub(crate) async fn input(
         .episode(episode_id)
         .ok_or(Error::Store)?
         .clone();
-    if !gray_checkpoint_ready(snapshot, &episode)? {
+    let attempt_candidate = attempt_boundary_candidate(&episode);
+    let checkpoint_ready = gray_checkpoint_ready(snapshot, &episode)?;
+    if !attempt_candidate && !checkpoint_ready {
         return Ok(None);
     }
     let candidate = episode.boundary_candidate.as_ref();
@@ -306,6 +322,58 @@ pub(crate) async fn input(
         .into_iter()
         .chain(recent_attempts.into_values())
         .collect::<Vec<_>>();
+    let competing_declaration = if attempt_candidate
+        && let (Some(phase), Some(strategy), Some((anchor, _))) = (
+            &activity.phase,
+            &activity.strategy,
+            &selected.boundary_operation,
+        )
+        && phase.phase_kind == episode.phase_contract.phase_kind
+        && phase.local_goal == episode.phase_contract.local_goal
+        && phase.primary_targets == episode.phase_contract.primary_targets
+        && (phase.acceptance_boundary != episode.phase_contract.acceptance_boundary
+            || phase.expected_state_transition != episode.phase_contract.expected_state_transition)
+        && !episode.attempt_ids.is_empty()
+        && !episode.attempt_ids.iter().any(|id| {
+            authority
+                .attempt(*id)
+                .is_some_and(|attempt| attempt.strategy_contract == *strategy)
+        }) {
+        let earlier = match super::production::source_operation_activity(
+            snapshot,
+            &selected,
+            anchor.operation_id,
+            runtime,
+        )
+        .await
+        {
+            Ok(value) => value,
+            Err(evertrace_capture::CasError::LockBusy) => return Ok(None),
+            Err(_) => return Err(Error::Store),
+        };
+        (earlier.phase.as_ref() == Some(phase)
+            && earlier.strategy.as_ref() == Some(strategy)
+            && earlier
+                .declaration_refs
+                .iter()
+                .all(|id| selected.source_refs.contains(id))
+            && earlier
+                .declaration_refs
+                .iter()
+                .all(|id| !activity.declaration_refs.contains(id)))
+        .then_some(earlier.declaration_refs)
+    } else {
+        None
+    };
+    let gray_zone = if competing_declaration.is_some() {
+        "attempt_or_episode"
+    } else if !checkpoint_ready {
+        return Ok(None);
+    } else if candidate.is_some() {
+        "boundary_pending"
+    } else {
+        "unknown_phase"
+    };
     let phase_delta = activity
         .phase
         .as_ref()
@@ -332,6 +400,7 @@ pub(crate) async fn input(
         .iter()
         .chain(&activity.declaration_refs)
         .chain(&activity.exit_refs)
+        .chain(competing_declaration.iter().flatten())
         .map(ToString::to_string)
         .collect::<BTreeSet<_>>();
     evidence.extend(
@@ -395,13 +464,22 @@ pub(crate) async fn input(
     if rationale.len() < minimum_rationale {
         return Ok(None);
     }
+    let plan_sources = match competing_declaration {
+        Some(earlier) => earlier
+            .into_iter()
+            .chain(activity.declaration_refs)
+            .collect::<BTreeSet<_>>()
+            .into_iter()
+            .collect(),
+        None => activity.declaration_refs,
+    };
     let json = serde_json::to_string(&serde_json::json!({"phase_contract":episode.phase_contract,
         "candidate":candidate.map(|value| serde_json::json!({"watermark":value.candidate_watermark,"kind":value.kind})),
-        "gray_zone":if candidate.is_some() { "boundary_pending" } else { "unknown_phase" },
+        "gray_zone":gray_zone,
         "bursts":summaries,"primary_attempt_id":primary_attempt,"attempts":attempts,
         "plan_delta":{"phase_contract":phase_delta,"strategy_contract":strategy_delta,
             "strategy_base_revision":strategy_base.map(|attempt| attempt.revision_id),
-            "source_refs":activity.declaration_refs},
+            "source_refs":plan_sources},
         "physical_result":activity.exit_code.map(|exit| serde_json::json!({
             "operation_id":selected.operation_id,"exit_code":exit,"source_refs":activity.exit_refs})),
         "rationale":rationale,"evidence_refs":evidence}))
@@ -448,7 +526,7 @@ pub(crate) async fn jobs(
         if jobs.len() >= limit {
             break;
         }
-        if !gray_checkpoint_ready(snapshot, episode)? {
+        if !attempt_boundary_candidate(episode) && !gray_checkpoint_ready(snapshot, episode)? {
             continue;
         }
         let Some(input) = input(writer, snapshot, episode.episode_id, runtime).await? else {
