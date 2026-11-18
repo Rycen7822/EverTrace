@@ -45,8 +45,13 @@ def _page(pair):
         "assessment": assessment, "issues": [], "difference": None, "difference_omitted": False}
     for name in ("left", "right"):
         side = pair[name]
-        page[name] = {"state": side["content_state"], "selection": side["selection"],
-            "result": side["fields"] if side["content_state"] == "ready" and side["fields_complete"] else None}
+        ready = side["content_state"] == "ready"
+        selection = side["selection"]
+        # Native reports the pair kind only when both sides are ready.
+        if ready and (selection is None or selection["object_kind"] != "result_evidence"):
+            raise BackendError("invalid_input")
+        page[name] = {"state": side["content_state"], "selection": selection,
+            "result": side["fields"] if ready and side["fields_complete"] else None}
     if assessment:
         page["issues"] = [{"member": issue["member"], "label": _REASON_LABELS.get(issue["reason"], issue["reason"]),
             "dimensions": [_DIMENSION_LABELS.get(value, value) for value in issue["dimensions"]]} for issue in assessment["issues"]]
