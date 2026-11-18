@@ -24,6 +24,33 @@
   <dd>{{ value.context.model_revision }} / {{ value.context.harness_revision }} / {{ value.context.algorithm_revision }}</dd>
   <dt>Budget / acceptance boundary</dt><dd>{{ value.context.budget }} / {{ value.context.acceptance_boundary }}</dd>
 </dl>
-<details><summary>原 anchor 与 applicability operands</summary>
-<pre>{{ value.context.anchor|pretty }}</pre><pre>{{ value.context.operands|pretty }}</pre></details>
+<details><summary>锚点与适用条件取值</summary>
+  {% set anchor = value.context.anchor %}
+  <section data-effect-anchor>
+    <h4>投影所用锚点</h4>
+    {% if anchor.kind == 'repository' %}
+    <dl class="semantic-fields">
+      <dt>仓库</dt><dd data-context-field="repository_id">{{ anchor.repository_id }}</dd>
+      <dt>工作树</dt><dd data-context-field="worktree_id">{{ anchor.worktree_id }}</dd>
+      <dt>工作树谱系</dt><dd class="memory-prose" data-context-field="worktree_lineage">{{ anchor.worktree_lineage }}</dd>
+    </dl>
+    {{ text_list('工作树快照', [anchor.worktree_snapshot_id], record_kind='worktree_snapshot', exact_revision=true) }}
+    {% elif anchor.kind == 'non_repository' %}
+    <p>非仓库锚点。</p>
+    {{ text_list('原环境证据引用', anchor.fixture_refs) }}
+    {% else %}<p>无法解释此锚点类型。</p>{% endif %}
+  </section>
+  <h4>投影中已记录的适用条件取值</h4>
+  {% if value.context.operands %}
+  <dl class="semantic-fields">
+    {% for operand in value.context.operands %}
+    <dt>{{ operand.field }}</dt><dd class="memory-prose" data-effect-operand="{{ operand.field }}">
+      {%- if operand.value.kind == 'boolean' -%}{{ 'true' if operand.value.value else 'false' }}
+      {%- elif operand.value.kind == 'text' -%}{{ operand.value.value }}
+      {%- else -%}无法解释此值类型{%- endif -%}
+    </dd>
+    {% endfor %}
+  </dl>
+  {% else %}<p>没有记录适用条件取值；不据此判断条件成立。</p>{% endif %}
+</details>
 <p>unknown 保持 unknown；本页不补猜环境，也不把其他 context 的旧成功转移到这里。</p>

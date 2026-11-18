@@ -48,9 +48,22 @@
 </dl>
 {% endif %}
 {{ text_list('原证据引用', value.evidence_refs) }}
-{% if content.kind != 'procedure_effect' %}
-<details><summary>原 context</summary>
-<pre>{{ value.local_context|pretty if content.kind != 'procedure_negative_review' else '由负面事实关联读取' }}</pre></details>
+{% if content.kind in ('procedure_usage', 'procedure_negative') %}
+<section class="semantic-section" data-recorded-context>
+  <h3>当时记录的上下文</h3>
+  {% if value.local_context is not none %}
+  <dl class="semantic-fields">
+    {% for label, field in [('仓库', 'repository_id'), ('工作树', 'worktree_id'), ('阶段', 'phase'), ('失败签名', 'failure_signature')] %}
+    <dt>{{ label }}</dt><dd class="memory-prose" data-context-field="{{ field }}">{{ value.local_context[field] or '未记录' }}</dd>
+    {% endfor %}
+  </dl>
+  {% else %}<p>未记录历史上下文。</p>{% endif %}
+</section>
+{% elif content.kind == 'procedure_negative_review' %}
+<p>复核事件不另存上下文。可读取原负面事实：</p>
+<button class="text-button" type="button" data-link-key="{{ value.negative_evidence_id }}"
+  data-object="{{ value.negative_evidence_id }}" data-revision="{{ value.negative_evidence_id }}"
+  data-kind="procedure_negative_evidence">读取原负面证据</button>
 {% endif %}
 {% set now = content.get('procedure_now') %}
 {% if now %}
