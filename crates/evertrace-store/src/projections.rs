@@ -12736,23 +12736,7 @@ impl JournalAdmissionState {
         self.validate_procedure_usage_command(command.events().iter().map(|event| &event.payload))
             .map_err(|_| StoreError::InvalidInput)?;
         autoresearch::validate_controlled_command(
-            autoresearch::ControlledRunAdmissionView {
-                runs: &self.experiment_runs,
-                attempts: &self.attempts,
-                work_bindings: &self.work_bindings,
-                operations: &self.operations,
-                snapshots: &self.worktree_snapshots,
-                receipts: &self.source_receipts,
-                observations: &self.source_observations,
-                surfaces: &self.evidence_surfaces,
-                artifacts: &self.work_artifacts,
-                procedures: &self.procedure,
-                tasks: &self.tasks,
-                workstreams: &self.workstreams,
-                episodes: &self.episodes,
-                episode_revisions: &self.episode_revisions,
-                worktrees: &self.worktrees,
-            },
+            self.controlled_run_admission(),
             command.events().iter().map(|event| &event.payload),
             StoreError::InvalidInput,
         )?;
@@ -13014,23 +12998,7 @@ impl JournalAdmissionState {
         )?;
         self.validate_procedure_usage_command(parsed.iter().map(|(payload, _, _)| payload))?;
         autoresearch::validate_controlled_command(
-            autoresearch::ControlledRunAdmissionView {
-                runs: &self.experiment_runs,
-                attempts: &self.attempts,
-                work_bindings: &self.work_bindings,
-                operations: &self.operations,
-                snapshots: &self.worktree_snapshots,
-                receipts: &self.source_receipts,
-                observations: &self.source_observations,
-                surfaces: &self.evidence_surfaces,
-                artifacts: &self.work_artifacts,
-                procedures: &self.procedure,
-                tasks: &self.tasks,
-                workstreams: &self.workstreams,
-                episodes: &self.episodes,
-                episode_revisions: &self.episode_revisions,
-                worktrees: &self.worktrees,
-            },
+            self.controlled_run_admission(),
             parsed.iter().map(|(payload, _, _)| payload),
             StoreError::StoreCorrupt,
         )?;

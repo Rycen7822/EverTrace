@@ -384,6 +384,17 @@ impl JournalAdmissionState {
                 }
             }
         }
+        if let Some(JournalPayload::ExperimentRunRecorded(run)) = payload.as_ref() {
+            let view = self.controlled_run_admission();
+            if let Some(parent) =
+                super::autoresearch::native_retry_parent(&view, run, cancelled, deadline)?
+            {
+                refs.insert(parent.to_string());
+            }
+            if std::time::Instant::now() >= deadline {
+                return Ok(O::TooLarge);
+            }
+        }
         // Current child revisions by canonical ownership/pinned input, not a reconstruction of a past subtree.
         let children: Box<dyn Iterator<Item = (bool, RevisionId)> + '_> = match payload.as_ref() {
             Some(JournalPayload::TaskRecorded(task)) => Box::new(

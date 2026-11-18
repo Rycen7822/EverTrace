@@ -13,7 +13,8 @@
 <button class="memory-item linked-record" type="button" data-link-key="{{ item.stable_key }}"
         data-revision="{{ item.revision_ref or '' }}" data-object="{{ item.object_ref or '' }}"
         data-kind="{{ item.object_kind }}" {% if not item.revision_ref %}disabled{% endif %}>
-<h3>{{ '采集覆盖凭证' if item.object_kind == 'capture_receipt' else item.object_kind }}</h3>
+<h3>{% if item.retry_parent %}本次重试的前一次实验（当前修订）
+  {% else %}{{ '采集覆盖凭证' if item.object_kind == 'capture_receipt' else item.object_kind }}{% endif %}</h3>
 <p>{{ item.object_ref or item.stable_key }}</p>
 <p>修订：{{ item.revision_ref or '缺少精确版本，不能打开详情。' }}</p>
 <p class="reading-origin">生命周期：{{ item.lifecycle or '未提供' }} · 权威：{{ item.authority or '未提供' }}</p>

@@ -7,7 +7,7 @@ from .backend import BackendError, _decode, _read_boundary, normalize_source_que
 from .memories import _metadata_card
 from .content import _decode_cursor
 
-_REFERENCE_ALGORITHM = "source_revision_reference_metadata_v12"
+_REFERENCE_ALGORITHM = "source_revision_reference_metadata_v13"
 _ARCHIVE_ALGORITHM = "source_archive_metadata_v1"
 _CATALOG_ALGORITHM = "scoped_source_metadata_v1"
 _SOURCE_SELECTION_LABELS = {
@@ -255,6 +255,9 @@ async def read_source_links(backend, reference, frontier, revision, after=None, 
         if record["content_state"] == "ready":
             row = _metadata_card(record["metadata"])
             row["declared_references"] = record["references"]
+            selection = page["selection"]
+            row["retry_parent"] = (selection is not None and selection["object_kind"] == row["object_kind"] == "experiment_run"
+                and selection["object_ref"] != row["object_ref"])
             items.append(row)
         else:
             unavailable.append({"references":record["references"], "state":record["content_state"]})

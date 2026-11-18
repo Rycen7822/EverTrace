@@ -49,6 +49,28 @@ pub(crate) struct ControlledRunAdmissionView<'a> {
     pub worktrees: &'a BTreeMap<WorktreeId, (WorktreeInstance, u64)>,
 }
 
+impl super::JournalAdmissionState {
+    pub(super) fn controlled_run_admission(&self) -> ControlledRunAdmissionView<'_> {
+        ControlledRunAdmissionView {
+            runs: &self.experiment_runs,
+            attempts: &self.attempts,
+            work_bindings: &self.work_bindings,
+            operations: &self.operations,
+            snapshots: &self.worktree_snapshots,
+            receipts: &self.source_receipts,
+            observations: &self.source_observations,
+            surfaces: &self.evidence_surfaces,
+            artifacts: &self.work_artifacts,
+            procedures: &self.procedure,
+            tasks: &self.tasks,
+            workstreams: &self.workstreams,
+            episodes: &self.episodes,
+            episode_revisions: &self.episode_revisions,
+            worktrees: &self.worktrees,
+        }
+    }
+}
+
 pub(crate) fn validate_controlled_command<'a>(
     view: ControlledRunAdmissionView<'_>,
     payloads: impl IntoIterator<Item = &'a JournalPayload>,
@@ -507,6 +529,101 @@ fn native_source_bytes<'a>(
         return Err(error);
     }
     Ok((receipt, observation, raw))
+}
+
+/// Only a recorded native retry names a parent; equal inputs and metric values never do.
+pub(super) fn native_retry_parent(
+    view: &ControlledRunAdmissionView<'_>,
+    child: &ExperimentRun,
+    cancelled: &std::sync::atomic::AtomicBool,
+    deadline: std::time::Instant,
+) -> Result<Option<RevisionId>, StoreError> {
+    let Some((source, launch)) = native_trial_identity(view, child) else {
+        return Ok(None);
+    };
+    let Some(retried) = launch
+        .retry_of_execution
+        .filter(|value| *value != launch.execution_key)
+    else {
+        return Ok(None);
+    };
+    let key = format!("{}/{retried}", launch.source_epoch);
+    let mut parent = None;
+    for (run, _) in view.runs.values() {
+        if cancelled.load(std::sync::atomic::Ordering::Relaxed) {
+            return Err(StoreError::Io);
+        }
+        if std::time::Instant::now() >= deadline {
+            return Ok(None);
+        }
+        if run.external_run_key.as_deref() == Some(key.as_str())
+            && run.workstream_id == child.workstream_id
+            && run.attempt_id == child.attempt_id
+            && let Some((earlier_source, earlier)) = native_trial_identity(view, run)
+            && earlier_source.source_instance_id == source.source_instance_id
+            && earlier_source.source_sequence < source.source_sequence
+            && earlier.request_key == launch.request_key
+            && earlier.execution_ordinal < launch.execution_ordinal
+            && parent.replace(run.revision_id).is_some()
+        {
+            return Ok(None);
+        }
+    }
+    Ok(parent)
+}
+
+#[derive(serde::Deserialize)]
+struct NativeTrialIdentity<'a> {
+    format: &'a str,
+    event: &'a str,
+    event_key: &'a str,
+    source_epoch: &'a str,
+    execution_key: &'a str,
+    request_key: &'a str,
+    execution_ordinal: u32,
+    retry_of_execution: Option<&'a str>,
+}
+
+fn native_trial_identity<'a>(
+    view: &'a ControlledRunAdmissionView<'_>,
+    run: &ExperimentRun,
+) -> Option<(&'a SourceReceipt, NativeTrialIdentity<'a>)> {
+    use evertrace_capture::process_source;
+    use evertrace_domain::{evidence::ObservationRole, work::is_native_test_contract_parser};
+    if !is_native_test_contract_parser(&run.metric_extractor_version)
+        || run.external_system_id.as_deref() != Some(process_source::FORMAT)
+        || run.attempt_binding_status != AttemptBindingStatus::Resolved
+    {
+        return None;
+    }
+    let mut launches = run.source_receipt_refs.iter().filter_map(|id| {
+        let (receipt, observation, raw) = native_source_bytes(
+            view,
+            *id,
+            ObservationRole::Intent,
+            false,
+            StoreError::InvalidInput,
+        )
+        .ok()?;
+        if receipt.source_revision.as_str() != process_source::SOURCE_REVISION
+            || receipt.identity_domain != process_source::FORMAT
+        {
+            return None;
+        }
+        let launch: NativeTrialIdentity<'_> = serde_json::from_slice(raw).ok()?;
+        let correlation = &observation.correlation;
+        (launch.format == process_source::FORMAT
+            && launch.event == "trial_launch"
+            && launch.event_key == receipt.source_record_identity.as_str()
+            && run.external_run_key.as_deref()
+                == Some(format!("{}/{}", launch.source_epoch, launch.execution_key).as_str())
+            && correlation.exact_key().is_some()
+            && correlation.host_trace_lineage_id.as_deref() == Some(launch.source_epoch)
+            && correlation.native_request_id.as_deref() == Some(launch.request_key)
+            && correlation.physical_execution_ordinal == Some(launch.execution_ordinal))
+        .then_some((receipt, launch))
+    });
+    launches.next().filter(|_| launches.next().is_none())
 }
 
 fn validate_native_contract(
