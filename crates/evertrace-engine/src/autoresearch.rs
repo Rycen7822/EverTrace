@@ -1094,7 +1094,7 @@ fn process_work_refs(
         "host-goal:{}:{}:",
         controller.boot_id, controller.pid_namespace
     );
-    let mut refs = BTreeSet::new();
+    let mut refs = BTreeSet::from([source.to_string()]);
     let mut causal = BTreeSet::new();
     let mut prior = BTreeSet::new();
     let deadline = std::time::Instant::now() + std::time::Duration::from_millis(40);
@@ -1102,8 +1102,14 @@ fn process_work_refs(
         if std::time::Instant::now() >= deadline {
             return Err(AutoresearchError::SelectionDeferred);
         }
-        if receipt.source_instance_id == observation.source_instance_id
+        // Only sibling launches can supply the initial study's entry anchor.
+        // Terminal witnesses enter through the selected Operation, not the publisher.
+        if declaration.format == evertrace_capture::process_source::FORMAT
+            && receipt.source_instance_id == observation.source_instance_id
             && receipt.source_revision == observation.source_revision
+            && receipt.observation_role == evertrace_domain::evidence::ObservationRole::Intent
+            && matches!(source_candidate(current, receipt.source_observation_id),
+                Some(SourceCandidate::Trial(trial)) if trial.study_key == declaration.study_key)
         {
             refs.insert(receipt.source_observation_id.to_string());
             causal.insert(receipt.source_observation_id);
@@ -1450,13 +1456,19 @@ pub(crate) fn controlled_source_snapshot(
         }
     }
     let mut selected = BTreeSet::new();
+    let mut expanded = BTreeSet::new();
     let mut rows = Vec::new();
     let mut bytes = 0_usize;
     let mut episode_heads = BTreeMap::new();
     let deadline = std::time::Instant::now() + std::time::Duration::from_millis(40);
     loop {
         let before = selected.len();
-        for reference in refs.clone() {
+        let pending = refs.difference(&expanded).cloned().collect::<Vec<_>>();
+        for reference in pending {
+            if std::time::Instant::now() >= deadline {
+                return Err(AutoresearchError::SelectionDeferred);
+            }
+            expanded.insert(reference.clone());
             if let Ok(observation) = reference.parse::<SourceObservationId>()
                 && let Some((value, _)) = current.source_observation(observation)
             {
@@ -1636,7 +1648,7 @@ pub(crate) fn controlled_source_snapshot(
         if rows.len() > 256 || bytes > 2 * 1024 * 1024 {
             return Err(AutoresearchError::EvidenceIncomplete);
         }
-        if selected.len() == before {
+        if selected.len() == before && refs.len() == expanded.len() {
             return Ok(Some(ProjectionSnapshot {
                 frontier: current.frontier(),
                 rows,
@@ -2250,15 +2262,15 @@ impl ControlledRunResolver {
             for launch in facts.observations.values().filter(|value| {
                 value.source_instance_id == observation.source_instance_id
                     && value.source_revision == observation.source_revision
+                    && value.observation_role == evertrace_domain::evidence::ObservationRole::Intent
             }) {
                 let launch_receipt = facts.receipt(launch.source_observation_id)?;
-                let raw: serde_json::Value = serde_json::from_slice(
-                    &self.protected_source(facts, launch.source_observation_id)?,
-                )
-                .map_err(|_| AutoresearchError::EvidenceIncomplete)?;
-                if raw["event"] != "trial_launch" || raw["study_key"] != declaration.study_key {
+                let raw = self.protected_source(facts, launch.source_observation_id)?;
+                let Some(trial) = ProcessTrialDeclaration::decode(&raw, launch, launch_receipt)
+                    .filter(|trial| trial.study_key == declaration.study_key)
+                else {
                     continue;
-                }
+                };
                 let direct = format!(
                     "native-execution-directory:{}:",
                     launch.source_observation_id
@@ -2268,8 +2280,8 @@ impl ControlledRunResolver {
                     anchor.worktree_instance_id == worktree
                         && anchor.capture_status
                             == evertrace_domain::repository::SnapshotCaptureStatus::Complete
-                        && anchor.head_oid.as_deref() == raw["source_anchor"]["commit"].as_str()
-                        && anchor.tree_oid.as_deref() == raw["source_anchor"]["tree"].as_str()
+                        && anchor.head_oid.as_deref() == Some(trial.source_anchor.commit.as_str())
+                        && anchor.tree_oid.as_deref() == Some(trial.source_anchor.tree.as_str())
                         && anchor
                             .evidence_refs
                             .iter()

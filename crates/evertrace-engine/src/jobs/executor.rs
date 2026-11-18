@@ -3206,6 +3206,7 @@ fn background_relevant(command: &JournalCommand) -> bool {
                 | evertrace_store::JournalPayload::TaskRecorded(_)
                 | evertrace_store::JournalPayload::OperationDerived(_)
                 | evertrace_store::JournalPayload::WorkBindingRecorded(_)
+                | evertrace_store::JournalPayload::ExperimentRunRecorded(_)
                 | evertrace_store::JournalPayload::ConfigAudit(_)
         )
     })
