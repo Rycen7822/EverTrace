@@ -807,20 +807,18 @@ fn validate_native_test_result(
     }
     let digest = hex(&result.raw_cas_refs[0].as_digest());
     let artifact_id = result.raw_artifact_refs[0];
-    let artifact = view
-        .artifacts
-        .get(&artifact_id)
-        .map(|(value, _)| value)
-        .or_else(|| {
-            payloads.iter().find_map(|payload| match payload {
-                JournalPayload::WorkArtifactRecorded(value)
-                    if value.work_artifact_id == artifact_id =>
-                {
-                    Some(value.as_ref())
-                }
-                _ => None,
-            })
+    let artifact = payloads
+        .iter()
+        .rev()
+        .find_map(|payload| match payload {
+            JournalPayload::WorkArtifactRecorded(value)
+                if value.work_artifact_id == artifact_id =>
+            {
+                Some(value.as_ref())
+            }
+            _ => None,
         })
+        .or_else(|| view.artifacts.get(&artifact_id).map(|(value, _)| value))
         .ok_or(error)?;
     let snapshot = &view.snapshots.get(&run.code_snapshot_id).ok_or(error)?.0;
     let worktree = &view
@@ -832,7 +830,11 @@ fn validate_native_test_result(
         return Err(error);
     };
     let id = *id;
-    if artifact.revision.content_blob_ref != result.raw_cas_refs.first().copied()
+    use evertrace_domain::work::{ArtifactPayloadStatus, WorkArtifactKind};
+    if artifact.revision.kind != WorkArtifactKind::ExperimentOutput
+        || artifact.revision.payload_status != ArtifactPayloadStatus::Available
+        || full && artifact.revision.produced_by_refs != [ArtifactActor::ExperimentRun(run.run_id)]
+        || artifact.revision.content_blob_ref != result.raw_cas_refs.first().copied()
         || artifact.revision.scope
             != (ArtifactScope::Worktree {
                 repository_instance_id: worktree.repository_instance_id,
@@ -870,15 +872,20 @@ fn validate_native_test_result(
         return Err(error);
     }
     let event = NativeTestResult::decode(raw).ok_or(error)?;
-    let launch = view
-        .observations
-        .values()
-        .find_map(|(value, _)| {
-            (value.source_instance_id == observation.source_instance_id
-                && value.source_record_identity.as_str() == event.launch_event
-                && value.observation_role == evertrace_domain::evidence::ObservationRole::Intent)
-                .then_some(value)
-        })
+    use evertrace_domain::evidence::ObservationRole;
+    let mut launches = run.source_receipt_refs.iter().filter_map(|id| {
+        let (receipt, _) = view.receipts.get(id)?;
+        let (value, _) = view.observations.get(&receipt.source_observation_id)?;
+        (value.source_receipt_ref == *id
+            && value.source_revision.as_str() == process_source::SOURCE_REVISION
+            && value.source_instance_id == observation.source_instance_id
+            && value.source_record_identity.as_str() == event.launch_event
+            && value.observation_role == ObservationRole::Intent)
+            .then_some(value)
+    });
+    let launch = launches
+        .next()
+        .filter(|_| launches.next().is_none())
         .ok_or(error)?;
     let key = format!("{}/{}", event.source_epoch, event.execution_key);
     if receipt.source_record_identity.as_str() != event.event_key
@@ -888,8 +895,7 @@ fn validate_native_test_result(
             != Some(event.source_epoch.as_str())
         || observation.correlation.native_request_id.as_deref() != Some(event.request_key.as_str())
         || observation.correlation.physical_execution_ordinal != Some(event.execution_ordinal)
-        || !run.source_receipt_refs.contains(&launch.source_receipt_ref)
-        || run.external_system_id.as_deref() != Some(evertrace_capture::process_source::FORMAT)
+        || run.external_system_id.as_deref() != Some(process_source::FORMAT)
         || run.external_run_key.as_deref() != Some(key.as_str())
     {
         return Err(error);
