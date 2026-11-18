@@ -7436,12 +7436,19 @@ impl JournalAdmissionState {
                 .map_err(|_| StoreError::StoreCorrupt)?;
                 // Evidence reads use only their source cohort plus direct Task/Worktree scope facts.
                 // Following a Task's unrelated request roots would incorrectly inherit their revocation or suppression.
-                // Correction parents supply immutable ownership, not an Episode's later receipts/members.
-                let structural_episode =
-                    correction_root && matches!(&payload, JournalPayload::WorkEpisodeRecorded(_));
+                // A correction inherits its Episode's worktree coordinate, not later snapshots, receipts or members.
+                let correction_scope_only = correction_root
+                    && match &payload {
+                        JournalPayload::WorkEpisodeRecorded(episode) => {
+                            pending.extend(episode.worktree_instance_id.map(|id| id.to_string()));
+                            true
+                        }
+                        JournalPayload::WorktreeInstanceRecorded(_) => true,
+                        _ => false,
+                    };
                 let receipt_proof = (lane_root || correction_root)
                     && matches!(&payload, JournalPayload::CaptureReceiptRecorded(_));
-                if !structural_episode
+                if !correction_scope_only
                     && (!source_cohort
                         && !matches!(&payload, JournalPayload::CaptureReceiptRecorded(_))
                         || receipt_proof
