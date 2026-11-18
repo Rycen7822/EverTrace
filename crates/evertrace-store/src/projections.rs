@@ -6770,12 +6770,12 @@ impl JournalAdmissionState {
             return Err(StoreError::InvalidInput);
         }
         if let evertrace_domain::query::ExactReadQuery::Record(record) = query {
-            let key = record
-                .reference
-                .stable_key
-                .strip_prefix("runtime:recall_need:")
-                .unwrap_or(&record.reference.stable_key);
-            if let Some((checkpoint, seq)) = self.checkpoints.get(key) {
+            let key = record.reference.stable_key.as_str();
+            // A checkpoint shares its frozen Episode revision. Resolve its own row key on refresh/back too.
+            let checkpoint_key = key
+                .strip_prefix("object:work:work_checkpoint:")
+                .unwrap_or(key);
+            if let Some((checkpoint, seq)) = self.checkpoints.get(checkpoint_key) {
                 if record
                     .reference
                     .revision_ref
@@ -6792,7 +6792,8 @@ impl JournalAdmissionState {
                 )?;
                 return self.stored_fields_context_for_row(row, state, cancelled, deadline, budget);
             }
-            if let Ok(id) = key.parse::<evertrace_domain::ids::RecallNeedId>() {
+            let recall_key = key.strip_prefix("runtime:recall_need:").unwrap_or(key);
+            if let Ok(id) = recall_key.parse::<evertrace_domain::ids::RecallNeedId>() {
                 let row = self.recall_ledger.current_row(id, PROJECTION_GENERATION)?;
                 if row.as_ref().is_some_and(|row| {
                     record

@@ -13,6 +13,17 @@
   {% else %}<p class="muted">未记录。</p>{% endif %}
 </section>
 {% endmacro %}
+{% macro phase_fields(title, phase) %}
+<section class="semantic-section">
+  <h3>{{ title }}</h3>
+  <p>阶段：{{ phase.phase_kind }} · {{ phase.phase_label }}</p>
+  <div class="memory-prose">{{ phase.local_goal }}</div>
+  {{ text_list('主要对象', phase.primary_targets) }}
+  {{ text_list('进入条件', phase.entry_conditions) }}
+  <h4>阶段验收边界</h4><div class="memory-prose">{{ phase.acceptance_boundary }}</div>
+  <h4>预期状态变化</h4><div class="memory-prose">{{ phase.expected_state_transition }}</div>
+</section>
+{% endmacro %}
 {% set value = content.value %}
 <div class="semantic-content" data-semantic-kind="{{ content.kind }}">
 {% if content.kind == 'recall_need' %}
@@ -124,14 +135,7 @@
   <h3>对象与假设</h3>
   <p class="memory-prose">对象族：{{ value.target_family }} · 假设／失败机制：{{ value.hypothesis_or_failure_family }}</p>
   <h3>验收边界</h3><div class="memory-prose">{{ value.acceptance_boundary }}</div>
-  <section class="semantic-section"><h3>记录的阶段</h3>
-    <p>{{ value.phase_contract.phase_kind }} · {{ value.phase_contract.phase_label }}</p>
-    <div class="memory-prose">{{ value.phase_contract.local_goal }}</div>
-    {{ text_list('主要对象', value.phase_contract.primary_targets) }}
-    {{ text_list('进入条件', value.phase_contract.entry_conditions) }}
-    <h4>阶段验收</h4><div class="memory-prose">{{ value.phase_contract.acceptance_boundary }}</div>
-    <h4>预期状态变化</h4><div class="memory-prose">{{ value.phase_contract.expected_state_transition }}</div>
-  </section>
+  {{ phase_fields('记录的阶段', value.phase_contract) }}
   <details><summary>范围、谱系与已记录的执行引用</summary>
     <p>仓库：{{ value.repository_instance_id or '无仓库归属' }} · 活跃工作树：{{ value.active_worktree_instance_id or '未记录' }}</p>
     <p>父工作线：{{ value.parent_workstream_id or '无' }} · 前序修订：{{ value.predecessor_revision_id or '无' }}</p>
@@ -231,14 +235,7 @@
   {% endif %}
 {% elif content.kind == 'work_episode' %}
   <h2>工作片段</h2>
-  <section class="semantic-section">
-    <h3>片段目标</h3><div class="memory-prose">{{ value.phase_contract.local_goal }}</div>
-    <p>阶段：{{ value.phase_contract.phase_kind }} · {{ value.phase_contract.phase_label }}</p>
-    {{ text_list('主要对象', value.phase_contract.primary_targets) }}
-    {{ text_list('进入条件', value.phase_contract.entry_conditions) }}
-    <h3>验收边界</h3><div class="memory-prose">{{ value.phase_contract.acceptance_boundary }}</div>
-    <h3>预期状态变化</h3><div class="memory-prose">{{ value.phase_contract.expected_state_transition }}</div>
-  </section>
+  {{ phase_fields('片段目标', value.phase_contract) }}
   {{ text_list('关联尝试（当前修订）', value.attempt_ids, record_kind='attempt') }}
   {{ text_list('候选路线组（当前修订）', value.competing_attempt_group_ids, record_kind='competing_attempt_group') }}
   {{ text_list('执行通道（当前修订）', value.execution_lane_ids, record_kind='execution_lane') }}
@@ -262,7 +259,7 @@
     {{ text_list('验证', value.verification_refs) }}
     {{ text_list('失败', value.failure_refs) }}
     {{ text_list('中断', value.interruption_refs) }}
-    {{ text_list('检查点', value.checkpoint_refs) }}
+    {{ text_list('检查点（冻结记录）', value.checkpoint_refs, record_kind='work_checkpoint') }}
   </details>
 {% elif content.kind == 'work_checkpoint' %}
   <h2>工作检查点</h2>
@@ -271,8 +268,8 @@
   <p>原片段：{{ value.episode_id }} · 冻结修订：{{ value.episode_revision_id }}</p>
   <button class="text-button" type="button" data-link-key="{{ value.episode_id }}"
     data-object="{{ value.episode_id }}" data-revision="{{ value.episode_revision_id }}" data-kind="work_episode">读取原片段修订</button>
-  <h3>阶段合同</h3><pre>{{ value.phase_contract|pretty }}</pre>
-  {{ text_list('活跃尝试', value.active_attempt_ids, record_kind='attempt') }}
+  {{ phase_fields('冻结的阶段合同', value.phase_contract) }}
+  {{ text_list('当时活跃的尝试（查看当前修订）', value.active_attempt_ids, record_kind='attempt') }}
   <h3>冻结的尝试修订</h3>
   <ul>{% for ref in value.attempt_revision_refs %}<li>
     <button class="text-button" type="button" data-link-key="{{ ref.attempt_id }}"
@@ -280,8 +277,16 @@
   </li>{% endfor %}</ul>
   {{ text_list('未解决事项', value.open_loops) }}
   {{ text_list('验证引用', value.verifier_refs) }}
-  <p>工作树快照：{{ value.current_worktree_snapshot_id or '未记录' }}</p>
-  <h3>待整理增量</h3><pre>{{ value.pending_delta_stats|pretty }}</pre>
+  {% if value.current_worktree_snapshot_id %}
+    {{ text_list('冻结的工作树快照', [value.current_worktree_snapshot_id], record_kind='worktree_snapshot', exact_revision=true) }}
+  {% else %}<p>工作树快照：未记录</p>{% endif %}
+  <section class="semantic-section"><h3>检查点记录的待整理增量</h3>
+    <dl class="semantic-fields">
+      <dt>选中活动</dt><dd>{{ value.pending_delta_stats.selected_token_count }}</dd>
+      <dt>有效操作片段</dt><dd>{{ value.pending_delta_stats.meaningful_burst_count }}</dd>
+      <dt>高价值信号</dt><dd>{{ value.pending_delta_stats.high_value_signal_count }}</dd>
+    </dl>
+  </section>
   {{ text_list('状态谱系', value.active_lineage_refs) }}
   {{ text_list('采集凭证', value.capture_receipt_revision_ids, record_kind='capture_receipt', exact_revision=true) }}
   {{ text_list('采集缺口', value.capture_gap_refs) }}
