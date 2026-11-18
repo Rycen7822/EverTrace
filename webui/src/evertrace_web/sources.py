@@ -7,7 +7,7 @@ from .backend import BackendError, _decode, _read_boundary, normalize_source_que
 from .memories import _metadata_card
 from .content import _decode_cursor
 
-_REFERENCE_ALGORITHM = "source_revision_reference_metadata_v11"
+_REFERENCE_ALGORITHM = "source_revision_reference_metadata_v12"
 _ARCHIVE_ALGORITHM = "source_archive_metadata_v1"
 _CATALOG_ALGORITHM = "scoped_source_metadata_v1"
 _SOURCE_SELECTION_LABELS = {

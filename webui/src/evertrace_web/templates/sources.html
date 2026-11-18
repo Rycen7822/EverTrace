@@ -4,7 +4,7 @@
 <button class="button" type="button" data-nav-back hidden>返回上一条记录</button>
 <p class="muted">显式修订保持原版；逻辑对象打开本次水位的当前修订。</p>
 <p class="muted">来源修订可关联采集凭证，修订级关联不代表该记录的通道覆盖。</p>
-<p class="muted">任务的工作线、工作线的片段和实验、Procedure 效果显示当前关联，不是所选父修订当时的子树。</p>
+<p class="muted">任务的工作线、工作线的片段和实验、尝试已确定归属的实验、Procedure 效果均显示当前关联，不是历史子树。</p>
 {% if matching_count is not none %}
 <p class="muted">共 {{ matching_count }} 条直接关联，含不可读项。</p>
 {% endif %}

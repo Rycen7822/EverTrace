@@ -404,6 +404,17 @@ impl JournalAdmissionState {
                         (run.workstream_id == stream.workstream_id, run.revision_id)
                     })),
             ),
+            Some(JournalPayload::AttemptRecorded(attempt)) => {
+                Box::new(self.experiment_runs.values().map(|(run, _)| {
+                    (
+                        run.attempt_binding_status
+                            == evertrace_domain::work::AttemptBindingStatus::Resolved
+                            && run.attempt_id == Some(attempt.attempt_id)
+                            && run.workstream_id == attempt.workstream_id,
+                        run.revision_id,
+                    )
+                }))
+            }
             Some(JournalPayload::RecoveryBundleRecorded(bundle)) => {
                 Box::new(self.recovery_applications.values().map(|(application, _)| {
                     (
