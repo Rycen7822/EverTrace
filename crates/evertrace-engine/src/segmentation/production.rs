@@ -877,14 +877,6 @@ pub(crate) async fn advance_activity(
                     };
                 }
             }
-            if readable_context(writer, current, &selected, runtime)
-                .await?
-                .is_none()
-            {
-                *after = previous;
-                progress.retryable = true;
-                return Ok(progress);
-            }
         }
         let episode = selected
             .state
@@ -946,15 +938,6 @@ pub(crate) async fn advance_activity(
         } else {
             Vec::new()
         };
-        if needs_checkpoint
-            && readable_context(writer, current, &selected, runtime)
-                .await?
-                .is_none()
-        {
-            *after = previous;
-            progress.retryable = true;
-            return Ok(progress);
-        }
         let confirmed =
             step.detector().boundary_status() == evertrace_domain::work::BoundaryStatus::Confirmed;
         let cause = if confirmed {
@@ -1060,6 +1043,14 @@ pub(crate) async fn advance_activity(
             *after = previous;
             progress.retryable = true;
             return Ok(progress);
+        }
+        // After the independent publisher check, re-read access before publishing protected Phase facts.
+        if (completion.is_some() || needs_checkpoint)
+            && readable_context(writer, current, &selected, runtime)
+                .await?
+                .is_none()
+        {
+            continue;
         }
         match writer
             .commit_if_frontier(command, occurred_at_us, current.frontier())
