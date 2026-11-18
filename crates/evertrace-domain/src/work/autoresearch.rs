@@ -203,6 +203,39 @@ impl NativeTestContract {
         source: SourceObservationId,
         harness_revision: &str,
     ) -> Option<Self> {
+        if !Self::has_direct_witness(snapshot, source) {
+            return None;
+        }
+        Self::decode_code_state(raw, snapshot, harness_revision)
+    }
+
+    /// A matching code state can be seen before its direct execution witness is committed.
+    pub fn awaits_direct_witness(
+        raw: &[u8],
+        snapshot: &crate::repository::WorktreeSnapshot,
+        source: SourceObservationId,
+        harness_revision: &str,
+    ) -> bool {
+        !Self::has_direct_witness(snapshot, source)
+            && Self::decode_code_state(raw, snapshot, harness_revision).is_some()
+    }
+
+    fn has_direct_witness(
+        snapshot: &crate::repository::WorktreeSnapshot,
+        source: SourceObservationId,
+    ) -> bool {
+        let prefix = format!("native-execution-directory:{source}:");
+        snapshot
+            .evidence_refs
+            .iter()
+            .any(|reference| reference.starts_with(&prefix))
+    }
+
+    fn decode_code_state(
+        raw: &[u8],
+        snapshot: &crate::repository::WorktreeSnapshot,
+        harness_revision: &str,
+    ) -> Option<Self> {
         let value: serde_json::Value = serde_json::from_slice(raw).ok()?;
         let config = &value["config"];
         let implementation = config["implementation"].as_str()?;
@@ -223,7 +256,6 @@ impl NativeTestContract {
         );
         let started_at_us = value["time_us"].as_i64()?;
         let anchor = &value["source_anchor"];
-        let prefix = format!("native-execution-directory:{source}:");
         if value["format"] != "process-trial-source-v4"
             || value["event"] != "trial_launch"
             || started_at_us < 0
@@ -239,10 +271,6 @@ impl NativeTestContract {
             || snapshot.head_oid.as_deref() != anchor["commit"].as_str()
             || snapshot.capture_status != crate::repository::SnapshotCaptureStatus::Complete
             || snapshot.tracked_diff_digest.as_deref() != Some(clean.as_str())
-            || !snapshot
-                .evidence_refs
-                .iter()
-                .any(|reference| reference.starts_with(&prefix))
         {
             return None;
         }

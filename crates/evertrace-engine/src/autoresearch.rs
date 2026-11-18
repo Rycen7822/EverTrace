@@ -2865,20 +2865,25 @@ impl ControlledRunResolver {
             let (fingerprint, mut receipts) = self.process_runtime_environment(&facts, &trial)?;
             let mut input =
                 process_trial_input(&trial, attempt, anchor, fingerprint, context.occurred_at_us)?;
-            if observation.correlation.exact_key().is_some()
+            use evertrace_domain::work::NativeTestContract;
+            let measured_exact = observation.correlation.exact_key().is_some()
                 && receipts.iter().any(|id| {
                     facts.receipts.get(id).is_some_and(|receipt| {
                         receipt.source_revision.as_str()
                             == evertrace_capture::process_source::IMAGE_SOURCE_REVISION
                             && (receipt.adapter_revision, receipt.parser_revision) == (3, 3)
                     })
-                })
-                && let Some(contract) = evertrace_domain::work::NativeTestContract::decode(
-                    &launch_raw,
-                    anchor,
-                    source,
-                    facts.receipt(source)?.source_revision.as_str(),
-                )
+                });
+            let harness = facts.receipt(source)?.source_revision.as_str();
+            // Don't freeze a measured launch into the legacy extractor while its snapshot is pending.
+            if measured_exact
+                && NativeTestContract::awaits_direct_witness(&launch_raw, anchor, source, harness)
+            {
+                return Ok(ControlledRunCommand::NoDelta);
+            }
+            if measured_exact
+                && let Some(contract) =
+                    NativeTestContract::decode(&launch_raw, anchor, source, harness)
             {
                 input.data_fingerprint = contract.data_fingerprint;
                 input.normalized_config = contract.normalized_config;
@@ -2892,8 +2897,7 @@ impl ControlledRunResolver {
                     .and_then(|episode| episode.entry_worktree_snapshot_id)
                     .and_then(|id| facts.snapshots.get(&id));
                 input.code_snapshot_id =
-                    evertrace_domain::work::NativeTestContract::code_basis(anchor, entry)
-                        .worktree_snapshot_id;
+                    NativeTestContract::code_basis(anchor, entry).worktree_snapshot_id;
                 input.created_at_us = input.created_at_us.min(contract.started_at_us);
             }
             receipts.extend([facts.receipt(source)?.source_receipt_id, opening_receipt]);
