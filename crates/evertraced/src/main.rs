@@ -217,7 +217,10 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
     // Keep this receiver alive during startup and maintenance awaits.
     let shutdown_signal = wait_for_signal()?;
     tokio::pin!(shutdown_signal);
-    let writer = open_writer(&data_dir).await?;
+    let mut writer = open_writer(&data_dir).await?;
+    writer
+        .recover_interrupted_recall_retrievals(engine.effective_config().hash())
+        .await?;
     let (writer_handle, writer_task) = spawn_writer(writer, 64)?;
     let mut writer_handle = Some(writer_handle);
     let mut writer_task = Some(writer_task);

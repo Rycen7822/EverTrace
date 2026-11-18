@@ -207,6 +207,36 @@ impl RecallLedgerState {
         self.needs.values().map(|(need, _)| need)
     }
 
+    pub(super) fn interrupted_retrievals(
+        &self,
+        after: Option<RecallNeedId>,
+        occurred_at_us: i64,
+    ) -> Result<Vec<evertrace_domain::recall::RecallRetrievalOutcome>, StoreError> {
+        use evertrace_domain::recall::RecallRetrievalOutcome;
+        use std::ops::Bound::{Excluded, Unbounded};
+        self.needs
+            .range((after.map_or(Unbounded, Excluded), Unbounded))
+            .map(|(_, (need, _))| need)
+            .filter(|need| {
+                need.obligation_state == RecallObligationState::Active
+                    && need.agent_response == RecallAgentResponse::RetrievalClaimed
+            })
+            .take(32)
+            .map(|need| {
+                Ok(RecallRetrievalOutcome {
+                    request_id: need
+                        .active_retrieval_request_id
+                        .clone()
+                        .ok_or(StoreError::StoreCorrupt)?,
+                    recall_need_id: need.recall_need_id,
+                    recall_need_hash: need.recall_need_hash,
+                    state: RetrievalOutcomeState::Unknown,
+                    occurred_at_us,
+                })
+            })
+            .collect()
+    }
+
     pub(crate) fn last_presentation_attempt(
         &self,
         recall_need_id: RecallNeedId,

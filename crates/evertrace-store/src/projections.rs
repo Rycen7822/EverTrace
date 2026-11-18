@@ -12210,6 +12210,15 @@ impl JournalAdmissionState {
         refs
     }
 
+    pub(crate) fn interrupted_recall_retrievals(
+        &self,
+        after: Option<evertrace_domain::ids::RecallNeedId>,
+        occurred_at_us: i64,
+    ) -> Result<Vec<evertrace_domain::recall::RecallRetrievalOutcome>, StoreError> {
+        self.recall_ledger
+            .interrupted_retrievals(after, occurred_at_us)
+    }
+
     pub(crate) fn recall_current_contexts(
         &self,
         frontier: u64,

@@ -708,6 +708,45 @@ impl JournalWriter {
         self.admission_state.queued_gc_jobs()
     }
 
+    /// Settle claims from a stopped process before admitting new MCP requests.
+    pub async fn recover_interrupted_recall_retrievals(
+        &mut self,
+        config_hash: [u8; 32],
+    ) -> Result<(), StoreError> {
+        use crate::JournalEventDraft;
+        use evertrace_domain::{ids::CommandId, recall::RecallLedgerEvent};
+        let occurred_at_us = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .ok()
+            .and_then(|elapsed| i64::try_from(elapsed.as_micros()).ok())
+            .ok_or(StoreError::InvalidInput)?;
+        let mut after = None;
+        loop {
+            let outcomes = self
+                .admission_state
+                .interrupted_recall_retrievals(after, occurred_at_us)?;
+            let Some(last) = outcomes.last() else {
+                return Ok(());
+            };
+            after = Some(last.recall_need_id);
+            let events = outcomes
+                .into_iter()
+                .map(|outcome| {
+                    JournalEventDraft::runtime(
+                        occurred_at_us,
+                        config_hash,
+                        "startup_recall_retrieval_v1",
+                        JournalPayload::RecallLedgerRecorded(Box::new(
+                            RecallLedgerEvent::RetrievalOutcome { outcome },
+                        )),
+                    )
+                })
+                .collect();
+            let command = JournalCommand::new(CommandId::new_v7(), events)?;
+            self.commit(&command, occurred_at_us).await?;
+        }
+    }
+
     pub fn recall_current_contexts(
         &self,
         limit: usize,
