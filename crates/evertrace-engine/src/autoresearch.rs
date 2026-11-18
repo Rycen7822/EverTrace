@@ -364,14 +364,22 @@ fn source_resolved(
     }
     if let SourceCandidate::TestResult(event) = envelope {
         let key = format!("{}/{}", event.source_epoch, event.execution_key);
-        // Old declarations keep their original extractor contract; do not reopen their namespace.
+        // Already accepted terminal receipts need no reprocessing. Legacy declarations keep their own extractor contract.
         if current.other_data_rows().any(|row| row.object_kind.as_deref() == Some("experiment_run")
             && row.payload_json.as_deref().is_some_and(|json| {
                 matches!(serde_json::from_str::<JournalPayload>(json),
                     Ok(JournalPayload::ExperimentRunRecorded(run))
                     if run.external_system_id.as_deref() == Some(evertrace_capture::process_source::FORMAT)
                         && run.external_run_key.as_deref() == Some(key.as_str())
-                        && !evertrace_domain::work::is_native_test_parser(&run.metric_extractor_version))
+                        && (run.terminal_evidence_refs.contains(&observation.source_receipt_ref)
+                            || !evertrace_domain::work::is_native_test_parser(&run.metric_extractor_version)
+                                && run.source_receipt_refs.iter().any(|id| {
+                                    current.source_receipt(*id).is_some_and(|(receipt, _)| {
+                                        receipt.source_instance_id == observation.source_instance_id
+                                            && receipt.source_record_identity.as_str() == event.launch_event
+                                            && receipt.observation_role == evertrace_domain::evidence::ObservationRole::Intent
+                                    })
+                                })))
             }))
         {
             return true;
@@ -379,14 +387,37 @@ fn source_resolved(
         let Some((receipt, _)) = current.source_receipt(observation.source_receipt_ref) else {
             return false;
         };
+        let Ok(digest) = receipt.cas_ref.parse::<CasDigest>() else {
+            return false;
+        };
+        let cas = CasId::from_digest(*digest.as_bytes());
         return current.other_data_rows().any(|row| {
-            row.object_kind.as_deref() == Some("result_evidence")
-                && row.payload_json.as_deref().is_some_and(|json| {
-                    matches!(serde_json::from_str::<JournalPayload>(json),
-                        Ok(JournalPayload::ResultEvidenceRecorded(result))
-                        if evertrace_domain::work::is_native_test_parser(&result.parser_receipt.parser_version)
-                            && result.raw_cas_refs.iter().any(|cas| hex(&cas.as_digest()) == receipt.cas_ref))
-                })
+            if row.object_kind.as_deref() != Some("result_evidence") {
+                return false;
+            }
+            let Some(JournalPayload::ResultEvidenceRecorded(result)) = row
+                .payload_json
+                .as_deref()
+                .and_then(|json| serde_json::from_str::<JournalPayload>(json).ok())
+            else {
+                return false;
+            };
+            if !evertrace_domain::work::is_native_test_parser(&result.parser_receipt.parser_version)
+                || result.raw_cas_refs != [cas]
+            {
+                return false;
+            }
+            let [artifact] = result.raw_artifact_refs.as_slice() else {
+                return false;
+            };
+            let key = artifact.to_string();
+            current.other_data_rows().any(|row| {
+                row.object_kind.as_deref() == Some("work_artifact")
+                    && row.object_id.as_deref() == Some(key.as_str())
+                    && matches!(row.payload_json.as_deref().and_then(|json| serde_json::from_str::<JournalPayload>(json).ok()),
+                        Some(JournalPayload::WorkArtifactRecorded(value))
+                        if value.revision.source_observation_refs == [observation.source_observation_id])
+            })
         });
     }
     if let SourceCandidate::Trial(trial) = envelope {
@@ -2421,12 +2452,15 @@ impl ControlledRunResolver {
         let digest = CasDigest::from_str(&facts.receipt(source)?.cas_ref)
             .map_err(|_| AutoresearchError::Cas)?;
         let cas = CasId::from_digest(*digest.as_bytes());
-        if facts
-            .runs
-            .results
-            .values()
-            .any(|value| value.experiment_run_id == run.run_id && value.raw_cas_refs.contains(&cas))
-        {
+        if facts.runs.results.values().any(|value| {
+            value.experiment_run_id == run.run_id
+                && value.raw_cas_refs == [cas]
+                && value.raw_artifact_refs.iter().any(|id| {
+                    facts.runs.artifacts.get(id).is_some_and(|artifact| {
+                        artifact.revision.source_observation_refs == [source]
+                    })
+                })
+        }) {
             return Ok((ControlledRunCommand::NoDelta, policy));
         }
         let artifact =
