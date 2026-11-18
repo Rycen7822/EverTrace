@@ -318,7 +318,10 @@ pub(crate) async fn input(
             Err(evertrace_capture::CasError::LockBusy) => return Ok(None),
             Err(_) => return Err(Error::Store),
         };
-        (earlier.phase.as_ref() == Some(phase)
+        (earlier
+            .phase
+            .as_ref()
+            .is_some_and(|anchor| super::same_phase_proposal(anchor, phase))
             && earlier.strategy.as_ref() == Some(strategy)
             && earlier
                 .declaration_refs

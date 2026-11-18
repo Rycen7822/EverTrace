@@ -18,3 +18,15 @@ pub use incremental::{IncrementalSegmentationStep, IncrementalSegmenter, Segment
 pub(crate) use production::advance_activity;
 pub(crate) use token::ActivityToken;
 pub use token::{BoundaryEvidence, SegmentationFacts, StateDeltaKind, VerifierTransition};
+
+use evertrace_domain::work::PhaseContract;
+
+/// A display label is not a contract change. All other fields must match across evidence.
+fn same_phase_proposal(left: &PhaseContract, right: &PhaseContract) -> bool {
+    left.phase_kind == right.phase_kind
+        && left.local_goal == right.local_goal
+        && left.primary_targets == right.primary_targets
+        && left.entry_conditions == right.entry_conditions
+        && left.acceptance_boundary == right.acceptance_boundary
+        && left.expected_state_transition == right.expected_state_transition
+}

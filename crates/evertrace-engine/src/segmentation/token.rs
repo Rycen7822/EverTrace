@@ -295,7 +295,7 @@ impl ActivityToken {
                 || declared.expected_state_transition != current.expected_state_transition;
             self.replaces_candidate = declared.phase_kind != PhaseKind::Unknown
                 && self.declared_contract_changed
-                && anchored.is_some_and(|anchor| anchor != declared);
+                && anchored.is_some_and(|anchor| !super::same_phase_proposal(anchor, declared));
         }
         Ok(self)
     }
