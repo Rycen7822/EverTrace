@@ -334,30 +334,6 @@ async fn phase_completion(
     .map_err(|_| evertrace_capture::CasError::Io)?
 }
 
-/// Recheck the exact archived witness after the potentially slow worktree probe, not just publisher trust.
-async fn completion_is_current(
-    current: &CurrentFacts,
-    source: SourceObservationId,
-    runtime: &evertrace_capture::RuntimeSnapshot,
-) -> Result<bool, crate::maintenance::BackgroundSchedulerError> {
-    use crate::maintenance::BackgroundSchedulerError as Error;
-    let (observation, _) = current.source_observation(source).ok_or(Error::Store)?;
-    let (receipt, _) = current
-        .source_receipt(observation.source_receipt_ref)
-        .ok_or(Error::Store)?;
-    let (observation, receipt) = (observation.clone(), receipt.clone());
-    let (cas_dir, key_dir) = (runtime.cas_dir.clone(), runtime.device_key_dir.clone());
-    tokio::task::spawn_blocking(move || {
-        let cas = evertrace_capture::CasStore::open_existing(cas_dir).map_err(|_| Error::Store)?;
-        let resolver = crate::autoresearch::ControlledRunResolver::new(cas);
-        Ok(resolver
-            .verified_root_goal(&receipt, &observation, Some(&key_dir))
-            .is_ok_and(|root| root.completion_intent()))
-    })
-    .await
-    .map_err(|_| Error::Store)?
-}
-
 struct CodeBoundarySnapshot {
     id: evertrace_domain::ids::WorktreeSnapshotId,
     payloads: Vec<evertrace_store::JournalPayload>,
@@ -1076,7 +1052,10 @@ pub(crate) async fn advance_activity(
             command
         };
         if let Some(source) = cause
-            && !completion_is_current(current, source, runtime).await?
+            && crate::autoresearch::read_live_root_goal(current, source, runtime)
+                .await
+                .map_err(|_| Error::Store)?
+                .is_none_or(|root| !root.completion_intent())
         {
             *after = previous;
             progress.retryable = true;

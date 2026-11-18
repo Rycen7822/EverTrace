@@ -1725,6 +1725,7 @@ pub enum ControlledRunCommand {
     NoDelta,
     WorkRoot {
         command: JournalCommand,
+        goal: SourceObservationId,
     },
     Declaration {
         run: Box<ExperimentRun>,
@@ -1740,6 +1741,31 @@ pub enum ControlledRunCommand {
         result: Box<ResultEvidence>,
         command: JournalCommand,
     },
+}
+
+/// Recheck the exact protected observation against the current Native publisher before publication.
+pub(crate) async fn read_live_root_goal(
+    current: &evertrace_store::CurrentFacts,
+    source: SourceObservationId,
+    runtime: &evertrace_capture::RuntimeSnapshot,
+) -> Result<Option<evertrace_capture::goal_source::RootGoal>, AutoresearchError> {
+    let (observation, _) = current
+        .source_observation(source)
+        .ok_or(AutoresearchError::EvidenceIncomplete)?;
+    let (receipt, _) = current
+        .source_receipt(observation.source_receipt_ref)
+        .ok_or(AutoresearchError::EvidenceIncomplete)?;
+    let (observation, receipt) = (observation.clone(), receipt.clone());
+    let (cas_dir, key_dir) = (runtime.cas_dir.clone(), runtime.device_key_dir.clone());
+    tokio::task::spawn_blocking(move || {
+        let cas = CasStore::open_existing(cas_dir).map_err(|_| AutoresearchError::Cas)?;
+        let resolver = ControlledRunResolver::new(cas);
+        Ok(resolver
+            .verified_root_goal(&receipt, &observation, Some(&key_dir))
+            .ok())
+    })
+    .await
+    .map_err(|_| AutoresearchError::Cas)?
 }
 
 #[derive(Clone, Debug)]
@@ -2272,7 +2298,7 @@ impl ControlledRunResolver {
         )?;
         Ok((
             command.map_or(ControlledRunCommand::NoDelta, |command| {
-                ControlledRunCommand::WorkRoot { command }
+                ControlledRunCommand::WorkRoot { command, goal }
             }),
             Some(policy),
         ))
@@ -3448,7 +3474,10 @@ impl ControlledRunResolver {
         .map_err(|_| AutoresearchError::ImmutableConflict)?;
         Ok((
             command.map_or(ControlledRunCommand::NoDelta, |command| {
-                ControlledRunCommand::WorkRoot { command }
+                ControlledRunCommand::WorkRoot {
+                    command,
+                    goal: source,
+                }
             }),
             policy,
         ))

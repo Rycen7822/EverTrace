@@ -1955,12 +1955,16 @@ impl BackgroundScheduler {
             } else {
                 resolver.resolve_source(&snapshot, source, &context, None)
             };
-            let (command, policy) = match resolution {
+            let (command, policy, goal) = match resolution {
                 Ok((ControlledRunCommand::NoDelta, _)) => continue,
-                Ok((ControlledRunCommand::WorkRoot { command }, policy))
-                | Ok((ControlledRunCommand::Declaration { command, .. }, policy))
+                Ok((ControlledRunCommand::WorkRoot { command, goal }, policy)) => {
+                    (command, policy, Some(goal))
+                }
+                Ok((ControlledRunCommand::Declaration { command, .. }, policy))
                 | Ok((ControlledRunCommand::Result { command }, policy))
-                | Ok((ControlledRunCommand::Terminal { command, .. }, policy)) => (command, policy),
+                | Ok((ControlledRunCommand::Terminal { command, .. }, policy)) => {
+                    (command, policy, None)
+                }
                 Err(AutoresearchError::Store(_)) => return Err(BackgroundSchedulerError::Store),
                 // Absent/contradictory/untrusted evidence is not a write or a fabricated terminal result.
                 Err(_) => continue,
@@ -2009,6 +2013,14 @@ impl BackgroundScheduler {
             .await
             .map_err(|_| BackgroundSchedulerError::Store)?;
             if !denied.is_empty() || !blocked.is_empty() {
+                continue;
+            }
+            if let Some(goal) = goal
+                && crate::autoresearch::read_live_root_goal(current, goal, &self.runtime)
+                    .await
+                    .map_err(|_| BackgroundSchedulerError::Store)?
+                    .is_none()
+            {
                 continue;
             }
             match self
