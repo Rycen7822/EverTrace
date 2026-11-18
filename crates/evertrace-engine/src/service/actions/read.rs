@@ -1427,7 +1427,9 @@ impl McpActionService {
             .map(ToString::to_string)
             .collect::<Vec<_>>();
         let query = exact_identifiers.join(" ");
+        let deadline = std::time::Instant::now() + std::time::Duration::from_millis(250);
         let supplemental = ProductionSearch::new(self.search_index.clone())
+            .with_validated_frontier(scope.snapshot.frontier)
             .with_procedure_revisions(BTreeSet::new())
             .search(SearchContext {
                 query_anchor: scope.anchor.search_anchor(),
@@ -1470,23 +1472,71 @@ impl McpActionService {
         let mut next_refs = need.recall_plan.supporting_evidence_refs;
         let mut completeness = "complete";
         match supplemental {
-            Ok(found) => {
-                let now = unix_time_us_for_mcp();
-                for candidate in found.candidates.into_iter().take(2) {
-                    if let Some(item) = classify_search_candidate(scope, &candidate, now) {
-                        items.push(item);
+            Ok(found)
+                if found.projection_frontier == scope.snapshot.frontier
+                    && found.authoritative_frontier == scope.snapshot.frontier =>
+            {
+                let mut candidates = Vec::new();
+                for candidate in found.candidates.iter().take(2) {
+                    let mut matching = scope
+                        .snapshot
+                        .data_rows()
+                        .filter(|row| normal_search_candidate_matches_row(candidate, row));
+                    if let Some(row) = matching.next()
+                        && matching.next().is_none()
+                    {
+                        candidates.push((candidate, row));
                     } else {
-                        next_refs.push(candidate.candidate_id);
                         completeness = "partial";
                     }
                 }
+                if !candidates.is_empty() {
+                    let rows = candidates.iter().map(|(_, row)| *row).collect::<Vec<_>>();
+                    let report = match &self.session_report {
+                        Some(report) => report.read().await.clone(),
+                        None => None,
+                    };
+                    let bound_report = scope
+                        .binding
+                        .repository_report
+                        .as_deref()
+                        .or(report.as_ref());
+                    let blocked = self
+                        .blocked_read_rows_from_rows(
+                            bound_report,
+                            &scope.snapshot.rows,
+                            &rows,
+                            scope.anchor.repository_id,
+                            Some(deadline),
+                        )
+                        .await;
+                    let now = unix_time_us_for_mcp();
+                    let label = scope_label(scope);
+                    for (candidate, row) in candidates {
+                        if std::time::Instant::now() < deadline
+                            && blocked
+                                .as_ref()
+                                .is_ok_and(|refs| !refs.contains(&row.row_id))
+                            && let Some(item) = classify_search_candidate_rows(
+                                &scope.snapshot.rows,
+                                &label,
+                                candidate,
+                                now,
+                            )
+                        {
+                            items.push(item);
+                        } else {
+                            completeness = "partial";
+                        }
+                    }
+                }
+                // Unreviewed supplement references must not leave through continuation hints.
                 if !found.degraded_reasons.is_empty() || !found.omitted_refs.is_empty() {
                     completeness = "partial";
                 }
                 warnings.extend(found.degraded_reasons);
-                next_refs.extend(found.omitted_refs);
             }
-            Err(_) => {
+            _ => {
                 completeness = "partial";
                 warnings.push("recall_supplement_unavailable".into());
             }
@@ -1556,14 +1606,6 @@ fn recall_ledger_command(
         )],
     )
     .map_err(|_| McpServiceError::Store)
-}
-
-fn classify_search_candidate(
-    scope: &McpRequestScope,
-    candidate: &evertrace_domain::query::SearchCandidate,
-    now: i64,
-) -> Option<McpServiceItem> {
-    classify_search_candidate_rows(&scope.snapshot.rows, &scope_label(scope), candidate, now)
 }
 
 fn normal_search_candidate_matches_row(
