@@ -70,6 +70,10 @@ impl Goal {
     fn root_ref(&self) -> String {
         format!("native-host-goal:{}", self.thread_id)
     }
+
+    fn epoch(&self) -> (&str, &str, i64) {
+        (&self.thread_id, &self.objective, self.created_at)
+    }
 }
 
 #[derive(Deserialize)]
@@ -121,6 +125,15 @@ pub fn observed_goal(raw: &[u8]) -> Result<Option<(String, String)>> {
     Ok(decode(raw)?.map(|goal| (goal.root_ref(), goal.objective)))
 }
 
+/// Compare already admitted goal observations, independent of lifecycle status.
+/// Creation time has only second precision in this source ABI.
+pub fn same_goal_epoch(archived: &[u8], current: &[u8]) -> bool {
+    match (decode(archived), decode(current)) {
+        (Ok(Some(old)), Ok(Some(new))) => old.epoch() == new.epoch(),
+        _ => false,
+    }
+}
+
 /// A current publisher and the protected original bytes have independently agreed on this root.
 pub struct RootGoal {
     reference: String,
@@ -150,9 +163,7 @@ impl RootGoal {
     pub fn matches_bound_state(&self, protected: &[u8], complete: bool) -> bool {
         decode(protected).is_ok_and(|goal| {
             goal.is_some_and(|goal| {
-                goal.thread_id == self.thread
-                    && goal.objective == self.objective
-                    && goal.created_at == self.created_at
+                goal.epoch() == (&*self.thread, &*self.objective, self.created_at)
                     && (goal.status == "complete") == complete
             })
         })

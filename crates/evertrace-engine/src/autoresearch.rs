@@ -2044,7 +2044,7 @@ impl ControlledRunResolver {
             }
             match self.resolve_root_goal(snapshot, facts, goal_id, context, key_dir) {
                 Ok((command, Some(policy))) => {
-                    verified.push((command, policy, native_id, effect, goal_id))
+                    verified.push((command, policy, native_id, effect, goal_id, raw))
                 }
                 Err(AutoresearchError::Store(error)) => {
                     return Err(AutoresearchError::Store(error));
@@ -2055,7 +2055,7 @@ impl ControlledRunResolver {
         if verified.len() != 1 {
             return Ok((ControlledRunCommand::NoDelta, None));
         }
-        let (command, policy, native, effect, goal) = verified
+        let (command, policy, native, effect, goal, goal_raw) = verified
             .pop()
             .ok_or(AutoresearchError::EvidenceIncomplete)?;
         if !matches!(command, ControlledRunCommand::NoDelta) {
@@ -2256,6 +2256,9 @@ impl ControlledRunResolver {
             effect,
             root_source: native,
             goal_source: goal,
+            goal_raw: &goal_raw,
+            resolver: self,
+            ordinary_work: work,
         };
         let command = process_work_command(
             snapshot,
@@ -4006,6 +4009,57 @@ struct ProcessWorkAnchor<'a> {
     effect: &'a evertrace_domain::evidence::ScopeEffect,
     root_source: SourceObservationId,
     goal_source: SourceObservationId,
+    goal_raw: &'a [u8],
+    resolver: &'a ControlledRunResolver,
+    ordinary_work: bool,
+}
+
+impl ProcessWorkAnchor<'_> {
+    fn matches_checkpoint_goal(
+        &self,
+        snapshot: &ProjectionSnapshot,
+        facts: &ControlledFacts,
+        stream: &Workstream,
+        prior: &str,
+        watermark: u64,
+    ) -> Result<bool, AutoresearchError> {
+        use evertrace_capture::goal_source;
+        // A later binding may accumulate the recreated goal. Only the earliest accepted
+        // binding for the prior declaration, within the checkpoint prefix, can anchor it.
+        let opening = snapshot
+            .data_rows()
+            .filter_map(|row| {
+                if row.object_kind.as_deref() != Some("work_binding")
+                    || row.source_event_seq > watermark
+                {
+                    return None;
+                }
+                let JournalPayload::WorkBindingRecorded(binding) =
+                    serde_json::from_str(row.payload_json.as_deref()?).ok()?
+                else {
+                    return None;
+                };
+                source_owns_stream(&binding, stream, prior)
+                    .then_some((row.source_event_seq, binding))
+            })
+            .min_by_key(|(sequence, _)| *sequence);
+        let Some((_, opening)) = opening else {
+            return Ok(false);
+        };
+        let reference = &facts.receipt(self.goal_source)?.source_ref;
+        let mut roots = opening.evidence_refs.iter().filter_map(|value| {
+            let id = value.parse::<SourceObservationId>().ok()?;
+            let receipt = facts.receipt(id).ok()?;
+            (receipt.source_ref == *reference
+                && goal_source::is_source_revision(receipt.source_revision.as_str()))
+            .then_some(id)
+        });
+        let Some(root) = roots.next().filter(|_| roots.next().is_none()) else {
+            return Ok(false);
+        };
+        let raw = self.resolver.protected_source(facts, root)?;
+        Ok(goal_source::same_goal_epoch(&raw, self.goal_raw))
+    }
 }
 
 fn resume_checkpoint_refs(
@@ -4079,6 +4133,20 @@ fn process_work_command(
         .map(|lane| lane_capture_receipt(snapshot.data_rows(), lane))
         .transpose()?
         .flatten();
+    // A scope can arrive before lane normalization. Ordinary Work must wait for the
+    // lane's current receipt rather than bypass the checkpoint gate as if already attached.
+    if anchor.ordinary_work
+        && root_capture.as_ref().is_none_or(|receipt| {
+            facts
+                .execution_lanes
+                .get(&receipt.execution_lane_id)
+                .is_none_or(|lane| {
+                    lane.active_capture_receipt_revision_id != receipt.capture_receipt_revision_id
+                })
+        })
+    {
+        return Ok(None);
+    }
     let root_lane = root_capture
         .as_ref()
         .map(|receipt| receipt.execution_lane_id);
@@ -4159,8 +4227,10 @@ fn process_work_command(
                 let basis = worktree
                     .and_then(|id| facts.worktrees.get(&id))
                     .and_then(|value| value.current_snapshot_id);
-                if prior.is_none()
-                    || !phase.session_ids.iter().any(|id| id == anchor.session)
+                let Some(prior) = prior else {
+                    return Ok(None);
+                };
+                if !phase.session_ids.iter().any(|id| id == anchor.session)
                     || phase.phase_contract != plan.phase
                     || !known_strategy
                     || (repository.is_some() && basis.is_none())
@@ -4170,6 +4240,15 @@ fn process_work_command(
                 let Some(checkpoint) = resume_checkpoint(snapshot, phase, basis) else {
                     return Ok(None);
                 };
+                if !anchor.matches_checkpoint_goal(
+                    snapshot,
+                    facts,
+                    stream,
+                    prior,
+                    phase.source_watermark,
+                )? {
+                    return Ok(None);
+                }
                 sources.push(checkpoint.clone());
             }
             if prior.is_none() && (phase.phase_contract != plan.phase || !known_strategy) {
