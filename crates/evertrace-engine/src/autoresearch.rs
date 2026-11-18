@@ -2777,6 +2777,44 @@ impl ControlledRunResolver {
             JournalPayload::ExperimentRunRecorded(Box::new(next.clone())),
             JournalPayload::ResultEvidenceRecorded(Box::new(result.clone())),
         ]);
+        if current.metric_extractor_version == NATIVE_TEST_COHORT_PARSER_VERSION {
+            let stream = facts
+                .workstreams
+                .get(&current.workstream_id)
+                .ok_or(AutoresearchError::EvidenceIncomplete)?;
+            let launch_phase = facts
+                .attempts
+                .get(&attempt)
+                .and_then(|value| value.episode_id)
+                .and_then(|id| facts.current_episodes.get(&id))
+                .and_then(|id| facts.episodes.get(id))
+                .ok_or(AutoresearchError::EvidenceIncomplete)?;
+            if evertrace_domain::work::awaiting_experiment_result(stream, launch_phase) {
+                let mut resumed = stream.clone();
+                resumed.revision_id = RevisionId::new_v7();
+                resumed.predecessor_revision_id = Some(stream.revision_id);
+                resumed.status = evertrace_domain::work::WorkstreamStatus::Active;
+                resumed.phase_contract = evertrace_domain::work::experiment_analysis_phase(
+                    &next,
+                    result.result_evidence_id,
+                );
+                resumed.source_watermark = facts.runs.frontier.max(
+                    stream
+                        .source_watermark
+                        .checked_add(1)
+                        .ok_or(AutoresearchError::InvalidInput)?,
+                );
+                // The accepted result anchors the analysis. Its launch snapshot is not a fresh Git observation.
+                let analysis =
+                    crate::work::episode::new_episode(&resumed, None, resumed.source_watermark)
+                        .map_err(|_| AutoresearchError::ImmutableConflict)?;
+                resumed.active_episode_id = Some(analysis.episode_id);
+                payloads.extend([
+                    JournalPayload::WorkEpisodeRecorded(Box::new(analysis)),
+                    JournalPayload::WorkstreamRecorded(Box::new(resumed)),
+                ]);
+            }
+        }
         let command = payload_command(context, payloads)?;
         Ok(ControlledRunCommand::Terminal {
             run: Box::new(next),
@@ -4286,7 +4324,6 @@ fn process_work_command(
         if stream.task_id != task.task_id
             || stream.repository_instance_id != repository
             || stream.worktree_instance_ids != worktree.into_iter().collect::<Vec<_>>()
-            || (prior.is_none() && stream.phase_contract != plan.phase)
         {
             return Err(AutoresearchError::ImmutableConflict);
         }
@@ -4307,6 +4344,9 @@ fn process_work_command(
                 })
         }) {
             return Ok(None);
+        }
+        if prior.is_none() && stream.phase_contract != plan.phase {
+            return Err(AutoresearchError::ImmutableConflict);
         }
         if let Some(episode_id) = stream.active_episode_id {
             let phase = facts

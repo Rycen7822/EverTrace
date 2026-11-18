@@ -352,6 +352,73 @@ pub struct WorkEpisode {
 }
 
 impl WorkEpisode {
+    pub fn start(
+        episode_id: WorkEpisodeId,
+        revision_id: RevisionId,
+        workstream: &super::Workstream,
+        entry_snapshot: Option<WorktreeSnapshotId>,
+        source_watermark: u64,
+    ) -> Result<Self, WorkError> {
+        if workstream.active_episode_id.is_some()
+            || workstream.status.is_terminal()
+            || source_watermark < workstream.source_watermark
+        {
+            return Err(WorkError::InvalidWorkIdentity);
+        }
+        let episode = WorkEpisode {
+            episode_id,
+            revision_id,
+            predecessor_revision_id: None,
+            revision_generation: 1,
+            task_id: workstream.task_id,
+            workstream_id: workstream.workstream_id,
+            repository_instance_id: workstream.repository_instance_id,
+            worktree_instance_id: workstream.active_worktree_instance_id,
+            phase_contract: workstream.phase_contract.clone(),
+            lifecycle_status: EpisodeLifecycle::Open,
+            boundary_status: BoundaryStatus::Provisional,
+            source_watermark,
+            semantic_watermark: 0,
+            confirmation_watermark: 0,
+            capture_watermark: 0,
+            entry_worktree_snapshot_id: entry_snapshot,
+            exit_worktree_snapshot_id: None,
+            session_ids: vec![],
+            execution_lane_ids: vec![],
+            attempt_ids: vec![],
+            competing_attempt_group_ids: vec![],
+            operation_burst_refs: vec![],
+            worktree_transition_refs: vec![],
+            failed_attempt_ids: vec![],
+            interrupted_attempt_ids: vec![],
+            returned_but_unselected_attempt_ids: vec![],
+            selected_attempt_ids: vec![],
+            failure_refs: vec![],
+            interruption_refs: vec![],
+            completed_outcome_refs: vec![],
+            selected_outcome_refs: vec![],
+            verification_refs: vec![],
+            open_loops: vec![],
+            checkpoint_refs: vec![],
+            capture_receipt_revision_ids: vec![],
+            capture_gap_refs: vec![],
+            capture_outage_refs: vec![],
+            pending_delta_stats: PendingDeltaStats::default(),
+            pending_semantic_delta: (source_watermark > 0).then_some(PendingSemanticInterval {
+                after_watermark: 0,
+                through_watermark: source_watermark,
+            }),
+            boundary_candidate: None,
+            capture_summary: CaptureSummary::default(),
+            segmentation_correction_refs: vec![],
+            experiment_run_refs: vec![],
+            work_artifact_refs: vec![],
+            semantic_digest_refs: vec![],
+        };
+        episode.validate()?;
+        Ok(episode)
+    }
+
     pub fn validate(&self) -> Result<(), WorkError> {
         self.phase_contract.validate()?;
         self.capture_summary.validate()?;

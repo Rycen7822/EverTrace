@@ -20,6 +20,34 @@ const MAX_FIELDS: usize = 128;
 const MAX_TEXT: usize = 1024;
 const CONTROLLED_SOURCE_VERSION: u32 = 1;
 
+/// A result can resume its own confirmed launch Phase, never an unrelated active Phase.
+pub fn awaiting_experiment_result(stream: &super::Workstream, launch: &super::WorkEpisode) -> bool {
+    stream.status == super::WorkstreamStatus::Paused
+        && stream.active_episode_id.is_none()
+        && launch.workstream_id == stream.workstream_id
+        && launch.task_id == stream.task_id
+        && launch.lifecycle_status == super::EpisodeLifecycle::Closed
+        && launch.boundary_status == super::BoundaryStatus::Confirmed
+        && launch.phase_contract.phase_kind == super::PhaseKind::Execute
+        && launch.phase_contract == stream.phase_contract
+}
+
+pub fn experiment_analysis_phase(
+    run: &ExperimentRun,
+    result: crate::ids::ResultEvidenceId,
+) -> super::PhaseContract {
+    super::PhaseContract {
+        phase_kind: super::PhaseKind::Analyze,
+        phase_label: "Analyze experiment result".into(),
+        local_goal: "Interpret the accepted result against the recorded experiment contract".into(),
+        primary_targets: vec![run.run_id.to_string()],
+        entry_conditions: vec![result.to_string()],
+        acceptance_boundary: "Explain the result and its limits using recorded evidence".into(),
+        expected_state_transition: "Result analyzed; adoption and comparison remain independent"
+            .into(),
+    }
+}
+
 /// Business eligibility diagnostics, independent of any presentation surface.
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "snake_case")]

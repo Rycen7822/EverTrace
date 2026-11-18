@@ -3986,6 +3986,20 @@ pub fn read_dependencies_for(row: &ObjectRow, payload: &JournalPayload) -> BTree
         }
         JournalPayload::WorkEpisodeRecorded(value) => {
             refs.insert(value.workstream_id.to_string());
+            if value.phase_contract.phase_kind == evertrace_domain::work::PhaseKind::Analyze {
+                refs.extend(
+                    value
+                        .phase_contract
+                        .entry_conditions
+                        .iter()
+                        .filter(|reference| {
+                            reference
+                                .parse::<evertrace_domain::ids::ResultEvidenceId>()
+                                .is_ok()
+                        })
+                        .cloned(),
+                );
+            }
             refs.extend(
                 value
                     .capture_receipt_revision_ids

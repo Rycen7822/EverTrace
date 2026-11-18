@@ -31,6 +31,7 @@ use crate::{
 };
 
 pub(crate) struct ControlledRunAdmissionView<'a> {
+    pub frontier: u64,
     pub runs: &'a BTreeMap<ExperimentRunId, (ExperimentRun, u64)>,
     pub attempts: &'a BTreeMap<AttemptId, (Attempt, u64)>,
     pub work_bindings:
@@ -52,6 +53,7 @@ pub(crate) struct ControlledRunAdmissionView<'a> {
 impl super::JournalAdmissionState {
     pub(super) fn controlled_run_admission(&self) -> ControlledRunAdmissionView<'_> {
         ControlledRunAdmissionView {
+            frontier: self.frontier,
             runs: &self.experiment_runs,
             attempts: &self.attempts,
             work_bindings: &self.work_bindings,
@@ -868,6 +870,78 @@ fn validate_native_terminal_cohort(
             .get(terminal)
             .is_none_or(|(receipt, _)| receipt.cas_ref != digest)
     {
+        return Err(error);
+    }
+    validate_native_analysis_handoff(view, run, result, payloads, error)
+}
+
+fn validate_native_analysis_handoff(
+    view: &ControlledRunAdmissionView<'_>,
+    run: &ExperimentRun,
+    result: &ResultEvidence,
+    payloads: &[&JournalPayload],
+    error: StoreError,
+) -> Result<(), StoreError> {
+    use evertrace_domain::work::{
+        NATIVE_TEST_COHORT_PARSER_VERSION, WorkstreamStatus, awaiting_experiment_result,
+        experiment_analysis_phase,
+    };
+    let mut episodes = payloads.iter().filter_map(|payload| match payload {
+        JournalPayload::WorkEpisodeRecorded(episode) => Some(episode.as_ref()),
+        _ => None,
+    });
+    let mut streams = payloads.iter().filter_map(|payload| match payload {
+        JournalPayload::WorkstreamRecorded(stream) => Some(stream.as_ref()),
+        _ => None,
+    });
+    let stream = &view.workstreams.get(&run.workstream_id).ok_or(error)?.0;
+    let attempt = &view
+        .attempts
+        .get(&run.attempt_id.ok_or(error)?)
+        .ok_or(error)?
+        .0;
+    let launch = &view
+        .episodes
+        .get(&attempt.episode_id.ok_or(error)?)
+        .ok_or(error)?
+        .0;
+    let (episode, resumed) = (episodes.next(), streams.next());
+    if run.metric_extractor_version != NATIVE_TEST_COHORT_PARSER_VERSION
+        || !awaiting_experiment_result(stream, launch)
+    {
+        return if episode.is_none() && resumed.is_none() {
+            Ok(())
+        } else {
+            Err(error)
+        };
+    }
+    let (Some(episode), Some(resumed)) = (episode, resumed) else {
+        return Err(error);
+    };
+    if episodes.next().is_some()
+        || streams.next().is_some()
+        || view.episodes.contains_key(&episode.episode_id)
+    {
+        return Err(error);
+    }
+    let mut expected = stream.clone();
+    expected.predecessor_revision_id = Some(stream.revision_id);
+    expected.revision_id = resumed.revision_id;
+    expected.status = WorkstreamStatus::Active;
+    expected.phase_contract = experiment_analysis_phase(run, result.result_evidence_id);
+    expected.source_watermark = view
+        .frontier
+        .max(stream.source_watermark.checked_add(1).ok_or(error)?);
+    let initial = WorkEpisode::start(
+        episode.episode_id,
+        episode.revision_id,
+        &expected,
+        None,
+        expected.source_watermark,
+    )
+    .map_err(|_| error)?;
+    expected.active_episode_id = Some(episode.episode_id);
+    if initial != *episode || expected != *resumed {
         return Err(error);
     }
     Ok(())
