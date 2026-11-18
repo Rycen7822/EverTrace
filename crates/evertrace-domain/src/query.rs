@@ -2881,7 +2881,9 @@ pub enum ExactRecordInfo {
         source: Option<Box<ExactSourceIdentity>>,
     },
     /// Current folded ledger axes, pinned by selection.source_event_seq; not Need revision history.
-    CurrentRecall,
+    CurrentRecall {
+        active_retrieval_request_id: Option<String>,
+    },
     /// Current mandatory projection; source_event_seq pins its source watermark, not Procedure history.
     CurrentProcedureEffect,
     Work {
@@ -2952,10 +2954,18 @@ impl ExactRecordWindow {
                                 })
                         }
                         ExactRecordInfo::Semantic { .. } => true,
-                        ExactRecordInfo::CurrentRecall => self
-                            .selection
-                            .as_ref()
-                            .is_some_and(|selected| selected.object_kind == "recall_need"),
+                        ExactRecordInfo::CurrentRecall {
+                            active_retrieval_request_id,
+                        } => {
+                            self.selection
+                                .as_ref()
+                                .is_some_and(|selected| selected.object_kind == "recall_need")
+                                && active_retrieval_request_id.as_ref().is_none_or(|id| {
+                                    !id.is_empty()
+                                        && id.len() <= 512
+                                        && !id.chars().any(char::is_control)
+                                })
+                        }
                         ExactRecordInfo::CurrentProcedureEffect => {
                             self.selection.as_ref().is_some_and(|selected| {
                                 selected.object_kind == "procedure_context_effect"

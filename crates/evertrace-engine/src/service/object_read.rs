@@ -685,10 +685,16 @@ fn record_data(
         P::ProcedureNegativeEvidenceRecorded(value) => semantic_record(&value, None, query, check),
         P::ProcedureNegativeReviewRecorded(value) => semantic_record(&value, None, query, check),
         P::RecallLedgerRecorded(event) => match *event {
-            evertrace_domain::recall::RecallLedgerEvent::NeedRecorded { need } => {
-                Ok(semantic_record(&need, None, query, check)?
-                    .map(|(_, window)| (Info::CurrentRecall, window)))
-            }
+            evertrace_domain::recall::RecallLedgerEvent::NeedRecorded { need } => Ok(
+                semantic_record(&need, None, query, check)?.map(|(_, window)| {
+                    (
+                        Info::CurrentRecall {
+                            active_retrieval_request_id: need.active_retrieval_request_id,
+                        },
+                        window,
+                    )
+                }),
+            ),
             _ => Ok(None),
         },
         P::TaskRecorded(value) => {

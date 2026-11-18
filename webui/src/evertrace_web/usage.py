@@ -45,6 +45,7 @@ async def _read_recall_trace(backend, reference, revision, request_id, after):
             return {"kind":"recall_trace", "page":page}
         if current["info"]["kind"] != "current_recall":
             raise BackendError("invalid_input")
+        active_request = current["info"]["active_retrieval_request_id"]
         if current["selection"]["revision_ref"] != revision:
             return {"kind":"conflict"}
         if cursor is not None and (cursor["frontier"] != state["frontier"]
@@ -76,7 +77,9 @@ async def _read_recall_trace(backend, reference, revision, request_id, after):
             if event.get("kind") not in ("need_recorded", "presentation_attempt", "retrieval_outcome"):
                 raise BackendError("invalid_read_response")
             if event["kind"] == "retrieval_outcome":
-                if request_id is not None and event["outcome"]["request_id"] != request_id:
+                if event["outcome"]["request_id"] != active_request:
+                    raise BackendError("invalid_read_response")
+                if request_id is not None and active_request != request_id:
                     continue
                 matched = True
             page["events"].append(event)
@@ -88,10 +91,11 @@ async def _read_recall_trace(backend, reference, revision, request_id, after):
             page["next_cursor"] = json.dumps({"algorithm":"recall-ledger-1", "reference":reference, "revision":revision,
                 "request_id":request_id, "frontier":state["frontier"], "data_identity":state["data_identity"], "after":next_scan},
                 separators=(",", ":"))
-        # Later empty pages do not prove that no earlier page recorded this request.
         if matched or request_id is None and events:
             page["history_state"] = "recorded"
-        elif cursor is None and next_scan is None:
+        # The writer binds at most one retrieval request to this Need, never replacing it.
+        # A matching current identity is not a historical event; leave it unknown until read.
+        elif request_id is not None and active_request != request_id:
             page["history_state"] = "not_recorded"
         sealed = await backend.read_record_window(reference, None,
             data_identity=state["data_identity"], selection=current["selection"])

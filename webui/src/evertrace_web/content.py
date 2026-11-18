@@ -141,7 +141,7 @@ async def read_record_detail(backend, reference, frontier, revision, object_kind
     if meta["state"]["frontier"] < frontier:
         return {"kind": "conflict"}
     marker = {"recall_need":"current_recall", "procedure_context_effect":"current_procedure_effect"}.get(object_kind)
-    if marker and meta["content_state"] == "ready" and meta["info"] != {"kind":marker}:
+    if marker and meta["content_state"] == "ready" and (meta["info"] or {}).get("kind") != marker:
         raise BackendError("invalid_read_response")
     row = meta["metadata"]
     if row is None:
