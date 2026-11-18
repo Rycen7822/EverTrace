@@ -11,7 +11,8 @@
   <dt>来源</dt><dd>{{ value.origin }}</dd>
   <dt>外部系统</dt><dd>{{ value.external_system_id or '未记录' }} · {{ value.external_run_key or '未记录' }}</dd>
 </dl>
-<p>工作线：{{ value.workstream_id }} · 代码快照：{{ value.code_snapshot_id }}</p>
+<p>工作线：{{ value.workstream_id }}</p>
+{{ text_list('此 Run 修订保存的代码快照', [value.code_snapshot_id], record_kind='worktree_snapshot', exact_revision=true) }}
 <button class="text-button" type="button" data-link-key="{{ value.workstream_id }}"
   data-object="{{ value.workstream_id }}" data-kind="workstream">读取当前工作线</button>
 {% if value.attempt_id %}
@@ -51,8 +52,8 @@
 </dl>
 {% else %}<p class="muted">未记录受控执行绑定。</p>{% endif %}
 </section>
-{{ text_list('来源回执', value.source_receipt_refs) }}
-{{ text_list('终态证据', value.terminal_evidence_refs) }}
+{{ text_list('保存的终态回执', value.terminal_evidence_refs, record_kind='source_receipt', exact_revision=true) }}
+{{ text_list('执行合同来源回执', value.source_receipt_refs, record_kind='source_receipt', exact_revision=true) }}
 <section class="semantic-section"><h3>工作产物</h3>
 {% for artifact in value.work_artifact_refs %}
 <button class="text-button" type="button" data-link-key="{{ artifact }}" data-object="{{ artifact }}"
