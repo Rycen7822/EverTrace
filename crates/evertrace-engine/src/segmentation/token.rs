@@ -287,12 +287,14 @@ impl ActivityToken {
             if self.observed_phase_kind != Some(declared.phase_kind) {
                 return Err(DetectorError::Ineligible);
             }
-            // Goal/acceptance deltas are hints. Labels and target spelling do not prove a new target family.
-            self.declared_contract_changed = declared.local_goal != current.local_goal
+            // These are proposal hints, not closure evidence. Label and target spelling alone do not change the Phase.
+            self.declared_contract_changed = (declared.phase_kind != PhaseKind::Unknown
+                && declared.phase_kind != current.phase_kind)
+                || declared.local_goal != current.local_goal
                 || declared.acceptance_boundary != current.acceptance_boundary
                 || declared.expected_state_transition != current.expected_state_transition;
             self.replaces_candidate = declared.phase_kind != PhaseKind::Unknown
-                && (declared.phase_kind != current.phase_kind || self.declared_contract_changed)
+                && self.declared_contract_changed
                 && anchored.is_some_and(|anchor| anchor != declared);
         }
         Ok(self)

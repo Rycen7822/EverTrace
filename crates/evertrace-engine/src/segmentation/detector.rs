@@ -338,8 +338,9 @@ impl SegmentationDetector {
                 .left_feature
                 .as_ref()
                 .is_some_and(|left| left.distance(&feature) < candidate.feature.distance(&feature));
-            if (observed == Some(candidate.original_phase) && !token.declared_contract_changed())
-                || returned_left
+            // A matching failure or tool shape is not a return to the old contract when the source still proposes a change.
+            if !token.declared_contract_changed()
+                && (observed == Some(candidate.original_phase) || returned_left)
             {
                 self.candidate = None;
                 self.boundary_status = BoundaryStatus::Provisional;
