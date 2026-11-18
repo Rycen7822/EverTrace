@@ -315,24 +315,54 @@ impl JournalAdmissionState {
         completed: &mut dyn FnMut(WorkEpisodeId) -> Result<bool, StoreError>,
     ) -> Result<Option<SegmentationReadContext>, StoreError> {
         use evertrace_domain::{evidence::CorrelationStrength, work::AssignmentStatus};
-        let mut bindings = BTreeMap::<OperationId, (&WorkBindingRevision, u64)>::new();
+        fn select_binding<'a>(
+            current: &mut Option<(&'a WorkBindingRevision, u64)>,
+            next: (&'a WorkBindingRevision, u64),
+        ) {
+            if current.is_none_or(|(previous, _)| {
+                next.0.revision_generation > previous.revision_generation
+            }) {
+                *current = Some(next);
+            }
+        }
+        let mut bindings = BTreeMap::<OperationId, Option<(&WorkBindingRevision, u64)>>::new();
+        if after > 0 {
+            for (id, (_, sequence)) in &self.operations {
+                if *sequence > after {
+                    bindings.insert(*id, None);
+                }
+            }
+        }
         for (binding, sequence) in self.work_bindings.values() {
-            let current = bindings
-                .entry(binding.operation_id)
-                .or_insert((binding, *sequence));
-            if binding.revision_generation > current.0.revision_generation {
-                *current = (binding, *sequence);
+            if *sequence > after {
+                select_binding(
+                    bindings.entry(binding.operation_id).or_default(),
+                    (binding, *sequence),
+                );
+            }
+        }
+        // Either side can advance. For these candidates, an earlier journal sequence may still
+        // hold the current binding; semantic generation, not journal ordering, decides.
+        if after > 0 && !bindings.is_empty() {
+            for (binding, sequence) in self.work_bindings.values() {
+                if *sequence <= after
+                    && let Some(current) = bindings.get_mut(&binding.operation_id)
+                {
+                    select_binding(current, (binding, *sequence));
+                }
             }
         }
         let mut selected: Option<(&Operation, &WorkBindingRevision, u64, &WorkEpisode)> = None;
-        for (operation, operation_sequence) in self.operations.values() {
-            let Some((binding, binding_sequence)) = bindings
-                .get(&operation.operation_id)
+        for (id, binding) in bindings {
+            let Some((binding, binding_sequence)) = binding
                 .filter(|(binding, _)| binding.assignment_status == AssignmentStatus::Resolved)
             else {
                 continue;
             };
-            let sequence = (*operation_sequence).max(*binding_sequence);
+            let Some((operation, operation_sequence)) = self.operations.get(&id) else {
+                continue;
+            };
+            let sequence = (*operation_sequence).max(binding_sequence);
             if sequence <= after
                 || checkpoint.is_some_and(|target| !target.matches(operation, binding))
             {
@@ -404,7 +434,7 @@ impl JournalAdmissionState {
                     }
                 })
             {
-                selected = Some((operation, *binding, sequence, episode));
+                selected = Some((operation, binding, sequence, episode));
             }
         }
         let Some((operation, binding, sequence, episode)) = selected else {
