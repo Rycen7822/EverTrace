@@ -1595,6 +1595,9 @@ async fn reset_runtime_authority(
         PresentationAttemptState, RecallDeliveryState, RecallLedgerEvent, RecallObligationState,
         RecallPresentationAttempt,
     };
+    writer
+        .recover_interrupted_recall_retrievals_at(occurred_at_us, config_hash)
+        .await?;
     let snapshot = writer.full_projection().await?;
     let mut payloads = Vec::new();
     // A snapshot also contains native derived rows, not only JournalPayload.

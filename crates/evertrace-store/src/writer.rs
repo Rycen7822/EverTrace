@@ -713,13 +713,22 @@ impl JournalWriter {
         &mut self,
         config_hash: [u8; 32],
     ) -> Result<(), StoreError> {
-        use crate::JournalEventDraft;
-        use evertrace_domain::{ids::CommandId, recall::RecallLedgerEvent};
         let occurred_at_us = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .ok()
             .and_then(|elapsed| i64::try_from(elapsed.as_micros()).ok())
             .ok_or(StoreError::InvalidInput)?;
+        self.recover_interrupted_recall_retrievals_at(occurred_at_us, config_hash)
+            .await
+    }
+
+    pub(crate) async fn recover_interrupted_recall_retrievals_at(
+        &mut self,
+        occurred_at_us: i64,
+        config_hash: [u8; 32],
+    ) -> Result<(), StoreError> {
+        use crate::JournalEventDraft;
+        use evertrace_domain::{ids::CommandId, recall::RecallLedgerEvent};
         let mut after = None;
         loop {
             let outcomes = self
@@ -735,7 +744,7 @@ impl JournalWriter {
                     JournalEventDraft::runtime(
                         occurred_at_us,
                         config_hash,
-                        "startup_recall_retrieval_v1",
+                        "recall_retrieval_recovery_v1",
                         JournalPayload::RecallLedgerRecorded(Box::new(
                             RecallLedgerEvent::RetrievalOutcome { outcome },
                         )),
