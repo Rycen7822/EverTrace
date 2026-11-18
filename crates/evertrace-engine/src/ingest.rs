@@ -45,6 +45,7 @@ pub(crate) struct SourceSnapshotGuard {
     raw: Vec<u8>,
     path: std::path::PathBuf,
     caller_pid: u32,
+    deadline: std::time::Instant,
 }
 
 impl SourceSnapshotGuard {
@@ -62,6 +63,9 @@ impl SourceSnapshotGuard {
         view: evertrace_store::repository::RepositoryCurrentView,
         purged: &BTreeSet<RepositoryId>,
     ) -> Result<(), evertrace_store::StoreError> {
+        if std::time::Instant::now() >= self.deadline {
+            return Err(evertrace_store::StoreError::InvalidInput);
+        }
         let current = source.items.first().filter(|item| !item.suppressed);
         if !current.is_some_and(|item| {
             item.selected.payload_json.as_deref() == Some(self.observation_payload.as_str())
@@ -73,9 +77,12 @@ impl SourceSnapshotGuard {
             return Err(evertrace_store::StoreError::InvalidInput);
         }
         self.repository.validate(view, purged)?;
-        if evertrace_capture::process_source::source_launch(&self.raw, &self.path, self.caller_pid)
-            .is_err()
-        {
+        if std::time::Instant::now() >= self.deadline {
+            return Err(evertrace_store::StoreError::InvalidInput);
+        }
+        evertrace_capture::process_source::source_launch(&self.raw, &self.path, self.caller_pid)
+            .map_err(|_| evertrace_store::StoreError::InvalidInput)?;
+        if std::time::Instant::now() >= self.deadline {
             return Err(evertrace_store::StoreError::InvalidInput);
         }
         Ok(())
@@ -490,6 +497,7 @@ impl EvidenceIngestor {
         &self,
         observation_id: SourceObservationId,
         caller_pid: u32,
+        request_deadline: std::time::Instant,
     ) -> Result<bool, IngestError> {
         use crate::repository::{
             GitOid, HostTrustDecision, ProbeLimits, RepositoryResolveInput, ResolutionKind,
@@ -628,7 +636,7 @@ impl EvidenceIngestor {
                 if Path::new(&namespace.cwd) != launch.directory() {
                     return None;
                 }
-                let deadline = Instant::now() + Duration::from_millis(500);
+                let deadline = (Instant::now() + Duration::from_millis(500)).min(request_deadline);
                 let location =
                     crate::repository::workspace_git_location(Path::new(&namespace.cwd), deadline)
                         .ok()??;
@@ -641,12 +649,11 @@ impl EvidenceIngestor {
                     namespace.evidence_ref(&observation_id.to_string()),
                 ];
                 references.extend(trust.evidence_refs);
-                Some((launch, namespace, location, references, deadline, raw, path))
+                Some((launch, namespace, location, references, raw, path))
             })
             .await
             .map_err(|_| IngestError::Store)?;
-            let Some((launch, namespace, location, references, deadline, raw, path)) = located
-            else {
+            let Some((launch, namespace, location, references, raw, path)) = located else {
                 return Ok(false);
             };
             let (view, purged) = self
@@ -675,6 +682,9 @@ impl EvidenceIngestor {
                     .map(GitOid::parse)
                     .collect::<Result<Vec<_>, _>>()
                     .ok()?;
+                // Time spent waiting for the writer is not Git probe time. Both
+                // stages still share the Hook request deadline and live-source guard.
+                let deadline = (Instant::now() + Duration::from_millis(500)).min(request_deadline);
                 let evidence = crate::repository::with_probe_deadline(deadline, || {
                     crate::repository::probe_repository(
                         Path::new(&namespace.cwd),
@@ -772,6 +782,7 @@ impl EvidenceIngestor {
                 raw,
                 path,
                 caller_pid,
+                deadline: request_deadline,
             };
             match self
                 .writer

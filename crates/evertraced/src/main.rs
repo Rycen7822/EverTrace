@@ -652,7 +652,7 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
                         let peer = context.peer_credentials.ok_or(ErrorCode::Untrusted)?;
                         let ingestor = source_ingestor.ok_or(ErrorCode::Internal)?;
                         let changed = tokio::time::timeout_at(tokio::time::Instant::from_std(deadline),
-                            ingestor.observe_process_source(source_observation_id, peer.pid))
+                            ingestor.observe_process_source(source_observation_id, peer.pid, deadline))
                             .await.map_err(|_| ErrorCode::Untrusted)?
                             .map_err(|_| ErrorCode::Internal)?;
                         Ok(Response::ProcessSourceObserved(
