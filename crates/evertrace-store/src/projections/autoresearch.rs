@@ -806,25 +806,6 @@ fn validate_native_test_result(
         return Err(error);
     }
     let digest = hex(&result.raw_cas_refs[0].as_digest());
-    let receipts = view
-        .receipts
-        .values()
-        .filter(|(value, _)| {
-            value.cas_ref == digest
-                && value.capture_completeness == CaptureCompleteness::Complete
-                && value.source_revision.as_str()
-                    == evertrace_capture::process_source::SOURCE_REVISION
-                && (value.adapter_revision, value.parser_revision)
-                    == (
-                        evertrace_capture::process_source::ADAPTER_REVISION,
-                        evertrace_capture::process_source::PARSER_REVISION,
-                    )
-        })
-        .collect::<Vec<_>>();
-    let [(receipt, _)] = receipts.as_slice() else {
-        return Err(error);
-    };
-    let id = receipt.source_observation_id;
     let artifact_id = result.raw_artifact_refs[0];
     let artifact = view
         .artifacts
@@ -847,8 +828,11 @@ fn validate_native_test_result(
         .get(&snapshot.worktree_instance_id)
         .ok_or(error)?
         .0;
-    if artifact.revision.source_observation_refs != [id]
-        || artifact.revision.content_blob_ref != result.raw_cas_refs.first().copied()
+    let [id] = artifact.revision.source_observation_refs.as_slice() else {
+        return Err(error);
+    };
+    let id = *id;
+    if artifact.revision.content_blob_ref != result.raw_cas_refs.first().copied()
         || artifact.revision.scope
             != (ArtifactScope::Worktree {
                 repository_instance_id: worktree.repository_instance_id,
@@ -857,14 +841,32 @@ fn validate_native_test_result(
     {
         return Err(error);
     }
-    let (_, observation, raw) = native_source_bytes(
+    // A CAS digest locates protected bytes, not the physical observation or publisher.
+    let receipt_id = view
+        .observations
+        .get(&id)
+        .ok_or(error)?
+        .0
+        .source_receipt_ref;
+    let (receipt, observation, raw) = native_source_bytes(
         view,
-        receipt.source_receipt_id,
+        receipt_id,
         evertrace_domain::evidence::ObservationRole::Result,
         true,
         error,
     )?;
-    if receipt.identity_domain != evertrace_capture::process_source::FORMAT {
+    use evertrace_capture::process_source;
+    if receipt.source_observation_id != id
+        || receipt.cas_ref != digest
+        || receipt.source_revision.as_str() != process_source::SOURCE_REVISION
+        || (receipt.adapter_revision, receipt.parser_revision)
+            != (
+                process_source::ADAPTER_REVISION,
+                process_source::PARSER_REVISION,
+            )
+        || receipt.identity_domain != process_source::FORMAT
+        || full && run.terminal_evidence_refs != [receipt_id]
+    {
         return Err(error);
     }
     let event = NativeTestResult::decode(raw).ok_or(error)?;
