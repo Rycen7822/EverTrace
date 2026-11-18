@@ -91,6 +91,7 @@ pub(crate) struct ActivityToken {
     verifier_transition: VerifierTransition,
     observed_phase_kind: Option<PhaseKind>,
     declared_contract_changed: bool,
+    replaces_candidate: bool,
     boundary_evidence: BoundaryEvidence,
     boundary_evidence_refs: Vec<SourceObservationId>,
     session_id: String,
@@ -267,6 +268,7 @@ impl ActivityToken {
             verifier_transition: facts.verifier_transition,
             observed_phase_kind: facts.observed_phase_kind,
             declared_contract_changed: false,
+            replaces_candidate: false,
             boundary_evidence: facts.boundary_evidence,
             boundary_evidence_refs: evidence_refs,
             session_id: lane.host_session_id.clone(),
@@ -278,6 +280,7 @@ impl ActivityToken {
         mut self,
         current: &evertrace_domain::work::PhaseContract,
         declared: Option<&evertrace_domain::work::PhaseContract>,
+        anchored: Option<&evertrace_domain::work::PhaseContract>,
     ) -> Result<Self, DetectorError> {
         if let Some(declared) = declared {
             declared.validate().map_err(|_| DetectorError::Ineligible)?;
@@ -288,8 +291,15 @@ impl ActivityToken {
             self.declared_contract_changed = declared.local_goal != current.local_goal
                 || declared.acceptance_boundary != current.acceptance_boundary
                 || declared.expected_state_transition != current.expected_state_transition;
+            self.replaces_candidate = declared.phase_kind != PhaseKind::Unknown
+                && (declared.phase_kind != current.phase_kind || self.declared_contract_changed)
+                && anchored.is_some_and(|anchor| anchor != declared);
         }
         Ok(self)
+    }
+
+    pub(super) const fn replaces_candidate(&self) -> bool {
+        self.replaces_candidate
     }
 
     pub(super) const fn declared_contract_changed(&self) -> bool {

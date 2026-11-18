@@ -323,6 +323,10 @@ impl SegmentationDetector {
         let mut retracted = false;
         let mut confirmation_evidence = vec![];
         let feature = BurstFeature::from_burst(burst.current());
+        if token.replaces_candidate() {
+            self.candidate = None;
+            self.boundary_status = BoundaryStatus::Provisional;
+        }
         if let Some(candidate) = &mut self.candidate {
             if candidate.observations < REFINEMENT_WINDOW {
                 candidate.observations = candidate

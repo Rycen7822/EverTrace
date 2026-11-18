@@ -188,6 +188,7 @@ async fn phase_completion(
     selected: &SegmentationReadContext,
     runtime: &evertrace_capture::RuntimeSnapshot,
     phase: Option<&evertrace_domain::work::PhaseContract>,
+    anchored: Option<&evertrace_domain::work::PhaseContract>,
 ) -> Result<Option<SourceObservationId>, evertrace_capture::CasError> {
     use evertrace_domain::work::{BoundaryCandidateKind, PhaseKind};
     let state = &selected.state;
@@ -207,7 +208,8 @@ async fn phase_completion(
     let Some(stream) = state.authority().workstream(episode.workstream_id) else {
         return Ok(None);
     };
-    if stream.root_goal != episode.phase_contract.local_goal
+    if anchored != Some(phase)
+        || stream.root_goal != episode.phase_contract.local_goal
         || candidate.candidate_phase_kind != Some(phase.phase_kind)
     {
         return Ok(None);
@@ -275,11 +277,6 @@ async fn phase_completion(
         })
         .collect::<Vec<_>>();
     if roots.is_empty() {
-        return Ok(None);
-    }
-    let previous =
-        source_operation_activity(current, selected, anchor.operation_id, runtime).await?;
-    if previous.phase.as_ref() != Some(phase) {
         return Ok(None);
     }
     let prior = selected
@@ -520,6 +517,7 @@ fn derive_activity(
     selected: &SegmentationReadContext,
     exit: Option<i32>,
     declared_phase: Option<&evertrace_domain::work::PhaseContract>,
+    anchored: Option<&evertrace_domain::work::PhaseContract>,
     completion: Option<SourceObservationId>,
 ) -> Result<SegmentOutcome, DetectorError> {
     let state = &selected.state;
@@ -559,7 +557,13 @@ fn derive_activity(
             .collect(),
     };
     let mut segmenter = IncrementalSegmenter::restore(state, selected.episode_id)?;
-    segmenter.observe_declared(state, selected.operation_id, facts, declared_phase)
+    segmenter.observe_declared(
+        state,
+        selected.operation_id,
+        facts,
+        declared_phase,
+        anchored,
+    )
 }
 
 pub(super) fn tool_request_sources(
@@ -815,8 +819,21 @@ pub(crate) async fn advance_activity(
         let Some(deadline) = readable_context(writer, current, &selected, runtime).await? else {
             continue;
         };
-        let activity = match source_activity(current, &selected, runtime).await {
-            Ok(activity) => activity,
+        let activities = async {
+            let activity = source_activity(current, &selected, runtime).await?;
+            let anchored = if activity.phase.is_some()
+                && let Some((anchor, _)) = &selected.boundary_operation
+            {
+                source_operation_activity(current, &selected, anchor.operation_id, runtime)
+                    .await?
+                    .phase
+            } else {
+                None
+            };
+            Ok((activity, anchored))
+        };
+        let (activity, anchored) = match activities.await {
+            Ok(pair) => pair,
             Err(error) => {
                 let changed =
                     writer.sync_frontier().await.map_err(|_| Error::Writer)? != current.frontier();
@@ -831,21 +848,29 @@ pub(crate) async fn advance_activity(
         if std::time::Instant::now() >= deadline {
             continue;
         }
-        let completion =
-            match phase_completion(current, &selected, runtime, activity.phase.as_ref()).await {
-                Ok(value) => value,
-                Err(evertrace_capture::CasError::LockBusy) => {
-                    *after = previous;
-                    progress.retryable = true;
-                    return Ok(progress);
-                }
-                Err(_) => return Err(Error::Store),
-            };
+        let completion = match phase_completion(
+            current,
+            &selected,
+            runtime,
+            activity.phase.as_ref(),
+            anchored.as_ref(),
+        )
+        .await
+        {
+            Ok(value) => value,
+            Err(evertrace_capture::CasError::LockBusy) => {
+                *after = previous;
+                progress.retryable = true;
+                return Ok(progress);
+            }
+            Err(_) => return Err(Error::Store),
+        };
         let derive = |completion| {
             derive_activity(
                 &selected,
                 activity.exit_code,
                 activity.phase.as_ref(),
+                anchored.as_ref(),
                 completion,
             )
         };
