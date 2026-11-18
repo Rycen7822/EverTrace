@@ -158,6 +158,7 @@ pub struct SegmentationReadContext {
     pub state: SegmentationCurrentState,
     pub root_refs: Vec<String>,
     pub boundary_operation: Option<(Operation, WorkBindingRevision)>,
+    pub boundary_repository_identity: Option<evertrace_domain::repository::FilesystemIdentity>,
     pub source_refs: Vec<evertrace_domain::ids::SourceObservationId>,
     pub repository_ids: std::collections::BTreeSet<evertrace_domain::ids::RepositoryId>,
     pub snapshot: Option<evertrace_domain::repository::WorktreeSnapshot>,
@@ -371,6 +372,7 @@ impl JournalAdmissionState {
                 }
             }
             let mut consumed = false;
+            let mut last_sequence = 0;
             for id in &episode.operation_burst_refs {
                 let (burst, _) = self
                     .operation_bursts
@@ -380,6 +382,14 @@ impl JournalAdmissionState {
                     member.operation_id == operation.operation_id
                         && member.operation_revision == operation.operation_revision
                 });
+                if let Some(last) = burst.members.last() {
+                    last_sequence = last_sequence.max(last.sequence);
+                }
+            }
+            // A previously unreadable revision behind the consumed prefix is not later activity.
+            // Its canonical Operation/Capture history stays intact; newer revisions can still enter.
+            if checkpoint.is_none() && sequence <= last_sequence {
+                continue;
             }
             if consumed == checkpoint.is_some()
                 && selected.is_none_or(|(_, _, previous, _)| {
@@ -565,6 +575,12 @@ impl JournalAdmissionState {
                     .ok_or(StoreError::StoreCorrupt)
             })
             .transpose()?;
+        let boundary_repository_identity = episode.boundary_candidate.as_ref().and_then(|_| {
+            self.repositories
+                .get(&episode.repository_instance_id?)?
+                .0
+                .common_dir_filesystem
+        });
         let candidate_checkpointed = if let Some(candidate) = &episode.boundary_candidate {
             let mut saved = false;
             for key in &episode.checkpoint_refs {
@@ -594,6 +610,7 @@ impl JournalAdmissionState {
             },
             root_refs: task.request_root_refs.clone(),
             boundary_operation,
+            boundary_repository_identity,
             source_refs: source_refs.into_iter().collect(),
             repository_ids,
             snapshot,

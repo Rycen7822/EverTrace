@@ -201,10 +201,6 @@ async fn phase_completion(
     else {
         return Ok(None);
     };
-    // A new code Phase needs a fresh entry anchor; retaining the old Phase's entry is not such proof.
-    if episode.repository_instance_id.is_some() {
-        return Ok(None);
-    }
     let Some(stream) = state.authority().workstream(episode.workstream_id) else {
         return Ok(None);
     };
@@ -336,6 +332,160 @@ async fn phase_completion(
     })
     .await
     .map_err(|_| evertrace_capture::CasError::Io)?
+}
+
+struct CodeBoundarySnapshot {
+    id: evertrace_domain::ids::WorktreeSnapshotId,
+    payloads: Vec<evertrace_store::JournalPayload>,
+}
+
+/// Capture the current coherent worktree state at confirmation, never a retroactive tool-exit snapshot.
+async fn code_boundary_snapshot(
+    writer: &crate::WriterHandle,
+    current: &CurrentFacts,
+    selected: &SegmentationReadContext,
+    completion: SourceObservationId,
+) -> Result<Option<CodeBoundarySnapshot>, crate::maintenance::BackgroundSchedulerError> {
+    use crate::maintenance::BackgroundSchedulerError as Error;
+    use crate::repository::{GitOid, HostTrustDecision, ProbeLimits, RepositoryResolveInput};
+    use evertrace_codex::policy::RepositoryTrustState::Trusted;
+    use evertrace_domain::repository::SnapshotCaptureStatus;
+    let Some((identity, repository, worktree)) =
+        selected.boundary_repository_identity.and_then(|identity| {
+            let episode = selected.state.episode(selected.episode_id)?;
+            let worktree = episode.worktree_instance_id?;
+            let stream = selected
+                .state
+                .authority()
+                .workstream(episode.workstream_id)?;
+            (stream.active_worktree_instance_id == Some(worktree)).then_some((
+                identity,
+                episode.repository_instance_id?,
+                worktree,
+            ))
+        })
+    else {
+        return Ok(None);
+    };
+    let Some(policy) = source_policy(current, selected)
+        .await
+        .map_err(|_| Error::Store)?
+    else {
+        return Ok(None);
+    };
+    let (view, purged) = writer
+        .repository_resolution_context(identity)
+        .await
+        .map_err(|_| Error::Writer)?;
+    if view.frontier != current.frontier()
+        || !view.repositories.contains_key(&repository)
+        || view.repositories.values().any(|row| {
+            !crate::repository::repository_read_gate(row, purged.contains(&row.repository_id))
+        })
+    {
+        return Ok(None);
+    }
+    let Some(operation) = selected.state.authority().operation(selected.operation_id) else {
+        return Ok(None);
+    };
+    let reference = completion.to_string();
+    let mut references = vec![reference.clone()];
+    references.extend(
+        operation
+            .input_source_observation_refs
+            .iter()
+            .map(ToString::to_string),
+    );
+    tokio::task::spawn_blocking(move || {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_millis(500);
+        let path = view.worktrees.get(&worktree)?.current_path.as_deref()?;
+        let locator = std::path::Path::new(path);
+        let trust = policy.trust(Some(path), deadline);
+        if trust.state != Trusted {
+            return None;
+        }
+        let location = crate::repository::workspace_git_location(locator, deadline).ok()??;
+        if location.worktree_path != locator || location.common_dir_filesystem != identity {
+            return None;
+        }
+        references.extend(trust.evidence_refs);
+        let root = evertrace_capture::ConfinedRoot::open_external_source(locator).ok()?;
+        let pinned_cwd = root.proc_cwd_path().ok()?;
+        let root_identity = evertrace_domain::repository::FilesystemIdentity {
+            device: root.identity().device,
+            inode: root.identity().inode,
+        };
+        let heads = view
+            .snapshots
+            .values()
+            .filter_map(|snapshot| snapshot.head_oid.as_deref())
+            .map(GitOid::parse)
+            .collect::<Result<Vec<_>, _>>()
+            .ok()?;
+        let now = i64::try_from(
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .ok()?
+                .as_micros(),
+        )
+        .ok()?;
+        let mut evidence = crate::repository::with_probe_deadline(deadline, || {
+            crate::repository::probe_repository_pinned(
+                &pinned_cwd,
+                locator,
+                root_identity,
+                HostTrustDecision::Trusted,
+                &references,
+                now,
+                &ProbeLimits::default(),
+                &[],
+                &heads,
+            )
+        })
+        .ok()?;
+        root.revalidate().ok()?;
+        if evidence.unavailable_reason.is_some()
+            || evidence.worktree_root.as_deref() != Some(path)
+            || evidence.worktree_root_filesystem != Some(root_identity)
+            || evidence.common_dir_filesystem != Some(identity)
+            || evidence.git_dir.as_deref().map(std::path::Path::new)
+                != Some(location.git_dir.as_path())
+            || policy.trust(Some(path), deadline).state != Trusted
+        {
+            return None;
+        }
+        // The pinned probe does not traverse sibling worktrees. Only this entry has witnessed admin identity.
+        let entry = evidence
+            .worktree_entries
+            .iter_mut()
+            .find(|entry| entry.path == path)?;
+        entry.gitdir = Some(location.git_dir.to_str()?.to_owned());
+        evidence.git_dir = entry.gitdir.clone();
+        evidence.common_dir = Some(location.common_dir.to_str()?.to_owned());
+        let input = RepositoryResolveInput {
+            view: &view,
+            evidence: &evidence,
+            derived_from_hint: None,
+        };
+        let resolved = input
+            .resolve_with_incomplete_history(&view.repositories.keys().copied().collect())
+            .ok()?;
+        let resolved =
+            crate::repository::complete_repository_source_start(&input, &reference, resolved)
+                .ok()?;
+        let snapshot = resolved.snapshots.iter().find(|snapshot| {
+            snapshot.worktree_instance_id == worktree
+                && snapshot.captured_at_us == now
+                && snapshot.capture_status == SnapshotCaptureStatus::Complete
+                && snapshot.evidence_refs.contains(&reference)
+        })?;
+        Some(CodeBoundarySnapshot {
+            id: snapshot.worktree_snapshot_id,
+            payloads: resolved.payloads(),
+        })
+    })
+    .await
+    .map_err(|_| Error::Store)
 }
 
 /// A nonzero physical exit is an operation failure, not a verifier result or semantic boundary.
@@ -654,28 +804,60 @@ pub(crate) async fn advance_activity(
         if std::time::Instant::now() >= deadline {
             continue;
         }
-        let completion = phase_completion(current, &selected, runtime, activity.phase.as_ref())
-            .await
-            .map_err(|_| Error::Store)?;
-        if completion.is_some()
-            && readable_context(writer, current, &selected, runtime)
-                .await?
-                .is_none()
-        {
-            *after = previous;
-            progress.retryable = true;
-            return Ok(progress);
-        }
-        let step = match derive_activity(
-            &selected,
-            activity.exit_code,
-            activity.phase.as_ref(),
-            completion,
-        ) {
+        let completion =
+            match phase_completion(current, &selected, runtime, activity.phase.as_ref()).await {
+                Ok(value) => value,
+                Err(evertrace_capture::CasError::LockBusy) => {
+                    *after = previous;
+                    progress.retryable = true;
+                    return Ok(progress);
+                }
+                Err(_) => return Err(Error::Store),
+            };
+        let derive = |completion| {
+            derive_activity(
+                &selected,
+                activity.exit_code,
+                activity.phase.as_ref(),
+                completion,
+            )
+        };
+        let mut step = match derive(completion) {
             Ok(SegmentOutcome::Delta(step)) => step,
             Ok(SegmentOutcome::NoDelta) | Err(DetectorError::Ineligible) => continue,
             Err(_) => return Err(Error::Store),
         };
+        let mut boundary_snapshot = None;
+        if let Some(completion) = completion {
+            let code_scope = selected
+                .state
+                .episode(selected.episode_id)
+                .ok_or(Error::Store)?
+                .repository_instance_id
+                .is_some();
+            if code_scope
+                && step.detector().boundary_status()
+                    == evertrace_domain::work::BoundaryStatus::Confirmed
+            {
+                boundary_snapshot =
+                    code_boundary_snapshot(writer, current, &selected, completion).await?;
+                if boundary_snapshot.is_none() {
+                    step = match derive(None) {
+                        Ok(SegmentOutcome::Delta(step)) => step,
+                        Ok(SegmentOutcome::NoDelta) | Err(DetectorError::Ineligible) => continue,
+                        Err(_) => return Err(Error::Store),
+                    };
+                }
+            }
+            if readable_context(writer, current, &selected, runtime)
+                .await?
+                .is_none()
+            {
+                *after = previous;
+                progress.retryable = true;
+                return Ok(progress);
+            }
+        }
         let episode = selected
             .state
             .episode(selected.episode_id)
@@ -753,14 +935,18 @@ pub(crate) async fn advance_activity(
                 .authority()
                 .workstream(episode.workstream_id)
                 .ok_or(Error::Store)?;
-            let closed =
-                crate::work::episode::confirm_episode_boundary(episode, &step, None, &receipts)
-                    .map_err(|_| Error::Store)?;
+            let closed = crate::work::episode::confirm_episode_boundary(
+                episode,
+                &step,
+                boundary_snapshot.as_ref().map(|snapshot| snapshot.id),
+                &receipts,
+            )
+            .map_err(|_| Error::Store)?;
             let next = crate::work::episode::next_episode(
                 stream,
                 episode,
                 activity.phase.ok_or(Error::Store)?,
-                None,
+                boundary_snapshot.as_ref().map(|snapshot| snapshot.id),
                 closed.source_watermark,
             )
             .map_err(|_| Error::Store)?;
@@ -799,8 +985,20 @@ pub(crate) async fn advance_activity(
             crate::work::episode::save_segmentation_update(context, episode, &step, &receipts)
         }
         .map_err(|_| Error::Store)?;
-        let command = if !artifacts.is_empty() {
-            let mut events = command.events().to_vec();
+        let command = if !artifacts.is_empty() || boundary_snapshot.is_some() {
+            let mut events = boundary_snapshot
+                .into_iter()
+                .flat_map(|snapshot| snapshot.payloads)
+                .map(|payload| {
+                    evertrace_store::JournalEventDraft::runtime(
+                        occurred_at_us,
+                        runtime.effective_config_hash,
+                        "phase-boundary-snapshot-v1",
+                        payload,
+                    )
+                })
+                .collect::<Vec<_>>();
+            events.extend_from_slice(command.events());
             for artifact in artifacts {
                 events.push(evertrace_store::JournalEventDraft::runtime(
                     occurred_at_us,
