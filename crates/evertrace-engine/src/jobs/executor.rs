@@ -1778,7 +1778,7 @@ async fn run_writer(
                     let background_notify = result
                         .as_ref()
                         .ok()
-                        .filter(|_| background_relevant(&command))
+                        .filter(|outcome| !outcome.replayed && background_relevant(&command))
                         .map(|outcome| outcome.last_seq);
                     let fatal = result.as_ref().err().copied().filter(|error| {
                         matches!(
@@ -3207,6 +3207,7 @@ fn background_relevant(command: &JournalCommand) -> bool {
                 | evertrace_store::JournalPayload::OperationDerived(_)
                 | evertrace_store::JournalPayload::WorkBindingRecorded(_)
                 | evertrace_store::JournalPayload::ExperimentRunRecorded(_)
+                | evertrace_store::JournalPayload::WorktreeSnapshotRecorded(_)
                 | evertrace_store::JournalPayload::ConfigAudit(_)
         )
     })
