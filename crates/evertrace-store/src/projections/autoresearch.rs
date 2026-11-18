@@ -92,11 +92,12 @@ pub(crate) fn validate_controlled_command<'a>(
         })
         .collect::<Vec<_>>();
     for run in &runs {
-        if evertrace_domain::work::is_native_test_contract_parser(&run.metric_extractor_version) {
-            validate_native_contract(&view, run, error)?;
-        }
         if run.comparison_execution_binding.is_none() && !run.is_declaration_only() {
             validate_native_terminal_cohort(&view, run, &payloads, error)?;
+        } else if evertrace_domain::work::is_native_test_contract_parser(
+            &run.metric_extractor_version,
+        ) {
+            validate_native_contract(&view, run, error)?;
         }
     }
     if !runs
@@ -771,7 +772,9 @@ fn validate_native_contract(
         || attempt.workstream_id != stream.workstream_id
         || attempt.task_id != stream.task_id
         || attempt.strategy_contract_fingerprint != run.strategy_contract_fingerprint
-        || stream.active_episode_id != Some(episode.episode_id)
+        // A successor revalidates the declared Attempt even after its launch Phase closes.
+        || run.is_declaration_only() && stream.active_episode_id != Some(episode.episode_id)
+        || episode.lifecycle_status == evertrace_domain::work::EpisodeLifecycle::Superseded
         || !episode.attempt_ids.contains(&attempt.attempt_id)
         || episode.workstream_id != stream.workstream_id
         || episode.task_id != stream.task_id

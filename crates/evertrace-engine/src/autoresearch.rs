@@ -2603,8 +2603,14 @@ impl ControlledRunResolver {
             if trial.study_key != plan.study_key || trial.source_epoch != plan.source_epoch {
                 return Err(AutoresearchError::UntrustedRunEvidence);
             }
-            let Some((attempt, witness)) =
-                process_trial_target(facts, &trial, &plan, launch.source_observation_id, opening)?
+            let Some((attempt, witness)) = process_trial_target(
+                facts,
+                &trial,
+                &plan,
+                launch.source_observation_id,
+                opening,
+                Some(current),
+            )?
             else {
                 return Ok(ControlledRunCommand::NoDelta);
             };
@@ -2852,7 +2858,7 @@ impl ControlledRunResolver {
             ((*run).clone(), attempt, false)
         } else {
             let Some((attempt, anchor)) =
-                process_trial_target(&facts, &trial, &plan, source, opening_source)?
+                process_trial_target(&facts, &trial, &plan, source, opening_source, None)?
             else {
                 return Ok(ControlledRunCommand::NoDelta);
             };
@@ -3886,6 +3892,7 @@ fn process_trial_target<'a>(
     plan: &ProcessWorkDeclaration,
     source: SourceObservationId,
     opening: SourceObservationId,
+    declared: Option<&ExperimentRun>,
 ) -> Result<Option<(&'a Attempt, &'a WorktreeSnapshot)>, AutoresearchError> {
     let reference = opening.to_string();
     let mut streams = facts
@@ -3898,19 +3905,33 @@ fn process_trial_target<'a>(
     if streams.next().is_some() {
         return Err(AutoresearchError::EvidenceIncomplete);
     }
-    if stream.status != evertrace_domain::work::workstream::WorkstreamStatus::Active
-        || stream.phase_contract != plan.definition.phase
-    {
-        return Ok(None);
-    }
-    let Some(episode) = stream
-        .active_episode_id
+    // A late terminal belongs to its already admitted launch, not today's active Phase.
+    let (episode_id, attempt_id) = if let Some(run) = declared {
+        let attempt = run
+            .attempt_id
+            .and_then(|id| facts.attempts.get(&id))
+            .ok_or(AutoresearchError::EvidenceIncomplete)?;
+        if run.workstream_id != stream.workstream_id || attempt.task_id != stream.task_id {
+            return Err(AutoresearchError::ImmutableConflict);
+        }
+        (attempt.episode_id, Some(attempt.attempt_id))
+    } else {
+        if stream.status != evertrace_domain::work::workstream::WorkstreamStatus::Active
+            || stream.phase_contract != plan.definition.phase
+        {
+            return Ok(None);
+        }
+        (stream.active_episode_id, None)
+    };
+    let Some(episode) = episode_id
         .and_then(|id| facts.current_episodes.get(&id))
         .and_then(|revision| facts.episodes.get(revision))
     else {
         return Ok(None);
     };
     if episode.workstream_id != stream.workstream_id
+        || episode.task_id != stream.task_id
+        || episode.lifecycle_status == evertrace_domain::work::EpisodeLifecycle::Superseded
         || episode.phase_contract != plan.definition.phase
     {
         return Err(AutoresearchError::ImmutableConflict);
@@ -3930,7 +3951,8 @@ fn process_trial_target<'a>(
         return Ok(None);
     }
     let mut attempts = facts.attempts.values().filter(|attempt| {
-        attempt.workstream_id == stream.workstream_id
+        attempt_id.is_none_or(|id| attempt.attempt_id == id)
+            && attempt.workstream_id == stream.workstream_id
             && attempt.episode_id == Some(episode.episode_id)
             && episode.attempt_ids.contains(&attempt.attempt_id)
             && attempt.strategy_contract == plan.definition.strategy
