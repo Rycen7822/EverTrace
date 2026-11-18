@@ -1561,7 +1561,10 @@ pub(crate) fn controlled_source_snapshot(
                         .iter()
                         .map(ToString::to_string),
                 );
-            } else {
+                refs.extend(resume_checkpoint_refs(phase).cloned());
+            } else if !(ordinary_work
+                && matches!(payload, JournalPayload::WorkCheckpointRecorded(_)))
+            {
                 refs.extend(evertrace_store::projections::read_dependencies_for(
                     row, &payload,
                 ));
@@ -4005,6 +4008,46 @@ struct ProcessWorkAnchor<'a> {
     goal_source: SourceObservationId,
 }
 
+fn resume_checkpoint_refs(
+    phase: &evertrace_domain::work::WorkEpisode,
+) -> impl Iterator<Item = &String> {
+    // Select only SessionEnd at the still-current operation prefix; stable keys end in algorithm revision.
+    let prefix = format!(
+        "{}:{}:{}:",
+        phase.episode_id,
+        phase.source_watermark,
+        evertrace_domain::work::CheckpointReason::SessionEnd.as_str()
+    );
+    phase
+        .checkpoint_refs
+        .iter()
+        .filter(move |key| key.starts_with(&prefix))
+}
+
+fn resume_checkpoint<'a>(
+    snapshot: &ProjectionSnapshot,
+    phase: &'a evertrace_domain::work::WorkEpisode,
+    basis: Option<evertrace_domain::ids::WorktreeSnapshotId>,
+) -> Option<&'a String> {
+    use evertrace_domain::work::CheckpointReason;
+    resume_checkpoint_refs(phase).find(|key| {
+        snapshot.data_rows().any(|row| {
+            row.object_kind.as_deref() == Some("work_checkpoint")
+                && row.object_id.as_ref() == Some(*key)
+                && matches!(row.payload_json.as_deref().and_then(|json| serde_json::from_str(json).ok()),
+                    Some(JournalPayload::WorkCheckpointRecorded(checkpoint))
+                    if checkpoint.episode_id == phase.episode_id
+                        && checkpoint.source_watermark == phase.source_watermark
+                        && checkpoint.created_reason == CheckpointReason::SessionEnd
+                        && checkpoint.continuation_candidate
+                        && checkpoint.phase_contract == phase.phase_contract
+                        && checkpoint.open_loops == phase.open_loops
+                        && checkpoint.capture_receipt_revision_ids == phase.capture_receipt_revision_ids
+                        && checkpoint.current_worktree_snapshot_id == basis)
+        })
+    })
+}
+
 fn process_work_command(
     snapshot: &ProjectionSnapshot,
     facts: &ControlledFacts,
@@ -4103,17 +4146,32 @@ fn process_work_command(
                 .and_then(|revision| facts.episodes.get(revision))
                 .ok_or(AutoresearchError::EvidenceIncomplete)?;
             let mut events = Vec::new();
-            if root_lane.is_some_and(|lane| {
-                !phase.execution_lane_ids.is_empty() && !phase.execution_lane_ids.contains(&lane)
-            }) {
-                return Ok(None);
-            }
+            let new_lane = root_lane.filter(|lane| {
+                !phase.execution_lane_ids.is_empty() && !phase.execution_lane_ids.contains(lane)
+            });
             let known_strategy = phase.attempt_ids.iter().any(|id| {
                 facts
                     .attempts
                     .get(id)
                     .is_some_and(|attempt| attempt.strategy_contract == plan.strategy)
             });
+            if new_lane.is_some() {
+                let basis = worktree
+                    .and_then(|id| facts.worktrees.get(&id))
+                    .and_then(|value| value.current_snapshot_id);
+                if prior.is_none()
+                    || !phase.session_ids.iter().any(|id| id == anchor.session)
+                    || phase.phase_contract != plan.phase
+                    || !known_strategy
+                    || (repository.is_some() && basis.is_none())
+                {
+                    return Ok(None);
+                }
+                let Some(checkpoint) = resume_checkpoint(snapshot, phase, basis) else {
+                    return Ok(None);
+                };
+                sources.push(checkpoint.clone());
+            }
             if prior.is_none() && (phase.phase_contract != plan.phase || !known_strategy) {
                 return Err(AutoresearchError::ImmutableConflict);
             }
@@ -4138,6 +4196,27 @@ fn process_work_command(
             });
             if owned.is_none() {
                 return Ok(None);
+            }
+            if let Some(lane) = new_lane.filter(|id| !stream.execution_lane_ids.contains(id)) {
+                let mut next = (*stream).clone();
+                next.revision_id = RevisionId::new_v7();
+                next.predecessor_revision_id = Some(stream.revision_id);
+                next.source_watermark = snapshot.frontier;
+                next.execution_lane_ids.push(lane);
+                next.execution_lane_ids.sort();
+                let repositories =
+                    evertrace_store::repository::RepositoryCurrentView::from_snapshot(snapshot)?;
+                let command = workstream::revise_workstream(
+                    context,
+                    task,
+                    &repositories,
+                    stream,
+                    next,
+                    crate::work::TypedWorkstreamChange::StructuredRevision,
+                    &sources,
+                )
+                .map_err(map_error)?;
+                events.extend_from_slice(command.events());
             }
             let mut proposal = None;
             if !known_strategy && phase.phase_contract == plan.phase {
