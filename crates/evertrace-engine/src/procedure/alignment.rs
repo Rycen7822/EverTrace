@@ -77,6 +77,7 @@ impl StageTrace {
         let mut episodes = std::collections::BTreeMap::new();
         let mut holders = std::collections::BTreeMap::new();
         let mut attempts = std::collections::BTreeMap::new();
+        let mut capture_corrections = None;
         for row in rows
             .iter()
             .filter(|row| row.row_kind == evertrace_store::ObjectRowKind::Data)
@@ -100,10 +101,61 @@ impl StageTrace {
                 && episode.worktree_instance_id == target.worktree_instance_id
                 && episode.source_watermark <= target.source_watermark
             {
-                if !episode.segmentation_correction_refs.is_empty()
-                    || !episode.competing_attempt_group_ids.is_empty()
-                {
+                if !episode.competing_attempt_group_ids.is_empty() {
                     return Ok(Self::default());
+                }
+                if !episode.segmentation_correction_refs.is_empty() {
+                    if episode.lifecycle_status != evertrace_domain::work::EpisodeLifecycle::Closed
+                    {
+                        return Ok(Self::default());
+                    }
+                    if capture_corrections.is_none() {
+                        let mut index = std::collections::BTreeMap::new();
+                        for correction in rows.iter().filter(|correction| {
+                            correction.row_kind == evertrace_store::ObjectRowKind::Data
+                                && correction.object_kind.as_deref()
+                                    == Some("segmentation_correction")
+                                && correction.source_event_seq <= boundary
+                        }) {
+                            let Some(raw) = correction.payload_json.as_deref() else {
+                                return Err(SemanticServiceError::InvalidInput);
+                            };
+                            let JournalPayload::SegmentationCorrectionRecorded(value) =
+                                decode(raw)?
+                            else {
+                                return Err(SemanticServiceError::InvalidInput);
+                            };
+                            if value.kind == evertrace_domain::work::CorrectionKind::CaptureRevision
+                                && value.validate().is_ok()
+                                && correction.current_revision_id.as_deref()
+                                    == Some(&value.correction_revision_id.to_string())
+                            {
+                                index.insert(
+                                    value.correction_revision_id,
+                                    (
+                                        value.source_episode_ids[0],
+                                        correction.source_event_seq,
+                                        value.source_watermark,
+                                    ),
+                                );
+                            }
+                        }
+                        capture_corrections = Some(index);
+                    }
+                    // Capture-only successors keep the original checkpoint pins. A missing or
+                    // semantic correction still makes this workstream's stage history ambiguous.
+                    let index = capture_corrections
+                        .as_ref()
+                        .expect("correction rows indexed");
+                    if !episode.segmentation_correction_refs.iter().all(|id| {
+                        index.get(id).is_some_and(|&(owner, seq, watermark)| {
+                            owner == episode.episode_id
+                                && seq <= row.source_event_seq
+                                && watermark <= episode.source_watermark
+                        })
+                    }) {
+                        return Ok(Self::default());
+                    }
                 }
                 for reference in &episode.checkpoint_refs {
                     holders.entry(reference.clone()).or_insert(row);
