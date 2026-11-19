@@ -472,7 +472,11 @@ impl WorkEpisode {
             || (self.boundary_status == BoundaryStatus::Candidate)
                 != self.boundary_candidate.is_some()
             || !all_lists
-            || !self.experiment_run_refs.is_empty()
+            || (!self.experiment_run_refs.is_empty()
+                && (self.experiment_run_refs.len() != 1
+                    || self.phase_contract.phase_kind != super::PhaseKind::Execute
+                    || self.lifecycle_status == EpisodeLifecycle::Open
+                    || self.exit_worktree_snapshot_id.is_none()))
             || !self.work_artifact_refs.is_empty()
             || (self.lifecycle_status == EpisodeLifecycle::Open
                 && (self.boundary_status == BoundaryStatus::Confirmed
@@ -521,7 +525,9 @@ impl WorkEpisode {
                 (BoundaryStatus::Provisional, BoundaryStatus::Candidate)
                     | (BoundaryStatus::Candidate, BoundaryStatus::Provisional)
                     | (BoundaryStatus::Candidate, BoundaryStatus::Confirmed)
-            );
+            )
+            || (next.boundary_status == BoundaryStatus::Confirmed
+                && next.experiment_run_refs.len() == 1);
         if next.episode_id != self.episode_id
             || next.revision_generation != next_generation
             || next.predecessor_revision_id != Some(self.revision_id)
@@ -536,6 +542,8 @@ impl WorkEpisode {
             || next.semantic_watermark < self.semantic_watermark
             || next.confirmation_watermark < self.confirmation_watermark
             || next.capture_watermark < self.capture_watermark
+            || (!self.experiment_run_refs.is_empty()
+                && next.experiment_run_refs != self.experiment_run_refs)
             || !lifecycle_ok
             || !boundary_ok
             || self.lifecycle_status == EpisodeLifecycle::Superseded

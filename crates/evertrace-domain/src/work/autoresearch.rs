@@ -20,6 +20,64 @@ const MAX_FIELDS: usize = 128;
 const MAX_TEXT: usize = 1024;
 const CONTROLLED_SOURCE_VERSION: u32 = 1;
 
+/// Freeze only the launch boundary. Its Run is declared, not a completed experiment.
+pub fn confirm_experiment_launch(
+    run: &ExperimentRun,
+    phase: &super::WorkEpisode,
+    stream: &super::Workstream,
+    witness: &crate::repository::WorktreeSnapshot,
+    watermark: u64,
+    revisions: (RevisionId, RevisionId),
+) -> Option<(super::WorkEpisode, super::Workstream)> {
+    use super::{
+        BoundaryStatus, EpisodeLifecycle, PendingSemanticInterval, PhaseKind, WorkstreamStatus,
+    };
+    if run.metric_extractor_version != NATIVE_TEST_COHORT_PARSER_VERSION
+        || run.comparison_execution_binding.is_some()
+        || !run.is_declaration_only()
+        || !run
+            .attempt_id
+            .is_some_and(|id| phase.attempt_ids.contains(&id))
+        || run.workstream_id != phase.workstream_id
+        || phase.workstream_id != stream.workstream_id
+        || phase.task_id != stream.task_id
+        || stream.status != WorkstreamStatus::Active
+        || stream.active_episode_id != Some(phase.episode_id)
+        || phase.lifecycle_status != EpisodeLifecycle::Open
+        || phase.phase_contract.phase_kind != PhaseKind::Execute
+        || phase.phase_contract != stream.phase_contract
+        || phase.worktree_instance_id != Some(witness.worktree_instance_id)
+        || !phase.experiment_run_refs.is_empty()
+    {
+        return None;
+    }
+    let mut closed = phase.clone();
+    closed.revision_id = revisions.0;
+    closed.predecessor_revision_id = Some(phase.revision_id);
+    closed.revision_generation = phase.revision_generation.checked_add(1)?;
+    closed.lifecycle_status = EpisodeLifecycle::Closed;
+    closed.boundary_status = BoundaryStatus::Confirmed;
+    closed.boundary_candidate = None;
+    closed.source_watermark = watermark.max(phase.source_watermark.checked_add(1)?);
+    closed.confirmation_watermark = closed.source_watermark;
+    closed.pending_semantic_delta = Some(PendingSemanticInterval {
+        after_watermark: closed.semantic_watermark,
+        through_watermark: closed.source_watermark,
+    });
+    closed.exit_worktree_snapshot_id = Some(witness.worktree_snapshot_id);
+    closed.experiment_run_refs = vec![run.run_id];
+    phase.validate_successor(&closed).ok()?;
+    let mut paused = stream.clone();
+    paused.revision_id = revisions.1;
+    paused.predecessor_revision_id = Some(stream.revision_id);
+    paused.active_episode_id = None;
+    paused.status = WorkstreamStatus::Paused;
+    paused.source_watermark = closed
+        .source_watermark
+        .max(stream.source_watermark.checked_add(1)?);
+    Some((closed, paused))
+}
+
 /// A result can resume its own confirmed launch Phase, never an unrelated active Phase.
 pub fn awaiting_experiment_result(stream: &super::Workstream, launch: &super::WorkEpisode) -> bool {
     stream.status == super::WorkstreamStatus::Paused

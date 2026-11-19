@@ -46,6 +46,10 @@ pub(crate) struct ControlledRunAdmissionView<'a> {
     pub tasks: &'a BTreeMap<TaskId, (Task, u64)>,
     pub workstreams: &'a BTreeMap<WorkstreamId, (Workstream, u64)>,
     pub episodes: &'a BTreeMap<WorkEpisodeId, (WorkEpisode, u64)>,
+    pub bursts: &'a BTreeMap<
+        evertrace_domain::ids::OperationBurstId,
+        (evertrace_domain::work::OperationBurst, u64),
+    >,
     pub episode_revisions: &'a BTreeMap<RevisionId, (WorkEpisode, u64)>,
     pub worktrees: &'a BTreeMap<WorktreeId, (WorktreeInstance, u64)>,
 }
@@ -67,6 +71,7 @@ impl super::JournalAdmissionState {
             tasks: &self.tasks,
             workstreams: &self.workstreams,
             episodes: &self.episodes,
+            bursts: &self.operation_bursts,
             episode_revisions: &self.episode_revisions,
             worktrees: &self.worktrees,
         }
@@ -93,13 +98,47 @@ pub(crate) fn validate_controlled_command<'a>(
             _ => None,
         })
         .collect::<Vec<_>>();
+    let mut closing = payloads.iter().filter_map(|payload| match payload {
+        JournalPayload::WorkEpisodeRecorded(episode)
+            if !episode.experiment_run_refs.is_empty()
+                && view
+                    .episodes
+                    .get(&episode.episode_id)
+                    .is_none_or(|(prior, _)| {
+                        prior.experiment_run_refs != episode.experiment_run_refs
+                    }) =>
+        {
+            Some(episode.as_ref())
+        }
+        _ => None,
+    });
+    let close = closing.next();
+    if let Some(episode) = close {
+        let [run] = runs.as_slice() else {
+            return Err(error);
+        };
+        if closing.next().is_some()
+            || !run.is_declaration_only()
+            || episode.experiment_run_refs != [run.run_id]
+            || run.metric_extractor_version
+                != evertrace_domain::work::NATIVE_TEST_COHORT_PARSER_VERSION
+            || view.runs.contains_key(&run.run_id)
+        {
+            return Err(error);
+        }
+    }
     for run in &runs {
         if run.comparison_execution_binding.is_none() && !run.is_declaration_only() {
             validate_native_terminal_cohort(&view, run, &payloads, error)?;
         } else if evertrace_domain::work::is_native_test_contract_parser(
             &run.metric_extractor_version,
         ) {
-            validate_native_contract(&view, run, error)?;
+            validate_native_contract(
+                &view,
+                run,
+                close.map(|episode| (episode, payloads.as_slice())),
+                error,
+            )?;
         }
     }
     if !runs
@@ -636,6 +675,7 @@ fn native_trial_identity<'a>(
 fn validate_native_contract(
     view: &ControlledRunAdmissionView<'_>,
     run: &ExperimentRun,
+    close: Option<(&WorkEpisode, &[&JournalPayload])>,
     error: StoreError,
 ) -> Result<evertrace_domain::work::NativeTestContract, StoreError> {
     use evertrace_capture::process_source;
@@ -796,12 +836,23 @@ fn validate_native_contract(
     }
     // A new execution outside the active Phase requires an exact, protected sibling study binding.
     if run.is_declaration_only() && stream.active_episode_id != Some(episode.episode_id) {
-        validate_late_native_launch(view, run, receipt, &value, stream, episode, error)?;
+        if stream.status.is_terminal()
+            || episode.lifecycle_status != evertrace_domain::work::EpisodeLifecycle::Closed
+        {
+            return Err(error);
+        }
+        validate_native_study(view, run, receipt, &value, stream, episode, error)?;
+    }
+    if let Some((closed, payloads)) = close {
+        validate_native_study(view, run, receipt, &value, stream, episode, error)?;
+        validate_native_launch_close(
+            view, run, attempt, stream, episode, anchor, closed, payloads, error,
+        )?;
     }
     Ok(contract)
 }
 
-fn validate_late_native_launch(
+fn validate_native_study(
     view: &ControlledRunAdmissionView<'_>,
     run: &ExperimentRun,
     launch: &SourceReceipt,
@@ -812,11 +863,9 @@ fn validate_late_native_launch(
 ) -> Result<(), StoreError> {
     use evertrace_domain::{
         evidence::ObservationRole,
-        work::{EpisodeLifecycle, NATIVE_TEST_COHORT_PARSER_VERSION, PhaseKind},
+        work::{NATIVE_TEST_COHORT_PARSER_VERSION, PhaseKind},
     };
     if run.metric_extractor_version != NATIVE_TEST_COHORT_PARSER_VERSION
-        || stream.status.is_terminal()
-        || episode.lifecycle_status != EpisodeLifecycle::Closed
         || episode.phase_contract.phase_kind != PhaseKind::Execute
     {
         return Err(error);
@@ -864,6 +913,77 @@ fn validate_late_native_launch(
     Ok(())
 }
 
+fn validate_native_launch_close(
+    view: &ControlledRunAdmissionView<'_>,
+    run: &ExperimentRun,
+    attempt: &Attempt,
+    stream: &Workstream,
+    phase: &WorkEpisode,
+    witness: &WorktreeSnapshot,
+    closed: &WorkEpisode,
+    payloads: &[&JournalPayload],
+    error: StoreError,
+) -> Result<(), StoreError> {
+    use evertrace_domain::work::{
+        AttemptExecutionStatus, AttemptLifecycleStatus, OperationBurstLifecycle,
+        confirm_experiment_launch,
+    };
+    let next_attempt = payloads
+        .iter()
+        .find_map(|payload| match payload {
+            JournalPayload::AttemptRecorded(value) if value.attempt_id == attempt.attempt_id => {
+                Some(value.as_ref())
+            }
+            _ => None,
+        })
+        .unwrap_or(attempt);
+    let mut streams = payloads.iter().filter_map(|payload| match payload {
+        JournalPayload::WorkstreamRecorded(value) => Some(value.as_ref()),
+        _ => None,
+    });
+    let paused = streams
+        .next()
+        .filter(|_| streams.next().is_none())
+        .ok_or(error)?;
+    if next_attempt.execution_status != AttemptExecutionStatus::Active
+        || next_attempt.lifecycle_status != AttemptLifecycleStatus::Active
+        || confirm_experiment_launch(
+            run,
+            phase,
+            stream,
+            witness,
+            view.frontier,
+            (closed.revision_id, paused.revision_id),
+        )
+        .is_none_or(|(expected, expected_stream)| expected != *closed || expected_stream != *paused)
+    {
+        return Err(error);
+    }
+    let mut updates = payloads.iter().filter_map(|payload| match payload {
+        JournalPayload::OperationBurstRecorded(value) => Some(value.as_ref()),
+        _ => None,
+    });
+    for id in &phase.operation_burst_refs {
+        let current = &view.bursts.get(id).ok_or(error)?.0;
+        if current.lifecycle == OperationBurstLifecycle::Open {
+            let next = updates.next().ok_or(error)?;
+            let mut expected = current.clone();
+            expected.revision_id = next.revision_id;
+            expected.predecessor_revision_id = Some(current.revision_id);
+            expected.revision_generation =
+                current.revision_generation.checked_add(1).ok_or(error)?;
+            expected.lifecycle = OperationBurstLifecycle::Closed;
+            if expected != *next || current.validate_successor(next).is_err() {
+                return Err(error);
+            }
+        }
+    }
+    if updates.next().is_some() {
+        return Err(error);
+    }
+    Ok(())
+}
+
 fn validate_native_terminal_cohort(
     view: &ControlledRunAdmissionView<'_>,
     run: &ExperimentRun,
@@ -875,7 +995,7 @@ fn validate_native_terminal_cohort(
         return Err(error);
     }
     let current = &view.runs.get(&run.run_id).ok_or(error)?.0;
-    let contract = validate_native_contract(view, run, error)?;
+    let contract = validate_native_contract(view, run, None, error)?;
     current.validate_successor(run).map_err(|_| error)?;
     let results = payloads
         .iter()

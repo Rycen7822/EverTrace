@@ -2862,7 +2862,7 @@ impl ControlledRunResolver {
         if existing.len() > 1 {
             return Err(AutoresearchError::ImmutableConflict);
         }
-        let (run, attempt, is_new) = if let Some(run) = existing.first() {
+        let (run, attempt, launch_witness) = if let Some(run) = existing.first() {
             let mut expected = vec![
                 facts.receipt(source)?.source_receipt_id,
                 facts.receipt(opening_source)?.source_receipt_id,
@@ -2893,7 +2893,7 @@ impl ControlledRunResolver {
                 .attempt_id
                 .and_then(|id| facts.attempts.get(&id))
                 .ok_or(AutoresearchError::EvidenceIncomplete)?;
-            ((*run).clone(), attempt, false)
+            ((*run).clone(), attempt, None)
         } else {
             let Some((attempt, anchor)) =
                 process_trial_target(&facts, &trial, &plan, source, opening_source, None)?
@@ -2954,7 +2954,7 @@ impl ControlledRunResolver {
             run.external_run_key = Some(external_key);
             run.validate()
                 .map_err(|_| AutoresearchError::InvalidInput)?;
-            (run, attempt, true)
+            (run, attempt, Some(anchor))
         };
         let bindings =
             self.process_trial_bindings(&facts, source, &trial, opening_source, &run, attempt)?;
@@ -2963,7 +2963,7 @@ impl ControlledRunResolver {
         } else {
             None
         };
-        if !is_new && bindings.is_empty() && active.is_none() {
+        if launch_witness.is_none() && bindings.is_empty() && active.is_none() {
             return Ok(ControlledRunCommand::NoDelta);
         }
         let (mut payloads, mut revision) = run_binding_updates(attempt, &bindings)?;
@@ -2979,11 +2979,44 @@ impl ControlledRunResolver {
             payloads.push(JournalPayload::AttemptRecorded(Box::new(next.clone())));
             revision = Some(next);
         }
-        if is_new {
+        if let Some(witness) = launch_witness {
             payloads.insert(
                 0,
                 JournalPayload::ExperimentRunRecorded(Box::new(run.clone())),
             );
+            let attempt = revision.as_ref().unwrap_or(attempt);
+            if attempt.execution_status == evertrace_domain::work::AttemptExecutionStatus::Active
+                && attempt.lifecycle_status
+                    == evertrace_domain::work::AttemptLifecycleStatus::Active
+                && let Some(phase) = attempt
+                    .episode_id
+                    .and_then(|id| facts.current_episodes.get(&id))
+                    .and_then(|id| facts.episodes.get(id))
+                && let Some((closed, paused)) = evertrace_domain::work::confirm_experiment_launch(
+                    &run,
+                    phase,
+                    &facts.workstreams[&run.workstream_id],
+                    witness,
+                    snapshot.frontier,
+                    (RevisionId::new_v7(), RevisionId::new_v7()),
+                )
+            {
+                for id in &phase.operation_burst_refs {
+                    let burst = facts
+                        .bursts
+                        .get(id)
+                        .ok_or(AutoresearchError::EvidenceIncomplete)?;
+                    if burst.lifecycle == evertrace_domain::work::OperationBurstLifecycle::Open {
+                        let closed = crate::segmentation::close_burst(burst.clone())
+                            .map_err(|_| AutoresearchError::ImmutableConflict)?;
+                        payloads.push(JournalPayload::OperationBurstRecorded(Box::new(closed)));
+                    }
+                }
+                payloads.extend([
+                    JournalPayload::WorkEpisodeRecorded(Box::new(closed)),
+                    JournalPayload::WorkstreamRecorded(Box::new(paused)),
+                ]);
+            }
         }
         let command = payload_command(context.clone(), payloads)?;
         Ok(ControlledRunCommand::Declaration {
@@ -4723,6 +4756,8 @@ struct ControlledFacts {
     workstreams: std::collections::BTreeMap<evertrace_domain::ids::WorkstreamId, Workstream>,
     episodes: std::collections::BTreeMap<RevisionId, WorkEpisode>,
     current_episodes: std::collections::BTreeMap<evertrace_domain::ids::WorkEpisodeId, RevisionId>,
+    bursts:
+        BTreeMap<evertrace_domain::ids::OperationBurstId, evertrace_domain::work::OperationBurst>,
     execution_lanes: BTreeMap<ExecutionLaneId, ExecutionLane>,
     worktrees: std::collections::BTreeMap<evertrace_domain::ids::WorktreeId, WorktreeInstance>,
     snapshots:
@@ -4777,6 +4812,7 @@ impl ControlledFacts {
             workstreams: Default::default(),
             episodes: Default::default(),
             current_episodes: Default::default(),
+            bursts: Default::default(),
             execution_lanes: Default::default(),
             worktrees: Default::default(),
             snapshots: Default::default(),
@@ -4806,6 +4842,7 @@ impl ControlledFacts {
                         | "task"
                         | "workstream"
                         | "work_episode"
+                        | "operation_burst"
                         | "worktree"
                         | "worktree_snapshot"
                         | "source_receipt"
@@ -4824,6 +4861,15 @@ impl ControlledFacts {
             let payload = serde_json::from_str::<JournalPayload>(payload)
                 .map_err(|_| AutoresearchError::Store(evertrace_store::StoreError::StoreCorrupt))?;
             match payload {
+                JournalPayload::OperationBurstRecorded(value) => {
+                    if facts
+                        .bursts
+                        .get(&value.operation_burst_id)
+                        .is_none_or(|old| old.revision_generation < value.revision_generation)
+                    {
+                        facts.bursts.insert(value.operation_burst_id, *value);
+                    }
+                }
                 JournalPayload::ExecutionLaneRecorded(value) => {
                     let replace = facts
                         .execution_lanes

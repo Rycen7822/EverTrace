@@ -4007,6 +4007,7 @@ pub fn read_dependencies_for(row: &ObjectRow, payload: &JournalPayload) -> BTree
                     .map(ToString::to_string),
             );
             refs.extend(value.operation_burst_refs.iter().map(ToString::to_string));
+            refs.extend(value.experiment_run_refs.iter().map(ToString::to_string));
             refs.extend(value.semantic_digest_refs.iter().cloned());
             refs.extend(value.verification_refs.iter().cloned());
             refs.extend(value.failure_refs.iter().cloned());
