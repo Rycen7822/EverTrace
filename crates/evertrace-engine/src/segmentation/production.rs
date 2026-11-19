@@ -603,8 +603,10 @@ pub(super) async fn tool_request_artifacts(
     runtime: &evertrace_capture::RuntimeSnapshot,
     now_us: i64,
     sources: &[SourceObservationId],
-) -> Result<Vec<evertrace_domain::work::WorkArtifact>, crate::maintenance::BackgroundSchedulerError>
-{
+) -> Result<
+    Option<Vec<evertrace_domain::work::WorkArtifact>>,
+    crate::maintenance::BackgroundSchedulerError,
+> {
     use crate::maintenance::BackgroundSchedulerError as Error;
     use evertrace_domain::work::{
         ArtifactActor, ArtifactDerivability, ArtifactPayloadStatus, ArtifactRetention,
@@ -622,7 +624,7 @@ pub(super) async fn tool_request_artifacts(
         }
     }
     if candidates.is_empty() {
-        return Ok(Vec::new());
+        return Ok(Some(Vec::new()));
     }
     let runtime = runtime.clone();
     let scope = match (episode.repository_instance_id, episode.worktree_instance_id) {
@@ -639,18 +641,25 @@ pub(super) async fn tool_request_artifacts(
     tokio::task::spawn_blocking(move || {
         let cas = evertrace_capture::CasStore::open_existing(&runtime.cas_dir)
             .map_err(|_| Error::Store)?;
+        // Read the bounded input set before publishing any of its derived blobs.
+        let mut inputs = Vec::with_capacity(candidates.len());
+        for (observation, receipt) in candidates {
+            let digest = receipt.cas_ref.parse().map_err(|_| Error::Store)?;
+            let (protected, _) = match cas.read_bounded(&digest, 131_072, 131_072) {
+                Ok(payload) => payload,
+                Err(evertrace_capture::CasError::NotFound) => return Ok(None),
+                Err(_) => return Err(Error::Store),
+            };
+            if protected.len() as u64 != receipt.protected_length {
+                return Err(Error::Store);
+            }
+            inputs.push((observation, receipt, protected));
+        }
         let key = evertrace_capture::DeviceKeyStore::new(runtime.device_key_dir)
             .load()
             .map_err(|_| Error::Store)?;
         let mut artifacts = Vec::new();
-        for (observation, receipt) in candidates {
-            let digest = receipt.cas_ref.parse().map_err(|_| Error::Store)?;
-            let (protected, _) = cas
-                .read_bounded(&digest, 131_072, 131_072)
-                .map_err(|_| Error::Store)?;
-            if protected.len() as u64 != receipt.protected_length {
-                return Err(Error::Store);
-            }
+        for (observation, receipt, protected) in inputs {
             let Ok(raw) = evertrace_capture::goal_source::read_tool_request(
                 &observation,
                 &receipt,
@@ -684,7 +693,7 @@ pub(super) async fn tool_request_artifacts(
                     .map_err(|_| Error::Store)?,
             );
         }
-        Ok(artifacts)
+        Ok(Some(artifacts))
     })
     .await
     .map_err(|_| Error::Store)?
@@ -946,7 +955,12 @@ pub(crate) async fn advance_activity(
                 progress.retryable = true;
                 return Ok(progress);
             }
-            tool_request_artifacts(current, episode, runtime, occurred_at_us, &sources).await?
+            let Some(artifacts) =
+                tool_request_artifacts(current, episode, runtime, occurred_at_us, &sources).await?
+            else {
+                continue;
+            };
+            artifacts
         } else {
             Vec::new()
         };

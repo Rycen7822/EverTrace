@@ -238,14 +238,17 @@ async fn save_selected_checkpoint(
         {
             return Ok(BackgroundProgress::default());
         }
-        let artifacts = super::production::tool_request_artifacts(
+        let Some(artifacts) = super::production::tool_request_artifacts(
             current,
             episode,
             runtime,
             occurred_at_us,
             &sources,
         )
-        .await?;
+        .await?
+        else {
+            return Ok(BackgroundProgress::default());
+        };
         let Some(allowed_until) =
             super::production::readable_context(writer, current, &selected, runtime).await?
         else {
