@@ -1007,6 +1007,7 @@ impl EvidenceIngestor {
                 .sync_objects_frontier()
                 .await
                 .map_err(map_writer_error)?;
+            let mut controllers = BTreeSet::new();
             let repository_ids = segment
                 .frames()
                 .iter()
@@ -1015,7 +1016,12 @@ impl EvidenceIngestor {
                 })
                 // Leave malformed input to its original per-frame error path.
                 .map_while(|frame| canonical_body(&frame.record).ok())
-                .filter_map(|body| body.repository_instance_id)
+                .filter_map(|body| {
+                    if let Some(controller) = trial_controller(&body) {
+                        controllers.insert(controller.to_owned());
+                    }
+                    body.repository_instance_id
+                })
                 .collect::<BTreeSet<_>>()
                 .into_iter()
                 .collect::<Vec<_>>();
@@ -1032,6 +1038,11 @@ impl EvidenceIngestor {
                 }
                 purged.extend(context.purged);
             }
+            let purged_processes = self
+                .writer
+                .purged_capture_processes(controllers)
+                .await
+                .map_err(map_writer_error)?;
             let mut committed = 0_usize;
             let mut invalid = false;
             let mut terminal = Vec::new();
@@ -1057,7 +1068,7 @@ impl EvidenceIngestor {
                                 .is_none_or(|ids| ids.contains(&frame.record.source_observation_id))
                         })
                         .map_while(|frame| canonical_body(&frame.record).ok())
-                        .filter(|body| !capture_is_purged(body, &purged))
+                        .filter(|body| !capture_is_purged(body, &purged, &purged_processes))
                         .map(|body| body.command_id)
                         .collect();
                     replay_batch = self
@@ -1077,7 +1088,7 @@ impl EvidenceIngestor {
                     }
                     Err(error) => return Err(error),
                 };
-                if capture_is_purged(&body, &purged) {
+                if capture_is_purged(&body, &purged, &purged_processes) {
                     terminal.push(body);
                     continue;
                 }
@@ -1519,14 +1530,6 @@ impl EvidenceIngestor {
             .events
             .into_keys()
             .collect();
-        if terminal_segments
-            .iter()
-            .flat_map(|(_, _, terminal)| terminal)
-            .any(|body| !capture_is_purged(body, &purges))
-        {
-            return Err(IngestError::StoreCorrupt);
-        }
-
         let candidates = terminal_segments
             .iter()
             .flat_map(|(_, _, terminal)| terminal)
@@ -1537,21 +1540,46 @@ impl EvidenceIngestor {
             .map_err(|_| IngestError::StoreCorrupt)?;
         let max_segments =
             usize::try_from(self.snapshot.max_main_files).map_err(|_| IngestError::Snapshot)?;
-        for record in spool
+        let records = spool
             .read_durable_records(max_segments, self.snapshot.main_high_watermark_bytes)
-            .map_err(|_| IngestError::Spool)?
-        {
+            .map_err(|_| IngestError::Spool)?;
+        let mut controllers = terminal_segments
+            .iter()
+            .flat_map(|(_, _, terminal)| terminal)
+            .filter_map(trial_controller)
+            .map(str::to_owned)
+            .collect::<BTreeSet<_>>();
+        let mut remaining_refs = Vec::new();
+        for record in records {
             let body = canonical_body(&record)?;
-            if capture_is_purged(&body, &purges) {
-                continue;
+            let matching = record
+                .cas_refs
+                .into_iter()
+                .filter(|reference| candidates.contains(reference))
+                .collect::<Vec<_>>();
+            if !matching.is_empty() {
+                if let Some(controller) = trial_controller(&body) {
+                    controllers.insert(controller.to_owned());
+                }
+                remaining_refs.push((body, matching));
             }
-            retained.extend(
-                record
-                    .cas_refs
-                    .iter()
-                    .filter(|reference| candidates.contains(*reference))
-                    .cloned(),
-            );
+        }
+        let purged_processes = self
+            .writer
+            .purged_capture_processes(controllers)
+            .await
+            .map_err(map_writer_error)?;
+        if terminal_segments
+            .iter()
+            .flat_map(|(_, _, terminal)| terminal)
+            .any(|body| !capture_is_purged(body, &purges, &purged_processes))
+        {
+            return Err(IngestError::StoreCorrupt);
+        }
+        for (body, refs) in remaining_refs {
+            if !capture_is_purged(&body, &purges, &purged_processes) {
+                retained.extend(refs);
+            }
         }
         let digests = candidates
             .difference(&retained)
@@ -1577,9 +1605,22 @@ fn canonical_body(record: &SpoolRecord) -> Result<CaptureRecordBody, IngestError
         })
 }
 
-fn capture_is_purged(body: &CaptureRecordBody, purged: &BTreeSet<RepositoryId>) -> bool {
+fn trial_controller(body: &CaptureRecordBody) -> Option<&str> {
+    evertrace_capture::process_source::trial_controller(
+        body.source_instance_id.as_str(),
+        body.source_revision.as_str(),
+        body.source_kind,
+    )
+}
+
+fn capture_is_purged(
+    body: &CaptureRecordBody,
+    purged: &BTreeSet<RepositoryId>,
+    purged_processes: &BTreeSet<String>,
+) -> bool {
     body.repository_instance_id
         .is_some_and(|repository_id| purged.contains(&repository_id))
+        || trial_controller(body).is_some_and(|source| purged_processes.contains(source))
 }
 
 pub(crate) fn capture_event_drafts(
@@ -2041,6 +2082,7 @@ fn map_writer_error(error: WriterActorError) -> IngestError {
     match error {
         WriterActorError::IdempotencyConflict => IngestError::IdempotencyConflict,
         WriterActorError::StoreCorrupt => IngestError::StoreCorrupt,
+        WriterActorError::StaleFrontier => IngestError::Busy,
         error => {
             tracing::warn!(target: "evertrace_lifecycle", ?error, "capture writer operation failed");
             IngestError::Store

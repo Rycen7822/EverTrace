@@ -297,6 +297,10 @@ enum WriterRequest {
             Result<Option<evertrace_store::projections::SourceRepositoryScopes>, WriterActorError>,
         >,
     },
+    PurgedCaptureProcesses {
+        controllers: std::collections::BTreeSet<String>,
+        reply: oneshot::Sender<Result<std::collections::BTreeSet<String>, WriterActorError>>,
+    },
     RepositoryReadContext {
         ids: std::collections::BTreeSet<evertrace_domain::ids::RepositoryId>,
         filesystem: Option<evertrace_domain::repository::FilesystemIdentity>,
@@ -608,6 +612,21 @@ impl WriterHandle {
                 deadline,
                 reply,
             })
+            .await
+            .map_err(|_| WriterActorError::Stopped)?;
+        response.await.map_err(|_| WriterActorError::Stopped)?
+    }
+
+    pub(crate) async fn purged_capture_processes(
+        &self,
+        controllers: std::collections::BTreeSet<String>,
+    ) -> Result<std::collections::BTreeSet<String>, WriterActorError> {
+        if controllers.is_empty() {
+            return Ok(controllers);
+        }
+        let (reply, response) = oneshot::channel();
+        self.sender
+            .send(WriterRequest::PurgedCaptureProcesses { controllers, reply })
             .await
             .map_err(|_| WriterActorError::Stopped)?;
         response.await.map_err(|_| WriterActorError::Stopped)?
@@ -2500,6 +2519,10 @@ async fn run_writer(
                         .process_source_repository_scopes(&sources, deadline)
                         .map_err(map_store_error);
                     let _ = reply.send(result);
+                }
+                WriterRequest::PurgedCaptureProcesses { controllers, reply } => {
+                    let writer = writer.as_ref().ok_or(WriterActorError::Stopped)?;
+                    let _ = reply.send(Ok(writer.purged_capture_processes(controllers)));
                 }
                 WriterRequest::RepositoryReadContext {
                     ids,

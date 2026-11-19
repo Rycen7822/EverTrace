@@ -85,6 +85,18 @@ pub fn closed_file_controller(source: &str) -> Option<&str> {
         .then_some(controller)
 }
 
+/// Live and weak file views of the pinned trial source use the same deletion fence.
+pub fn trial_controller<'a>(
+    source: &'a str,
+    revision: &str,
+    kind: EvidenceSourceKind,
+) -> Option<&'a str> {
+    (kind == EvidenceSourceKind::Other
+        && revision == SOURCE_REVISION
+        && source.starts_with("process:"))
+    .then(|| closed_file_controller(source).unwrap_or(source))
+}
+
 const LIMIT: usize = 65_536;
 pub const SOURCE_BYTES: u64 = 262_144;
 const SOURCE_RECORDS: u64 = 64;

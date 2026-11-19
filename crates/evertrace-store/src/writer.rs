@@ -811,6 +811,15 @@ impl JournalWriter {
             .process_source_repository_scopes(sources, deadline)
     }
 
+    /// Classify only the controller identities in the current spool request.
+    pub fn purged_capture_processes(
+        &self,
+        mut controllers: std::collections::BTreeSet<String>,
+    ) -> std::collections::BTreeSet<String> {
+        controllers.retain(|source| self.admission_state.capture_process_purge_applies(source));
+        controllers
+    }
+
     pub fn repository_read_context(
         &self,
         ids: &std::collections::BTreeSet<evertrace_domain::ids::RepositoryId>,
@@ -1510,6 +1519,16 @@ impl JournalWriter {
                 }
             }
             _ => {}
+        }
+        // Pending confirmation can win after ingest selected a frame. Do not append
+        // fresh trial evidence in that case; ingest will reclassify the durable frame.
+        if command.events().iter().any(|event| {
+            matches!(&event.payload, JournalPayload::SourceReceiptRecorded(receipt)
+                if evertrace_capture::process_source::trial_controller(
+                    receipt.source_instance_id.as_str(), receipt.source_revision.as_str(), receipt.source_kind,
+                ).is_some_and(|source| self.admission_state.capture_process_purge_applies(source)))
+        }) {
+            return Err(StoreError::StaleFrontier);
         }
         let next_admission_state = self.admission_state.apply_command(command, self.next_seq)?;
         let first_seq = reserve_range(&mut self.next_seq, prepared.event_count)?;

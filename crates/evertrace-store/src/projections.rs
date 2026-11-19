@@ -4453,6 +4453,7 @@ pub(crate) struct RepositoryClosureKeys {
     source_observation_ids: BTreeSet<SourceObservationId>,
     source_receipt_ids: BTreeSet<SourceReceiptId>,
     source_revisions: BTreeSet<(SourceInstanceId, SourceRevision)>,
+    bound_process_controllers: BTreeSet<String>,
     host_occurrence_ids: BTreeSet<HostOccurrenceId>,
     operation_ids: BTreeSet<OperationId>,
     scope_effect_ids: BTreeSet<ScopeEffectId>,
@@ -10816,6 +10817,10 @@ fn derive_repository_scope_purge_plan(
                 )
             })
             .collect(),
+        bound_process_controllers: process_scopes
+            .into_iter()
+            .filter_map(|(controller, ids)| ids.contains(&repository_id).then_some(controller))
+            .collect(),
         host_occurrence_ids: target_occurrence_ids,
         operation_ids: target_operation_ids,
         scope_effect_ids: target_scope_effect_ids,
@@ -12610,6 +12615,12 @@ impl JournalAdmissionState {
             })
             .collect();
         Ok((std::time::Instant::now() < deadline).then_some(by_requested_source))
+    }
+
+    pub(crate) fn capture_process_purge_applies(&self, controller: &str) -> bool {
+        self.repository_closures
+            .values()
+            .any(|closure| closure.bound_process_controllers.contains(controller))
     }
 
     pub(crate) fn repository_read_context(
