@@ -71,6 +71,20 @@ pub fn is_owned_revision(revision: &str) -> bool {
                 | IMAGE_SOURCE_REVISION
         )
 }
+/// A closed file is a distinct observation source, but its bytes inherit the controller's restrictions.
+pub fn closed_file_controller(source: &str) -> Option<&str> {
+    let (controller, suffix) = source.split_once(":file:")?;
+    let (device, inode) = suffix.split_once(':')?;
+    let mut identity = controller.strip_prefix("process:")?.split(':');
+    uuid::Uuid::parse_str(identity.next()?).ok()?;
+    identity.next()?.parse::<u64>().ok()?; // PID namespace
+    identity.next()?.parse::<u32>().ok()?; // PID
+    identity.next()?.parse::<u64>().ok()?; // Start ticks
+    device.parse::<u64>().ok()?;
+    (identity.next().is_none() && inode.parse::<u64>().is_ok_and(|value| value > 0))
+        .then_some(controller)
+}
+
 const LIMIT: usize = 65_536;
 pub const SOURCE_BYTES: u64 = 262_144;
 const SOURCE_RECORDS: u64 = 64;
@@ -1563,14 +1577,8 @@ pub fn record_matches(raw: &[u8], body: &crate::CaptureRecordBody) -> bool {
             && (is_native_profile(body.adapter_revision, body.parser_revision)
                 || (body.adapter_revision, body.parser_revision) == (9, 6))
     };
-    let file_view = body
-        .source_instance_id
-        .as_str()
-        .strip_prefix(&format!("{instance}:file:"))
-        .and_then(|suffix| suffix.split_once(':'))
-        .is_some_and(|(device, inode)| {
-            device.parse::<u64>().is_ok() && inode.parse::<u64>().is_ok_and(|value| value > 0)
-        })
+    let file_view = closed_file_controller(body.source_instance_id.as_str())
+        == Some(instance.as_str())
         && body
             .source_ref
             .strip_prefix("file:")

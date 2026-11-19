@@ -12556,13 +12556,32 @@ impl JournalAdmissionState {
         if sources.len() > usize::from(evertrace_domain::query::METADATA_READ_LIMIT) {
             return Err(StoreError::InvalidInput);
         }
-        process_source_repository_scopes(
+        use evertrace_capture::process_source::closed_file_controller;
+        let controllers = sources
+            .iter()
+            .map(|source| closed_file_controller(source).unwrap_or(source).to_owned())
+            .collect();
+        let Some(restrictions) = process_source_repository_scopes(
             &self.work_bindings,
             &self.source_observations,
             &self.scope_effects,
-            Some(sources),
+            Some(&controllers),
             Some(deadline),
-        )
+        )?
+        else {
+            return Ok(None);
+        };
+        // Use only the already-admitted Work scope. File identity is not an authority
+        // to infer a new scope, normalize a record or grant historical source access.
+        let by_requested_source = sources
+            .iter()
+            .filter_map(|source| {
+                restrictions
+                    .get(closed_file_controller(source).unwrap_or(source))
+                    .map(|repositories| (source.clone(), repositories.clone()))
+            })
+            .collect();
+        Ok((std::time::Instant::now() < deadline).then_some(by_requested_source))
     }
 
     pub(crate) fn repository_read_context(
