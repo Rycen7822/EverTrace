@@ -972,9 +972,14 @@ fn root_scope_candidates(
                 CasDigest::from_str(&receipt.cas_ref).map_err(|_| AutoresearchError::Cas)?;
             // Native execution deliberately has no presentation surface. Read its bounded L0 CAS
             // only to select candidates; the resolver still authenticates every source/effect.
-            let (raw, _) = cas
-                .read_bounded(&digest, 128 * 1024, 65536)
-                .map_err(|_| AutoresearchError::Cas)?;
+            let (raw, _) = match cas.read_bounded(&digest, 128 * 1024, 65536) {
+                Ok(payload) => payload,
+                // Without this witness we cannot rule out another match in the same context.
+                Err(evertrace_capture::CasError::NotFound) => {
+                    return Err(AutoresearchError::EvidenceIncomplete);
+                }
+                Err(_) => return Err(AutoresearchError::Cas),
+            };
             let directory =
                 evertrace_capture::execution_source::execution_directory(native, receipt, &raw);
             if directory
