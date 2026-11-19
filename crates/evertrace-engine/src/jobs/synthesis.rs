@@ -152,6 +152,7 @@ pub struct SynthesisRequest<'a> {
 // Only this bounded, owned context crosses the provider wait in production.
 pub(crate) struct PreparedSynthesis {
     input: ProtectedSemanticInput,
+    physical_only: bool,
     fingerprint: [u8; 32],
     prompt_hash: [u8; 32],
     daily: DerivationQuotaUsage,
@@ -397,6 +398,7 @@ impl SynthesisPlanner {
             trigger,
             delta: direct_delta,
             refs: selected_direct_refs,
+            physical_only,
         } = input;
         if direct_delta.is_empty() {
             let mut terminal = job.clone();
@@ -427,7 +429,7 @@ impl SynthesisPlanner {
             .map(Err)
             .map_err(|_| crate::semantic::SemanticServiceError::InvalidInput);
         }
-        let resolution = self.prepare(
+        let mut resolution = self.prepare(
             SynthesisRequest {
                 current,
                 target: SynthesisTarget::Episode(episode.revision_id),
@@ -441,6 +443,9 @@ impl SynthesisPlanner {
             },
             None,
         )?;
+        if let Ok(prepared) = &mut resolution {
+            prepared.physical_only = physical_only;
+        }
         Ok(Ok((
             resolution,
             EventScope {
@@ -801,6 +806,7 @@ impl SynthesisPlanner {
             .collect();
         Ok(Ok(PreparedSynthesis {
             input,
+            physical_only: false,
             fingerprint,
             prompt_hash,
             daily,
@@ -840,6 +846,7 @@ impl SynthesisPlanner {
     ) -> Result<SynthesisResolution, crate::semantic::SemanticServiceError> {
         let PreparedSynthesis {
             input,
+            physical_only,
             fingerprint,
             prompt_hash,
             daily,
@@ -930,13 +937,20 @@ impl SynthesisPlanner {
                 },
             );
         }
-        let mut application = match materialize_application(
-            derived.application,
-            episode.as_ref(),
-            &evidence_refs,
-            request.occurred_at_us,
-            input.stage_trace.as_ref(),
-        ) {
+        let application = if physical_only {
+            physical_progress_only(derived.application, &input.direct_delta)
+        } else {
+            Ok(derived.application)
+        };
+        let mut application = match application.and_then(|application| {
+            materialize_application(
+                application,
+                episode.as_ref(),
+                &evidence_refs,
+                request.occurred_at_us,
+                input.stage_trace.as_ref(),
+            )
+        }) {
             Ok(value) => value,
             Err(_) => {
                 return audit_resolution(
@@ -1277,6 +1291,7 @@ struct EpisodeJobInput {
     trigger: SemanticDigestTrigger,
     delta: Vec<ProtectedDeltaItem>,
     refs: Vec<String>,
+    physical_only: bool,
 }
 
 type PhysicalSource = std::sync::Arc<evertrace_domain::evidence::SourceObservation>;
@@ -1366,6 +1381,7 @@ fn scheduled_input(
         trigger,
         delta,
         refs,
+        physical_only: false,
     })
 }
 
@@ -1546,6 +1562,7 @@ impl EpisodeJobInput {
             .flat_map(|item| item.direct_refs.iter().cloned())
             .collect();
         self.refs.sort();
+        self.physical_only = !delta.is_empty();
         self.delta = delta;
         Ok(())
     }
@@ -1916,6 +1933,46 @@ fn validate_candidates(
         }
     }
     Ok(())
+}
+
+/// Physical-only input has no authority to add an outcome, decision or reusable asset.
+/// The provider can group identical measurements, but may not reinterpret their meaning.
+fn physical_progress_only(
+    mut provider: ProviderSemanticApplication,
+    measurements: &[ProtectedDeltaItem],
+) -> Result<ProviderSemanticApplication, crate::semantic::SemanticServiceError> {
+    use crate::semantic::SemanticServiceError::InvalidInput;
+    if !provider.decision_delta.is_empty()
+        || !provider.failed_routes.is_empty()
+        || !provider.resolved_items.is_empty()
+        || !provider.open_loops.is_empty()
+        || !provider.outcome_delta.is_empty()
+        || !provider.omissions.is_empty()
+        || !provider.candidates.is_empty()
+        || provider.progress_delta.is_empty()
+    {
+        return Err(InvalidInput);
+    }
+    let mut covered = std::collections::BTreeSet::new();
+    for item in &mut provider.progress_delta {
+        if item.direct_refs.is_empty()
+            || !item.direct_refs.iter().all(|reference| {
+                covered.insert(reference.clone())
+                    && measurements.iter().any(|measurement| {
+                        measurement.direct_refs.contains(reference)
+                            && measurement.value == item.value
+                    })
+            })
+        {
+            return Err(InvalidInput);
+        }
+        item.label = "Physical process result".into();
+    }
+    if covered.len() != measurements.len() {
+        return Err(InvalidInput);
+    }
+    provider.completeness = evertrace_domain::semantic::SemanticCompleteness::Partial;
+    Ok(provider)
 }
 
 fn materialize_application(
