@@ -256,6 +256,8 @@ async def read_source_links(backend, reference, frontier, revision, after=None, 
             row = _metadata_card(record["metadata"])
             row["declared_references"] = record["references"]
             selection = page["selection"]
+            row["phase_review"] = (selection is not None and selection["object_kind"] == "work_episode"
+                and row["object_kind"] == "work_artifact")
             row["retry_parent"] = (selection is not None and selection["object_kind"] == row["object_kind"] == "experiment_run"
                 and selection["object_ref"] != row["object_ref"])
             items.append(row)

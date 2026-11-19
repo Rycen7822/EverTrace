@@ -384,6 +384,61 @@ impl JournalAdmissionState {
                 }
             }
         }
+        if let Some(JournalPayload::WorkEpisodeRecorded(episode)) = payload.as_ref() {
+            use evertrace_domain::work::{ArtifactActor, ArtifactScope, WorkArtifactKind};
+            let revision = episode.revision_id.to_string();
+            for job in self.jobs.values() {
+                if cancelled.load(std::sync::atomic::Ordering::Relaxed) {
+                    return Err(StoreError::Io);
+                }
+                if std::time::Instant::now() >= deadline {
+                    return Ok(O::TooLarge);
+                }
+                if job.kind != crate::PHASE_REFINEMENT_JOB_KIND
+                    || job.state != crate::JobStatus::Succeeded
+                    || job.target_revision != revision
+                    || job.target_watermark != episode.source_watermark
+                    || job.target_generation != episode.revision_generation
+                {
+                    continue;
+                }
+                let Some(artifact_revision) = job.terminal.as_ref().and_then(|terminal| {
+                    terminal.result_ref.as_deref()?.parse::<RevisionId>().ok()
+                }) else {
+                    continue;
+                };
+                let Some((artifact, _)) = self.artifact_revisions.get(&artifact_revision) else {
+                    continue;
+                };
+                let scope_matches = match artifact.revision.scope {
+                    ArtifactScope::Task { task_id } => {
+                        episode.repository_instance_id.is_none()
+                            && episode.worktree_instance_id.is_none()
+                            && episode.task_id == task_id
+                    }
+                    ArtifactScope::Worktree {
+                        repository_instance_id,
+                        worktree_instance_id,
+                    } => {
+                        episode.repository_instance_id == Some(repository_instance_id)
+                            && episode.worktree_instance_id == Some(worktree_instance_id)
+                    }
+                    _ => false,
+                };
+                // The successful job pins the exact reviewed input and output. Neither current artifact
+                // heads nor later advice about another revision belong to this historical selection.
+                if scope_matches
+                    && artifact.revision.kind == WorkArtifactKind::Review
+                    && artifact.revision.produced_by_refs
+                        == [ArtifactActor::WorkEpisode(episode.episode_id)]
+                {
+                    refs.insert(artifact_revision.to_string());
+                    if refs.len() > READ_DEPENDENCY_LIMIT {
+                        return Ok(O::TooLarge);
+                    }
+                }
+            }
+        }
         if let Some(JournalPayload::ExperimentRunRecorded(run)) = payload.as_ref() {
             let view = self.controlled_run_admission();
             if let Some(parent) =
