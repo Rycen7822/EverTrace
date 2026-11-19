@@ -2938,6 +2938,14 @@ impl ControlledRunResolver {
                     NativeTestContract::code_basis(anchor, entry).worktree_snapshot_id;
                 input.created_at_us = input.created_at_us.min(contract.started_at_us);
             }
+            let stream = &facts.workstreams[&attempt.workstream_id];
+            if stream.active_episode_id != attempt.episode_id
+                && input.metric_extractor_version
+                    != evertrace_domain::work::NATIVE_TEST_COHORT_PARSER_VERSION
+            {
+                // Only the same study's exact, independently measured executions can continue after close.
+                return Ok(ControlledRunCommand::NoDelta);
+            }
             receipts.extend([facts.receipt(source)?.source_receipt_id, opening_receipt]);
             input.source_receipt_refs = receipts;
             let mut run = create_experiment_run(attempt, input)?;
@@ -3386,10 +3394,18 @@ impl ControlledRunResolver {
                 continue;
             }
             let current = facts.bindings.get(&operation.operation_id);
+            // Late evidence can bind to the Run and Attempt without changing the frozen Phase membership.
+            let episode_id = if stream.active_episode_id == attempt.episode_id {
+                attempt.episode_id
+            } else {
+                current
+                    .and_then(|binding| binding.primary_binding.episode_id)
+                    .filter(|id| Some(*id) == attempt.episode_id)
+            };
             let primary = evertrace_domain::work::PrimaryWorkBinding {
                 task_id: Some(stream.task_id),
                 workstream_id: Some(stream.workstream_id),
-                episode_id: attempt.episode_id,
+                episode_id,
                 attempt_id: Some(attempt.attempt_id),
                 experiment_run_id: Some(run.run_id),
                 competing_group_id: current
@@ -3947,6 +3963,16 @@ fn process_trial_target<'a>(
     if streams.next().is_some() {
         return Err(AutoresearchError::EvidenceIncomplete);
     }
+    let roots = facts
+        .bindings
+        .values()
+        .filter(|binding| {
+            source_owns_stream(binding, stream, &reference) && !binding.scope_effect_refs.is_empty()
+        })
+        .collect::<Vec<_>>();
+    if roots.is_empty() {
+        return Ok(None);
+    }
     // A late terminal belongs to its already admitted launch, not today's active Phase.
     let (episode_id, attempt_id) = if let Some(run) = declared {
         let attempt = run
@@ -3957,13 +3983,25 @@ fn process_trial_target<'a>(
             return Err(AutoresearchError::ImmutableConflict);
         }
         (attempt.episode_id, Some(attempt.attempt_id))
-    } else {
-        if stream.status != evertrace_domain::work::workstream::WorkstreamStatus::Active
-            || stream.phase_contract != plan.definition.phase
-        {
+    } else if !stream.status.is_terminal()
+        && plan.definition.phase.phase_kind == evertrace_domain::work::PhaseKind::Execute
+    {
+        // The accepted study binding pins the launch Phase even while results are being analyzed.
+        let pinned = roots
+            .iter()
+            .filter_map(|binding| binding.primary_binding.episode_id)
+            .collect::<BTreeSet<_>>();
+        let mut pinned = pinned.into_iter();
+        let Some(id) = pinned.next().filter(|_| pinned.next().is_none()) else {
             return Ok(None);
-        }
+        };
+        (Some(id), None)
+    } else if stream.status == evertrace_domain::work::WorkstreamStatus::Active
+        && stream.phase_contract == plan.definition.phase
+    {
         (stream.active_episode_id, None)
+    } else {
+        return Ok(None);
     };
     let Some(episode) = episode_id
         .and_then(|id| facts.current_episodes.get(&id))
@@ -3978,18 +4016,10 @@ fn process_trial_target<'a>(
     {
         return Err(AutoresearchError::ImmutableConflict);
     }
-    let roots = facts
-        .bindings
-        .values()
-        .filter(|binding| {
-            binding.assignment_status == AssignmentStatus::Resolved
-                && binding.primary_binding.workstream_id == Some(stream.workstream_id)
-                && binding.primary_binding.task_id == Some(stream.task_id)
-                && !binding.scope_effect_refs.is_empty()
-                && binding.evidence_refs.contains(&reference)
-        })
-        .collect::<Vec<_>>();
-    if roots.is_empty() {
+    if declared.is_none()
+        && stream.active_episode_id != Some(episode.episode_id)
+        && episode.lifecycle_status != evertrace_domain::work::EpisodeLifecycle::Closed
+    {
         return Ok(None);
     }
     let mut attempts = facts.attempts.values().filter(|attempt| {

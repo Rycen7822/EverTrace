@@ -27,7 +27,6 @@ pub(crate) fn source_run_binding(
     if operation.pairing_state != evertrace_domain::evidence::PairingState::Paired
         || primary.task_id.is_none()
         || primary.workstream_id.is_none()
-        || primary.episode_id.is_none()
         || primary.attempt_id.is_none()
         || primary.experiment_run_id.is_none()
         || evidence_refs.is_empty()

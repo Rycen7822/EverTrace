@@ -505,9 +505,13 @@ fn native_source_bytes<'a>(
         || observation.source_instance_id != receipt.source_instance_id
         || observation.source_revision != receipt.source_revision
         || observation.source_record_identity != receipt.source_record_identity
-        // Intent supplies the admitted namespace; image3 separately authenticates its entire raw body.
-        || role != evertrace_domain::evidence::ObservationRole::Intent
-            && observation.content_trust != ContentTrust::Observed
+        // Intent supplies the admitted namespace; image3 separately authenticates it. A study
+        // declaration is never an observed result; only an already accepted root can own it.
+        || match role {
+            evertrace_domain::evidence::ObservationRole::Intent => false,
+            evertrace_domain::evidence::ObservationRole::Other => observation.content_trust != ContentTrust::UntrustedSourceContent,
+            _ => observation.content_trust != ContentTrust::Observed,
+        }
         || observation.source_role != SourceRole::Tool
         || surface.source_role != observation.source_role
         || surface.content_trust != observation.content_trust
@@ -774,8 +778,6 @@ fn validate_native_contract(
         || attempt.workstream_id != stream.workstream_id
         || attempt.task_id != stream.task_id
         || attempt.strategy_contract_fingerprint != run.strategy_contract_fingerprint
-        // A successor revalidates the declared Attempt even after its launch Phase closes.
-        || run.is_declaration_only() && stream.active_episode_id != Some(episode.episode_id)
         || episode.lifecycle_status == evertrace_domain::work::EpisodeLifecycle::Superseded
         || !episode.attempt_ids.contains(&attempt.attempt_id)
         || episode.workstream_id != stream.workstream_id
@@ -792,7 +794,74 @@ fn validate_native_contract(
     {
         return Err(error);
     }
+    // A new execution outside the active Phase requires an exact, protected sibling study binding.
+    if run.is_declaration_only() && stream.active_episode_id != Some(episode.episode_id) {
+        validate_late_native_launch(view, run, receipt, &value, stream, episode, error)?;
+    }
     Ok(contract)
+}
+
+fn validate_late_native_launch(
+    view: &ControlledRunAdmissionView<'_>,
+    run: &ExperimentRun,
+    launch: &SourceReceipt,
+    event: &serde_json::Value,
+    stream: &Workstream,
+    episode: &WorkEpisode,
+    error: StoreError,
+) -> Result<(), StoreError> {
+    use evertrace_domain::{
+        evidence::ObservationRole,
+        work::{EpisodeLifecycle, NATIVE_TEST_COHORT_PARSER_VERSION, PhaseKind},
+    };
+    if run.metric_extractor_version != NATIVE_TEST_COHORT_PARSER_VERSION
+        || stream.status.is_terminal()
+        || episode.lifecycle_status != EpisodeLifecycle::Closed
+        || episode.phase_contract.phase_kind != PhaseKind::Execute
+    {
+        return Err(error);
+    }
+    let mut openings = run.source_receipt_refs.iter().filter_map(|id| {
+        let (receipt, _) = view.receipts.get(id)?;
+        (receipt.source_instance_id == launch.source_instance_id
+            && receipt.source_revision == launch.source_revision
+            && receipt.source_sequence == 1)
+            .then_some(receipt.source_receipt_id)
+    });
+    let opening = openings
+        .next()
+        .filter(|_| openings.next().is_none())
+        .ok_or(error)?;
+    let (receipt, observation, raw) =
+        native_source_bytes(view, opening, ObservationRole::Other, false, error)?;
+    let study: serde_json::Value = serde_json::from_slice(raw).map_err(|_| error)?;
+    let phase: evertrace_domain::work::PhaseContract =
+        serde_json::from_value(study["definition"]["phase"].clone()).map_err(|_| error)?;
+    let reference = observation.source_observation_id.to_string();
+    if receipt.identity_domain != evertrace_capture::process_source::FORMAT
+        || study["format"] != evertrace_capture::process_source::FORMAT
+        || study["event"] != "study_opened"
+        || study["event_key"].as_str() != Some(receipt.source_record_identity.as_str())
+        || study["source_epoch"] != event["source_epoch"]
+        || study["study_key"] != event["study_key"]
+        || phase != episode.phase_contract
+        || !stream.worktree_lineage_refs.contains(&reference)
+    {
+        return Err(error);
+    }
+    let bindings = current_binding_lineage(view.work_bindings.values().map(|(value, _)| value))
+        .map_err(|_| error)?;
+    if !bindings.values().any(|binding| {
+        binding.assignment_status == AssignmentStatus::Resolved
+            && binding.primary_binding.task_id == Some(stream.task_id)
+            && binding.primary_binding.workstream_id == Some(stream.workstream_id)
+            && binding.primary_binding.episode_id == Some(episode.episode_id)
+            && !binding.scope_effect_refs.is_empty()
+            && binding.evidence_refs.contains(&reference)
+    }) {
+        return Err(error);
+    }
+    Ok(())
 }
 
 fn validate_native_terminal_cohort(
