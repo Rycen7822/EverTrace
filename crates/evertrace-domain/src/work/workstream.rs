@@ -39,6 +39,19 @@ pub struct PhaseContract {
 }
 
 impl PhaseContract {
+    /// A display label is not evidence of a different contract.
+    pub fn same_proposal(&self, other: &Self) -> bool {
+        self.phase_kind == other.phase_kind && self.same_content(other)
+    }
+
+    pub fn same_content(&self, other: &Self) -> bool {
+        self.local_goal == other.local_goal
+            && self.primary_targets == other.primary_targets
+            && self.entry_conditions == other.entry_conditions
+            && self.acceptance_boundary == other.acceptance_boundary
+            && self.expected_state_transition == other.expected_state_transition
+    }
+
     pub fn validate(&self) -> Result<(), WorkError> {
         if !bounded(&self.local_goal)
             || !bounded(&self.phase_label)

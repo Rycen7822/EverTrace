@@ -290,10 +290,10 @@ impl ActivityToken {
             // A changed target or entry condition is a proposal, not evidence that the old Phase finished.
             self.declared_contract_changed = (declared.phase_kind != PhaseKind::Unknown
                 && declared.phase_kind != current.phase_kind)
-                || !super::same_phase_content(current, declared);
+                || !current.same_content(declared);
             self.replaces_candidate = declared.phase_kind != PhaseKind::Unknown
                 && self.declared_contract_changed
-                && anchored.is_some_and(|anchor| !super::same_phase_proposal(anchor, declared));
+                && anchored.is_some_and(|anchor| !anchor.same_proposal(declared));
         }
         Ok(self)
     }

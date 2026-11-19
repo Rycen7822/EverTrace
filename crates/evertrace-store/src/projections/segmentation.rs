@@ -149,6 +149,17 @@ pub struct SegmentationCurrentState {
     episode_window: Option<WorkEpisodeId>,
 }
 
+/// Exact, same-scope witness for a competing semantic alignment, not an assignment.
+#[derive(Clone, Debug)]
+pub struct WorkstreamAlignment {
+    pub workstream_id: WorkstreamId,
+    pub episode_id: WorkEpisodeId,
+    pub operation_id: OperationId,
+    pub binding_revision_id: evertrace_domain::ids::WorkBindingRevisionId,
+    pub baseline_attempt_id: AttemptId,
+    pub source_refs: Vec<SourceObservationId>,
+}
+
 /// One pending canonical activity and its bounded, single-frontier authority.
 #[derive(Clone, Debug)]
 pub struct SegmentationReadContext {
@@ -158,6 +169,7 @@ pub struct SegmentationReadContext {
     pub state: SegmentationCurrentState,
     pub root_refs: Vec<String>,
     pub boundary_operation: Option<(Operation, WorkBindingRevision)>,
+    pub alignment_alternative: Option<WorkstreamAlignment>,
     pub boundary_repository_identity: Option<evertrace_domain::repository::FilesystemIdentity>,
     pub source_refs: Vec<evertrace_domain::ids::SourceObservationId>,
     pub repository_ids: std::collections::BTreeSet<evertrace_domain::ids::RepositoryId>,
@@ -353,7 +365,7 @@ impl JournalAdmissionState {
             }
         }
         let mut selected: Option<(&Operation, &WorkBindingRevision, u64, &WorkEpisode)> = None;
-        for (id, binding) in bindings {
+        for (&id, &binding) in &bindings {
             let Some((binding, binding_sequence)) = binding
                 .filter(|(binding, _)| binding.assignment_status == AssignmentStatus::Resolved)
             else {
@@ -594,6 +606,81 @@ impl JournalAdmissionState {
             }
             recent.insert((burst.source_watermark, burst.operation_burst_id), burst);
         }
+        let alignment_alternative = if matches!(checkpoint, Some(ActivityTarget::Refinement(_)))
+            && let Some(candidate) = &episode.boundary_candidate
+            && let Some(lane) = operation.execution_lane_id.and_then(|id| lanes.get(&id))
+            && let [attempt] = episode.attempt_ids.as_slice()
+            && let Some((attempt, _)) = self.attempts.get(attempt)
+        {
+            let mut alternatives = lane.operation_ids.iter().rev().take(32).filter_map(|id| {
+                use evertrace_domain::{
+                    evidence::PairingState,
+                    work::{EpisodeLifecycle, WorkstreamStatus},
+                };
+                let (prior, op_seq) = self.operations.get(id)?;
+                let (binding, binding_seq) = bindings.get(id).copied().flatten()?;
+                let primary = &binding.primary_binding;
+                if binding.assignment_status != AssignmentStatus::Resolved
+                    || primary.task_id != Some(episode.task_id)
+                    || primary.workstream_id == Some(episode.workstream_id)
+                    || prior.execution_lane_id != Some(lane.execution_lane_id)
+                    || prior.pairing_state != PairingState::Paired
+                    || (*op_seq).max(binding_seq) >= candidate.candidate_watermark
+                {
+                    return None;
+                }
+                let (other, _) = self.episodes.get(&primary.episode_id?)?;
+                let (stream, _) = self.workstreams.get(&primary.workstream_id?)?;
+                let (host, _) = self.host_occurrences.get(&prior.host_occurrence_id)?;
+                let [other_attempt] = other.attempt_ids.as_slice() else {
+                    return None;
+                };
+                let (other_attempt, _) = self.attempts.get(other_attempt)?;
+                (stream.status == WorkstreamStatus::Active
+                    && stream.active_episode_id == Some(other.episode_id)
+                    && other.lifecycle_status == EpisodeLifecycle::Open
+                    && other.boundary_candidate.is_none()
+                    && other.repository_instance_id == episode.repository_instance_id
+                    && other.worktree_instance_id == episode.worktree_instance_id
+                    && other.phase_contract.same_proposal(&episode.phase_contract)
+                    && other_attempt.strategy_contract == attempt.strategy_contract
+                    && host.correlation_strength == CorrelationStrength::Exact
+                    && host.possible_duplicate_group_id.is_none()
+                    && host.normalization_state
+                        != evertrace_domain::evidence::NormalizationState::NormalizationConflicted)
+                    .then_some((prior, binding, other))
+            });
+            let first = alternatives.next();
+            if let Some((prior, binding, other)) = first
+                && !alternatives
+                    .any(|(_, _, alternative)| alternative.episode_id != other.episode_id)
+            {
+                let sources = prior
+                    .input_source_observation_refs
+                    .iter()
+                    .chain(&prior.result_source_observation_refs)
+                    .copied()
+                    .chain(
+                        binding
+                            .evidence_refs
+                            .iter()
+                            .filter_map(|id| id.parse::<SourceObservationId>().ok()),
+                    )
+                    .collect::<BTreeSet<_>>();
+                Some(WorkstreamAlignment {
+                    workstream_id: other.workstream_id,
+                    episode_id: other.episode_id,
+                    operation_id: prior.operation_id,
+                    binding_revision_id: binding.work_binding_revision_id,
+                    baseline_attempt_id: attempt.attempt_id,
+                    source_refs: sources.into_iter().collect(),
+                })
+            } else {
+                None
+            }
+        } else {
+            None
+        };
         let authority = SegmentationCurrentView {
             frontier: self.frontier,
             occurrences: BTreeMap::from([(occurrence.host_occurrence_id, occurrence.clone())]),
@@ -659,6 +746,7 @@ impl JournalAdmissionState {
             },
             root_refs: task.request_root_refs.clone(),
             boundary_operation,
+            alignment_alternative,
             boundary_repository_identity,
             source_refs: source_refs.into_iter().collect(),
             repository_ids,

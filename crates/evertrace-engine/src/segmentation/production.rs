@@ -208,7 +208,7 @@ async fn phase_completion(
     let Some(stream) = state.authority().workstream(episode.workstream_id) else {
         return Ok(None);
     };
-    if !anchored.is_some_and(|anchor| super::same_phase_proposal(anchor, phase))
+    if !anchored.is_some_and(|anchor| anchor.same_proposal(phase))
         || stream.root_goal != episode.phase_contract.local_goal
         || candidate.candidate_phase_kind != Some(phase.phase_kind)
     {

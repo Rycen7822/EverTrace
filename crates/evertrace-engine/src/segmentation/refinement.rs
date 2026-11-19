@@ -313,6 +313,7 @@ pub(crate) async fn input(
         .collect::<Vec<_>>();
     let mut prior_declaration = None;
     let mut scope_conflict = None;
+    let mut alignment = None;
     if attempt_candidate
         && let (Some(phase), Some(strategy), Some((anchor, anchor_binding))) = (
             &activity.phase,
@@ -322,10 +323,11 @@ pub(crate) async fn input(
         && phase.phase_kind == episode.phase_contract.phase_kind
         && phase.local_goal == episode.phase_contract.local_goal
     {
-        let competing = phase.primary_targets == episode.phase_contract.primary_targets
+        let changed_boundary = phase.primary_targets == episode.phase_contract.primary_targets
             && (phase.acceptance_boundary != episode.phase_contract.acceptance_boundary
                 || phase.expected_state_transition
-                    != episode.phase_contract.expected_state_transition)
+                    != episode.phase_contract.expected_state_transition);
+        let competing = changed_boundary
             && !episode.attempt_ids.is_empty()
             && !episode.attempt_ids.iter().any(|id| {
                 authority
@@ -352,7 +354,17 @@ pub(crate) async fn input(
             ];
             (effects[0] != effects[1]).then_some((actual, effects))
         })();
-        if competing || scope.is_some() {
+        let alternative = selected
+            .alignment_alternative
+            .as_ref()
+            .filter(|alternative| {
+                changed_boundary
+                    && activity.exit_code.is_some()
+                    && authority
+                        .attempt(alternative.baseline_attempt_id)
+                        .is_some_and(|attempt| attempt.strategy_contract == *strategy)
+            });
+        if competing || scope.is_some() || alternative.is_some() {
             let earlier = match super::production::source_operation_activity(
                 snapshot,
                 &selected,
@@ -368,7 +380,7 @@ pub(crate) async fn input(
             if earlier
                 .phase
                 .as_ref()
-                .is_some_and(|anchor| super::same_phase_proposal(anchor, phase))
+                .is_some_and(|anchor| anchor.same_proposal(phase))
                 && earlier.strategy.as_ref() == Some(strategy)
                 && !earlier.declaration_refs.is_empty()
                 && earlier.declaration_refs.iter().all(|id| {
@@ -377,11 +389,25 @@ pub(crate) async fn input(
             {
                 prior_declaration = Some(earlier.declaration_refs);
                 scope_conflict = scope;
+                alignment = alternative;
             }
         }
     }
     let gray_zone = if scope_conflict.is_some() {
         "plan_operation_conflict"
+    } else if let Some(alternative) = alignment {
+        selected
+            .source_refs
+            .extend(alternative.source_refs.iter().copied());
+        selected.source_refs.sort();
+        selected.source_refs.dedup();
+        if super::production::readable_context(writer, snapshot, &selected, runtime)
+            .await?
+            .is_none()
+        {
+            return Ok(None);
+        }
+        "workstream_alignment"
     } else if prior_declaration.is_some() {
         "attempt_or_episode"
     } else if !checkpoint_ready {
@@ -493,6 +519,9 @@ pub(crate) async fn input(
     if let Some((_, effects)) = &scope_conflict {
         evidence.extend(effects.iter().map(ToString::to_string));
     }
+    if let Some(alternative) = alignment {
+        evidence.insert(alternative.binding_revision_id.to_string());
+    }
     let mut context = serde_json::json!({"phase_contract":episode.phase_contract,
         "candidate":candidate.map(|value| serde_json::json!({"watermark":value.candidate_watermark,"kind":value.kind})),
         "gray_zone":gray_zone,
@@ -508,6 +537,10 @@ pub(crate) async fn input(
         // facts from another scope: this Review has only the observed scope's provenance.
         context["scope_conflict"] =
             serde_json::json!({"observed_repository":observed,"scope_effects":effects});
+    }
+    if let Some(alternative) = alignment {
+        context["alignment_alternative"] = serde_json::json!({"workstream":alternative.workstream_id,
+            "episode":alternative.episode_id,"operation":alternative.operation_id,"binding_revision":alternative.binding_revision_id});
     }
     let json = serde_json::to_string(&context).map_err(|_| Error::Store)?;
     if json.len() > 16384 {
