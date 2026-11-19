@@ -4,7 +4,6 @@ import json
 
 from . import BackendError
 from .content import _decode_cursor, read_record_detail
-from .sources import read_source_links
 
 SUPPORT_DETAIL_KINDS = {"global_support_contract", "global_support_validation"}
 
@@ -190,10 +189,6 @@ async def read_support_detail(backend, reference, frontier, revision, object_kin
         raise BackendError("resource_exhausted") from error
 
 
-def _link_seal(page):
-    return tuple(page[key] for key in ("status", "items", "unavailable", "matching_count"))
-
-
 async def _read_support(backend, reference, frontier, revision, object_kind):
     reply = await backend.read_record_window(reference, revision)
     if reply["kind"] == "conflict":
@@ -224,43 +219,37 @@ async def _read_support(backend, reference, frontier, revision, object_kind):
         now = reply["page"]
         seals.append((public, None, now))
         current.update({"state":now["content_state"], "metadata":now["metadata"]})
-    event, links, after, bound = {"state":"unavailable"}, [], None, 0
-    for _ in range(3):
-        page = await read_source_links(backend, contract, bound, contract, after)
-        if page["kind"] == "conflict":
-            return page
-        links.append((after, bound, page))
-        if page["status"] != "ready":
-            event = {"state":page["status"]}
-            break
-        choices = [item for item in page["items"] if item["object_kind"] == "global_support_validation"]
-        if len(choices) > 1:
-            raise BackendError("invalid_read_response")
-        if choices:
-            selected = choices[0]
-            reply = await read_record_detail(backend, selected["stable_key"], 0, selected["revision_ref"],
+    if origin["content_state"] != "ready":
+        return {"kind":"conflict"}
+    info = origin["info"]
+    if info["kind"] != "global_support":
+        raise BackendError("invalid_read_response")
+    selected = info["current_validation"]
+    event = {"state":"unavailable"}
+    if selected == value.get("validation_revision_id") and selected is not None:
+        event = {"state":"ready", "value":value}
+    elif selected is not None:
+        reply = await backend.read_record_window(selected, selected, data_identity=identity)
+        if reply["kind"] == "conflict":
+            return reply
+        target = reply["page"]
+        seals.append((selected, selected, target))
+        event = {"state":target["content_state"]}
+        if target["content_state"] == "ready":
+            reply = await read_record_detail(backend, selected, frontier, selected,
                 "global_support_validation", data_identity=identity)
-            if reply["kind"] == "conflict":
-                return reply
-            if reply["items"]:
-                selected_detail = reply["items"][0]["semantic_detail"]
-                event = {"state":selected_detail["state"]}
-                if selected_detail["state"] == "ready":
-                    latest = selected_detail["content"]["value"]
-                    if latest["support_contract_ref"] != contract:
-                        raise BackendError("invalid_read_response")
-                    event["value"] = latest
-            break
-        if page["next_cursor"] is None:
-            break
-        after, bound = page["next_cursor"], page["frontier"]
+            if reply["kind"] == "conflict" or not reply["items"]:
+                return {"kind":"conflict"}
+            selected_detail = reply["items"][0]["semantic_detail"]
+            if selected_detail["state"] != "ready":
+                return {"kind":"conflict"}
+            latest = selected_detail["content"]["value"]
+            if latest["support_contract_ref"] != contract or latest["validation_revision_id"] != selected:
+                raise BackendError("invalid_read_response")
+            event["value"] = latest
     for key, selected_revision, before in seals:
         reply = await backend.read_record_window(key, selected_revision, data_identity=identity, selection=before["selection"])
         if reply["kind"] == "conflict" or not _same_page(before, reply["page"]):
-            return {"kind":"conflict"}
-    for after, bound, before in links:
-        page = await read_source_links(backend, contract, bound, contract, after)
-        if page["kind"] == "conflict" or _link_seal(page) != _link_seal(before):
             return {"kind":"conflict"}
     content.update({"asset_now":current, "contract_now":event})
     return result

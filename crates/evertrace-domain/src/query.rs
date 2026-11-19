@@ -2876,6 +2876,10 @@ pub enum ExactRecordInfo {
     Semantic {
         text_bytes: Option<u64>,
     },
+    /// Association from the current support map, not a grant to read the event body.
+    GlobalSupport {
+        current_validation: Option<RevisionId>,
+    },
     /// A declared source with the same protected CAS payload, not a producer, verification or read grant.
     Artifact {
         source: Option<Box<ExactSourceIdentity>>,
@@ -2957,6 +2961,14 @@ impl ExactRecordWindow {
                                 })
                         }
                         ExactRecordInfo::Semantic { .. } => true,
+                        ExactRecordInfo::GlobalSupport { .. } => {
+                            self.selection.as_ref().is_some_and(|selected| {
+                                matches!(
+                                    selected.object_kind.as_str(),
+                                    "global_support_contract" | "global_support_validation"
+                                )
+                            })
+                        }
                         ExactRecordInfo::CurrentRecall {
                             active_retrieval_request_id,
                         } => {

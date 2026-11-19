@@ -1123,7 +1123,9 @@ impl EngineService {
             || before.source_suppressed != current.source_suppressed
         {
             return Ok(Outcome::Conflict(current.state.frontier));
-        } else if before.analysis_entry() != current.analysis_entry() {
+        } else if before.analysis_entry() != current.analysis_entry()
+            || before.current_support_validation != current.current_support_validation
+        {
             return Ok(Outcome::Conflict(current.state.frontier));
         } else {
             result.content_state = read_state;
@@ -1132,6 +1134,17 @@ impl EngineService {
                     &mut info
                 {
                     *analysis_entry = current.analysis_entry().cloned();
+                }
+                if matches!(
+                    current
+                        .selected
+                        .as_ref()
+                        .and_then(|row| row.object_kind.as_deref()),
+                    Some("global_support_contract" | "global_support_validation")
+                ) {
+                    info = evertrace_domain::query::ExactRecordInfo::GlobalSupport {
+                        current_validation: current.current_support_validation,
+                    };
                 }
                 result.info = Some(info);
                 result.window = window;

@@ -3081,6 +3081,7 @@ pub struct StoredFieldsContext {
     pub rows: Vec<ObjectRow>,
     pub source_suppressed: bool,
     pub(crate) analysis_entry: Option<autoresearch::AnalysisEntry>,
+    pub current_support_validation: Option<RevisionId>,
 }
 
 impl StoredFieldsContext {
@@ -7318,6 +7319,7 @@ impl JournalAdmissionState {
             rows: Vec::new(),
             source_suppressed: false,
             analysis_entry: None,
+            current_support_validation: None,
         };
         let Some(root) = selected else {
             return Ok(Outcome::Page(Box::new(context)));
@@ -7348,6 +7350,18 @@ impl JournalAdmissionState {
                     .ok_or(StoreError::StoreCorrupt)?,
             )
             .map_err(|_| StoreError::StoreCorrupt)?;
+            let contract = match &payload {
+                JournalPayload::GlobalSupportContractRecorded(value) => {
+                    Some(value.support_contract_revision_id)
+                }
+                JournalPayload::GlobalSupportValidationRecorded(value) => {
+                    Some(value.support_contract_ref)
+                }
+                _ => None,
+            };
+            context.current_support_validation = contract
+                .and_then(|id| self.scenario_core.current_validation(id))
+                .map(|event| event.validation_revision_id);
             let Some(mut refs) = self.stored_read_dependencies(
                 &root,
                 &payload,
