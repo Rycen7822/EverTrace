@@ -478,9 +478,12 @@ pub(crate) async fn input(
             .ok_or(Error::Store)?
             .parse()
             .map_err(|_| Error::Store)?;
-        let (raw, _) = cas
-            .read_bounded(&digest, 131072, 131072)
-            .map_err(|_| Error::Store)?;
+        let (raw, _) = match cas.read_bounded(&digest, 131072, 131072) {
+            Ok(payload) => payload,
+            // Missing rationale cannot shrink the evidence window sent for judgment.
+            Err(evertrace_capture::CasError::NotFound) => return Ok(None),
+            Err(_) => return Err(Error::Store),
+        };
         let Ok(original) = serde_json::from_slice::<serde_json::Value>(&raw) else {
             continue;
         };
