@@ -78,7 +78,99 @@ impl super::JournalAdmissionState {
     }
 }
 
+/// Request-local candidate; journal command identity must still verify the handoff.
+#[derive(Debug, PartialEq)]
+pub(crate) struct AnalysisEntry {
+    pub(crate) result: evertrace_domain::query::ExactRecordRef,
+    pub(crate) cohort: [u64; 3],
+}
+
 impl super::JournalAdmissionState {
+    pub(super) fn experiment_analysis_entry(
+        &self,
+        episode: &WorkEpisode,
+        cancelled: &std::sync::atomic::AtomicBool,
+        deadline: std::time::Instant,
+    ) -> Result<Option<AnalysisEntry>, StoreError> {
+        use evertrace_domain::work::{
+            NATIVE_TEST_COHORT_PARSER_VERSION, PhaseKind, experiment_analysis_phase,
+        };
+        if episode.phase_contract.phase_kind != PhaseKind::Analyze {
+            return Ok(None);
+        }
+        let [entry] = episode.phase_contract.entry_conditions.as_slice() else {
+            return Ok(None);
+        };
+        let Some((mut result, mut result_seq)) = entry
+            .parse::<ResultEvidenceId>()
+            .ok()
+            .and_then(|id| self.result_evidence.get(&id))
+            .map(|(value, seq)| (value, *seq))
+        else {
+            return Ok(None);
+        };
+        let Some((run, run_seq)) = self
+            .experiment_run_revisions
+            .get(&result.experiment_run_revision_id)
+        else {
+            return Ok(None);
+        };
+        if run.metric_extractor_version != NATIVE_TEST_COHORT_PARSER_VERSION
+            || run.run_id != result.experiment_run_id
+            || run.workstream_id != episode.workstream_id
+            || episode.phase_contract != experiment_analysis_phase(run, result.result_evidence_id)
+        {
+            return Ok(None);
+        }
+        let check = |count| {
+            if cancelled.load(std::sync::atomic::Ordering::Relaxed)
+                || std::time::Instant::now() >= deadline
+                || count >= super::READ_DEPENDENCY_LIMIT
+            {
+                return Err(StoreError::Io);
+            }
+            Ok(())
+        };
+        let mut birth = episode;
+        let mut count = 0;
+        while let Some(prior) = birth.predecessor_revision_id {
+            count += 1;
+            check(count)?;
+            birth = &self
+                .episode_revisions
+                .get(&prior)
+                .ok_or(StoreError::StoreCorrupt)?
+                .0;
+        }
+        let birth_seq = self
+            .episode_revisions
+            .get(&birth.revision_id)
+            .ok_or(StoreError::StoreCorrupt)?
+            .1;
+        if *run_seq >= birth_seq {
+            return Ok(None);
+        }
+        while result_seq >= birth_seq {
+            count += 1;
+            check(count)?;
+            let Some(prior) = result.parent_revision_id else {
+                return Ok(None);
+            };
+            (result, result_seq) = self
+                .result_evidence_revisions
+                .get(&prior)
+                .map(|(value, seq)| (value, *seq))
+                .ok_or(StoreError::StoreCorrupt)?;
+        }
+        Ok(Some(AnalysisEntry {
+            result: evertrace_domain::query::ExactRecordRef {
+                stable_key: entry.clone(),
+                revision_ref: Some(result.revision_id.to_string()),
+            },
+            cohort: [*run_seq, result_seq, birth_seq],
+        }))
+    }
+
     /// Reuse an already accepted native Run's exact launch for one newly verified terminal.
     /// Called under the writer before append, never during replay or historical normalization.
     pub(crate) fn recover_native_terminal_gate(

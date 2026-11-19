@@ -204,6 +204,8 @@ async def read_record_detail(backend, reference, frontier, revision, object_kind
         detail["content"].update({"ledger_event_seq": selection["source_event_seq"],
             "need_hash": bytes(record["recall_need_hash"]).hex(), "plan_fingerprint": bytes(record["recall_plan_fingerprint"]).hex(),
             "matched_contracts": [bytes(value).hex() for value in record["matched_contract_ids"]]})
+    if object_kind == "work_episode" and record is not None and final["info"].get("analysis_entry"):
+        detail["content"]["analysis_entry"] = final["info"]["analysis_entry"]
     if object_kind == "procedure_context_effect" and record is not None:
         detail["content"]["context_hash"] = bytes(record["context_fingerprint_hash"]).hex()
     if object_kind == "work_artifact" and record is not None:

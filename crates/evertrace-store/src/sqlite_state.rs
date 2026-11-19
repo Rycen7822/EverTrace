@@ -562,6 +562,22 @@ impl SqliteState {
         })
     }
 
+    pub(crate) fn same_journal_command(&self, cohort: [u64; 3]) -> Result<bool, StoreError> {
+        self.with_connection(|connection| {
+            let mut statement = connection
+                .prepare("SELECT command_id FROM journal_events WHERE seq=?1")
+                .map_err(|_| StoreError::StoreCorrupt)?;
+            let mut command_at = |seq: u64| -> Result<String, StoreError> {
+                statement
+                    .query_row(params![seq.to_be_bytes().as_slice()], |row| row.get(0))
+                    .map_err(|_| StoreError::StoreCorrupt)
+            };
+            let [run, result, episode] = cohort;
+            let command = command_at(episode)?;
+            Ok(command_at(result)? == command && command_at(run)? == command)
+        })
+    }
+
     pub(crate) fn committed_rows(
         &self,
         command_id: CommandId,

@@ -2889,6 +2889,9 @@ pub enum ExactRecordInfo {
     Work {
         goal_bytes: u64,
         open_loop_bytes: Vec<u64>,
+        /// The Result revision accepted with this Analyze Phase, not its current head.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        analysis_entry: Option<ExactRecordRef>,
     },
 }
 

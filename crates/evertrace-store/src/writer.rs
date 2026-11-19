@@ -1874,13 +1874,19 @@ impl JournalWriter {
         StoreError,
     > {
         let (before, state) = self.metadata_read_boundary(effective_config_hash)?;
-        let result = self.stored_fields_at_state(
+        let mut result = self.stored_fields_at_state(
             query,
             state,
             cancelled,
             deadline,
             &mut crate::projections::ReadDependencyBudget::default(),
         )?;
+        if let evertrace_domain::query::MetadataReadOutcome::Page(context) = &mut result
+            && let Some(entry) = &context.analysis_entry
+            && !self.lock_sqlite()?.same_journal_command(entry.cohort)?
+        {
+            context.analysis_entry = None;
+        }
         self.finish_metadata_read(before, cancelled)?;
         Ok(result)
     }

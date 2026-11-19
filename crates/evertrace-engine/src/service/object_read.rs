@@ -705,6 +705,7 @@ fn record_data(
         }
         P::WorkEpisodeRecorded(value) => {
             let info = Info::Work {
+                analysis_entry: None,
                 goal_bytes: value.phase_contract.local_goal.len() as u64,
                 open_loop_bytes: value
                     .open_loops
@@ -1122,9 +1123,16 @@ impl EngineService {
             || before.source_suppressed != current.source_suppressed
         {
             return Ok(Outcome::Conflict(current.state.frontier));
+        } else if before.analysis_entry() != current.analysis_entry() {
+            return Ok(Outcome::Conflict(current.state.frontier));
         } else {
             result.content_state = read_state;
-            if let Some((info, window)) = data {
+            if let Some((mut info, window)) = data {
+                if let evertrace_domain::query::ExactRecordInfo::Work { analysis_entry, .. } =
+                    &mut info
+                {
+                    *analysis_entry = current.analysis_entry().cloned();
+                }
                 result.info = Some(info);
                 result.window = window;
             }

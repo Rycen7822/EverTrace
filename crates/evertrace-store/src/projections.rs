@@ -3080,6 +3080,13 @@ pub struct StoredFieldsContext {
     pub selected: Option<ObjectRow>,
     pub rows: Vec<ObjectRow>,
     pub source_suppressed: bool,
+    pub(crate) analysis_entry: Option<autoresearch::AnalysisEntry>,
+}
+
+impl StoredFieldsContext {
+    pub fn analysis_entry(&self) -> Option<&evertrace_domain::query::ExactRecordRef> {
+        self.analysis_entry.as_ref().map(|entry| &entry.result)
+    }
 }
 
 /// A bounded current read, not a complete projection or a reusable reader.
@@ -7309,6 +7316,7 @@ impl JournalAdmissionState {
             selected: None,
             rows: Vec::new(),
             source_suppressed: false,
+            analysis_entry: None,
         };
         let Some(root) = selected else {
             return Ok(Outcome::Page(Box::new(context)));
@@ -7349,6 +7357,13 @@ impl JournalAdmissionState {
             else {
                 return Ok(Outcome::TooLarge);
             };
+            if let JournalPayload::WorkEpisodeRecorded(episode) = &payload
+                && let Some(entry) = self.experiment_analysis_entry(episode, cancelled, deadline)?
+            {
+                refs.remove(&entry.result.stable_key);
+                refs.extend(entry.result.revision_ref.iter().cloned());
+                context.analysis_entry = Some(entry);
+            }
             // Direct lane/receipt bodies inherit known physical scopes without changing source identity.
             // A lane reference in an ordinary Work read is not an aggregate lane body.
             let scoped_lane = match &payload {
