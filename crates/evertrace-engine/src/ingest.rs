@@ -826,7 +826,7 @@ impl EvidenceIngestor {
     async fn observe_live_process(
         &self,
         verified: &mut crate::capture::VerifiedCapture,
-    ) -> Result<(), IngestError> {
+    ) -> Result<bool, IngestError> {
         use evertrace_capture::process_source;
         use evertrace_domain::evidence::{CaptureCompleteness, ContentTrust, ObservationRole};
         let body = &verified.body;
@@ -842,10 +842,10 @@ impl EvidenceIngestor {
                 || body.correlation.native_request_id.is_none()
                 || body.correlation.physical_execution_ordinal.is_none())
         {
-            return Ok(());
+            return Ok(false);
         }
         let Some(surface) = verified.surface.as_ref() else {
-            return Ok(());
+            return Ok(false);
         };
         let raw = surface.protected_text.as_bytes().to_vec();
         let snapshot = RuntimeSnapshot::snapshot_path(
@@ -874,7 +874,7 @@ impl EvidenceIngestor {
                 surface.content_trust = ContentTrust::Observed;
             }
         }
-        Ok(())
+        Ok(observed && !image)
     }
 
     async fn normalize_live_native(
@@ -1378,7 +1378,7 @@ impl EvidenceIngestor {
                     progress.projected_surfaces += surface_count;
                     continue;
                 }
-                self.observe_live_process(&mut verified).await?;
+                let live_terminal = self.observe_live_process(&mut verified).await?;
                 if native_profile {
                     if let Some(report) = self.execution_canary.as_ref().and_then(|canary| {
                         if process_profile {
@@ -1438,10 +1438,16 @@ impl EvidenceIngestor {
                     )?,
                 )
                 .map_err(|_| IngestError::InvalidRecord)?;
-                let outcome = self
-                    .writer
-                    .commit(command, recorded_at_us)
-                    .await
+                let outcome =
+                    if live_terminal && verified.observation.correlation.exact_key().is_none() {
+                        // An accepted Run may finish after the ephemeral canary is gone.
+                        // The durable dirty target takes the normal background normalization path.
+                        self.writer
+                            .commit_live_process_terminal(command, recorded_at_us)
+                            .await
+                    } else {
+                        self.writer.commit(command, recorded_at_us).await
+                    }
                     .map_err(map_writer_error)?;
                 if !outcome.replayed {
                     // L0 is accepted first. A measured live directory gets one bounded

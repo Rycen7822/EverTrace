@@ -78,6 +78,153 @@ impl super::JournalAdmissionState {
     }
 }
 
+impl super::JournalAdmissionState {
+    /// Reuse an already accepted native Run's exact launch for one newly verified terminal.
+    /// Called under the writer before append, never during replay or historical normalization.
+    pub(crate) fn recover_native_terminal_gate(
+        &self,
+        terminal: &evertrace_domain::evidence::SourceObservation,
+        receipt: &SourceReceipt,
+        surface: &evertrace_domain::evidence::EvidenceSurface,
+    ) -> Result<Option<String>, StoreError> {
+        use evertrace_capture::process_source;
+        use evertrace_domain::evidence::{CorrelationAdmission, ObservationRole};
+        use evertrace_domain::work::NATIVE_TEST_COHORT_PARSER_VERSION;
+        if terminal.source_revision.as_str() != process_source::SOURCE_REVISION
+            || (terminal.adapter_revision, terminal.parser_revision)
+                != (
+                    process_source::ADAPTER_REVISION,
+                    process_source::PARSER_REVISION,
+                )
+            || terminal.source_role != SourceRole::Tool
+            || terminal.content_trust != ContentTrust::Observed
+            || terminal.capture_completeness != CaptureCompleteness::Complete
+            || terminal.correlation.admission != CorrelationAdmission::Unavailable
+            || surface.source_observation_revision_ref != terminal.source_observation_id
+            || surface.validate().is_err()
+            || receipt.source_observation_id != terminal.source_observation_id
+            || receipt.source_receipt_id != terminal.source_receipt_ref
+            || receipt.source_instance_id != terminal.source_instance_id
+            || receipt.adapter_manifest_ref != terminal.correlation.adapter_manifest_ref
+            || receipt.capture_completeness != CaptureCompleteness::Complete
+            || self
+                .source_observations
+                .contains_key(&terminal.source_observation_id)
+        {
+            return Ok(None);
+        }
+        let raw = surface.protected_text.as_bytes();
+        let Some(launch_id) = process_source::native_terminal_launch(raw, terminal) else {
+            return Ok(None);
+        };
+        let view = self.controlled_run_admission();
+        let Some((launch, _)) = view.observations.get(&launch_id) else {
+            return Ok(None);
+        };
+        let Ok((launch_receipt, _, launch_raw)) = native_source_bytes(
+            &view,
+            launch.source_receipt_ref,
+            ObservationRole::Intent,
+            false,
+            StoreError::InvalidInput,
+        ) else {
+            return Ok(None);
+        };
+        let Some(gate) = launch.correlation.strong_gate_receipt_ref.as_ref() else {
+            return Ok(None);
+        };
+        let mut correlation = terminal.correlation.clone();
+        correlation.admission = CorrelationAdmission::ExactCapable;
+        correlation.strong_gate_receipt_ref = Some(gate.clone());
+        if correlation.validate().is_err()
+            || correlation.exact_key().is_none()
+            || correlation.exact_key() != launch.correlation.exact_key()
+            || correlation.adapter_manifest_ref != launch.correlation.adapter_manifest_ref
+            || (launch.adapter_revision, launch.parser_revision)
+                != (terminal.adapter_revision, terminal.parser_revision)
+            || !process_source::native_correlation_matches(launch_raw, &launch.correlation)
+            || !process_source::same_native_execution(launch_raw, raw)
+        {
+            return Ok(None);
+        }
+        let Some(identity) = serde_json::from_slice::<NativeTrialIdentity<'_>>(launch_raw).ok()
+        else {
+            return Ok(None);
+        };
+        let key = format!("{}/{}", identity.source_epoch, identity.execution_key);
+        // The journal already owns the Run identity. Read only this source's accepted owner;
+        // do not copy the projection or retain another external-run index.
+        let deadline = std::time::Instant::now() + std::time::Duration::from_millis(25);
+        let mut owners = view
+            .runs
+            .values()
+            .take_while(|_| std::time::Instant::now() < deadline)
+            .filter(|(run, _)| {
+                run.external_system_id.as_deref() == Some(process_source::FORMAT)
+                    && run.external_run_key.as_deref() == Some(key.as_str())
+            });
+        let Some((run, _)) = owners.next() else {
+            return Ok(None);
+        };
+        if owners.next().is_some()
+            || std::time::Instant::now() >= deadline
+            || !run.is_declaration_only()
+            || run.metric_extractor_version != NATIVE_TEST_COHORT_PARSER_VERSION
+            || run.attempt_binding_status != AttemptBindingStatus::Resolved
+            || !run
+                .source_receipt_refs
+                .contains(&launch_receipt.source_receipt_id)
+        {
+            return Ok(None);
+        }
+        let Some(repository) = view
+            .workstreams
+            .get(&run.workstream_id)
+            .and_then(|(stream, _)| stream.repository_instance_id)
+        else {
+            return Ok(None);
+        };
+        if self.scope_purges.current(repository).is_some()
+            || self.repositories.get(&repository).is_none_or(|(repo, _)| {
+                repo.user_disabled
+                    || repo
+                        .capability_state
+                        .as_ref()
+                        .is_some_and(|state| state.trust_revoked)
+            })
+        {
+            return Ok(None);
+        }
+        if self.deletions.events().next().is_some() {
+            use crate::DefaultRetrievalSuppressionGeneration::{ContentSpanV2, ObservationSpanV1};
+            let refs = [ObservationSpanV1, ContentSpanV2]
+                .into_iter()
+                .map(|generation| {
+                    crate::default_retrieval_suppression_ref_hash(surface, receipt, generation)
+                })
+                .collect::<Result<_, _>>()?;
+            if super::source_suppressed(self.deletions.events(), Some(&refs)) {
+                return Ok(None);
+            }
+            let lookup = super::CandidateSourceLookup::Current {
+                observations: view.observations,
+                receipts: view.receipts,
+                surfaces: view.surfaces,
+            };
+            for id in &run.source_receipt_refs {
+                let Some((receipt, _)) = view.receipts.get(id) else {
+                    return Ok(None);
+                };
+                let refs = lookup.suppression_refs(receipt.source_observation_id)?;
+                if super::source_suppressed(self.deletions.events(), refs.as_ref()) {
+                    return Ok(None);
+                }
+            }
+        }
+        Ok(Some(gate.clone()))
+    }
+}
+
 pub(crate) fn validate_controlled_command<'a>(
     view: ControlledRunAdmissionView<'_>,
     payloads: impl IntoIterator<Item = &'a JournalPayload>,

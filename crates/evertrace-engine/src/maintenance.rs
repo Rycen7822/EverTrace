@@ -5415,8 +5415,15 @@ fn is_process_source(
     receipt: &evertrace_domain::evidence::SourceReceipt,
 ) -> bool {
     use evertrace_domain::evidence::{
-        CaptureCompleteness, ContentTrust, CorrelationAdmission, EvidenceSourceKind, SourceRole,
+        CaptureCompleteness, ContentTrust, CorrelationAdmission, EvidenceSourceKind,
+        ObservationRole, SourceRole,
     };
+    let measured_terminal = observation.observation_role == ObservationRole::Result
+        && observation.parser_revision == evertrace_capture::process_source::PARSER_REVISION
+        && observation.parser_revision == receipt.parser_revision
+        && observation.content_trust == ContentTrust::Observed
+        && observation.capture_completeness == CaptureCompleteness::Complete
+        && observation.correlation.exact_key().is_some();
     receipt.source_kind == EvidenceSourceKind::Other
         && receipt.source_revision.as_str() == evertrace_capture::process_source::SOURCE_REVISION
         && receipt.adapter_revision == evertrace_capture::process_source::ADAPTER_REVISION
@@ -5430,9 +5437,10 @@ fn is_process_source(
         && observation.correlation.adapter_revision == receipt.adapter_revision
         && observation.correlation.adapter_manifest_ref == receipt.adapter_manifest_ref
         && observation.source_role == SourceRole::Tool
-        && observation.content_trust == ContentTrust::UntrustedSourceContent
-        && observation.capture_completeness == CaptureCompleteness::Partial
-        && receipt.capture_completeness == CaptureCompleteness::Partial
+        && (measured_terminal
+            || (observation.content_trust == ContentTrust::UntrustedSourceContent
+                && observation.capture_completeness == CaptureCompleteness::Partial))
+        && receipt.capture_completeness == observation.capture_completeness
         && ((observation.correlation.admission == CorrelationAdmission::Unavailable
             && observation.correlation.strong_gate_receipt_ref.is_none())
             || (observation.correlation.admission == CorrelationAdmission::ExactCapable

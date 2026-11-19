@@ -376,6 +376,7 @@ enum WriterRequest {
 enum WriterCommitCondition {
     None,
     Frontier(u64),
+    LiveProcessTerminal,
     SourceObservation(Box<SourceObservationGuard>),
     SourceSnapshot(Box<crate::ingest::SourceSnapshotGuard>),
     LiveNormalization(Box<crate::capture::LiveNormalizationGuard>),
@@ -1356,6 +1357,19 @@ impl WriterHandle {
         .await
     }
 
+    pub(crate) async fn commit_live_process_terminal(
+        &self,
+        command: JournalCommand,
+        ingested_at_us: i64,
+    ) -> Result<CommitOutcome, WriterActorError> {
+        self.commit_with_condition(
+            command,
+            ingested_at_us,
+            WriterCommitCondition::LiveProcessTerminal,
+        )
+        .await
+    }
+
     pub async fn commit_source_observation(
         &self,
         command: JournalCommand,
@@ -1697,6 +1711,11 @@ async fn run_writer(
                         WriterCommitCondition::Frontier(frontier) => {
                             writer
                                 .commit_if_frontier(&command, ingested_at_us, frontier)
+                                .await
+                        }
+                        WriterCommitCondition::LiveProcessTerminal => {
+                            writer
+                                .commit_live_process_terminal(&command, ingested_at_us)
                                 .await
                         }
                         WriterCommitCondition::SourceObservation(guard) => {

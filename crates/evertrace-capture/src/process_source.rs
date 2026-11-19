@@ -1315,6 +1315,54 @@ pub fn native_correlation_matches(raw: &[u8], value: &HostCorrelationEvidence) -
         && value.pairing_role == role
 }
 
+/// Select the immutable original launch; selection alone does not admit a terminal.
+pub fn native_terminal_launch(
+    raw: &[u8],
+    observation: &evertrace_domain::evidence::SourceObservation,
+) -> Option<SourceObservationId> {
+    let (terminal, role) = decode(raw).ok()?;
+    if terminal.event != "trial_finished"
+        || role != ObservationRole::Result
+        || observation.observation_role != role
+        || terminal.event_key != observation.source_record_identity.as_str()
+        || !native_correlation_matches(raw, &observation.correlation)
+    {
+        return None;
+    }
+    source_observation_id(
+        &observation.source_instance_id,
+        &observation.source_revision,
+        &SourceRecordIdentity::parse(terminal.launch_event?).ok()?,
+    )
+    .ok()
+}
+
+/// Recheck the physical and source-local tuple against the *recorded* launch, not a path or metric.
+pub fn same_native_execution(launch_raw: &[u8], terminal_raw: &[u8]) -> bool {
+    let (Ok((launch, _)), Ok((terminal, _))) = (decode(launch_raw), decode(terminal_raw)) else {
+        return false;
+    };
+    launch.format == FORMAT
+        && terminal.format == FORMAT
+        && launch.event == "trial_launch"
+        && terminal.event == "trial_finished"
+        && terminal.launch_event.as_ref() == Some(&launch.event_key)
+        && launch.controller == terminal.controller
+        && launch.process.is_some()
+        && launch.process == terminal.process
+        && launch.study_key == terminal.study_key
+        && launch.source_epoch == terminal.source_epoch
+        && launch.execution_key.is_some()
+        && launch.execution_key == terminal.execution_key
+        && launch.request_key.is_some()
+        && launch.request_key == terminal.request_key
+        && launch.execution_ordinal.is_some_and(|ordinal| ordinal > 0)
+        && launch.execution_ordinal == terminal.execution_ordinal
+        && launch.lane_thread_id == terminal.lane_thread_id
+        && launch.sequence < terminal.sequence
+        && launch.time_us <= terminal.time_us
+}
+
 /// Native v4 normalization history keeps its original capture contract across replay.
 pub fn is_native_profile(adapter: u32, parser: u32) -> bool {
     matches!(

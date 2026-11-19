@@ -1325,6 +1325,56 @@ impl JournalWriter {
         self.commit_inner(command, ingested_at_us, None).await
     }
 
+    /// Ingest has already verified the original live terminal. Check its accepted owner at
+    /// the writer, so a revoke or purge cannot race the continuation's L0 admission.
+    pub async fn commit_live_process_terminal(
+        &mut self,
+        command: &JournalCommand,
+        ingested_at_us: i64,
+    ) -> Result<CommitOutcome, StoreError> {
+        use evertrace_domain::evidence::CorrelationAdmission;
+        let terminal = command
+            .events()
+            .iter()
+            .find_map(|event| match &event.payload {
+                JournalPayload::SourceObservationRecorded(value) => Some(value),
+                _ => None,
+            });
+        let surface = command
+            .events()
+            .iter()
+            .find_map(|event| match &event.payload {
+                JournalPayload::EvidenceSurfaceRecorded(value) => Some(value),
+                _ => None,
+            });
+        let receipt = command
+            .events()
+            .iter()
+            .find_map(|event| match &event.payload {
+                JournalPayload::SourceReceiptRecorded(value) => Some(value),
+                _ => None,
+            });
+        if let (Some(terminal), Some(receipt), Some(surface)) = (terminal, receipt, surface)
+            && let Some(gate) = self
+                .admission_state
+                .recover_native_terminal_gate(terminal, receipt, surface)?
+        {
+            let mut events = command.events().to_vec();
+            for event in &mut events {
+                if let JournalPayload::SourceObservationRecorded(value) = &mut event.payload
+                    && value.source_observation_id == terminal.source_observation_id
+                {
+                    value.correlation.admission = CorrelationAdmission::ExactCapable;
+                    value.correlation.strong_gate_receipt_ref = Some(gate);
+                    break;
+                }
+            }
+            let command = JournalCommand::new(command.command_id(), events)?;
+            return self.commit(&command, ingested_at_us).await;
+        }
+        self.commit(command, ingested_at_us).await
+    }
+
     pub async fn commit_if_frontier(
         &mut self,
         command: &JournalCommand,
