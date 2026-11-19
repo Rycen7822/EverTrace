@@ -62,7 +62,7 @@
   </details>
   <details>
     <summary>来源、支持与冲突</summary>
-    {{ text_list('来源观察', value.source_observation_refs) }}
+    {{ text_list('来源观察', value.source_observation_refs, record_kind='source_observation', exact_revision=true) }}
     {{ text_list('证据引用', value.evidence_refs) }}
     {{ text_list('替代的修订', value.supersedes_revision_refs) }}
     {{ text_list('支持的修订', value.supports_revision_refs) }}
@@ -345,7 +345,7 @@
     data-revision="{{ value.atom_revision_id }}" data-kind="atom_revision">读取原 Atom 正文</button>
   <details><summary>规则范围、支持与授权</summary>
     <h3>已存范围</h3><pre>{{ value.scope_identity|pretty }}</pre>
-    <p>支持合同：{{ value.support_contract_ref }}</p>
+    {{ text_list('支持合同', [value.support_contract_ref], record_kind='global_support_contract', exact_revision=true) }}
     {{ text_list('授权修订', value.authorization_revision_refs) }}
     <p>产生此记录的 acceptance：{{ value.created_by_acceptance_ref }}</p>
     {% if value.supersedes_membership_revision_id %}<p>替代的 membership：{{ value.supersedes_membership_revision_id }}</p>{% endif %}
