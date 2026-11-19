@@ -287,12 +287,10 @@ impl ActivityToken {
             if self.observed_phase_kind != Some(declared.phase_kind) {
                 return Err(DetectorError::Ineligible);
             }
-            // These are proposal hints, not closure evidence. Label and target spelling alone do not change the Phase.
+            // A changed target or entry condition is a proposal, not evidence that the old Phase finished.
             self.declared_contract_changed = (declared.phase_kind != PhaseKind::Unknown
                 && declared.phase_kind != current.phase_kind)
-                || declared.local_goal != current.local_goal
-                || declared.acceptance_boundary != current.acceptance_boundary
-                || declared.expected_state_transition != current.expected_state_transition;
+                || !super::same_phase_content(current, declared);
             self.replaces_candidate = declared.phase_kind != PhaseKind::Unknown
                 && self.declared_contract_changed
                 && anchored.is_some_and(|anchor| !super::same_phase_proposal(anchor, declared));
