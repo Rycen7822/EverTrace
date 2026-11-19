@@ -4408,7 +4408,7 @@ fn process_work_command(
         }) {
             return Ok(None);
         }
-        if prior.is_none() && stream.phase_contract != plan.phase {
+        if prior.is_none() && !stream.phase_contract.same_proposal(&plan.phase) {
             return Err(AutoresearchError::ImmutableConflict);
         }
         if let Some(episode_id) = stream.active_episode_id {
@@ -4418,6 +4418,7 @@ fn process_work_command(
                 .and_then(|revision| facts.episodes.get(revision))
                 .ok_or(AutoresearchError::EvidenceIncomplete)?;
             let mut events = Vec::new();
+            let same_phase = phase.phase_contract.same_proposal(&plan.phase);
             let new_lane = root_lane.filter(|lane| {
                 !phase.execution_lane_ids.is_empty() && !phase.execution_lane_ids.contains(lane)
             });
@@ -4435,7 +4436,7 @@ fn process_work_command(
                     return Ok(None);
                 };
                 if !phase.session_ids.iter().any(|id| id == anchor.session)
-                    || phase.phase_contract != plan.phase
+                    || !same_phase
                     || !known_strategy
                     || (repository.is_some() && basis.is_none())
                 {
@@ -4455,7 +4456,7 @@ fn process_work_command(
                 }
                 sources.push(checkpoint.clone());
             }
-            if prior.is_none() && (phase.phase_contract != plan.phase || !known_strategy) {
+            if prior.is_none() && (!same_phase || !known_strategy) {
                 return Err(AutoresearchError::ImmutableConflict);
             }
             let view = evertrace_store::WorkIdentityCurrentView::from_snapshot(snapshot)?;
@@ -4502,7 +4503,7 @@ fn process_work_command(
                 events.extend_from_slice(command.events());
             }
             let mut proposal = None;
-            if !known_strategy && phase.phase_contract == plan.phase {
+            if !known_strategy && same_phase {
                 let pending = facts
                     .attempts
                     .values()
