@@ -205,9 +205,12 @@ impl IncrementalSegmenter {
                 Err(DetectorError::PendingTransition)
             };
         }
+        // Keep the left context separate even when the new proposal has the same Phase kind and physical tool shape.
+        let starts_proposal = token.declared_contract_changed()
+            && (episode.boundary_candidate.is_none() || token.replaces_candidate());
         let mut next_folder = self.folder.clone();
         let mut next_detector = self.detector.clone();
-        let burst = next_folder.push(&token)?;
+        let burst = next_folder.push(&token, starts_proposal)?;
         if burst.no_delta() {
             return Ok(SegmentOutcome::NoDelta);
         }

@@ -95,7 +95,11 @@ impl OperationBurstFolder {
         })
     }
 
-    pub(crate) fn push(&mut self, token: &ActivityToken) -> Result<BurstFoldUpdate, DetectorError> {
+    pub(crate) fn push(
+        &mut self,
+        token: &ActivityToken,
+        starts_proposal: bool,
+    ) -> Result<BurstFoldUpdate, DetectorError> {
         if let Some(previous) = self.seen.get(&token.operation_id()) {
             if previous.revision > token.operation_revision() {
                 return Err(DetectorError::WatermarkRegression);
@@ -123,10 +127,11 @@ impl OperationBurstFolder {
                 });
             }
         }
-        if self
-            .current
-            .as_ref()
-            .is_some_and(|current| can_extend(current, token))
+        if !starts_proposal
+            && self
+                .current
+                .as_ref()
+                .is_some_and(|current| can_extend(current, token))
         {
             let current = self.current.as_ref().expect("checked above");
             if current.members.len() < MAX_BURST_ITEMS {
