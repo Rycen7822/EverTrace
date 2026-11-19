@@ -27,7 +27,34 @@ const PROJECTION_GENERATION: u64 = 1;
 pub(crate) const OBJECT_DELETION_JOB_KIND: &str = "object_forget_v1";
 pub const OBJECT_DELETION_ALGORITHM_REVISION: &str = "s32-object-forget-v1";
 pub const REPOSITORY_SCOPE_PURGE_JOB_KIND: &str = "repository_scope_purge_v1";
-pub const REPOSITORY_SCOPE_PURGE_ALGORITHM_REVISION: &str = "s33-repository-scope-purge-v1";
+pub const REPOSITORY_SCOPE_PURGE_ALGORITHM_REVISION: &str = "s33-repository-scope-purge-v2";
+const ORIGINAL_REPOSITORY_SCOPE_PURGE_ALGORITHM: &str = "s33-repository-scope-purge-v1";
+
+/// The durable job already stores the rule used to turn its confirmation frontier into CAS ordinals.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum RepositoryPurgePlan {
+    Original,
+    IncludeClosedProcessFiles,
+}
+
+impl RepositoryPurgePlan {
+    pub(crate) const CURRENT: Self = Self::IncludeClosedProcessFiles;
+
+    pub(crate) fn for_revision(revision: &str) -> Result<Self, StoreError> {
+        match revision {
+            ORIGINAL_REPOSITORY_SCOPE_PURGE_ALGORITHM => Ok(Self::Original),
+            REPOSITORY_SCOPE_PURGE_ALGORITHM_REVISION => Ok(Self::CURRENT),
+            _ => Err(StoreError::InvalidInput),
+        }
+    }
+
+    fn revision(self) -> &'static str {
+        match self {
+            Self::Original => ORIGINAL_REPOSITORY_SCOPE_PURGE_ALGORITHM,
+            Self::IncludeClosedProcessFiles => REPOSITORY_SCOPE_PURGE_ALGORITHM_REVISION,
+        }
+    }
+}
 pub const REPOSITORY_SCOPE_PURGE_BATCH_SIZE: u64 = 256;
 const OBJECT_DELETION_LEASE_US: i64 = 30_000_000;
 
@@ -125,6 +152,7 @@ pub struct RepositoryScopePurgePreview {
     pub dependent_procedure_impacts: Vec<ObjectDeletionProcedureImpact>,
     pub(crate) closure: crate::projections::RepositoryClosureKeys,
     pub(crate) active_target_repository_jobs: Vec<DurableJob>,
+    pub(crate) plan: RepositoryPurgePlan,
 }
 
 impl RepositoryScopePurgePreview {
@@ -195,7 +223,7 @@ pub fn pending_repository_scope_purge(
         target_watermark: confirmation_frontier,
         target_generation: preview.deletion_generation,
         kind: REPOSITORY_SCOPE_PURGE_JOB_KIND.into(),
-        algorithm_revision: REPOSITORY_SCOPE_PURGE_ALGORITHM_REVISION.into(),
+        algorithm_revision: preview.plan.revision().into(),
         model_id: None,
         priority: 0,
         state: JobStatus::Queued,

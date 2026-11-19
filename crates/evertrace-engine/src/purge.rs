@@ -225,6 +225,7 @@ pub fn pending_repository_purge_command(
                     occurred_at_us,
                     SourceKind::Manual,
                     effective_config_hash,
+                    evertrace_store::REPOSITORY_SCOPE_PURGE_ALGORITHM_REVISION,
                     Some(request_id.to_string()),
                     payload,
                 )
@@ -263,6 +264,7 @@ pub fn advance_repository_purge_command(
                 occurred_at_us,
                 SourceKind::System,
                 effective_config_hash,
+                &leased_job.algorithm_revision,
                 Some(current.purge_job_id.to_string()),
                 JournalPayload::ScopePurgeProgressRecorded(Box::new(progress)),
             ),
@@ -270,6 +272,7 @@ pub fn advance_repository_purge_command(
                 occurred_at_us,
                 SourceKind::System,
                 effective_config_hash,
+                &leased_job.algorithm_revision,
                 Some(current.purge_job_id.to_string()),
                 JournalPayload::JobState(queued_job),
             ),
@@ -300,6 +303,7 @@ pub fn complete_repository_purge_command(
                     occurred_at_us,
                     SourceKind::System,
                     effective_config_hash,
+                    &leased_job.algorithm_revision,
                     Some(current.purge_job_id.to_string()),
                     JournalPayload::ScopePurgeProgressRecorded(Box::new(progress)),
                 )
@@ -308,6 +312,7 @@ pub fn complete_repository_purge_command(
                 occurred_at_us,
                 SourceKind::System,
                 effective_config_hash,
+                &leased_job.algorithm_revision,
                 Some(current.purge_job_id.to_string()),
                 JournalPayload::JobState(job),
             )])
@@ -338,6 +343,7 @@ fn repository_purge_draft(
     occurred_at_us: i64,
     source_kind: SourceKind,
     effective_config_hash: [u8; 32],
+    algorithm_revision: &str,
     correlation_id: Option<String>,
     payload: JournalPayload,
 ) -> JournalEventDraft {
@@ -348,7 +354,7 @@ fn repository_purge_draft(
         causation_id: correlation_id.clone(),
         correlation_id,
         effective_config_hash,
-        algorithm_revision: evertrace_store::REPOSITORY_SCOPE_PURGE_ALGORITHM_REVISION.into(),
+        algorithm_revision: algorithm_revision.into(),
         payload,
     }
 }

@@ -4033,11 +4033,8 @@ fn system_current_detail(
             }
             Ok(Some(HumanSystemDetail::Job {
                 detail: Box::new(HumanJobDetail {
-                    native_history_cleanup_availability: matches!(
-                        value.algorithm_revision.as_str(),
-                        evertrace_store::purge::OBJECT_DELETION_ALGORITHM_REVISION
-                            | evertrace_store::purge::REPOSITORY_SCOPE_PURGE_ALGORITHM_REVISION
-                    )
+                    native_history_cleanup_availability: (value.algorithm_revision == evertrace_store::purge::OBJECT_DELETION_ALGORITHM_REVISION
+                        || value.kind == evertrace_store::REPOSITORY_SCOPE_PURGE_JOB_KIND)
                     .then_some(
                         HumanNativeHistoryCleanupAvailability::ExternalReaderExclusionUnverified,
                     ),

@@ -2921,10 +2921,10 @@ pub(crate) async fn reconcile_repository_scope_purge_batch(
         let confirmation = writer
             .project_at_frontier(progress.confirmation_frontier)
             .await?;
-        let preview = evertrace_store::repository_scope_purge_preview(
+        let preview = evertrace_store::projections::accepted_repository_scope_purge_preview(
             &confirmation,
-            progress.target.repository_id(),
-            progress.target.repository_revision(),
+            &progress,
+            leased_job,
         )
         .map_err(map_store_error)?;
         if preview.deletion_generation != progress.deletion_generation

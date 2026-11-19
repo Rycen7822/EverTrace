@@ -9940,6 +9940,23 @@ fn derive_repository_scope_purge_preview(
     expected_repository_revision: u32,
     existing_allowed: bool,
 ) -> Result<crate::purge::RepositoryScopePurgePreview, StoreError> {
+    derive_repository_scope_purge_plan(
+        inputs,
+        repository_id,
+        expected_repository_revision,
+        existing_allowed,
+        crate::purge::RepositoryPurgePlan::CURRENT,
+    )
+}
+
+fn derive_repository_scope_purge_plan(
+    inputs: RepositoryScopePreviewInputs<'_>,
+    repository_id: RepositoryId,
+    expected_repository_revision: u32,
+    existing_allowed: bool,
+    plan: crate::purge::RepositoryPurgePlan,
+) -> Result<crate::purge::RepositoryScopePurgePreview, StoreError> {
+    use evertrace_capture::process_source;
     let repository = &inputs
         .repositories
         .get(&repository_id)
@@ -10034,6 +10051,16 @@ fn derive_repository_scope_purge_preview(
             (receipt.repository_instance_id == Some(repository_id)
                 || scoped_operation_sources.contains(&receipt.source_observation_id)
                 || target_source_instances.contains(receipt.source_instance_id.as_str())
+                || (plan == crate::purge::RepositoryPurgePlan::IncludeClosedProcessFiles
+                    && receipt.source_kind
+                        == evertrace_domain::evidence::EvidenceSourceKind::Other
+                    && receipt.source_revision.as_str() == process_source::SOURCE_REVISION
+                    && process_source::closed_file_controller(receipt.source_instance_id.as_str())
+                        .is_some_and(|controller| {
+                            process_scopes
+                                .get(controller)
+                                .is_some_and(|ids| ids.contains(&repository_id))
+                        }))
                 || receipt
                     .worktree_instance_id
                     .is_some_and(|id| worktree_ids.contains(&id)))
@@ -10856,6 +10883,7 @@ fn derive_repository_scope_purge_preview(
         dependent_procedure_impacts,
         closure,
         active_target_repository_jobs,
+        plan,
     };
     if preview.pending_command_event_count().is_err() {
         preview
@@ -13345,13 +13373,6 @@ impl JournalAdmissionState {
                 {
                     return Err(error);
                 }
-                let preview = derive_repository_scope_purge_preview(
-                    self.repository_scope_preview_inputs(),
-                    progress.target.repository_id(),
-                    progress.target.repository_revision(),
-                    false,
-                )
-                .map_err(|_| error)?;
                 let jobs = payloads
                     .iter()
                     .filter_map(|(payload, _, _, _)| match payload {
@@ -13366,6 +13387,16 @@ impl JournalAdmissionState {
                 let [job] = jobs.as_slice() else {
                     return Err(error);
                 };
+                let plan = crate::purge::RepositoryPurgePlan::for_revision(&job.algorithm_revision)
+                    .map_err(|_| error)?;
+                let preview = derive_repository_scope_purge_plan(
+                    self.repository_scope_preview_inputs(),
+                    progress.target.repository_id(),
+                    progress.target.repository_revision(),
+                    false,
+                    plan,
+                )
+                .map_err(|_| error)?;
                 let (expected_progress, expected_job, expected_revoked_target_jobs) =
                     crate::purge::pending_repository_scope_purge(
                         &preview,
@@ -14845,15 +14876,53 @@ pub fn repository_scope_purge_preview(
     repository_id: RepositoryId,
     expected_repository_revision: u32,
 ) -> Result<crate::purge::RepositoryScopePurgePreview, StoreError> {
+    repository_scope_purge_plan(
+        snapshot,
+        repository_id,
+        expected_repository_revision,
+        crate::purge::RepositoryPurgePlan::CURRENT,
+    )
+}
+
+/// Rebuild the identical physical plan used at confirmation, not today's preview.
+pub fn accepted_repository_scope_purge_preview(
+    snapshot: &ProjectionSnapshot,
+    progress: &evertrace_domain::purge::ScopePurgeProgress,
+    job: &DurableJob,
+) -> Result<crate::purge::RepositoryScopePurgePreview, StoreError> {
+    if job.kind != crate::purge::REPOSITORY_SCOPE_PURGE_JOB_KIND
+        || snapshot.frontier != progress.confirmation_frontier
+        || job.job_id != progress.purge_job_id
+        || job.target_generation != progress.deletion_generation
+        || job.target_watermark != progress.confirmation_frontier
+    {
+        return Err(StoreError::InvalidInput);
+    }
+    let plan = crate::purge::RepositoryPurgePlan::for_revision(&job.algorithm_revision)?;
+    repository_scope_purge_plan(
+        snapshot,
+        progress.target.repository_id(),
+        progress.target.repository_revision(),
+        plan,
+    )
+}
+
+fn repository_scope_purge_plan(
+    snapshot: &ProjectionSnapshot,
+    repository_id: RepositoryId,
+    expected_repository_revision: u32,
+    plan: crate::purge::RepositoryPurgePlan,
+) -> Result<crate::purge::RepositoryScopePurgePreview, StoreError> {
     if snapshot.frontier == 0 {
         return Err(StoreError::InvalidInput);
     }
     let state = ReducerState::from_current_rows(&snapshot.rows, snapshot.frontier)?;
-    derive_repository_scope_purge_preview(
+    derive_repository_scope_purge_plan(
         state.repository_scope_preview_inputs(),
         repository_id,
         expected_repository_revision,
         false,
+        plan,
     )
 }
 
@@ -15262,11 +15331,26 @@ fn apply_event(
         }
         JournalPayload::ScopePurgeProgressRecorded(value) => {
             if value.stage == ScopePurgeStage::Pending {
-                let preview = derive_repository_scope_purge_preview(
+                let mut plan = None;
+                for event in command
+                    .iter()
+                    .filter(|event| event.event_type == "job_state_v1")
+                {
+                    if let JournalPayload::JobState(job) = event.payload()?
+                        && job.job_id == value.purge_job_id
+                    {
+                        plan = Some(crate::purge::RepositoryPurgePlan::for_revision(
+                            &job.algorithm_revision,
+                        )?);
+                        break;
+                    }
+                }
+                let preview = derive_repository_scope_purge_plan(
                     state.repository_scope_preview_inputs(),
                     value.target.repository_id(),
                     value.target.repository_revision(),
                     false,
+                    plan.ok_or(StoreError::StoreCorrupt)?,
                 )?;
                 state
                     .repository_closures

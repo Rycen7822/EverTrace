@@ -1706,16 +1706,14 @@ impl CurrentLedger {
                 .cloned()
                 .collect::<Vec<_>>();
             let confirmed = crate::projections::reduce_journal(&prefix)?;
-            let plan = crate::repository_scope_purge_preview(
-                &confirmed,
-                progress.target.repository_id(),
-                progress.target.repository_revision(),
-            )?;
             let job = self
                 .jobs
                 .iter()
                 .find(|job| job.job_id == progress.purge_job_id)
                 .ok_or(StoreError::StoreCorrupt)?;
+            let plan = crate::projections::accepted_repository_scope_purge_preview(
+                &confirmed, &progress, job,
+            )?;
             if plan.deletion_generation != progress.deletion_generation
                 || plan.physical_item_count()? != job.budget.max_items
             {
