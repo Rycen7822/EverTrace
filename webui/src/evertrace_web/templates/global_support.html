@@ -45,6 +45,11 @@
   <p>原生选择的事件：{{ current.value.validation_revision_id }}；generation {{ current.value.dependency_generation }}；
     状态：<strong data-support-current>{{ current.value.state }}</strong>；
     provenance degraded：{{ current.value.provenance_degraded }}。</p>
+  {% set event_ref = current.value.validation_revision_id %}
+  {% if content.kind == 'support_contract' or value.validation_revision_id != event_ref %}
+  <button class="button" type="button" data-link-key="{{ event_ref }}" data-revision="{{ event_ref }}"
+    data-object="{{ event_ref }}" data-kind="global_support_validation">读取该校验事件的原修订</button>
+  {% endif %}
   {{ support_refs('当前事件记录的 surviving support', current.value.surviving_support_refs) }}
   {{ support_refs('当前事件记录的 invalid / missing refs', current.value.invalid_or_missing_refs) }}
   {% else %}<p>读取状态：{{ current.state }}。没有用所选旧事件、空列表或计数代替当前校验。</p>{% endif %}
