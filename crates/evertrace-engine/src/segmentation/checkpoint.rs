@@ -37,7 +37,7 @@ pub(crate) async fn advance_checkpoints(
     current: &evertrace_store::CurrentFacts,
     runtime: &evertrace_capture::RuntimeSnapshot,
 ) -> Result<crate::maintenance::BackgroundProgress, crate::maintenance::BackgroundSchedulerError> {
-    use evertrace_capture::{CasDigest, CasStore, checkpoint_source};
+    use evertrace_capture::{CasDigest, CasError, CasStore, checkpoint_source};
     let idle = BackgroundProgress {
         completed: 0,
         retryable: false,
@@ -80,13 +80,17 @@ pub(crate) async fn advance_checkpoints(
             .cas_ref
             .parse::<CasDigest>()
             .map_err(|_| Error::Store)?;
-        let protected = tokio::task::spawn_blocking(move || {
+        let protected = match tokio::task::spawn_blocking(move || {
             CasStore::open_existing(cas_dir)?.read_bounded(&digest, 8192, 8192)
         })
         .await
         .map_err(|_| Error::Store)?
-        .map_err(|_| Error::Store)?
-        .0;
+        {
+            Ok((bytes, _)) => bytes,
+            // A missing request is not authority for a checkpoint, but must not hide later requests.
+            Err(CasError::NotFound) => continue,
+            Err(_) => return Err(Error::Store),
+        };
         let Some(request) = checkpoint_source::observed_request(observation, receipt, &protected)
         else {
             continue;
