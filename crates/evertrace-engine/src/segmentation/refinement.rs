@@ -277,9 +277,12 @@ pub(crate) async fn input(
     {
         return Ok(None);
     }
-    let activity = super::production::source_activity(snapshot, &selected, runtime)
+    let Some(activity) = super::production::source_activity(snapshot, &selected, runtime)
         .await
-        .map_err(|_| Error::Store)?;
+        .map_err(|_| Error::Store)?
+    else {
+        return Ok(None);
+    };
     if activity
         .declaration_refs
         .iter()
@@ -373,8 +376,8 @@ pub(crate) async fn input(
             )
             .await
             {
-                Ok(value) => value,
-                Err(evertrace_capture::CasError::LockBusy) => return Ok(None),
+                Ok(Some(value)) => value,
+                Ok(None) | Err(evertrace_capture::CasError::LockBusy) => return Ok(None),
                 Err(_) => return Err(Error::Store),
             };
             if earlier

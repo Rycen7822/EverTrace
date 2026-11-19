@@ -58,7 +58,7 @@ pub(super) async fn source_activity(
     current: &CurrentFacts,
     selected: &SegmentationReadContext,
     runtime: &evertrace_capture::RuntimeSnapshot,
-) -> Result<SourceActivity, evertrace_capture::CasError> {
+) -> Result<Option<SourceActivity>, evertrace_capture::CasError> {
     source_operation_activity(current, selected, selected.operation_id, runtime).await
 }
 
@@ -67,7 +67,7 @@ pub(super) async fn source_operation_activity(
     selected: &SegmentationReadContext,
     operation_id: evertrace_domain::ids::OperationId,
     runtime: &evertrace_capture::RuntimeSnapshot,
-) -> Result<SourceActivity, evertrace_capture::CasError> {
+) -> Result<Option<SourceActivity>, evertrace_capture::CasError> {
     use evertrace_capture::CasError as Error;
     let (operation, binding) = if operation_id == selected.operation_id {
         let view = selected.state.authority();
@@ -112,7 +112,7 @@ pub(super) async fn source_operation_activity(
         })
         .collect::<Vec<_>>();
     if records.is_empty() {
-        return Ok(SourceActivity::default());
+        return Ok(Some(SourceActivity::default()));
     }
     let cas_dir = runtime.cas_dir.clone();
     tokio::task::spawn_blocking(move || {
@@ -120,7 +120,12 @@ pub(super) async fn source_operation_activity(
         let mut protected = Vec::new();
         for (observation, receipt) in records {
             let digest = receipt.cas_ref.parse::<evertrace_capture::CasDigest>()?;
-            let (bytes, _) = cas.read_bounded(&digest, 128 * 1024, 128 * 1024)?;
+            let (bytes, _) = match cas.read_bounded(&digest, 128 * 1024, 128 * 1024) {
+                Ok(payload) => payload,
+                // Absence is neither a decoded negative fact nor a corrupt journal.
+                Err(Error::NotFound) => return Ok(None),
+                Err(error) => return Err(error),
+            };
             if bytes.len() as u64 != receipt.protected_length {
                 return Err(Error::StoreCorrupt);
             }
@@ -165,7 +170,7 @@ pub(super) async fn source_operation_activity(
                 }
             }
         }
-        Ok(SourceActivity {
+        Ok(Some(SourceActivity {
             exit_code: (exits.len() == 1).then(|| *exits.first().expect("one physical result")),
             exit_refs: if exits.len() == 1 {
                 exit_refs.into_iter().collect()
@@ -175,7 +180,7 @@ pub(super) async fn source_operation_activity(
             phase: (phases.len() == 1).then(|| phases.remove(0)),
             strategy: (strategies.len() == 1).then(|| strategies.remove(0)),
             declaration_refs: declaration_refs.into_iter().collect(),
-        })
+        }))
     })
     .await
     .map_err(|_| Error::Io)?
@@ -796,20 +801,27 @@ pub(crate) async fn advance_activity(
             continue;
         };
         let activities = async {
-            let activity = source_activity(current, &selected, runtime).await?;
+            let Some(activity) = source_activity(current, &selected, runtime).await? else {
+                return Ok(None);
+            };
             let anchored = if activity.phase.is_some()
                 && let Some((anchor, _)) = &selected.boundary_operation
             {
-                source_operation_activity(current, &selected, anchor.operation_id, runtime)
-                    .await?
-                    .phase
+                let Some(anchor) =
+                    source_operation_activity(current, &selected, anchor.operation_id, runtime)
+                        .await?
+                else {
+                    return Ok(None);
+                };
+                anchor.phase
             } else {
                 None
             };
-            Ok((activity, anchored))
+            Ok(Some((activity, anchored)))
         };
         let (activity, anchored) = match activities.await {
-            Ok(pair) => pair,
+            Ok(Some(pair)) => pair,
+            Ok(None) => continue,
             Err(error) => {
                 let changed =
                     writer.sync_frontier().await.map_err(|_| Error::Writer)? != current.frontier();
