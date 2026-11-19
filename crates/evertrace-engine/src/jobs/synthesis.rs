@@ -352,12 +352,14 @@ impl SynthesisPlanner {
         occurred_at_us: i64,
         max_wall_time: std::time::Duration,
     ) -> Result<JournalCommand, crate::semantic::SemanticServiceError> {
+        let input = scheduled_input(current, job, None)?;
         let prepared = self.prepare_episode_job(
             current,
             job,
             effective_config_hash,
             occurred_at_us,
             max_wall_time,
+            input,
         )?;
         let (prepared, scope) = match prepared {
             Ok(value) => value,
@@ -382,6 +384,7 @@ impl SynthesisPlanner {
         effective_config_hash: [u8; 32],
         occurred_at_us: i64,
         max_wall_time: std::time::Duration,
+        input: EpisodeJobInput,
     ) -> Result<EpisodeJobPreparation, crate::semantic::SemanticServiceError> {
         let expected_budget = self.durable_budget(max_wall_time)?;
         if job.state != JobStatus::Leased
@@ -389,7 +392,12 @@ impl SynthesisPlanner {
         {
             return Err(crate::semantic::SemanticServiceError::InvalidInput);
         }
-        let (episode, trigger, direct_delta, selected_direct_refs) = scheduled_input(current, job)?;
+        let EpisodeJobInput {
+            episode,
+            trigger,
+            delta: direct_delta,
+            refs: selected_direct_refs,
+        } = input;
         if direct_delta.is_empty() {
             let mut terminal = job.clone();
             terminal.state = JobStatus::Failed;
@@ -451,18 +459,30 @@ impl SynthesisPlanner {
         occurred_at_us: i64,
         max_wall_time: std::time::Duration,
         writer: &crate::WriterHandle,
+        access: (
+            &evertrace_capture::RuntimeSnapshot,
+            Option<&evertrace_codex::HostProbeReport>,
+        ),
         admission: F,
     ) -> Result<JournalCommand, crate::semantic::SemanticServiceError>
     where
-        F: Fn() -> Fut + Sync,
+        F: Fn(Vec<String>) -> Fut + Sync,
         Fut: std::future::Future<Output = Result<(), ProviderError>> + Send,
     {
+        let mut physical = Vec::new();
+        let mut input = scheduled_input(&current, job, Some(&mut physical))?;
+        if !physical.is_empty() {
+            input
+                .extend_physical(&current, writer, access, physical, job.config_hash)
+                .await?;
+        }
         let preparation = self.prepare_episode_job(
             &current,
             job,
             job.config_hash,
             occurred_at_us,
             max_wall_time,
+            input,
         )?;
         drop(current);
         let (prepared, scope) = match preparation {
@@ -472,8 +492,12 @@ impl SynthesisPlanner {
         let resolution = match prepared {
             Ok(prepared) => {
                 let started = std::time::Instant::now();
-                let derived = self.derive_prepared(&prepared, admission).await;
+                let verify = || admission(prepared.input.source_refs.clone());
+                let derived = self.derive_prepared(&prepared, verify).await;
                 let elapsed = started.elapsed();
+                admission(prepared.input.source_refs.clone())
+                    .await
+                    .map_err(|_| crate::semantic::SemanticServiceError::BaseConflict)?;
                 let current = writer
                     .project_current(true)
                     .await
@@ -1239,7 +1263,7 @@ pub(crate) fn synthesis_budget(
 pub(crate) fn synthesis_target_is_current(current: &CurrentFacts, job: &DurableJob) -> bool {
     match evertrace_domain::semantic::SemanticJobTarget::parse(&job.target_revision) {
         Ok(evertrace_domain::semantic::SemanticJobTarget::Episode(_)) => {
-            scheduled_input(current, job).is_ok()
+            scheduled_input(current, job, None).is_ok()
         }
         Ok(evertrace_domain::semantic::SemanticJobTarget::Source { .. }) => {
             source::input(current, job).is_ok()
@@ -1248,18 +1272,20 @@ pub(crate) fn synthesis_target_is_current(current: &CurrentFacts, job: &DurableJ
     }
 }
 
+struct EpisodeJobInput {
+    episode: WorkEpisode,
+    trigger: SemanticDigestTrigger,
+    delta: Vec<ProtectedDeltaItem>,
+    refs: Vec<String>,
+}
+
+type PhysicalSource = std::sync::Arc<evertrace_domain::evidence::SourceObservation>;
+
 fn scheduled_input(
     current: &CurrentFacts,
     job: &DurableJob,
-) -> Result<
-    (
-        WorkEpisode,
-        SemanticDigestTrigger,
-        Vec<ProtectedDeltaItem>,
-        Vec<String>,
-    ),
-    crate::semantic::SemanticServiceError,
-> {
+    physical: Option<&mut Vec<PhysicalSource>>,
+) -> Result<EpisodeJobInput, crate::semantic::SemanticServiceError> {
     let evertrace_domain::semantic::SemanticJobTarget::Episode(revision_id) =
         evertrace_domain::semantic::SemanticJobTarget::parse(&job.target_revision)
             .map_err(|_| crate::semantic::SemanticServiceError::InvalidInput)?
@@ -1321,8 +1347,13 @@ fn scheduled_input(
             ),
         );
     }
-    let selected_direct_refs = by_ref.keys().cloned().collect::<Vec<_>>();
-    let direct_delta = by_ref
+    if by_ref.is_empty()
+        && let Some(physical) = physical
+    {
+        *physical = physical_result_sources(current, &authority, &episode)?;
+    }
+    let refs = by_ref.keys().cloned().collect::<Vec<_>>();
+    let delta = by_ref
         .into_iter()
         .map(|(reference, (kind, value))| ProtectedDeltaItem {
             kind,
@@ -1330,7 +1361,194 @@ fn scheduled_input(
             direct_refs: vec![reference],
         })
         .collect();
-    Ok((episode, trigger, direct_delta, selected_direct_refs))
+    Ok(EpisodeJobInput {
+        episode,
+        trigger,
+        delta,
+        refs,
+    })
+}
+
+// Select only results already present in this Episode's frozen bursts and still
+// admitted under the same precise binding. No history, command line or stdout is sent.
+fn physical_result_sources(
+    current: &CurrentFacts,
+    authority: &SegmentationCurrentView,
+    episode: &WorkEpisode,
+) -> Result<Vec<PhysicalSource>, crate::semantic::SemanticServiceError> {
+    use crate::semantic::SemanticServiceError::InvalidInput;
+    use evertrace_domain::evidence::{
+        CorrelationStrength, NormalizationState, ObservationRole, PairingState,
+    };
+    let revision = episode.revision_id.to_string();
+    let boundary = current
+        .other_data_rows()
+        .find(|row| {
+            row.object_kind.as_deref() == Some("work_episode")
+                && row.current_revision_id.as_deref() == Some(&revision)
+        })
+        .ok_or(InvalidInput)?
+        .source_event_seq;
+    let ids = episode
+        .operation_burst_refs
+        .iter()
+        .map(ToString::to_string)
+        .collect::<std::collections::BTreeSet<_>>();
+    let mut selected = std::collections::BTreeMap::new();
+    for row in current.other_data_rows().filter(|row| {
+        row.source_event_seq <= boundary
+            && row.object_kind.as_deref() == Some("operation_burst")
+            && row.object_id.as_ref().is_some_and(|id| ids.contains(id))
+    }) {
+        let JournalPayload::OperationBurstRecorded(burst) =
+            serde_json::from_str(row.payload_json.as_deref().ok_or(InvalidInput)?)
+                .map_err(|_| InvalidInput)?
+        else {
+            return Err(InvalidInput);
+        };
+        if burst.primary_binding.task_id != Some(episode.task_id)
+            || burst.primary_binding.workstream_id != Some(episode.workstream_id)
+            || burst.primary_binding.episode_id != Some(episode.episode_id)
+        {
+            continue;
+        }
+        for member in &burst.members {
+            let Some((op, binding)) = authority
+                .operation(member.operation_id)
+                .zip(authority.binding(member.operation_id))
+            else {
+                continue;
+            };
+            if member.source_watermark > episode.source_watermark
+                || member.source_watermark <= episode.semantic_watermark
+                || op.operation_revision != member.operation_revision
+                || op.pairing_state != PairingState::Paired
+                || binding.work_binding_revision_id != member.work_binding_revision_id
+                || binding.assignment_status != AssignmentStatus::Resolved
+                || binding.primary_binding != burst.primary_binding
+                || op.execution_lane_id != Some(burst.execution_lane_id)
+                || !authority
+                    .occurrence(op.host_occurrence_id)
+                    .is_some_and(|occurrence| {
+                        occurrence.correlation_strength == CorrelationStrength::Exact
+                            && occurrence.possible_duplicate_group_id.is_none()
+                            && occurrence.normalization_state
+                                != NormalizationState::NormalizationConflicted
+                    })
+            {
+                continue;
+            }
+            let ([result], [scope]) = (
+                op.result_source_observation_refs.as_slice(),
+                op.scope_effect_ids.as_slice(),
+            ) else {
+                continue;
+            };
+            if !member.source_observation_refs.contains(result)
+                || !authority.scope_effect(*scope).is_some_and(|effect| {
+                    effect.operation_id == member.operation_id
+                        && effect.repository_instance_id == episode.repository_instance_id
+                        && effect.worktree_instance_id == episode.worktree_instance_id
+                })
+            {
+                continue;
+            }
+            let Some((observation, seq)) = current.source_observation(*result) else {
+                continue;
+            };
+            if seq <= episode.semantic_watermark
+                || seq > episode.source_watermark
+                || observation.observation_role != ObservationRole::Result
+                || !current
+                    .source_receipt(observation.source_receipt_ref)
+                    .is_some_and(|(receipt, _)| {
+                        receipt.archive_mode == evertrace_domain::evidence::SourceArchiveMode::Exact
+                            && receipt.protected_length <= 128 * 1024
+                            && evertrace_capture::execution_source::is_execution(
+                                observation,
+                                receipt,
+                            )
+                    })
+            {
+                continue;
+            }
+            selected.insert((seq, *result), observation.clone());
+            if selected.len() > 8 {
+                selected.pop_first();
+            }
+        }
+    }
+    Ok(selected.into_values().collect())
+}
+
+impl EpisodeJobInput {
+    async fn extend_physical(
+        &mut self,
+        current: &CurrentFacts,
+        writer: &crate::WriterHandle,
+        (runtime, report): (
+            &evertrace_capture::RuntimeSnapshot,
+            Option<&evertrace_codex::HostProbeReport>,
+        ),
+        sources: Vec<PhysicalSource>,
+        config_hash: [u8; 32],
+    ) -> Result<(), crate::semantic::SemanticServiceError> {
+        use crate::semantic::SemanticServiceError::InvalidInput;
+        let mut refs = sources
+            .iter()
+            .map(|row| row.source_observation_id.to_string())
+            .collect::<Vec<_>>();
+        refs.sort();
+        if !crate::session_import::blocked_source_observations(
+            writer,
+            report,
+            current,
+            &refs,
+            config_hash,
+        )
+        .await
+        .map_err(|_| InvalidInput)?
+        .is_empty()
+        {
+            return Err(InvalidInput);
+        }
+        let records = sources
+            .into_iter()
+            .map(|source| {
+                current
+                    .source_receipt(source.source_receipt_ref)
+                    .map(|(receipt, _)| (source, receipt.clone()))
+                    .ok_or(InvalidInput)
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        let dir = runtime.cas_dir.clone();
+        let delta = tokio::task::spawn_blocking(move || {
+            let cas = evertrace_capture::CasStore::open_existing(dir).map_err(|_| InvalidInput)?;
+            let mut delta = Vec::new();
+            for (source, receipt) in records {
+                let digest = receipt.cas_ref.parse().map_err(|_| InvalidInput)?;
+                let (bytes, _) = cas.read_bounded(&digest, 128*1024, 128*1024).map_err(|_| InvalidInput)?;
+                let mut verifier = evertrace_capture::cas::SourceArchiveVerifier::new(&receipt, &source).map_err(|_| InvalidInput)?;
+                verifier.update(&bytes).map_err(|_| InvalidInput)?;
+                verifier.finish().map_err(|_| InvalidInput)?;
+                if let Some(exit) = evertrace_capture::execution_source::execution_exit_code(&source, &receipt, &bytes) {
+                    delta.push(ProtectedDeltaItem {
+                        kind: ProtectedDeltaKind::Progress,
+                        value: format!("Observed process exit code {exit}; not an acceptance or verifier result."),
+                        direct_refs: vec![source.source_observation_id.to_string()],
+                    });
+                }
+            }
+            Ok::<_, crate::semantic::SemanticServiceError>(delta)
+        }).await.map_err(|_| InvalidInput)??;
+        self.refs = delta
+            .iter()
+            .flat_map(|item| item.direct_refs.iter().cloned())
+            .collect();
+        self.refs.sort();
+        self.delta = delta;
+        Ok(())
+    }
 }
 
 fn bounded_protected_text(protected_text: &str) -> String {

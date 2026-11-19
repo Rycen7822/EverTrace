@@ -3312,6 +3312,8 @@ impl BackgroundScheduler {
                             )
                             .await
                     } else {
+                        let report = self.report.read().await.clone();
+                        let job_ref = &job;
                         self.synthesis
                             .execute_owned_episode_job(
                                 current,
@@ -3319,21 +3321,33 @@ impl BackgroundScheduler {
                                 occurred_at_us,
                                 max_synthesis_wall_time,
                                 &self.writer,
-                                || async {
+                                (&self.runtime, report.as_ref()),
+                                |refs| async move {
                                     let current =
                                         self.writer.project_current(true).await.map_err(|_| {
                                             crate::provider::ProviderError::Transport
                                         })?;
                                     if current.frontier() == claim_frontier
                                         && self
-                                            .synthesis_repository_allowed(&current, &job)
+                                            .synthesis_repository_allowed(&current, job_ref)
                                             .await
                                             .unwrap_or(false)
                                     {
-                                        Ok(())
-                                    } else {
-                                        Err(crate::provider::ProviderError::Disabled)
+                                        let report = self.report.read().await.clone();
+                                        if crate::session_import::blocked_source_observations(
+                                            &self.writer,
+                                            report.as_ref(),
+                                            &current,
+                                            &refs,
+                                            job_ref.config_hash,
+                                        )
+                                        .await
+                                        .is_ok_and(|blocked| blocked.is_empty())
+                                        {
+                                            return Ok(());
+                                        }
                                     }
+                                    Err(crate::provider::ProviderError::Disabled)
                                 },
                             )
                             .await

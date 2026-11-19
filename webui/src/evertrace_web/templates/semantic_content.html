@@ -256,7 +256,7 @@
   </details>
   <details><summary>结果、摘要和验证的原始引用</summary>
     <p>这里只列已存引用；其内容与资格须在原记录中按权限查看。</p>
-    {{ text_list('语义摘要', value.semantic_digest_refs) }}
+    {{ text_list('语义摘要（确切修订）', value.semantic_digest_refs, record_kind='semantic_digest', exact_revision=true) }}
     {{ text_list('采集覆盖凭证', value.capture_receipt_revision_ids, record_kind='capture_receipt', exact_revision=true) }}
     {{ text_list('片段更正', value.segmentation_correction_refs, record_kind='segmentation_correction', exact_revision=true) }}
     {{ text_list('已完成结果', value.completed_outcome_refs) }}
