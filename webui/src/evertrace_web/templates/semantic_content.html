@@ -251,6 +251,11 @@
     <p>修订：{{ value.revision_id }} · 修订代数：{{ value.revision_generation }}</p>
     <p>Task：{{ value.task_id }} · Workstream：{{ value.workstream_id }}</p>
     <p>Repository：{{ value.repository_instance_id or '未归属' }} · Worktree：{{ value.worktree_instance_id or '未归属' }}</p>
+    {% for label, snapshot in [('进入快照', value.entry_worktree_snapshot_id), ('退出快照', value.exit_worktree_snapshot_id)] %}
+    <p>{{ label }}：{% if snapshot %}<button class="text-button" type="button" data-link-key="{{ snapshot }}"
+      data-object="{{ snapshot }}" data-revision="{{ snapshot }}" data-kind="worktree_snapshot">读取 {{ snapshot }}</button>
+      {% else %}未记录{% endif %}</p>
+    {% endfor %}
     <p>来源水位：{{ value.source_watermark }} · 语义水位：{{ value.semantic_watermark }}
       · 确认水位：{{ value.confirmation_watermark }} · 捕获水位：{{ value.capture_watermark }}</p>
   </details>
