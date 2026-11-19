@@ -576,6 +576,18 @@ impl JournalAdmissionState {
                             .get(&(member.operation_id, member.operation_revision))
                             .ok_or(StoreError::StoreCorrupt)?
                             .0;
+                        if matches!(checkpoint, Some(ActivityTarget::Refinement(_))) {
+                            for id in &anchor.scope_effect_ids {
+                                let effect = &self
+                                    .scope_effects
+                                    .get(id)
+                                    .ok_or(StoreError::StoreCorrupt)?
+                                    .0;
+                                source_refs.extend(effect.evidence_refs.iter().copied());
+                                repository_ids.extend(effect.repository_instance_id);
+                                scope_effects.insert(*id, effect.clone());
+                            }
+                        }
                         boundary_operation = Some((anchor.clone(), binding.clone()));
                     }
                 }

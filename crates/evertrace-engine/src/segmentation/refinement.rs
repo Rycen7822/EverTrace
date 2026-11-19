@@ -4,7 +4,7 @@ use std::time::{Duration, Instant};
 
 use evertrace_domain::canonical::sha256;
 use evertrace_domain::{
-    ids::{CommandId, JobId, WorkEpisodeId},
+    ids::{CommandId, JobId, RepositoryId, ScopeEffectId, WorkEpisodeId},
     revision::RevisionId,
     work::{
         ArtifactActor, ArtifactDerivability, ArtifactPayloadStatus, ArtifactRetention,
@@ -144,6 +144,28 @@ fn contract_delta<T: Serialize>(base: &T, declared: &T) -> Result<serde_json::Va
     };
     delta.retain(|key, value| base.get(key) != Some(value));
     Ok(serde_json::Value::Object(delta))
+}
+
+/// An explicit repository ID is a source's claim, not a Work binding. Prove
+/// observed scope from separately admitted effects, never from declaration text.
+fn scope_effect(
+    view: &evertrace_store::SegmentationCurrentView,
+    operation: &evertrace_domain::evidence::Operation,
+    repository: RepositoryId,
+) -> Option<ScopeEffectId> {
+    let [id] = operation.scope_effect_ids.as_slice() else {
+        return None;
+    };
+    let effect = view.scope_effect(*id)?;
+    (effect.repository_instance_id == Some(repository)
+        && effect.worktree_instance_id.is_some()
+        && effect.operation_id == operation.operation_id
+        && !operation.input_source_observation_refs.is_empty()
+        && effect
+            .evidence_refs
+            .iter()
+            .any(|source| operation.input_source_observation_refs.contains(source)))
+    .then_some(*id)
 }
 
 pub(crate) async fn input(
@@ -289,53 +311,78 @@ pub(crate) async fn input(
         .into_iter()
         .chain(recent_attempts.into_values())
         .collect::<Vec<_>>();
-    let competing_declaration = if attempt_candidate
-        && let (Some(phase), Some(strategy), Some((anchor, _))) = (
+    let mut prior_declaration = None;
+    let mut scope_conflict = None;
+    if attempt_candidate
+        && let (Some(phase), Some(strategy), Some((anchor, anchor_binding))) = (
             &activity.phase,
             &activity.strategy,
             &selected.boundary_operation,
         )
         && phase.phase_kind == episode.phase_contract.phase_kind
         && phase.local_goal == episode.phase_contract.local_goal
-        && phase.primary_targets == episode.phase_contract.primary_targets
-        && (phase.acceptance_boundary != episode.phase_contract.acceptance_boundary
-            || phase.expected_state_transition != episode.phase_contract.expected_state_transition)
-        && !episode.attempt_ids.is_empty()
-        && !episode.attempt_ids.iter().any(|id| {
-            authority
-                .attempt(*id)
-                .is_some_and(|attempt| attempt.strategy_contract == *strategy)
-        }) {
-        let earlier = match super::production::source_operation_activity(
-            snapshot,
-            &selected,
-            anchor.operation_id,
-            runtime,
-        )
-        .await
-        {
-            Ok(value) => value,
-            Err(evertrace_capture::CasError::LockBusy) => return Ok(None),
-            Err(_) => return Err(Error::Store),
-        };
-        (earlier
-            .phase
-            .as_ref()
-            .is_some_and(|anchor| super::same_phase_proposal(anchor, phase))
-            && earlier.strategy.as_ref() == Some(strategy)
-            && earlier
-                .declaration_refs
-                .iter()
-                .all(|id| selected.source_refs.contains(id))
-            && earlier
-                .declaration_refs
-                .iter()
-                .all(|id| !activity.declaration_refs.contains(id)))
-        .then_some(earlier.declaration_refs)
-    } else {
-        None
-    };
-    let gray_zone = if competing_declaration.is_some() {
+    {
+        let competing = phase.primary_targets == episode.phase_contract.primary_targets
+            && (phase.acceptance_boundary != episode.phase_contract.acceptance_boundary
+                || phase.expected_state_transition
+                    != episode.phase_contract.expected_state_transition)
+            && !episode.attempt_ids.is_empty()
+            && !episode.attempt_ids.iter().any(|id| {
+                authority
+                    .attempt(*id)
+                    .is_some_and(|attempt| attempt.strategy_contract == *strategy)
+            });
+        let scope = (|| {
+            let [target] = phase.primary_targets.as_slice() else {
+                return None;
+            };
+            let planned = target.parse::<RepositoryId>().ok()?;
+            let actual = episode.repository_instance_id?;
+            if planned == actual
+                || anchor_binding.assignment_status
+                    != evertrace_domain::work::AssignmentStatus::Resolved
+                || anchor_binding.primary_binding != binding.primary_binding
+            {
+                return None;
+            }
+            let current = authority.operation(selected.operation_id)?;
+            let effects = [
+                scope_effect(authority, anchor, actual)?,
+                scope_effect(authority, current, actual)?,
+            ];
+            (effects[0] != effects[1]).then_some((actual, effects))
+        })();
+        if competing || scope.is_some() {
+            let earlier = match super::production::source_operation_activity(
+                snapshot,
+                &selected,
+                anchor.operation_id,
+                runtime,
+            )
+            .await
+            {
+                Ok(value) => value,
+                Err(evertrace_capture::CasError::LockBusy) => return Ok(None),
+                Err(_) => return Err(Error::Store),
+            };
+            if earlier
+                .phase
+                .as_ref()
+                .is_some_and(|anchor| super::same_phase_proposal(anchor, phase))
+                && earlier.strategy.as_ref() == Some(strategy)
+                && !earlier.declaration_refs.is_empty()
+                && earlier.declaration_refs.iter().all(|id| {
+                    selected.source_refs.contains(id) && !activity.declaration_refs.contains(id)
+                })
+            {
+                prior_declaration = Some(earlier.declaration_refs);
+                scope_conflict = scope;
+            }
+        }
+    }
+    let gray_zone = if scope_conflict.is_some() {
+        "plan_operation_conflict"
+    } else if prior_declaration.is_some() {
         "attempt_or_episode"
     } else if !checkpoint_ready {
         return Ok(None);
@@ -370,7 +417,7 @@ pub(crate) async fn input(
         .iter()
         .chain(&activity.declaration_refs)
         .chain(&activity.exit_refs)
-        .chain(competing_declaration.iter().flatten())
+        .chain(prior_declaration.iter().flatten())
         .map(ToString::to_string)
         .collect::<BTreeSet<_>>();
     evidence.extend(
@@ -434,7 +481,7 @@ pub(crate) async fn input(
     if rationale.len() < minimum_rationale {
         return Ok(None);
     }
-    let plan_sources = match competing_declaration {
+    let plan_sources = match prior_declaration {
         Some(earlier) => earlier
             .into_iter()
             .chain(activity.declaration_refs)
@@ -443,7 +490,10 @@ pub(crate) async fn input(
             .collect(),
         None => activity.declaration_refs,
     };
-    let json = serde_json::to_string(&serde_json::json!({"phase_contract":episode.phase_contract,
+    if let Some((_, effects)) = &scope_conflict {
+        evidence.extend(effects.iter().map(ToString::to_string));
+    }
+    let mut context = serde_json::json!({"phase_contract":episode.phase_contract,
         "candidate":candidate.map(|value| serde_json::json!({"watermark":value.candidate_watermark,"kind":value.kind})),
         "gray_zone":gray_zone,
         "bursts":summaries,"primary_attempt_id":primary_attempt,"attempts":attempts,
@@ -452,8 +502,14 @@ pub(crate) async fn input(
             "source_refs":plan_sources},
         "physical_result":activity.exit_code.map(|exit| serde_json::json!({
             "operation_id":selected.operation_id,"exit_code":exit,"source_refs":activity.exit_refs})),
-        "rationale":rationale,"evidence_refs":evidence}))
-    .map_err(|_| Error::Store)?;
+        "rationale":rationale,"evidence_refs":evidence});
+    if let Some((observed, effects)) = scope_conflict {
+        // The claimed target is already in plan_delta. Do not resolve it or import
+        // facts from another scope: this Review has only the observed scope's provenance.
+        context["scope_conflict"] =
+            serde_json::json!({"observed_repository":observed,"scope_effects":effects});
+    }
+    let json = serde_json::to_string(&context).map_err(|_| Error::Store)?;
     if json.len() > 16384 {
         return Ok(None);
     }
