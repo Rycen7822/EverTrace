@@ -507,13 +507,10 @@ impl EvidenceIngestor {
             path::Path,
             time::{Duration, Instant},
         };
-        let Some(authority) = self
+        let authority = self
             .execution_canary
             .as_ref()
-            .and_then(|value| value.execution_scope_source())
-        else {
-            return Ok(false);
-        };
+            .and_then(|value| value.execution_scope_source());
         // Admit durable Native starts with the child cue. Selective child-only intake can leave
         // its live parent queued behind unrelated records until the process carrier has exited.
         let spool = DurableSpool::open_read_only(
@@ -526,16 +523,36 @@ impl EvidenceIngestor {
         let records = match spool.read_durable_records(MAX_SEGMENTS_PER_DRAIN, 64 * 1024 * 1024) {
             Ok(records) => records,
             Err(evertrace_capture::SpoolError::ResourceExhausted) => {
-                self.drain_once().await?;
+                if authority.is_some() {
+                    self.drain_once().await?;
+                }
                 return Ok(false);
             }
             Err(error) => return Err(map_spool(error)),
         };
         let mut observations = BTreeSet::from([observation_id]);
+        let mut live_terminal = false;
         for record in records {
             let Ok((body, id)) = decode_validated_record_body(&record) else {
                 continue;
             };
+            if authority.is_none() {
+                if id == observation_id
+                    && body.source_revision.as_str() == process_source::SOURCE_REVISION
+                    && (body.adapter_revision, body.parser_revision)
+                        == (
+                            process_source::ADAPTER_REVISION,
+                            process_source::PARSER_REVISION,
+                        )
+                    && body.observation_role == evertrace_domain::evidence::ObservationRole::Result
+                    && body.correlation.native_request_id.is_some()
+                    && body.correlation.physical_execution_ordinal.is_some()
+                {
+                    live_terminal = true;
+                    break;
+                }
+                continue;
+            }
             if evertrace_capture::execution_source::is_source_revision(
                 body.source_revision.as_str(),
             ) && evertrace_capture::execution_source::Profile::from_revision(
@@ -548,6 +565,11 @@ impl EvidenceIngestor {
                     break;
                 }
             }
+        }
+        // Capture the live child exit before the publisher reaps it. Repository and
+        // correlation qualification remain independent; the actual L0 verifier still runs.
+        if authority.is_none() && !live_terminal {
+            return Ok(false);
         }
         if observations.len() > MAX_SELECTED_OBSERVATIONS {
             self.drain_once().await?;
@@ -613,6 +635,9 @@ impl EvidenceIngestor {
                     && observation.capture_completeness
                         == evertrace_domain::evidence::CaptureCompleteness::Complete);
             }
+            let Some(authority) = authority.as_ref() else {
+                return Ok(false);
+            };
             let command_id = source_snapshot_command_id(observation_id, receipt.recorded_at_us)?;
             if self
                 .writer
