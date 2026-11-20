@@ -668,16 +668,8 @@ impl NativeRetrieval<'_> {
             )?;
         }
         self.check_temporal_completeness();
-        let still_missing = self.gaps(&witnessed);
-        let mut gaps = pending_gaps
-            .into_iter()
-            .filter(|gap| still_missing.contains(gap))
-            .collect::<Vec<_>>();
-        for gap in still_missing {
-            if gap.kind == NamedGapKind::TemporalEvidence && !gaps.contains(&gap) {
-                gaps.push(gap);
-            }
-        }
+        // A discovered edge only resolves an answer slot if its exact trace fits in the reply.
+        witnessed.clear();
         let mut projected = Vec::new();
         let mut answer_bytes = self
             .result
@@ -712,6 +704,7 @@ impl NativeRetrieval<'_> {
                 answer_bytes += statement.len();
                 let role = EvidenceRole::for_relation(&kind).ok_or(SearchError::Corrupt)?;
                 let ordering_basis = role.ordering_basis();
+                witnessed.insert(kind.clone());
                 projected.push((
                     GroundedStatement {
                         statement,
@@ -728,6 +721,16 @@ impl NativeRetrieval<'_> {
                 self.degraded("relation_endpoint_omitted_or_ambiguous");
             }
         }
+        let gaps = self
+            .gaps(&witnessed)
+            .into_iter()
+            .filter(|gap| {
+                matches!(
+                    gap.kind,
+                    NamedGapKind::AllowlistedRelationSlot | NamedGapKind::TemporalEvidence
+                ) || pending_gaps.contains(gap)
+            })
+            .collect::<Vec<_>>();
         let conflicts: BTreeSet<_> = self
             .result
             .candidates
