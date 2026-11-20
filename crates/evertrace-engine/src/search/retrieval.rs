@@ -349,6 +349,15 @@ impl NativeRetrieval<'_> {
         }
         gaps
     }
+
+    fn packed_gaps(&self, witnessed: &BTreeSet<String>, unpacked: &[NamedGap]) -> Vec<NamedGap> {
+        self.gaps(witnessed)
+            .into_iter()
+            // A clipped quote is not itself evidence of a missing exact identifier.
+            .filter(|gap| gap.kind != NamedGapKind::ExactIdentifier || unpacked.contains(gap))
+            .collect()
+    }
+
     pub(super) async fn run(mut self) -> Result<HumanSearchPage, SearchError> {
         if self.result.completeness == RetrievalCompleteness::Unknown {
             return Ok(HumanSearchPage {
@@ -534,13 +543,71 @@ impl NativeRetrieval<'_> {
             }
             frontier = refs.difference(&visited).cloned().collect();
         }
-        // Required slots refer to original rows, never gaps invented by snippet truncation.
-        let pending_gaps = self.gaps(&witnessed);
+        let unpacked_gaps = self.gaps(&witnessed);
         let revision_bridge = self.time_scope.and_then(|scope| {
             scope.missing_revision_bridge(&self.result.candidates, &self.deadline)
         });
-        // Freeze generation 1 after D, before the one named, result-changing gap.
+        // Freeze the base candidates and their relation traces before deciding whether E can run.
         self.pack()?;
+        // A slot is supported only if every admitted edge of that kind fits in the reply.
+        witnessed.clear();
+        let mut incomplete = BTreeSet::new();
+        let mut projected = Vec::new();
+        let candidate_bytes: usize = self
+            .result
+            .candidates
+            .iter()
+            .map(|candidate| candidate.text.len() * 2 + candidate.temporal_wire_bytes())
+            .sum::<usize>();
+        let answer_limit = self.answer_text_limit() * 2;
+        let mut relation_bytes = 0usize;
+        for (source, target, kind) in relation_links {
+            let resolve = |reference: &str| {
+                let mut matches = self
+                    .result
+                    .candidates
+                    .iter()
+                    .filter(|candidate| candidate.matches_reference(reference));
+                let first = matches.next()?;
+                matches.next().is_none().then(|| first.candidate_id.clone())
+            };
+            let endpoints = (resolve(&source), resolve(&target));
+            if let (Some(source_ref), Some(target_ref)) = endpoints {
+                let statement = serde_json::to_string(&GroundedRelationStatement {
+                    relation_kind: kind.clone(),
+                    source_ref: source_ref.clone(),
+                    target_ref: target_ref.clone(),
+                    frontier: self.result.projection_frontier,
+                })
+                .map_err(|_| SearchError::Corrupt)?;
+                if candidate_bytes + relation_bytes + statement.len() > answer_limit {
+                    incomplete.insert(kind);
+                    self.degraded("relation_trace_pack_budget_exhausted");
+                    continue;
+                }
+                relation_bytes += statement.len();
+                let role = EvidenceRole::for_relation(&kind).ok_or(SearchError::Corrupt)?;
+                let ordering_basis = role.ordering_basis();
+                witnessed.insert(kind.clone());
+                projected.push((
+                    GroundedStatement {
+                        statement,
+                        support_refs: BTreeSet::from([source_ref, target_ref]),
+                        derivation_kind: DerivationKind::DeterministicDerived,
+                        ordering_basis,
+                        content_trust: "untrusted_source_content".into(),
+                        instruction_authority: "none".into(),
+                    },
+                    role,
+                    kind,
+                ));
+            } else {
+                incomplete.insert(kind);
+                self.degraded("relation_endpoint_omitted_or_ambiguous");
+            }
+        }
+        witnessed.retain(|kind| !incomplete.contains(kind));
+        let pending_gaps = self.packed_gaps(&witnessed, &unpacked_gaps);
         let base: BTreeSet<_> = self
             .result
             .candidates
@@ -654,7 +721,7 @@ impl NativeRetrieval<'_> {
                             .map_or(0, SourceSequencePosition::wire_bytes),
                     );
                 let delta_bytes = matches[0].text.len().min(512) + metadata_bytes.div_ceil(2);
-                if bytes + delta_bytes <= self.answer_text_limit() {
+                if bytes + delta_bytes + relation_bytes.div_ceil(2) <= self.answer_text_limit() {
                     self.admit(matches, "named_exact_gap")?;
                     added = self
                         .result
@@ -698,73 +765,7 @@ impl NativeRetrieval<'_> {
             )?;
         }
         self.check_temporal_completeness();
-        // A slot is supported only if every admitted edge of that kind fits in the reply.
-        witnessed.clear();
-        let mut incomplete = BTreeSet::new();
-        let mut projected = Vec::new();
-        let mut answer_bytes = self
-            .result
-            .candidates
-            .iter()
-            .map(|candidate| candidate.text.len() * 2 + candidate.temporal_wire_bytes())
-            .sum::<usize>();
-        let answer_limit = self.answer_text_limit() * 2;
-        for (source, target, kind) in relation_links {
-            let resolve = |reference: &str| {
-                let mut matches = self
-                    .result
-                    .candidates
-                    .iter()
-                    .filter(|candidate| candidate.matches_reference(reference));
-                let first = matches.next()?;
-                matches.next().is_none().then(|| first.candidate_id.clone())
-            };
-            let endpoints = (resolve(&source), resolve(&target));
-            if let (Some(source_ref), Some(target_ref)) = endpoints {
-                let statement = serde_json::to_string(&GroundedRelationStatement {
-                    relation_kind: kind.clone(),
-                    source_ref: source_ref.clone(),
-                    target_ref: target_ref.clone(),
-                    frontier: self.result.projection_frontier,
-                })
-                .map_err(|_| SearchError::Corrupt)?;
-                if answer_bytes + statement.len() > answer_limit {
-                    incomplete.insert(kind);
-                    self.degraded("relation_trace_pack_budget_exhausted");
-                    continue;
-                }
-                answer_bytes += statement.len();
-                let role = EvidenceRole::for_relation(&kind).ok_or(SearchError::Corrupt)?;
-                let ordering_basis = role.ordering_basis();
-                witnessed.insert(kind.clone());
-                projected.push((
-                    GroundedStatement {
-                        statement,
-                        support_refs: BTreeSet::from([source_ref, target_ref]),
-                        derivation_kind: DerivationKind::DeterministicDerived,
-                        ordering_basis,
-                        content_trust: "untrusted_source_content".into(),
-                        instruction_authority: "none".into(),
-                    },
-                    role,
-                    kind,
-                ));
-            } else {
-                incomplete.insert(kind);
-                self.degraded("relation_endpoint_omitted_or_ambiguous");
-            }
-        }
-        witnessed.retain(|kind| !incomplete.contains(kind));
-        let gaps = self
-            .gaps(&witnessed)
-            .into_iter()
-            .filter(|gap| {
-                matches!(
-                    gap.kind,
-                    NamedGapKind::AllowlistedRelationSlot | NamedGapKind::TemporalEvidence
-                ) || pending_gaps.contains(gap)
-            })
-            .collect::<Vec<_>>();
+        let gaps = self.packed_gaps(&witnessed, &unpacked_gaps);
         let conflicts: BTreeSet<_> = self
             .result
             .candidates
