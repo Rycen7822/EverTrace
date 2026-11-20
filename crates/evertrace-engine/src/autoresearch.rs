@@ -5704,7 +5704,7 @@ pub fn assess_result_cohort(
 }
 
 /// Reparse only an otherwise eligible cohort using the original parser and verified protected inputs.
-/// Reads are request-local, capped at 64 KiB per input / 1 MiB per member, and cancellation checked by CAS.
+/// CAS enforces the request-local decode budget (64 KiB per input, 1 MiB per member) before reading payloads.
 pub fn read_result_cohort(
     cas_dir: &std::path::Path,
     members: &[(&ResultEvidence, &ExperimentRun)],
@@ -5728,28 +5728,29 @@ pub fn read_result_cohort(
             return Ok(assessment);
         }
     };
+    const INPUT_BYTES: u64 = 64 * 1024;
     for (index, (result, run)) in members.iter().enumerate() {
         let mut inputs = Vec::new();
-        let mut total = 0;
+        let mut decoded_budget = 16 * INPUT_BYTES;
+        // Leave room for compression overhead and envelope headers, but also bound file reads.
+        let mut encoded_budget = 2 * decoded_budget;
         let mut reason = None;
         for id in &result.raw_cas_refs {
-            match cas.read_text_window_checked(
+            match cas.read_bounded_checked(
                 &CasDigest::from_str(&hex(&id.as_digest()))
                     .map_err(|_| AutoresearchError::InvalidInput)?,
-                0..65536,
-                check,
+                encoded_budget.min(2 * INPUT_BYTES),
+                decoded_budget.min(INPUT_BYTES),
+                &mut *check,
             ) {
-                Ok((window, text)) => {
-                    total += window.bytes.len();
-                    if window.total_bytes > 65536 || total > 1024 * 1024 {
-                        reason = Some(ResultComparisonReason::EvidenceBudgetExceeded);
-                        break;
-                    }
-                    if !text {
+                Ok((bytes, encoded)) => {
+                    if std::str::from_utf8(&bytes).is_err() {
                         reason = Some(ResultComparisonReason::ReparseMismatch);
                         break;
                     }
-                    inputs.push(window.bytes);
+                    encoded_budget -= encoded;
+                    decoded_budget -= bytes.len() as u64;
+                    inputs.push(bytes);
                 }
                 Err(evertrace_capture::CasError::ReadBudgetExceeded) => {
                     reason = Some(ResultComparisonReason::EvidenceBudgetExceeded);
