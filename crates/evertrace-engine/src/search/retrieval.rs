@@ -1,6 +1,6 @@
 //! Request-local production retrieval. All channels borrow one native snapshot;
 //! this does not consume the characterization session or create another index.
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 
 use evertrace_domain::query::*;
 use evertrace_store::{SearchHardFilter, SearchProjectionRow, SearchSnapshot};
@@ -257,7 +257,11 @@ impl NativeRetrieval<'_> {
         }
         Ok(())
     }
-    fn gaps(&self, witnessed: &BTreeSet<String>) -> Vec<NamedGap> {
+    fn gaps(
+        &self,
+        witnessed: &BTreeSet<String>,
+        clipped_exact: &BTreeMap<String, BTreeSet<String>>,
+    ) -> Vec<NamedGap> {
         let mut gaps = self
             .context
             .protected_facets
@@ -292,6 +296,9 @@ impl NativeRetrieval<'_> {
                 candidate.candidate_id == *identifier
                     || candidate.source_ref == *identifier
                     || candidate.text.contains(identifier)
+                    || clipped_exact
+                        .get(identifier)
+                        .is_some_and(|refs| refs.contains(&candidate.candidate_id))
             }) {
                 gaps.push(NamedGap {
                     kind: NamedGapKind::ExactIdentifier,
@@ -348,14 +355,6 @@ impl NativeRetrieval<'_> {
             });
         }
         gaps
-    }
-
-    fn packed_gaps(&self, witnessed: &BTreeSet<String>, unpacked: &[NamedGap]) -> Vec<NamedGap> {
-        self.gaps(witnessed)
-            .into_iter()
-            // A clipped quote is not itself evidence of a missing exact identifier.
-            .filter(|gap| gap.kind != NamedGapKind::ExactIdentifier || unpacked.contains(gap))
-            .collect()
     }
 
     pub(super) async fn run(mut self) -> Result<HumanSearchPage, SearchError> {
@@ -442,7 +441,6 @@ impl NativeRetrieval<'_> {
             .into_iter()
             .filter(|kind| relation_allowed(kind))
             .collect();
-        let mut witnessed = BTreeSet::new();
         let mut relation_links = BTreeSet::new();
         let mut visited = BTreeSet::new();
         let mut frontier = self.references();
@@ -519,7 +517,6 @@ impl NativeRetrieval<'_> {
                     && edge.target_id.as_ref().is_some_and(|id| refs.contains(id))
                 {
                     if let Some(kind) = &edge.relation_kind {
-                        witnessed.insert(kind.clone());
                         relation_links.insert((
                             edge.source_id.clone().ok_or(SearchError::Corrupt)?,
                             edge.target_id.clone().ok_or(SearchError::Corrupt)?,
@@ -543,14 +540,14 @@ impl NativeRetrieval<'_> {
             }
             frontier = refs.difference(&visited).cloned().collect();
         }
-        let unpacked_gaps = self.gaps(&witnessed);
         let revision_bridge = self.time_scope.and_then(|scope| {
             scope.missing_revision_bridge(&self.result.candidates, &self.deadline)
         });
         // Freeze the base candidates and their relation traces before deciding whether E can run.
-        self.pack()?;
+        let mut clipped_exact = BTreeMap::new();
+        self.pack(&mut clipped_exact)?;
         // A slot is supported only if every admitted edge of that kind fits in the reply.
-        witnessed.clear();
+        let mut witnessed = BTreeSet::new();
         let mut incomplete = BTreeSet::new();
         let mut projected = Vec::new();
         let candidate_bytes: usize = self
@@ -607,7 +604,7 @@ impl NativeRetrieval<'_> {
             }
         }
         witnessed.retain(|kind| !incomplete.contains(kind));
-        let pending_gaps = self.packed_gaps(&witnessed, &unpacked_gaps);
+        let pending_gaps = self.gaps(&witnessed, &clipped_exact);
         let base: BTreeSet<_> = self
             .result
             .candidates
@@ -755,7 +752,7 @@ impl NativeRetrieval<'_> {
                 self.degraded("named_gap_ambiguous");
             }
         }
-        self.pack()?;
+        self.pack(&mut clipped_exact)?;
         if let Some(scope) = self.time_scope {
             scope.align_revision_domain(
                 &mut self.result.candidates,
@@ -765,7 +762,7 @@ impl NativeRetrieval<'_> {
             )?;
         }
         self.check_temporal_completeness();
-        let gaps = self.packed_gaps(&witnessed, &unpacked_gaps);
+        let gaps = self.gaps(&witnessed, &clipped_exact);
         let conflicts: BTreeSet<_> = self
             .result
             .candidates
@@ -1010,7 +1007,10 @@ impl NativeRetrieval<'_> {
         }
     }
 
-    fn pack(&mut self) -> Result<(), SearchError> {
+    fn pack(
+        &mut self,
+        clipped_exact: &mut BTreeMap<String, BTreeSet<String>>,
+    ) -> Result<(), SearchError> {
         if self.context.unverified_hard_constraint() {
             self.result
                 .candidates
@@ -1029,24 +1029,40 @@ impl NativeRetrieval<'_> {
         let mut bytes: usize = 0;
         let mut kept = Vec::new();
         for mut candidate in std::mem::take(&mut self.result.candidates) {
-            if candidate.text.len() > 512 {
-                let mut end = 509;
+            let clipped = candidate.text.len() > 512;
+            let mut end = candidate.text.len();
+            if clipped {
+                end = 509;
                 while !candidate.text.is_char_boundary(end) {
                     end -= 1;
                 }
-                candidate.text.truncate(end);
-                candidate.text.push('…');
                 self.degraded("source_snippet_truncated");
             }
+            let snippet_bytes = if clipped { end + '…'.len_utf8() } else { end };
             let time_bytes = candidate.temporal_wire_bytes().div_ceil(2);
-            let candidate_bytes = candidate.text.len().saturating_add(time_bytes);
+            let candidate_bytes = snippet_bytes.saturating_add(time_bytes);
             if kept.len() >= limit || bytes.saturating_add(candidate_bytes) > text_limit {
                 self.result.omitted_refs.insert(candidate.candidate_id);
                 self.degraded("answer_pack_budget_exhausted");
-            } else {
-                bytes += candidate_bytes;
-                kept.push(candidate);
+                continue;
             }
+            if clipped {
+                // A kept reference witnesses the full source; an omitted one cannot close the gap.
+                for identifier in &self.context.query_facets.exact_identifiers {
+                    if !candidate.text[..end].contains(identifier)
+                        && candidate.text.contains(identifier)
+                    {
+                        clipped_exact
+                            .entry(identifier.clone())
+                            .or_default()
+                            .insert(candidate.candidate_id.clone());
+                    }
+                }
+                candidate.text.truncate(end);
+                candidate.text.push('…');
+            }
+            bytes += candidate_bytes;
+            kept.push(candidate);
         }
         self.result.candidates = kept;
         if self.sequence_scope.is_none()
