@@ -1,14 +1,21 @@
-//! Request-local production retrieval. All channels borrow one native snapshot;
-//! this does not consume the characterization session or create another index.
+//! Request-local production retrieval. All channels use the same canonical frontier.
 use std::collections::{BTreeMap, BTreeSet};
 
+use evertrace_domain::error::ErrorCode;
 use evertrace_domain::query::*;
-use evertrace_store::{SearchHardFilter, SearchProjectionRow, SearchSnapshot};
+use evertrace_store::{SearchHardFilter, SearchIndex, SearchProjectionRow, SearchSnapshot};
 
 use super::{
     SearchError,
     production::{RelationSources, RequestDeadline, hard_compatible},
+    read_context::SearchReadAccess,
 };
+
+pub(super) struct ScopedRelationRead<'a> {
+    pub index: &'a SearchIndex,
+    pub access: &'a SearchReadAccess<'a>,
+    pub checks_remaining: usize,
+}
 
 // Only the evidence FTS tier uses this preference; it is neither a grant nor
 // a truth/authority upgrade. Existing exact and normative candidates stay first.
@@ -45,7 +52,6 @@ fn preferred_evidence_filter(
 }
 
 pub(super) struct NativeRetrieval<'a> {
-    pub snapshot: &'a SearchSnapshot,
     pub context: &'a SearchContext,
     pub result: SearchResult,
     pub objects: SearchHardFilter,
@@ -64,7 +70,11 @@ impl NativeRetrieval<'_> {
     fn remaining(&self) -> usize {
         self.result.budget.candidates_remaining.min(32) as usize
     }
-    async fn evidence_fts(&mut self, filter: &SearchHardFilter) -> Result<(), SearchError> {
+    async fn evidence_fts(
+        &mut self,
+        snapshot: &SearchSnapshot,
+        filter: &SearchHardFilter,
+    ) -> Result<(), SearchError> {
         // Retained hits occupy fetch slots, not new budget. One further hit
         // proves truncation; exact-fit duplicate hits must not invent omission.
         let retained = self
@@ -84,10 +94,7 @@ impl NativeRetrieval<'_> {
         let limit = (self.remaining() + retained).min(32) + 1;
         match self
             .deadline
-            .run(
-                self.snapshot
-                    .fts(&self.context.protected_query, filter, limit),
-            )
+            .run(snapshot.fts(&self.context.protected_query, filter, limit))
             .await
         {
             Ok(Ok(rows)) => self.admit(rows, "evidence_fts")?,
@@ -217,6 +224,7 @@ impl NativeRetrieval<'_> {
     }
     async fn lookup_relation_targets(
         &mut self,
+        snapshot: &SearchSnapshot,
         identifiers: &[String],
         episodes: &[String],
     ) -> Result<(), SearchError> {
@@ -242,12 +250,7 @@ impl NativeRetrieval<'_> {
             }
             match self
                 .deadline
-                .run(self.snapshot.structured_with_sources(
-                    identifiers,
-                    &filter,
-                    limit + 1,
-                    sources,
-                ))
+                .run(snapshot.structured_with_sources(identifiers, &filter, limit + 1, sources))
                 .await
             {
                 Ok(Ok(rows)) => self.admit(rows, "typed_relation")?,
@@ -257,6 +260,81 @@ impl NativeRetrieval<'_> {
         }
         Ok(())
     }
+    async fn admit_scoped_targets(
+        &mut self,
+        snapshot: SearchSnapshot,
+        access: &mut ScopedRelationRead<'_>,
+        targets: Vec<String>,
+    ) -> Result<Option<SearchSnapshot>, SearchError> {
+        let targets: Vec<_> = targets
+            .into_iter()
+            .filter(|target| {
+                !self
+                    .result
+                    .candidates
+                    .iter()
+                    .any(|item| item.matches_reference(target))
+            })
+            .collect();
+        if targets.is_empty() {
+            return Ok(Some(snapshot));
+        }
+        let mut filter = self.objects.clone();
+        filter.object_kind = Some("atom_revision".into());
+        filter.atom_revisions = None; // The exact neighbors below need their own live grant.
+        let cap = access.checks_remaining;
+        let rows = match self
+            .deadline
+            .run(snapshot.structured(&targets, &filter, cap + 1))
+            .await
+        {
+            Ok(Ok(rows)) => rows,
+            Ok(Err(_)) => {
+                self.degraded("relation_target_channel_unavailable");
+                return Ok(Some(snapshot));
+            }
+            Err(()) => {
+                self.degraded("retrieval_deadline_exhausted");
+                return Ok(Some(snapshot));
+            }
+        };
+        if rows.len() > cap {
+            self.degraded("search_access_window_exhausted");
+        }
+        if rows.is_empty() || cap == 0 {
+            return Ok(Some(snapshot));
+        }
+        // Live source admission itself takes a reader. Never wait for it while holding the index lease.
+        let frontier = snapshot.frontier();
+        drop(snapshot);
+        let mut admitted = Vec::new();
+        for row in rows.into_iter().take(cap) {
+            access.checks_remaining -= 1;
+            let atom = row.source_ref.as_deref().ok_or(SearchError::Corrupt)?;
+            let revision = row.candidate_id.as_deref().ok_or(SearchError::Corrupt)?;
+            match access.access.check_current(atom, revision).await {
+                Ok(()) => admitted.push(row),
+                Err(ErrorCode::Untrusted) => self.degraded("source_read_restricted"),
+                Err(_) => self.degraded("search_access_unavailable"),
+            }
+            if self.deadline.remaining().is_none() {
+                return Ok(None);
+            }
+        }
+        let Ok(Ok(snapshot)) = self
+            .deadline
+            .run(access.index.snapshot_after_validated_frontier(frontier))
+            .await
+        else {
+            return Ok(None);
+        };
+        if snapshot.frontier() != frontier || snapshot.authoritative_frontier() != frontier {
+            return Ok(None);
+        }
+        self.admit(admitted, "typed_relation")?;
+        Ok(Some(snapshot))
+    }
+
     fn gaps(
         &self,
         witnessed: &BTreeSet<String>,
@@ -359,6 +437,7 @@ impl NativeRetrieval<'_> {
 
     pub(super) async fn read_evidence(
         &mut self,
+        snapshot: &SearchSnapshot,
         identifiers: &[String],
     ) -> Result<(), SearchError> {
         // B: original EvidenceSurface, not object metadata relabelled as evidence.
@@ -370,7 +449,7 @@ impl NativeRetrieval<'_> {
             } else {
                 match self
                     .deadline
-                    .run(self.snapshot.structured(identifiers, &filter, limit))
+                    .run(snapshot.structured(identifiers, &filter, limit))
                     .await
                 {
                     Ok(Ok(rows)) => self.admit(rows, "evidence_exact")?,
@@ -379,29 +458,36 @@ impl NativeRetrieval<'_> {
                 }
                 if let Some(mut preferred) = preferred_evidence_filter(self.context, &filter) {
                     preferred.capture_completeness = Some("complete".into());
-                    self.evidence_fts(&preferred).await?;
+                    self.evidence_fts(snapshot, &preferred).await?;
                     preferred.capture_completeness = None;
-                    self.evidence_fts(&preferred).await?;
+                    self.evidence_fts(snapshot, &preferred).await?;
                 }
-                self.evidence_fts(&filter).await?;
+                self.evidence_fts(snapshot, &filter).await?;
             }
         }
         Ok(())
     }
 
-    pub(super) async fn run(mut self) -> Result<HumanSearchPage, SearchError> {
+    pub(super) async fn run(
+        mut self,
+        snapshot: SearchSnapshot,
+    ) -> Result<HumanSearchPage, SearchError> {
         if self.result.completeness == RetrievalCompleteness::Unknown {
             return Ok(HumanSearchPage {
                 result: self.result,
                 grounded_view: None,
             });
         }
-        self.read_evidence(&self.context.query_facets.exact_identifiers)
+        self.read_evidence(&snapshot, &self.context.query_facets.exact_identifiers)
             .await?;
-        self.finish().await
+        self.finish(snapshot, None).await
     }
 
-    pub(super) async fn finish(mut self) -> Result<HumanSearchPage, SearchError> {
+    pub(super) async fn finish(
+        mut self,
+        mut snapshot: SearchSnapshot,
+        mut access: Option<ScopedRelationRead<'_>>,
+    ) -> Result<HumanSearchPage, SearchError> {
         // C: preserve permission-checked bridge rows for D. Literal conditions
         // constrain answer evidence, not the existence of a connecting object.
         self.result.layer = RetrievalLayer::C;
@@ -451,6 +537,7 @@ impl NativeRetrieval<'_> {
             .filter(|kind| relation_allowed(kind))
             .collect();
         let mut relation_links = BTreeSet::new();
+        let mut incomplete = BTreeSet::new();
         let mut visited = BTreeSet::new();
         let mut frontier = self.references();
         self.result.layer = RetrievalLayer::D;
@@ -467,7 +554,7 @@ impl NativeRetrieval<'_> {
             visited.extend(sources.iter().cloned());
             let edges = match self
                 .deadline
-                .run(self.snapshot.adjacent_relations(&sources, &kinds, 65))
+                .run(snapshot.adjacent_relations(&sources, &kinds, 65))
                 .await
             {
                 Ok(Ok(Some(rows))) => rows,
@@ -519,7 +606,16 @@ impl NativeRetrieval<'_> {
             } else {
                 Vec::new()
             };
-            self.lookup_relation_targets(&targets, &episodes).await?;
+            if let Some(access) = access.as_mut() {
+                let Some(reopened) = self.admit_scoped_targets(snapshot, access, targets).await?
+                else {
+                    return Ok(self.invalidated("canonical_frontier_changed"));
+                };
+                snapshot = reopened;
+            } else {
+                self.lookup_relation_targets(&snapshot, &targets, &episodes)
+                    .await?;
+            }
             let refs = self.references();
             for edge in &edges {
                 if edge.source_id.as_ref().is_some_and(|id| refs.contains(id))
@@ -545,6 +641,10 @@ impl NativeRetrieval<'_> {
                             }
                         }
                     }
+                } else if access.is_some()
+                    && let Some(kind) = &edge.relation_kind
+                {
+                    incomplete.insert(kind.clone());
                 }
             }
             frontier = refs.difference(&visited).cloned().collect();
@@ -557,7 +657,6 @@ impl NativeRetrieval<'_> {
         self.pack(&mut clipped_exact)?;
         // A slot is supported only if every admitted edge of that kind fits in the reply.
         let mut witnessed = BTreeSet::new();
-        let mut incomplete = BTreeSet::new();
         let mut projected = Vec::new();
         let candidate_bytes: usize = self
             .result
@@ -664,9 +763,9 @@ impl NativeRetrieval<'_> {
                 };
                 let lookup = async {
                     if let Some(identifiers) = &identifiers {
-                        self.snapshot.structured(identifiers, &filter, limit).await
+                        snapshot.structured(identifiers, &filter, limit).await
                     } else {
-                        self.snapshot.fts(&gap.identifier, &filter, limit).await
+                        snapshot.fts(&gap.identifier, &filter, limit).await
                     }
                 };
                 match self.deadline.run(lookup).await {
@@ -788,7 +887,7 @@ impl NativeRetrieval<'_> {
         {
             self.result.completeness = RetrievalCompleteness::Partial;
         }
-        match self.deadline.run(self.snapshot.is_current()).await {
+        match self.deadline.run(snapshot.is_current()).await {
             Ok(Ok(true)) => {}
             _ => return Ok(self.invalidated("canonical_frontier_changed")),
         }

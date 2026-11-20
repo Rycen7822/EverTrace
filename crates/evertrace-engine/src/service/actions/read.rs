@@ -146,6 +146,8 @@ impl McpActionService {
                 ["search_deadline_exhausted"],
             ));
         }
+        let relation = crate::search::explicit_atom_relation(&query, &scope.target_anchors);
+        let atom_relation = relation.is_some();
         let mut context = SearchContext {
             query_anchor: scope.anchor.search_anchor(),
             intent: SearchIntent::StageAssistance,
@@ -157,11 +159,18 @@ impl McpActionService {
                 .execution_context(scope.context.frontier, &scope.context.scope),
             query_facets: QueryFacetSet {
                 statement_role: evertrace_domain::query::StatementRole::Unknown,
-                parse_status: FacetParseStatus::Unknown,
-                target_anchors: scope.target_anchors.clone(),
+                parse_status: if atom_relation {
+                    FacetParseStatus::Complete
+                } else {
+                    FacetParseStatus::Unknown
+                },
+                target_anchors: relation.map_or_else(
+                    || scope.target_anchors.clone(),
+                    |(target, _)| vec![target.into()],
+                ),
                 exact_identifiers: Vec::new(),
                 condition_literals: Vec::new(),
-                relation_requirements: Vec::new(),
+                relation_requirements: relation.map(|(_, kind)| kind.into()).into_iter().collect(),
                 polarity: Polarity::Positive,
                 explicit_exclusions: Vec::new(),
                 temporal_mode: TemporalMode::Current,
@@ -169,7 +178,8 @@ impl McpActionService {
                 quantity_constraints: vec![QuantityConstraint::ResultLimit { limit: 3 }],
                 scope_boundary: None,
                 source_boundary: None,
-                answer_shape: None,
+                answer_shape: atom_relation
+                    .then_some(evertrace_domain::query::AnswerShape::SourceSnippet),
                 lifecycle_boundary: LifecycleBoundary::Active,
             },
             task_id: scope.anchor.task_id,
@@ -180,7 +190,7 @@ impl McpActionService {
                 candidates_remaining: 3,
                 tokens_remaining: 1_200,
                 latency_us_remaining: latency_us,
-                hops_remaining: 0,
+                hops_remaining: if atom_relation { 2 } else { 0 },
                 follow_ups_remaining: 0,
             },
         };
@@ -240,13 +250,14 @@ impl McpActionService {
         )
         .await
         .map_err(|_| McpServiceError::Store)?;
-        let mut found = ProductionSearch::new(self.search_index.clone())
+        let page = ProductionSearch::new(self.search_index.clone())
             .with_validated_frontier(scope.context.frontier)
             .with_method_proposals(methods)
             .with_procedure_revisions(searchable_procedure_revisions)
             .search_with_access(context.clone(), &read_access)
             .await
             .map_err(|_| McpServiceError::Store)?;
+        let mut found = page.result;
         let selected_candidates = found.candidates.iter().take(3).collect::<Vec<_>>();
         let candidate_ids = selected_candidates
             .iter()
@@ -545,15 +556,16 @@ impl McpActionService {
                 found.completeness = RetrievalCompleteness::Partial;
             }
         }
+        let overflowed = [
+            "retrieval_budget_exhausted",
+            "evidence_channel_budget_exhausted",
+        ]
+        .iter()
+        .any(|reason| found.degraded_reasons.contains(*reason));
         let mut view = None;
         if targets_resolved
-            && [
-                "retrieval_budget_exhausted",
-                "evidence_channel_budget_exhausted",
-            ]
-            .iter()
-            .any(|reason| found.degraded_reasons.contains(*reason))
             && found.authoritative_frontier == review_frontier
+            && (atom_relation || overflowed)
         {
             let reviewed = review
                 .items
@@ -564,10 +576,39 @@ impl McpActionService {
                 })
                 .filter_map(|item| item.object_revision_ref.as_deref())
                 .collect::<BTreeSet<_>>();
-            view = ProductionSearch::new(self.search_index.clone())
-                .ground_reviewed(&context, found.clone(), &reviewed, scope.deadline)
-                .await
-                .map(Box::new);
+            if atom_relation {
+                if let Some(mut relation) = page.grounded_view
+                    && !relation.candidate_set.candidate_refs.is_empty()
+                    && relation
+                        .candidate_set
+                        .candidate_refs
+                        .iter()
+                        .all(|id| reviewed.contains(id.as_str()))
+                {
+                    if !relation.unresolved_gaps.is_empty() {
+                        found
+                            .degraded_reasons
+                            .insert("search_relation_unresolved".into());
+                    }
+                    relation
+                        .omitted_refs
+                        .retain(|id| !blocked_candidates.contains(id));
+                    view = Some(Box::new(relation));
+                }
+            } else {
+                view = ProductionSearch::new(self.search_index.clone())
+                    .ground_reviewed(&context, found.clone(), &reviewed, scope.deadline)
+                    .await
+                    .map(Box::new);
+            }
+        }
+        if atom_relation && view.is_none() {
+            found
+                .degraded_reasons
+                .insert("grounded_view_unavailable".into());
+            if found.completeness != RetrievalCompleteness::Unknown {
+                found.completeness = RetrievalCompleteness::Partial;
+            }
         }
         let mut result = Self::search_result_from_review(
             request_id,
@@ -747,12 +788,20 @@ impl McpActionService {
             "search_access_window_exhausted",
             "evidence_channel_budget_exhausted",
             "retrieval_budget_exhausted",
+            "relation_candidate_budget_exhausted",
+            "relation_fanout_truncated",
         ]
         .iter()
         .any(|reason| found.degraded_reasons.contains(*reason));
         let unproven = trimmed
-            || found.degraded_reasons.contains("search_target_unresolved")
-            || found.degraded_reasons.contains("search_access_unavailable")
+            || [
+                "search_target_unresolved",
+                "search_relation_unresolved",
+                "grounded_view_unavailable",
+                "search_access_unavailable",
+            ]
+            .iter()
+            .any(|reason| found.degraded_reasons.contains(*reason))
             || found
                 .degraded_reasons
                 .contains("read_access_frontier_changed")

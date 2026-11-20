@@ -6,7 +6,7 @@ use std::{
 };
 
 use evertrace_domain::query::{
-    FacetParseStatus, LifecycleBoundary, Polarity, QuantityConstraint, QueryError,
+    FacetParseStatus, HumanSearchPage, LifecycleBoundary, Polarity, QuantityConstraint, QueryError,
     RetrievalCompleteness, RetrievalLayer, ScopeBoundary, SearchCandidate, SearchContext,
     SearchResult, SourceBoundary, SuppressionSnapshot, TemporalMode, TemporalOrdering,
     TemporalQualifier, production_retrieval_layer, requested_ordering,
@@ -14,6 +14,8 @@ use evertrace_domain::query::{
 use evertrace_domain::{error::ErrorCode, evidence::SourceRevision};
 use evertrace_store::{SearchHardFilter, SearchIndex, SearchProjectionRow, StoreError};
 use thiserror::Error;
+
+use super::retrieval::ScopedRelationRead;
 
 /// One canonical source revision, resolved after the native read gate.
 pub(crate) struct SourceSequenceScope {
@@ -703,7 +705,6 @@ impl ProductionSearch {
         time_scope: Option<&TemporalReadScope<'_>>,
         relation_sources: RelationSources<'_>,
     ) -> Result<evertrace_domain::query::HumanSearchPage, SearchError> {
-        use evertrace_domain::query::HumanSearchPage;
         context.validate()?;
         if self.readable_refs.is_none() {
             return Err(SearchError::Unsupported);
@@ -756,7 +757,6 @@ impl ProductionSearch {
             )
             .await?;
         super::retrieval::NativeRetrieval {
-            snapshot: &snapshot,
             context: &context,
             result,
             objects,
@@ -767,7 +767,7 @@ impl ProductionSearch {
             time_scope,
             relation_sources: Some(relation_sources),
         }
-        .run()
+        .run(snapshot)
         .await
     }
 
@@ -781,11 +781,12 @@ impl ProductionSearch {
         mut self,
         mut context: SearchContext,
         access: &super::read_context::SearchReadAccess<'_>,
-    ) -> Result<SearchResult, SearchError> {
+    ) -> Result<HumanSearchPage, SearchError> {
         context.validate()?;
         if matches!(context.suppression, SuppressionSnapshot::Unavailable) {
-            return self.search(context).await;
+            return self.search(context).await.map(ungrounded);
         }
+        let atom_relation = !context.query_facets.relation_requirements.is_empty();
         let discover = async {
             let snapshot = self
                 .index
@@ -798,7 +799,7 @@ impl ProductionSearch {
             let mut atoms = self.hard_filter(&context, true, None);
             atoms.object_kind = Some("atom_revision".into());
             // The existing lagging-index path is limited to revalidated current objects.
-            let evidence = (frontiers.0 == frontiers.1)
+            let evidence = (!atom_relation && frontiers.0 == frontiers.1)
                 .then(|| self.evidence_filter(&context, false, None))
                 .flatten();
             let limit = SEARCH_ACCESS_WINDOW + 1;
@@ -810,13 +811,17 @@ impl ProductionSearch {
             let mut incomplete = false;
             for (channel, filter) in std::iter::once(atoms).chain(evidence).enumerate() {
                 let exact = snapshot.structured(&identifiers, &filter, limit).await?;
-                let fts = snapshot
-                    .fts(&context.protected_query, &filter, limit)
-                    .await
-                    .unwrap_or_else(|_| {
-                        incomplete = true;
-                        Vec::new()
-                    });
+                let fts = if atom_relation {
+                    Vec::new() // An explicit relation operand isn't a lexical query.
+                } else {
+                    snapshot
+                        .fts(&context.protected_query, &filter, limit)
+                        .await
+                        .unwrap_or_else(|_| {
+                            incomplete = true;
+                            Vec::new()
+                        })
+                };
                 for (tier, rows) in [exact, fts].into_iter().enumerate() {
                     for (rank, row) in rows.into_iter().enumerate() {
                         let order = target_anchor_position(&context, &row)
@@ -851,21 +856,21 @@ impl ProductionSearch {
             tokio::time::timeout_at(tokio::time::Instant::from_std(access.deadline), discover)
                 .await
         else {
-            return Ok(deadline_result(
+            return Ok(ungrounded(deadline_result(
                 context,
                 "search_access_window_exhausted",
                 0,
                 0,
-            ));
+            )));
         };
         let (frontiers, offered, mut unavailable) = discovered?;
         if frontiers.1 != access.frontier {
-            return Ok(deadline_result(
+            return Ok(ungrounded(deadline_result(
                 context,
                 "execution_context_frontier_changed",
                 frontiers.0,
                 frontiers.1,
-            ));
+            )));
         }
         let mut grants = CandidateGrants {
             frontiers,
@@ -873,6 +878,7 @@ impl ProductionSearch {
             evidence_sources: BTreeSet::new(),
         };
         let mut restricted = false;
+        let checks_remaining = SEARCH_ACCESS_WINDOW.saturating_sub(offered.len());
         let exhausted = offered.len() > SEARCH_ACCESS_WINDOW;
         for read in offered.into_iter().take(SEARCH_ACCESS_WINDOW) {
             let (verified, reference, target) = match read {
@@ -895,12 +901,12 @@ impl ProductionSearch {
                 Err(_) => unavailable = true,
             }
             if Instant::now() >= access.deadline {
-                return Ok(deadline_result(
+                return Ok(ungrounded(deadline_result(
                     context,
                     "search_access_window_exhausted",
                     frontiers.0,
                     frontiers.1,
-                ));
+                )));
             }
         }
         self.candidate_grants = Some(grants);
@@ -910,6 +916,7 @@ impl ProductionSearch {
             .as_micros()
             .try_into()
             .unwrap_or(u64::MAX);
+        let relation_context = atom_relation.then(|| context.clone());
         let mut result = self.search(context).await?;
         if self
             .candidate_grants
@@ -935,7 +942,20 @@ impl ProductionSearch {
                 }
             }
         }
-        Ok(result)
+        if let Some(context) = relation_context {
+            let read = ScopedRelationRead {
+                index: &self.index,
+                access,
+                checks_remaining,
+            };
+            if let Some(page) = self
+                .finish_mcp_view(&context, result.clone(), access.deadline, Some(read))
+                .await
+            {
+                return Ok(page);
+            }
+        }
+        Ok(ungrounded(result))
     }
 
     /// Ordinary MCP can group already reviewed evidence without reopening the candidate pool.
@@ -946,11 +966,6 @@ impl ProductionSearch {
         approved_refs: &BTreeSet<&str>,
         expires: Instant,
     ) -> Option<evertrace_domain::query::GroundedEvidenceView> {
-        if result.projection_frontier != result.authoritative_frontier
-            || result.completeness == RetrievalCompleteness::Unknown
-        {
-            return None;
-        }
         result
             .candidates
             .retain(|candidate| approved_refs.contains(candidate.candidate_id.as_str()));
@@ -959,6 +974,25 @@ impl ProductionSearch {
         }
         // Unreturned references did not pass the final output review.
         result.omitted_refs.clear();
+        result.budget.hops_remaining = 0;
+        result.budget.follow_ups_remaining = 0;
+        self.finish_mcp_view(context, result, expires, None)
+            .await?
+            .grounded_view
+    }
+
+    async fn finish_mcp_view(
+        &self,
+        context: &SearchContext,
+        result: SearchResult,
+        expires: Instant,
+        access: Option<ScopedRelationRead<'_>>,
+    ) -> Option<HumanSearchPage> {
+        if result.projection_frontier != result.authoritative_frontier
+            || result.completeness == RetrievalCompleteness::Unknown
+        {
+            return None;
+        }
         let started = Instant::now();
         let latency = expires
             .checked_duration_since(started)?
@@ -979,11 +1013,7 @@ impl ProductionSearch {
         {
             return None;
         }
-        // This packaging pass has no expansion or follow-up authority of its own.
-        result.budget.hops_remaining = 0;
-        result.budget.follow_ups_remaining = 0;
         let page = super::retrieval::NativeRetrieval {
-            snapshot: &snapshot,
             context,
             result,
             objects: self.hard_filter(context, true, None),
@@ -994,14 +1024,10 @@ impl ProductionSearch {
             time_scope: None,
             relation_sources: None,
         }
-        .finish()
+        .finish(snapshot, access)
         .await
         .ok()?;
-        if page.validate() {
-            page.grounded_view
-        } else {
-            None
-        }
+        page.validate().then_some(page)
     }
 
     pub async fn search_with_diagnostic_fts_failure(
@@ -1100,7 +1126,6 @@ impl ProductionSearch {
             return Ok(result);
         }
         let mut retrieval = super::retrieval::NativeRetrieval {
-            snapshot: &snapshot,
             context: &context,
             result,
             objects: self.hard_filter(&context, true, None),
@@ -1121,7 +1146,7 @@ impl ProductionSearch {
             })
         });
         if has_unread_source {
-            retrieval.read_evidence(&[]).await?;
+            retrieval.read_evidence(&snapshot, &[]).await?;
         }
         if !matches!(deadline.run(snapshot.is_current()).await, Ok(Ok(true))) {
             return Ok(deadline_result(
@@ -1212,6 +1237,11 @@ impl ProductionSearch {
         }
         let mut filter = self.hard_filter(&context, true, time_scope);
         filter.global_only = global_only;
+        let atom_relation = self.candidate_grants.is_some()
+            && !context.query_facets.relation_requirements.is_empty();
+        if atom_relation {
+            filter.object_kind = Some("atom_revision".into());
+        }
         let requested_limit = if context.query_facets.count_unit().is_some()
             || context.query_facets.answer_shape
                 == Some(evertrace_domain::query::AnswerShape::TemporalComparison)
@@ -1371,7 +1401,9 @@ impl ProductionSearch {
                 }
             }
         }
-        let fts_result = if force_fts_failure {
+        let fts_result = if atom_relation {
+            Ok(Vec::new())
+        } else if force_fts_failure {
             Err(StoreError::LanceDb)
         } else {
             match deadline
@@ -1689,6 +1721,13 @@ impl RequestDeadline {
         tokio::time::timeout(remaining, future)
             .await
             .map_err(|_| ())
+    }
+}
+
+fn ungrounded(result: SearchResult) -> HumanSearchPage {
+    HumanSearchPage {
+        result,
+        grounded_view: None,
     }
 }
 
