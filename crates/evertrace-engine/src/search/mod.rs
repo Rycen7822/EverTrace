@@ -44,32 +44,73 @@ pub(crate) fn explicit_atom_relation<'a>(
         .then_some((operand, "atom_contradicts"))
 }
 
-/// Recognize an explicit comparison only when both operands are existing source/span identities.
-pub(crate) fn explicit_source_order(
+fn source_target(reference: &str) -> bool {
+    use evertrace_domain::{evidence::EvidenceSurface, ids::SourceObservationId};
+    reference.parse::<SourceObservationId>().is_ok()
+        || EvidenceSurface::parse_candidate_ref(reference).is_some()
+}
+
+/// Closed selectors over nominated source operands; no inference from question prose.
+pub(crate) fn explicit_source_shape(
     input: &str,
     targets: &[String],
-) -> Option<evertrace_domain::query::TemporalOrdering> {
-    use evertrace_domain::{
-        evidence::EvidenceSurface, ids::SourceObservationId, query::TemporalOrdering,
-    };
+) -> Option<(
+    evertrace_domain::query::AnswerShape,
+    evertrace_domain::query::TemporalOrdering,
+)> {
+    use evertrace_domain::query::{AnswerShape, TemporalOrdering};
 
-    let [left, right] = targets else {
+    if targets.is_empty() || !targets.iter().all(|reference| source_target(reference)) {
+        return None;
+    }
+    let text = input.trim().trim_end_matches('?').trim_end();
+    let (form, clause) = text.split_once(' ')?;
+    let (by, domain) = clause.split_once(' ')?;
+    if !by.eq_ignore_ascii_case("by") {
+        return None;
+    }
+    let shape = if form.eq_ignore_ascii_case("compare") && targets.len() == 2 {
+        AnswerShape::TemporalComparison
+    } else if form.eq_ignore_ascii_case("timeline") {
+        AnswerShape::Timeline
+    } else if form.eq_ignore_ascii_case("latest") {
+        AnswerShape::Latest
+    } else {
         return None;
     };
-    if ![left, right].iter().all(|reference| {
-        reference.parse::<SourceObservationId>().is_ok()
-            || EvidenceSurface::parse_candidate_ref(reference).is_some()
-    }) {
+    let order = if domain.eq_ignore_ascii_case("source sequence") {
+        TemporalOrdering::SourceSequence
+    } else if domain.eq_ignore_ascii_case("event time") {
+        TemporalOrdering::EventTime
+    } else {
+        return None;
+    };
+    Some((shape, order))
+}
+
+pub(crate) fn explicit_count_unit(
+    input: &str,
+    targets: &[String],
+) -> Option<evertrace_domain::query::CountUnit> {
+    use evertrace_domain::{ids::AtomId, query::CountUnit, revision::RevisionId};
+
+    if targets.is_empty() {
         return None;
     }
-    let query = input.trim().trim_end_matches('?').trim_end();
-    if query.eq_ignore_ascii_case("compare by source sequence") {
-        Some(TemporalOrdering::SourceSequence)
-    } else if query.eq_ignore_ascii_case("compare by event time") {
-        Some(TemporalOrdering::EventTime)
-    } else {
-        None
+    let text = input.trim().trim_end_matches('?').trim_end();
+    if text.eq_ignore_ascii_case("count referenced source observations")
+        && targets.iter().all(|id| source_target(id))
+    {
+        return Some(CountUnit::SourceObservation);
     }
+    if text.eq_ignore_ascii_case("count referenced atom revisions")
+        && targets
+            .iter()
+            .all(|id| id.parse::<AtomId>().is_ok() || id.parse::<RevisionId>().is_ok())
+    {
+        return Some(CountUnit::ObjectRevision);
+    }
+    None
 }
 
 const EXACT_SLOT_SEPARATOR: &str = "; exact ";

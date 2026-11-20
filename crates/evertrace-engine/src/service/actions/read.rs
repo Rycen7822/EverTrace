@@ -148,7 +148,9 @@ impl McpActionService {
         }
         let relation = crate::search::explicit_atom_relation(&query, &scope.target_anchors);
         let atom_relation = relation.is_some();
-        let source_order = crate::search::explicit_source_order(&query, &scope.target_anchors);
+        let source_shape = crate::search::explicit_source_shape(&query, &scope.target_anchors);
+        let count_unit = crate::search::explicit_count_unit(&query, &scope.target_anchors);
+        let exact_shape = source_shape.is_some() || count_unit.is_some();
         let entity_list = crate::search::entity_list_topic(&query).is_some();
         let exact_slots = if entity_list {
             None
@@ -156,7 +158,11 @@ impl McpActionService {
             crate::search::explicit_exact_slots(&query, &scope.target_anchors)
         };
         let explicit_exact = exact_slots.is_some();
-        let explicit_view = atom_relation || source_order.is_some() || explicit_exact;
+        let explicit_view = atom_relation || exact_shape || explicit_exact;
+        let mut quantity = vec![QuantityConstraint::ResultLimit { limit: 3 }];
+        if let Some(unit) = count_unit {
+            quantity.push(QuantityConstraint::DistinctCount { unit });
+        }
         let mut context = SearchContext {
             query_anchor: scope.anchor.search_anchor(),
             intent: SearchIntent::StageAssistance,
@@ -168,7 +174,7 @@ impl McpActionService {
                 .execution_context(scope.context.frontier, &scope.context.scope),
             query_facets: QueryFacetSet {
                 statement_role: evertrace_domain::query::StatementRole::Unknown,
-                parse_status: if atom_relation || source_order.is_some() {
+                parse_status: if atom_relation || exact_shape {
                     FacetParseStatus::Complete
                 } else {
                     FacetParseStatus::Unknown
@@ -183,15 +189,21 @@ impl McpActionService {
                 polarity: Polarity::Positive,
                 explicit_exclusions: Vec::new(),
                 temporal_mode: TemporalMode::Current,
-                temporal_qualifiers: source_order
-                    .map(|domain| evertrace_domain::query::TemporalQualifier::OrderBy { domain })
+                temporal_qualifiers: source_shape
+                    .map(
+                        |(_, domain)| evertrace_domain::query::TemporalQualifier::OrderBy {
+                            domain,
+                        },
+                    )
                     .into_iter()
                     .collect(),
-                quantity_constraints: vec![QuantityConstraint::ResultLimit { limit: 3 }],
+                quantity_constraints: quantity,
                 scope_boundary: None,
                 source_boundary: None,
-                answer_shape: if source_order.is_some() {
-                    Some(evertrace_domain::query::AnswerShape::TemporalComparison)
+                answer_shape: if let Some((shape, _)) = source_shape {
+                    Some(shape)
+                } else if count_unit.is_some() {
+                    Some(evertrace_domain::query::AnswerShape::Count)
                 } else if entity_list {
                     Some(evertrace_domain::query::AnswerShape::EntityList)
                 } else {
@@ -602,13 +614,16 @@ impl McpActionService {
                         .iter()
                         .all(|id| reviewed.contains(id.as_str()))
                 {
-                    if explicit_exact || !grounded.unresolved_gaps.is_empty() {
+                    if exact_shape && grounded.completeness != RetrievalCompleteness::Complete {
+                        found
+                            .degraded_reasons
+                            .insert("search_bounded_operator_partial".into());
+                    }
+                    if explicit_exact || (atom_relation && !grounded.unresolved_gaps.is_empty()) {
                         let reason = if explicit_exact {
                             "search_exact_request_partial"
-                        } else if atom_relation {
-                            "search_relation_unresolved"
                         } else {
-                            "search_temporal_comparison_unresolved"
+                            "search_relation_unresolved"
                         };
                         found.degraded_reasons.insert(reason.into());
                     }
@@ -829,7 +844,7 @@ impl McpActionService {
                 "search_relation_unresolved",
                 "search_exact_request_partial",
                 "search_entity_list_partial",
-                "search_temporal_comparison_unresolved",
+                "search_bounded_operator_partial",
                 "source_sequence_coverage_unverified",
                 "grounded_view_unavailable",
                 "search_access_unavailable",

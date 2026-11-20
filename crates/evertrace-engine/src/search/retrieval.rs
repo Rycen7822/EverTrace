@@ -51,6 +51,13 @@ fn preferred_evidence_filter(
     Some(preferred)
 }
 
+#[derive(Clone, Copy)]
+pub(super) enum ExactEvidence {
+    Lexical,
+    Counted,
+    Ordered,
+}
+
 pub(super) struct NativeRetrieval<'a> {
     pub context: &'a SearchContext,
     pub result: SearchResult,
@@ -484,7 +491,7 @@ impl NativeRetrieval<'_> {
         &mut self,
         snapshot: &SearchSnapshot,
         identifiers: &[String],
-        unique_operands: bool,
+        selection: ExactEvidence,
     ) -> Result<(), SearchError> {
         self.result.layer = RetrievalLayer::B;
         if let Some(filter) = self.evidence.as_ref() {
@@ -497,7 +504,7 @@ impl NativeRetrieval<'_> {
                     .run(snapshot.structured(
                         identifiers,
                         filter,
-                        limit + usize::from(unique_operands),
+                        limit + usize::from(!matches!(selection, ExactEvidence::Lexical)),
                     ))
                     .await
                 {
@@ -506,7 +513,7 @@ impl NativeRetrieval<'_> {
                             self.degraded("evidence_channel_budget_exhausted");
                             return Ok(()); // A prefix cannot prove that a requested source resolves uniquely.
                         }
-                        if unique_operands {
+                        if matches!(selection, ExactEvidence::Ordered) {
                             let ambiguous: Vec<_> = identifiers
                                 .iter()
                                 .filter(|id| {
@@ -547,7 +554,7 @@ impl NativeRetrieval<'_> {
     ) -> Result<(), SearchError> {
         // B: original EvidenceSurface, not object metadata relabelled as evidence.
         let had_room = self.remaining() != 0;
-        self.read_exact_evidence(snapshot, identifiers, false)
+        self.read_exact_evidence(snapshot, identifiers, ExactEvidence::Lexical)
             .await?;
         if had_room && let Some(filter) = self.evidence.clone() {
             if let Some(mut preferred) = preferred_evidence_filter(self.context, &filter) {

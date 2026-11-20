@@ -6,7 +6,7 @@ use std::{
 };
 
 use evertrace_domain::query::{
-    AnswerShape, FacetParseStatus, HumanSearchPage, LifecycleBoundary, Polarity,
+    AnswerShape, CountUnit, FacetParseStatus, HumanSearchPage, LifecycleBoundary, Polarity,
     QuantityConstraint, QueryError, RetrievalCompleteness, RetrievalLayer, ScopeBoundary,
     SearchCandidate, SearchContext, SearchResult, SourceBoundary, SuppressionSnapshot,
     TemporalMode, TemporalOrdering, TemporalQualifier, production_retrieval_layer,
@@ -16,7 +16,7 @@ use evertrace_domain::{error::ErrorCode, evidence::SourceRevision};
 use evertrace_store::{SearchHardFilter, SearchIndex, SearchProjectionRow, StoreError};
 use thiserror::Error;
 
-use super::retrieval::ScopedCandidateRead;
+use super::retrieval::{ExactEvidence, ScopedCandidateRead};
 
 /// One canonical source revision, resolved after the native read gate.
 pub(crate) struct SourceSequenceScope {
@@ -788,10 +788,15 @@ impl ProductionSearch {
             return self.search(context).await.map(ungrounded);
         }
         let atom_relation = !context.query_facets.relation_requirements.is_empty();
-        let source_order = (context.query_facets.answer_shape
-            == Some(AnswerShape::TemporalComparison))
-        .then(|| requested_ordering(&context.query_facets.temporal_qualifiers))
-        .flatten();
+        let source_order = context
+            .query_facets
+            .answer_shape
+            .filter(|shape| shape.uses_temporal_order())
+            .and_then(|_| requested_ordering(&context.query_facets.temporal_qualifiers));
+        let count_unit = context.query_facets.count_unit();
+        let source_only =
+            source_order.is_some() || count_unit == Some(CountUnit::SourceObservation);
+        let atoms_only = atom_relation || count_unit == Some(CountUnit::ObjectRevision);
         let discover = async {
             let snapshot = self
                 .index
@@ -804,23 +809,25 @@ impl ProductionSearch {
             let mut atoms = self.hard_filter(&context, true, None);
             atoms.object_kind = Some("atom_revision".into());
             // The existing lagging-index path is limited to revalidated current objects.
-            let evidence = (!atom_relation && frontiers.0 == frontiers.1)
+            let evidence = (!atoms_only && frontiers.0 == frontiers.1)
                 .then(|| self.evidence_filter(&context, false, None))
                 .flatten();
             let limit = SEARCH_ACCESS_WINDOW + 1;
-            let mut identifiers = exact_identifiers(&context);
-            identifiers.extend(context.query_facets.target_anchors.iter().cloned());
+            let mut identifiers = context.query_facets.target_anchors.clone();
+            if !source_only && count_unit.is_none() {
+                identifiers.extend(exact_identifiers(&context));
+            }
             identifiers.sort();
             identifiers.dedup();
             let mut offered = Vec::new();
             let mut incomplete = false;
             let channels = std::iter::once((0, atoms))
-                .filter(|_| source_order.is_none())
+                .filter(|_| !source_only)
                 .chain(evidence.map(|filter| (1, filter)));
             for (channel, filter) in channels {
                 let exact = snapshot.structured(&identifiers, &filter, limit).await?;
-                let fts = if atom_relation || source_order.is_some() {
-                    Vec::new() // An explicit relation operand isn't a lexical query.
+                let fts = if atoms_only || source_only {
+                    Vec::new() // Explicit operands are not lexical queries.
                 } else {
                     snapshot
                         .fts(scoped_lexical_query(&context), &filter, limit)
@@ -930,7 +937,7 @@ impl ProductionSearch {
             .as_micros()
             .try_into()
             .unwrap_or(u64::MAX);
-        if source_order.is_some() && frontiers.0 != frontiers.1 {
+        if (source_only || count_unit.is_some()) && frontiers.0 != frontiers.1 {
             return Ok(ungrounded(deadline_result(
                 context,
                 "search_projection_stale",
@@ -939,9 +946,9 @@ impl ProductionSearch {
             )));
         }
         let exact_followup = context.budget.follow_ups_remaining > 0;
-        let view_context =
-            (atom_relation || source_order.is_some() || exact_followup).then(|| context.clone());
-        let mut result = if source_order.is_some() {
+        let view_context = (atom_relation || source_only || exact_followup || count_unit.is_some())
+            .then(|| context.clone());
+        let mut result = if source_only {
             SearchResult {
                 layer: RetrievalLayer::B,
                 candidates: Vec::new(),
@@ -1079,9 +1086,11 @@ impl ProductionSearch {
         {
             return None;
         }
-        let evidence = (time_scope.is_some() || result.budget.follow_ups_remaining > 0)
-            .then(|| self.evidence_filter(context, false, time_scope))
-            .flatten();
+        let source_count = context.query_facets.count_unit() == Some(CountUnit::SourceObservation);
+        let evidence =
+            (source_count || time_scope.is_some() || result.budget.follow_ups_remaining > 0)
+                .then(|| self.evidence_filter(context, false, time_scope))
+                .flatten();
         let mut retrieval = super::retrieval::NativeRetrieval {
             context,
             result,
@@ -1093,9 +1102,14 @@ impl ProductionSearch {
             time_scope,
             relation_sources: None,
         };
-        if time_scope.is_some() {
+        if source_count || time_scope.is_some() {
+            let mode = if source_count {
+                ExactEvidence::Counted
+            } else {
+                ExactEvidence::Ordered
+            };
             retrieval
-                .read_exact_evidence(&snapshot, &context.query_facets.target_anchors, true)
+                .read_exact_evidence(&snapshot, &context.query_facets.target_anchors, mode)
                 .await
                 .ok()?;
         }
@@ -1312,9 +1326,10 @@ impl ProductionSearch {
         }
         let mut filter = self.hard_filter(&context, true, time_scope);
         filter.global_only = global_only;
-        let atom_relation = self.candidate_grants.is_some()
-            && !context.query_facets.relation_requirements.is_empty();
-        if atom_relation {
+        let exact_atom_only = self.candidate_grants.is_some()
+            && (!context.query_facets.relation_requirements.is_empty()
+                || context.query_facets.count_unit() == Some(CountUnit::ObjectRevision));
+        if exact_atom_only {
             filter.object_kind = Some("atom_revision".into());
         }
         let requested_limit = if context.query_facets.count_unit().is_some()
@@ -1476,7 +1491,7 @@ impl ProductionSearch {
                 }
             }
         }
-        let fts_result = if atom_relation {
+        let fts_result = if exact_atom_only {
             Ok(Vec::new())
         } else if force_fts_failure {
             Err(StoreError::LanceDb)
