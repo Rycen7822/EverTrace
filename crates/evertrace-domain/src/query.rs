@@ -581,6 +581,19 @@ pub struct NamedGap {
 }
 
 impl NamedGap {
+    pub fn validate_follow_up(&self) -> Result<(), QueryError> {
+        self.validate()?;
+        match self.kind {
+            NamedGapKind::ExactIdentifier if self.identifier.len() <= 512 => Ok(()),
+            NamedGapKind::StableObjectId | NamedGapKind::TemporalEvidence
+                if valid_target_reference(&self.identifier) =>
+            {
+                Ok(())
+            }
+            _ => Err(QueryError::Invalid),
+        }
+    }
+
     pub fn validate(&self) -> Result<(), QueryError> {
         if self.identifier.is_empty() || !self.changes_result {
             Err(QueryError::Invalid)
@@ -767,6 +780,9 @@ pub struct GroundedEvidenceView {
     pub candidate_comparison: Option<GroundedTemporalComparison>,
     pub evidence_need: EvidenceNeed,
     pub candidate_set: CandidateBoundary,
+    /// The request-local trigger for the sole admitted delta; absent in generation 1.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub follow_up_gap: Option<NamedGap>,
     pub trace: Vec<GroundedTraceStep>,
     pub active_evidence: Vec<GroundedStatement>,
     pub unresolved_gaps: Vec<NamedGap>,
@@ -1265,6 +1281,75 @@ impl GroundedEvidenceView {
         })
     }
 
+    fn validate_follow_up_trace(&self) -> Result<(), QueryError> {
+        let Some(gap) = &self.follow_up_gap else {
+            return if self.candidate_set.generation == 1 {
+                Ok(())
+            } else {
+                Err(QueryError::Invalid)
+            };
+        };
+        gap.validate_follow_up()?;
+        let added = &self.candidate_set.added_candidate_refs;
+        if self.candidate_set.generation != 2
+            || (gap.kind != NamedGapKind::TemporalEvidence
+                && self
+                    .candidate_set
+                    .base_candidate_refs
+                    .contains(&gap.identifier))
+        {
+            return Err(QueryError::Invalid);
+        }
+        let mut delta_quote = None;
+        for step in &self.trace {
+            let statement = self
+                .active_evidence
+                .get(step.statement_index as usize)
+                .ok_or(QueryError::Invalid)?;
+            if statement.derivation_kind != DerivationKind::Quoted {
+                continue;
+            }
+            if &statement.support_refs == added && delta_quote.replace((step, statement)).is_some()
+            {
+                return Err(QueryError::Invalid);
+            }
+            if gap.kind == NamedGapKind::ExactIdentifier
+                && statement
+                    .support_refs
+                    .is_subset(&self.candidate_set.base_candidate_refs)
+                && statement.statement.contains(&gap.identifier)
+            {
+                return Err(QueryError::Invalid);
+            }
+        }
+        let (step, statement) = delta_quote.ok_or(QueryError::Invalid)?;
+        let exact_closed = !self
+            .unresolved_gaps
+            .iter()
+            .any(|pending| pending.kind == gap.kind && pending.identifier == gap.identifier);
+        let valid = match gap.kind {
+            NamedGapKind::ExactIdentifier => {
+                exact_closed
+                    && (added.contains(&gap.identifier)
+                        || statement.statement.contains(&gap.identifier))
+            }
+            NamedGapKind::StableObjectId => exact_closed,
+            NamedGapKind::TemporalEvidence => {
+                step.role == EvidenceRole::Bridge
+                    && self.evidence_need.answer_shape == Some(AnswerShape::TemporalComparison)
+                    && requested_ordering(&self.evidence_need.temporal_scope.qualifiers)
+                        == Some(TemporalOrdering::Supersession)
+                    && self.evidence_need.target.contains(&gap.identifier)
+            }
+            NamedGapKind::AllowlistedRelationSlot | NamedGapKind::ProtectedFacet => false,
+        };
+        if valid {
+            Ok(())
+        } else {
+            Err(QueryError::Invalid)
+        }
+    }
+
     fn validate_inner(&self, frontier: Option<u64>) -> Result<(), QueryError> {
         self.evidence_need.validate()?;
         if let Some(comparison) = &self.candidate_comparison {
@@ -1289,6 +1374,7 @@ impl GroundedEvidenceView {
             }
         }
         self.candidate_set.validate()?;
+        self.validate_follow_up_trace()?;
         if let Some(count) = &self.candidate_count {
             if self.evidence_need.answer_shape != Some(AnswerShape::Count)
                 || self.evidence_need.count_unit.is_none()
@@ -3818,6 +3904,7 @@ impl HumanSearchPage {
                     .is_ok()
                     && view.candidate_set.candidate_refs == refs
                     && view.completeness == self.result.completeness
+                    && self.follow_up_boundary_valid(view)
                     && self.count_derivation_valid(view)
                     && self.latest_derivation_valid(view)
                     && self.comparison_derivation_valid(view)
@@ -3826,6 +3913,35 @@ impl HumanSearchPage {
             && self.timeline_order_valid()
             && self.sequence_positions_valid()
             && self.time_positions_valid()
+    }
+
+    fn follow_up_boundary_valid(&self, view: &GroundedEvidenceView) -> bool {
+        let Some(gap) = &view.follow_up_gap else {
+            return self.result.layer != RetrievalLayer::E;
+        };
+        self.result.layer == RetrievalLayer::E
+            && self.result.budget.follow_ups_remaining == 0
+            && self
+                .result
+                .candidates
+                .split_last()
+                .is_some_and(|(delta, base)| {
+                    view.candidate_set
+                        .added_candidate_refs
+                        .contains(&delta.candidate_id)
+                        && match gap.kind {
+                            NamedGapKind::StableObjectId => {
+                                delta.matches_reference(&gap.identifier)
+                                    && !base.iter().any(|candidate| {
+                                        candidate.matches_reference(&gap.identifier)
+                                    })
+                            }
+                            NamedGapKind::TemporalEvidence => {
+                                delta.row_variant == SearchCandidateVariant::EvidenceSurface
+                            }
+                            _ => true,
+                        }
+                })
     }
 
     fn count_derivation_valid(&self, view: &GroundedEvidenceView) -> bool {

@@ -47,7 +47,7 @@ impl DiagnosticRetrieval {
             result,
             deadline,
             generation_one_exact_refs: None,
-            followed_up: false,
+            follow_up_gap: None,
         })
     }
 }
@@ -58,7 +58,7 @@ pub struct DiagnosticSession {
     deadline: Instant,
     frontier: u64,
     generation_one_exact_refs: Option<BTreeSet<String>>,
-    followed_up: bool,
+    follow_up_gap: Option<NamedGap>,
 }
 
 impl DiagnosticSession {
@@ -228,7 +228,7 @@ impl DiagnosticSession {
             return Err(SearchError::Unsupported);
         };
         gap.validate()?;
-        if self.followed_up
+        if self.follow_up_gap.is_some()
             || self.result.budget.follow_ups_remaining == 0
             || !self.work_point()
             || matches!(
@@ -240,6 +240,7 @@ impl DiagnosticSession {
         {
             return Err(SearchError::Unsupported);
         }
+        gap.validate_follow_up()?;
         let mut matches = Vec::new();
         for row in rows {
             if !self.work_point() {
@@ -278,7 +279,7 @@ impl DiagnosticSession {
         self.result.budget.consume_candidate_text(row.text.len())?;
         push_candidate(&mut self.result, row, "named_gap_follow_up")?;
         self.result.budget.follow_ups_remaining -= 1;
-        self.followed_up = true;
+        self.follow_up_gap = Some(gap.clone());
         self.result.layer = RetrievalLayer::E;
         Ok(&self.result)
     }
@@ -371,6 +372,7 @@ impl DiagnosticSession {
                 added_candidate_refs,
                 candidate_refs,
             },
+            follow_up_gap: self.follow_up_gap.clone(),
             trace,
             active_evidence,
             unresolved_gaps,

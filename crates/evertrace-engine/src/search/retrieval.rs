@@ -63,6 +63,28 @@ pub(super) struct NativeRetrieval<'a> {
     pub relation_sources: Option<RelationSources<'a>>,
 }
 
+fn snippet_end(text: &str) -> usize {
+    if text.len() <= 512 {
+        return text.len();
+    }
+    text.floor_char_boundary(512 - '…'.len_utf8())
+}
+
+fn exact_excerpt(text: &str, identifier: &str) -> Option<String> {
+    let offset = text.find(identifier)?;
+    let capacity = 512 - 2 * '…'.len_utf8();
+    let padding = capacity.checked_sub(identifier.len())? / 2;
+    let start = text.ceil_char_boundary(offset.saturating_sub(padding));
+    let end = text.floor_char_boundary((start + capacity).min(text.len()));
+    let slice = text.get(start..end)?;
+    if !slice.contains(identifier) {
+        return None;
+    }
+    let leading = if start == 0 { "" } else { "…" };
+    let trailing = if end == text.len() { "" } else { "…" };
+    Some(format!("{leading}{slice}{trailing}"))
+}
+
 impl NativeRetrieval<'_> {
     fn degraded(&mut self, reason: &str) {
         self.result.degraded_reasons.insert(reason.into());
@@ -795,12 +817,13 @@ impl NativeRetrieval<'_> {
             .map(|candidate| candidate.candidate_id.clone())
             .collect();
         let mut added = BTreeSet::new();
+        let mut follow_up_gap = None;
         if let [gap] = pending_gaps.as_slice()
             && (gap.kind == NamedGapKind::ExactIdentifier
                 || (gap.kind == NamedGapKind::TemporalEvidence
                     && revision_bridge.is_some_and(|(endpoint, _)| endpoint == gap.identifier)
                     && self.result.budget.hops_remaining >= 2))
-            && gap.changes_result
+            && gap.validate_follow_up().is_ok()
             && self.result.budget.follow_ups_remaining > 0
             && access.as_ref().is_none_or(|access| {
                 access.checks_remaining >= 2
@@ -948,8 +971,32 @@ impl NativeRetrieval<'_> {
                             .as_ref()
                             .map_or(0, SourceSequencePosition::wire_bytes),
                     );
-                let delta_bytes = matches[0].text.len().min(512) + metadata_bytes.div_ceil(2);
-                if bytes + delta_bytes + relation_bytes.div_ceil(2) <= self.answer_text_limit() {
+                let text = &matches[0].text;
+                let needs_excerpt = gap.kind == NamedGapKind::ExactIdentifier
+                    && !text[..snippet_end(text)].contains(&gap.identifier);
+                let excerpt = needs_excerpt
+                    .then(|| exact_excerpt(text, &gap.identifier))
+                    .flatten()
+                    .filter(|quote| {
+                        self.context
+                            .query_facets
+                            .condition_literals
+                            .iter()
+                            .all(|literal| quote.contains(literal))
+                    });
+                let snippet_bytes = excerpt
+                    .as_ref()
+                    .map_or_else(|| text.len().min(512), String::len);
+                let delta_bytes = snippet_bytes + metadata_bytes.div_ceil(2);
+                let trigger_bytes = serde_json::to_vec(gap)
+                    .map_err(|_| SearchError::Corrupt)?
+                    .len()
+                    + 17;
+                if needs_excerpt && excerpt.is_none() {
+                    self.degraded("named_gap_witness_clipped");
+                } else if bytes + delta_bytes + (relation_bytes + trigger_bytes).div_ceil(2)
+                    <= self.answer_text_limit()
+                {
                     self.admit(matches, "named_exact_gap")?;
                     added = self
                         .result
@@ -959,6 +1006,13 @@ impl NativeRetrieval<'_> {
                         .filter(|id| !base.contains(id))
                         .collect();
                     if added.len() == 1 {
+                        if let Some(excerpt) = excerpt
+                            && let Some(last) = self.result.candidates.last_mut()
+                        {
+                            last.text = excerpt;
+                            self.degraded("source_snippet_truncated");
+                        }
+                        follow_up_gap = Some(gap.clone());
                         self.result.layer = RetrievalLayer::E;
                     }
                 } else {
@@ -1124,6 +1178,7 @@ impl NativeRetrieval<'_> {
                 added_candidate_refs: added,
                 candidate_refs: refs,
             },
+            follow_up_gap,
             trace,
             active_evidence,
             unresolved_gaps: gaps,
@@ -1261,12 +1316,8 @@ impl NativeRetrieval<'_> {
         let mut kept = Vec::new();
         for mut candidate in std::mem::take(&mut self.result.candidates) {
             let clipped = candidate.text.len() > 512;
-            let mut end = candidate.text.len();
+            let end = snippet_end(&candidate.text);
             if clipped {
-                end = 509;
-                while !candidate.text.is_char_boundary(end) {
-                    end -= 1;
-                }
                 self.degraded("source_snippet_truncated");
             }
             let snippet_bytes = if clipped { end + '…'.len_utf8() } else { end };
