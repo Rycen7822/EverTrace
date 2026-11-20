@@ -185,6 +185,7 @@ impl JournalAdmissionState {
         source: StoredFieldsContext,
         mut budget: ReadDependencyBudget,
         retained: &[ObjectRow],
+        checkpoint_tools: &[RevisionId],
         cancelled: &std::sync::atomic::AtomicBool,
         deadline: std::time::Instant,
     ) -> Result<evertrace_domain::query::MetadataReadOutcome<ReferenceReadContext>, StoreError>
@@ -293,6 +294,23 @@ impl JournalAdmissionState {
             let refs = source_references_for(root, &value);
             (Some(value), refs)
         };
+        if let Some(JournalPayload::WorkCheckpointRecorded(checkpoint)) = payload.as_ref() {
+            use evertrace_domain::work::{ArtifactActor, WorkArtifactKind};
+            for revision in checkpoint_tools {
+                let (artifact, seq) = self
+                    .artifact_revisions
+                    .get(revision)
+                    .ok_or(StoreError::StoreCorrupt)?;
+                if *seq > state.frontier
+                    || artifact.revision.kind != WorkArtifactKind::Log
+                    || artifact.revision.produced_by_refs
+                        != [ArtifactActor::WorkEpisode(checkpoint.episode_id)]
+                {
+                    return Err(StoreError::StoreCorrupt);
+                }
+                refs.insert(revision.to_string());
+            }
+        }
         refs.extend(
             retained
                 .iter()

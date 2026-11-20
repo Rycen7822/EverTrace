@@ -562,6 +562,36 @@ impl SqliteState {
         })
     }
 
+    /// Exact product companions of one admitted checkpoint; never a scan by Episode or time.
+    pub(crate) fn checkpoint_tool_revisions(
+        &self,
+        seq: u64,
+    ) -> Result<Vec<evertrace_domain::revision::RevisionId>, StoreError> {
+        self.with_connection(|connection| {
+            let mut statement = connection
+                .prepare(
+                    "SELECT CASE WHEN length(CAST(payload_json AS BLOB)) <= 65536
+                            THEN json_extract(payload_json, '$.value.revision.revision_id') END
+                     FROM journal_events WHERE command_id=(SELECT command_id FROM journal_events
+                         WHERE seq=?1 AND event_type='work_checkpoint_recorded_v1')
+                       AND event_type='work_artifact_recorded_v1' AND algorithm_revision='tool_request_v1'
+                     ORDER BY ordinal LIMIT 3",
+                )
+                .map_err(|_| StoreError::StoreCorrupt)?;
+            let rows = statement
+                .query_map(params![seq.to_be_bytes().as_slice()], |row| row.get::<_, String>(0))
+                .map_err(|_| StoreError::StoreCorrupt)?;
+            let revisions = rows
+                .map(|row| row.map_err(|_| StoreError::StoreCorrupt)?.parse().map_err(|_| StoreError::StoreCorrupt))
+                .collect::<Result<Vec<_>, _>>()?;
+            // The current checkpoint producer may save only the left and right original requests.
+            if revisions.len() > 2 {
+                return Err(StoreError::StoreCorrupt);
+            }
+            Ok(revisions)
+        })
+    }
+
     pub(crate) fn same_journal_command(&self, cohort: [u64; 3]) -> Result<bool, StoreError> {
         self.with_connection(|connection| {
             let mut statement = connection

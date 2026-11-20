@@ -6782,6 +6782,13 @@ impl JournalAdmissionState {
         Ok(rows)
     }
 
+    pub(crate) fn checkpoint_by_reference(&self, key: &str) -> Option<&(WorkCheckpoint, u64)> {
+        self.checkpoints.get(
+            key.strip_prefix("object:work:work_checkpoint:")
+                .unwrap_or(key),
+        )
+    }
+
     pub(crate) fn stored_fields_context(
         &self,
         query: &evertrace_domain::query::ExactReadQuery,
@@ -6796,10 +6803,7 @@ impl JournalAdmissionState {
         if let evertrace_domain::query::ExactReadQuery::Record(record) = query {
             let key = record.reference.stable_key.as_str();
             // A checkpoint shares its frozen Episode revision. Resolve its own row key on refresh/back too.
-            let checkpoint_key = key
-                .strip_prefix("object:work:work_checkpoint:")
-                .unwrap_or(key);
-            if let Some((checkpoint, seq)) = self.checkpoints.get(checkpoint_key) {
+            if let Some((checkpoint, seq)) = self.checkpoint_by_reference(key) {
                 if record
                     .reference
                     .revision_ref

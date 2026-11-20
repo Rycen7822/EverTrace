@@ -1681,27 +1681,30 @@ impl JournalWriter {
                 expected_selection: None,
             });
             // Raw reference selectors also admit physical revisions outside the Record/Fields wire contracts.
-            // Only missing, closed Work coordinates use the historical Record path; never widen Fields.
-            let cached =
-                if evertrace_domain::query::procedure_effect_revision(&reference.stable_key)
+            // Record preserves a checkpoint's own key rather than its borrowed Episode revision.
+            let cached = if self
+                .admission_state
+                .checkpoint_by_reference(&reference.stable_key)
+                .is_some()
+                || evertrace_domain::query::procedure_effect_revision(&reference.stable_key)
                     .is_some()
-                {
-                    self.stored_fields_at_state(
-                        &query,
-                        state.clone(),
-                        cancelled,
-                        deadline,
-                        &mut budget,
-                    )?
-                } else {
-                    self.admission_state.stored_fields_context_with_budget(
-                        query.lookup_ref(),
-                        state.clone(),
-                        cancelled,
-                        deadline,
-                        &mut budget,
-                    )?
-                };
+            {
+                self.stored_fields_at_state(
+                    &query,
+                    state.clone(),
+                    cancelled,
+                    deadline,
+                    &mut budget,
+                )?
+            } else {
+                self.admission_state.stored_fields_context_with_budget(
+                    query.lookup_ref(),
+                    state.clone(),
+                    cancelled,
+                    deadline,
+                    &mut budget,
+                )?
+            };
             let source = if matches!(&cached, O::Page(context) if context.selected.is_none())
                 && (query
                     .lookup_ref()
@@ -1791,8 +1794,24 @@ impl JournalWriter {
                 }
                 retained.extend(effects);
             }
+            let checkpoint_tools = if let Some(root) = source.selected.as_ref()
+                && root.object_kind.as_deref() == Some("work_checkpoint")
+            {
+                self.lock_sqlite()?
+                    .checkpoint_tool_revisions(root.source_event_seq)?
+            } else {
+                Vec::new()
+            };
             self.admission_state.reference_metadata_context(
-                reference, after, limit, source, budget, &retained, cancelled, deadline,
+                reference,
+                after,
+                limit,
+                source,
+                budget,
+                &retained,
+                &checkpoint_tools,
+                cancelled,
+                deadline,
             )
         })()?;
         self.finish_metadata_read(before, cancelled)?;
