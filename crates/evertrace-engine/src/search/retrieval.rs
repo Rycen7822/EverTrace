@@ -307,7 +307,7 @@ impl NativeRetrieval<'_> {
         }
         let mut filter = self.objects.clone();
         filter.object_kind = Some("atom_revision".into());
-        filter.atom_revisions = None; // The exact neighbors below need their own live grant.
+        filter.object_access = None; // The exact neighbors below need their own live grant.
         let cap = access.checks_remaining;
         let rows = match self
             .deadline
@@ -361,7 +361,10 @@ impl NativeRetrieval<'_> {
                 access.access.check_evidence(source).await
             } else if row.object_kind.as_deref() == Some("atom_revision") {
                 let revision = row.candidate_id.as_deref().ok_or(SearchError::Corrupt)?;
-                access.access.check_current(source, revision).await
+                access
+                    .access
+                    .check_current(source, revision, "atom_revision")
+                    .await
             } else {
                 return Err(SearchError::Corrupt);
             };
@@ -865,7 +868,7 @@ impl NativeRetrieval<'_> {
             if access.is_some() {
                 // Scoped E may discover new rows only in native channels with a live admission check.
                 objects.object_kind = Some("atom_revision".into());
-                objects.atom_revisions = None;
+                objects.object_access = None;
             }
             let evidence = self.evidence.clone().map(|mut filter| {
                 if access.is_some() {

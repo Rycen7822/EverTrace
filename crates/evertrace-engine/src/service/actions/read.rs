@@ -481,12 +481,16 @@ impl McpActionService {
                     evertrace_domain::query::SearchCandidateVariant::EvidenceSurface => {
                         fresh_access.check_evidence(&candidate.source_ref).await
                     }
-                    _ if candidate.object_kind.as_deref() == Some("atom_revision") => {
+                    _ => {
+                        let Some(kind) = candidate.object_kind.as_deref().filter(|kind| {
+                            crate::search::read_context::SCOPED_OBJECT_KINDS.contains(kind)
+                        }) else {
+                            continue;
+                        };
                         fresh_access
-                            .check_current(&candidate.source_ref, &candidate.candidate_id)
+                            .check_current(&candidate.source_ref, &candidate.candidate_id, kind)
                             .await
                     }
-                    _ => continue,
                 };
                 if proof.is_err() {
                     blocked_candidates.insert(candidate.candidate_id.clone());
@@ -848,6 +852,7 @@ impl McpActionService {
                 "source_sequence_coverage_unverified",
                 "grounded_view_unavailable",
                 "search_access_unavailable",
+                "source_read_restricted",
             ]
             .iter()
             .any(|reason| found.degraded_reasons.contains(*reason))

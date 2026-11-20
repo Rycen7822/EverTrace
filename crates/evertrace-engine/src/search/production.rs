@@ -13,10 +13,15 @@ use evertrace_domain::query::{
     requested_ordering,
 };
 use evertrace_domain::{error::ErrorCode, evidence::SourceRevision};
-use evertrace_store::{SearchHardFilter, SearchIndex, SearchProjectionRow, StoreError};
+use evertrace_store::{
+    SearchHardFilter, SearchIndex, SearchProjectionRow, StoreError, search::SearchObjectAccess,
+};
 use thiserror::Error;
 
-use super::retrieval::{ExactEvidence, ScopedCandidateRead};
+use super::{
+    read_context::SCOPED_OBJECT_KINDS,
+    retrieval::{ExactEvidence, ScopedCandidateRead},
+};
 
 /// One canonical source revision, resolved after the native read gate.
 pub(crate) struct SourceSequenceScope {
@@ -481,13 +486,17 @@ const SEARCH_ACCESS_WINDOW: usize = 32;
 
 struct CandidateGrants {
     frontiers: (u64, u64),
-    atom_revisions: BTreeSet<String>,
+    object_revisions: BTreeSet<String>,
     evidence_sources: BTreeSet<String>,
 }
 
 #[derive(Clone, Ord, PartialOrd, Eq, PartialEq)]
 enum OfferedRead {
-    Atom { revision: String, atom: String },
+    Object {
+        revision: String,
+        key: String,
+        kind: String,
+    },
     Evidence(String),
 }
 
@@ -608,10 +617,14 @@ impl ProductionSearch {
             procedure_revisions: self.procedure_revisions.clone(),
             method_proposal_revisions: self.method_proposal_revisions.clone(),
             object_kind: None,
-            atom_revisions: self
+            object_access: self
                 .candidate_grants
                 .as_ref()
-                .map(|grants| grants.atom_revisions.clone()),
+                .filter(|_| object_only)
+                .map(|grants| SearchObjectAccess {
+                    kinds: SCOPED_OBJECT_KINDS,
+                    revisions: Some(grants.object_revisions.clone()),
+                }),
             task_id: context.task_id.map(|id| id.to_string()),
             repository_id: context.repository_id.map(|id| id.to_string()),
             worktree_id: context.worktree_id.map(|id| id.to_string()),
@@ -806,8 +819,14 @@ impl ProductionSearch {
             if frontiers.1 != access.frontier {
                 return Ok((frontiers, Vec::new(), false));
             }
-            let mut atoms = self.hard_filter(&context, true, None);
-            atoms.object_kind = Some("atom_revision".into());
+            let mut objects = self.hard_filter(&context, true, None);
+            objects.object_access = Some(SearchObjectAccess {
+                kinds: SCOPED_OBJECT_KINDS,
+                revisions: None,
+            });
+            if atoms_only {
+                objects.object_kind = Some("atom_revision".into());
+            }
             // The existing lagging-index path is limited to revalidated current objects.
             let evidence = (!atoms_only && frontiers.0 == frontiers.1)
                 .then(|| self.evidence_filter(&context, false, None))
@@ -821,7 +840,7 @@ impl ProductionSearch {
             identifiers.dedup();
             let mut offered = Vec::new();
             let mut incomplete = false;
-            let channels = std::iter::once((0, atoms))
+            let channels = std::iter::once((0, objects))
                 .filter(|_| !source_only)
                 .chain(evidence.map(|filter| (1, filter)));
             for (channel, filter) in channels {
@@ -845,9 +864,10 @@ impl ProductionSearch {
                             });
                         let reference = row.source_ref.ok_or(StoreError::StoreCorrupt)?;
                         let read = if channel == 0 {
-                            OfferedRead::Atom {
+                            OfferedRead::Object {
                                 revision: row.candidate_id.ok_or(StoreError::StoreCorrupt)?,
-                                atom: reference,
+                                key: reference,
+                                kind: row.object_kind.ok_or(StoreError::StoreCorrupt)?,
                             }
                         } else {
                             OfferedRead::Evidence(reference)
@@ -889,7 +909,7 @@ impl ProductionSearch {
         }
         let mut grants = CandidateGrants {
             frontiers,
-            atom_revisions: BTreeSet::new(),
+            object_revisions: BTreeSet::new(),
             evidence_sources: BTreeSet::new(),
         };
         let mut temporal_sources = BTreeMap::new();
@@ -898,10 +918,14 @@ impl ProductionSearch {
         let exhausted = offered.len() > SEARCH_ACCESS_WINDOW;
         for read in offered.into_iter().take(SEARCH_ACCESS_WINDOW) {
             let (verified, reference, target) = match read {
-                OfferedRead::Atom { revision, atom } => (
-                    access.check_current(&atom, &revision).await,
+                OfferedRead::Object {
                     revision,
-                    &mut grants.atom_revisions,
+                    key,
+                    kind,
+                } => (
+                    access.check_current(&key, &revision, &kind).await,
+                    revision,
+                    &mut grants.object_revisions,
                 ),
                 OfferedRead::Evidence(source) => {
                     let verified = if source_order.is_some() {
@@ -965,7 +989,7 @@ impl ProductionSearch {
         if self
             .candidate_grants
             .as_ref()
-            .is_some_and(|grants| !grants.atom_revisions.is_disjoint(&result.omitted_refs))
+            .is_some_and(|grants| !grants.object_revisions.is_disjoint(&result.omitted_refs))
         {
             result
                 .degraded_reasons

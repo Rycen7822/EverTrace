@@ -112,6 +112,15 @@ pub(crate) struct SearchReadAccess<'a> {
     pub deadline: Instant,
 }
 
+/// Ordinary Search families whose public current revision and source/scope closure use exact reads.
+pub(crate) const SCOPED_OBJECT_KINDS: &[&str] = &[
+    "atom_revision",
+    "task",
+    "workstream",
+    "work_episode",
+    "attempt",
+];
+
 impl SearchReadAccess<'_> {
     pub async fn check_revision(&self, revision: &str) -> Result<(), ErrorCode> {
         self.check(
@@ -126,10 +135,17 @@ impl SearchReadAccess<'_> {
     }
 
     /// A lagging index may offer an immutable revision; only its current alias can grant Search access.
-    pub(crate) async fn check_current(&self, atom: &str, revision: &str) -> Result<(), ErrorCode> {
-        self.check_record(atom, revision, "atom_revision")
-            .await
-            .map(drop)
+    pub(crate) async fn check_current(
+        &self,
+        key: &str,
+        revision: &str,
+        kind: &str,
+    ) -> Result<(), ErrorCode> {
+        let context = self.check_record(key, revision, kind).await?;
+        if context.selected.and_then(|row| row.object_id).as_deref() != Some(key) {
+            return Err(ErrorCode::StoreCorrupt);
+        }
+        Ok(())
     }
 
     pub(crate) async fn check_evidence(&self, source: &str) -> Result<(), ErrorCode> {

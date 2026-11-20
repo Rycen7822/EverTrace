@@ -45,6 +45,13 @@ pub struct SearchSnapshot {
     _lease: crate::connection::StoreReadLease,
 }
 
+#[derive(Clone, Debug)]
+pub struct SearchObjectAccess {
+    pub kinds: &'static [&'static str],
+    /// None selects only these families for bounded discovery. Otherwise these families require a grant.
+    pub revisions: Option<BTreeSet<String>>,
+}
+
 #[derive(Clone, Debug, Default)]
 pub struct SearchHardFilter {
     /// Request-local canonical read grants. None preserves existing caller policy;
@@ -57,8 +64,7 @@ pub struct SearchHardFilter {
     pub method_proposal_revisions: BTreeSet<String>,
     /// A scoped lexical discovery can select one kind without changing its grants.
     pub object_kind: Option<String>,
-    /// Exact Atom revisions admitted by the same-frontier source read gate.
-    pub atom_revisions: Option<BTreeSet<String>>,
+    pub object_access: Option<SearchObjectAccess>,
     pub task_id: Option<String>,
     pub repository_id: Option<String>,
     pub worktree_id: Option<String>,
@@ -686,22 +692,29 @@ fn filter_sql_dialect(filter: &SearchHardFilter, dialect: FilterDialect) -> Opti
     if let Some(kind) = &filter.object_kind {
         clauses.push(format!("object_kind = {}", sql_literal(kind)));
     }
-    if let Some(revisions) = &filter.atom_revisions {
-        let allowed = if revisions.is_empty() {
-            "FALSE".into()
-        } else {
-            format!(
-                "candidate_id IN ({})",
-                revisions
-                    .iter()
-                    .map(|id| sql_literal(id))
-                    .collect::<Vec<_>>()
-                    .join(", ")
-            )
-        };
-        clauses.push(format!(
-            "(object_kind IS NULL OR object_kind != 'atom_revision' OR ({allowed}))"
-        ));
+    if let Some(access) = &filter.object_access {
+        let kinds = access
+            .kinds
+            .iter()
+            .map(|kind| sql_literal(kind))
+            .collect::<Vec<_>>()
+            .join(", ");
+        clauses.push(match &access.revisions {
+            None => format!("object_kind IN ({kinds})"),
+            Some(revisions) => {
+                let unrelated = format!("object_kind IS NULL OR object_kind NOT IN ({kinds})");
+                if revisions.is_empty() {
+                    format!("({unrelated})")
+                } else {
+                    let ids = revisions
+                        .iter()
+                        .map(|id| sql_literal(id))
+                        .collect::<Vec<_>>()
+                        .join(", ");
+                    format!("({unrelated} OR candidate_id IN ({ids}))")
+                }
+            }
+        });
     }
     if filter.global_only {
         clauses.push("task_id IS NULL AND repository_id IS NULL AND worktree_id IS NULL".into());
