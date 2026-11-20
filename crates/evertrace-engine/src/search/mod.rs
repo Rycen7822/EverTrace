@@ -72,5 +72,34 @@ pub(crate) fn explicit_source_order(
     }
 }
 
+const EXACT_SLOT_SEPARATOR: &str = "; exact ";
+
+/// Only explicitly delimited identifiers become required slots of an anchored search.
+pub(crate) fn explicit_exact_slots(input: &str, targets: &[String]) -> Option<Vec<String>> {
+    let mut fields = input.split(EXACT_SLOT_SEPARATOR);
+    if targets.is_empty() || fields.next()?.trim().is_empty() {
+        return None;
+    }
+    let mut identifiers = Vec::new();
+    for field in fields {
+        let identifier = field.trim().strip_prefix('`')?.strip_suffix('`')?;
+        if !(1..=128).contains(&identifier.len())
+            || !identifier.bytes().all(|byte| {
+                byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'.' | b':' | b'/')
+            })
+            || !identifier.bytes().any(|byte| byte.is_ascii_alphanumeric())
+        {
+            return None;
+        }
+        if !identifiers.iter().any(|old| old == identifier) {
+            identifiers.push(identifier.to_owned());
+        }
+        if identifiers.len() > 3 {
+            return None;
+        }
+    }
+    (!identifiers.is_empty()).then_some(identifiers)
+}
+
 #[cfg(test)]
 include!("tests.rs");

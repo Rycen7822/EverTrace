@@ -149,7 +149,9 @@ impl McpActionService {
         let relation = crate::search::explicit_atom_relation(&query, &scope.target_anchors);
         let atom_relation = relation.is_some();
         let source_order = crate::search::explicit_source_order(&query, &scope.target_anchors);
-        let explicit_view = atom_relation || source_order.is_some();
+        let exact_slots = crate::search::explicit_exact_slots(&query, &scope.target_anchors);
+        let explicit_exact = exact_slots.is_some();
+        let explicit_view = atom_relation || source_order.is_some() || explicit_exact;
         let mut context = SearchContext {
             query_anchor: scope.anchor.search_anchor(),
             intent: SearchIntent::StageAssistance,
@@ -161,7 +163,7 @@ impl McpActionService {
                 .execution_context(scope.context.frontier, &scope.context.scope),
             query_facets: QueryFacetSet {
                 statement_role: evertrace_domain::query::StatementRole::Unknown,
-                parse_status: if explicit_view {
+                parse_status: if atom_relation || source_order.is_some() {
                     FacetParseStatus::Complete
                 } else {
                     FacetParseStatus::Unknown
@@ -170,7 +172,7 @@ impl McpActionService {
                     || scope.target_anchors.clone(),
                     |(target, _)| vec![target.into()],
                 ),
-                exact_identifiers: Vec::new(),
+                exact_identifiers: exact_slots.unwrap_or_default(),
                 condition_literals: Vec::new(),
                 relation_requirements: relation.map(|(_, kind)| kind.into()).into_iter().collect(),
                 polarity: Polarity::Positive,
@@ -199,7 +201,7 @@ impl McpActionService {
                 tokens_remaining: 1_200,
                 latency_us_remaining: latency_us,
                 hops_remaining: if atom_relation { 2 } else { 0 },
-                follow_ups_remaining: 0,
+                follow_ups_remaining: u8::from(explicit_exact),
             },
         };
         self.protect_search_context(&mut context)?;
@@ -593,8 +595,10 @@ impl McpActionService {
                         .iter()
                         .all(|id| reviewed.contains(id.as_str()))
                 {
-                    if !grounded.unresolved_gaps.is_empty() {
-                        let reason = if atom_relation {
+                    if explicit_exact || !grounded.unresolved_gaps.is_empty() {
+                        let reason = if explicit_exact {
+                            "search_exact_request_partial"
+                        } else if atom_relation {
                             "search_relation_unresolved"
                         } else {
                             "search_temporal_comparison_unresolved"
@@ -808,6 +812,7 @@ impl McpActionService {
             || [
                 "search_target_unresolved",
                 "search_relation_unresolved",
+                "search_exact_request_partial",
                 "search_temporal_comparison_unresolved",
                 "source_sequence_coverage_unverified",
                 "grounded_view_unavailable",

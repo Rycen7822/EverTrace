@@ -11,7 +11,7 @@ use super::{
     read_context::SearchReadAccess,
 };
 
-pub(super) struct ScopedRelationRead<'a> {
+pub(super) struct ScopedCandidateRead<'a> {
     pub index: &'a SearchIndex,
     pub access: &'a SearchReadAccess<'a>,
     pub checks_remaining: usize,
@@ -73,6 +73,7 @@ impl NativeRetrieval<'_> {
     async fn evidence_fts(
         &mut self,
         snapshot: &SearchSnapshot,
+        text: &str,
         filter: &SearchHardFilter,
     ) -> Result<(), SearchError> {
         // Retained hits occupy fetch slots, not new budget. One further hit
@@ -92,11 +93,7 @@ impl NativeRetrieval<'_> {
             return Ok(());
         }
         let limit = (self.remaining() + retained).min(32) + 1;
-        match self
-            .deadline
-            .run(snapshot.fts(&self.context.protected_query, filter, limit))
-            .await
-        {
+        match self.deadline.run(snapshot.fts(text, filter, limit)).await {
             Ok(Ok(rows)) => self.admit(rows, "evidence_fts")?,
             Ok(Err(_)) => self.degraded("evidence_fts_unavailable"),
             Err(()) => self.degraded("retrieval_deadline_exhausted"),
@@ -263,7 +260,7 @@ impl NativeRetrieval<'_> {
     async fn admit_scoped_targets(
         &mut self,
         snapshot: SearchSnapshot,
-        access: &mut ScopedRelationRead<'_>,
+        access: &mut ScopedCandidateRead<'_>,
         targets: Vec<String>,
     ) -> Result<Option<SearchSnapshot>, SearchError> {
         let targets: Vec<_> = targets
@@ -301,18 +298,45 @@ impl NativeRetrieval<'_> {
         if rows.len() > cap {
             self.degraded("search_access_window_exhausted");
         }
-        if rows.is_empty() || cap == 0 {
-            return Ok(Some(snapshot));
+        let Some((snapshot, admitted)) = self
+            .scope_rows(snapshot, access, rows.into_iter().take(cap).collect())
+            .await?
+        else {
+            return Ok(None);
+        };
+        self.admit(admitted, "typed_relation")?;
+        Ok(Some(snapshot))
+    }
+
+    async fn scope_rows(
+        &mut self,
+        snapshot: SearchSnapshot,
+        access: &mut ScopedCandidateRead<'_>,
+        rows: Vec<SearchProjectionRow>,
+    ) -> Result<Option<(SearchSnapshot, Vec<SearchProjectionRow>)>, SearchError> {
+        if rows.len() > access.checks_remaining {
+            self.degraded("search_access_window_exhausted");
+            return Ok(Some((snapshot, Vec::new())));
+        }
+        if rows.is_empty() {
+            return Ok(Some((snapshot, rows)));
         }
         // Live source admission itself takes a reader. Never wait for it while holding the index lease.
         let frontier = snapshot.frontier();
         drop(snapshot);
         let mut admitted = Vec::new();
-        for row in rows.into_iter().take(cap) {
+        for row in rows {
             access.checks_remaining -= 1;
-            let atom = row.source_ref.as_deref().ok_or(SearchError::Corrupt)?;
-            let revision = row.candidate_id.as_deref().ok_or(SearchError::Corrupt)?;
-            match access.access.check_current(atom, revision).await {
+            let source = row.source_ref.as_deref().ok_or(SearchError::Corrupt)?;
+            let verified = if row.row_variant == "evidence_surface" {
+                access.access.check_evidence(source).await
+            } else if row.object_kind.as_deref() == Some("atom_revision") {
+                let revision = row.candidate_id.as_deref().ok_or(SearchError::Corrupt)?;
+                access.access.check_current(source, revision).await
+            } else {
+                return Err(SearchError::Corrupt);
+            };
+            match verified {
                 Ok(()) => admitted.push(row),
                 Err(ErrorCode::Untrusted) => self.degraded("source_read_restricted"),
                 Err(_) => self.degraded("search_access_unavailable"),
@@ -331,8 +355,7 @@ impl NativeRetrieval<'_> {
         if snapshot.frontier() != frontier || snapshot.authoritative_frontier() != frontier {
             return Ok(None);
         }
-        self.admit(admitted, "typed_relation")?;
-        Ok(Some(snapshot))
+        Ok(Some((snapshot, admitted)))
     }
 
     fn gaps(
@@ -497,6 +520,7 @@ impl NativeRetrieval<'_> {
     pub(super) async fn read_evidence(
         &mut self,
         snapshot: &SearchSnapshot,
+        text: &str,
         identifiers: &[String],
     ) -> Result<(), SearchError> {
         // B: original EvidenceSurface, not object metadata relabelled as evidence.
@@ -506,11 +530,11 @@ impl NativeRetrieval<'_> {
         if had_room && let Some(filter) = self.evidence.clone() {
             if let Some(mut preferred) = preferred_evidence_filter(self.context, &filter) {
                 preferred.capture_completeness = Some("complete".into());
-                self.evidence_fts(snapshot, &preferred).await?;
+                self.evidence_fts(snapshot, text, &preferred).await?;
                 preferred.capture_completeness = None;
-                self.evidence_fts(snapshot, &preferred).await?;
+                self.evidence_fts(snapshot, text, &preferred).await?;
             }
-            self.evidence_fts(snapshot, &filter).await?;
+            self.evidence_fts(snapshot, text, &filter).await?;
         }
         Ok(())
     }
@@ -525,15 +549,19 @@ impl NativeRetrieval<'_> {
                 grounded_view: None,
             });
         }
-        self.read_evidence(&snapshot, &self.context.query_facets.exact_identifiers)
-            .await?;
+        self.read_evidence(
+            &snapshot,
+            &self.context.protected_query,
+            &self.context.query_facets.exact_identifiers,
+        )
+        .await?;
         self.finish(snapshot, None).await
     }
 
     pub(super) async fn finish(
         mut self,
         mut snapshot: SearchSnapshot,
-        mut access: Option<ScopedRelationRead<'_>>,
+        mut access: Option<ScopedCandidateRead<'_>>,
     ) -> Result<HumanSearchPage, SearchError> {
         // C: preserve permission-checked bridge rows for D. Literal conditions
         // constrain answer evidence, not the existence of a connecting object.
@@ -772,9 +800,23 @@ impl NativeRetrieval<'_> {
                 || (gap.kind == NamedGapKind::TemporalEvidence
                     && revision_bridge.is_some_and(|(endpoint, _)| endpoint == gap.identifier)
                     && self.result.budget.hops_remaining >= 2))
+            && gap.changes_result
             && self.result.budget.follow_ups_remaining > 0
+            && access.as_ref().is_none_or(|access| {
+                access.checks_remaining >= 2
+                    && ![
+                        "search_access_window_exhausted",
+                        "search_access_unavailable",
+                        "source_read_restricted",
+                    ]
+                    .iter()
+                    .any(|reason| self.result.degraded_reasons.contains(*reason))
+            })
             && self.remaining()
-                >= (if gap.kind == NamedGapKind::ExactIdentifier && self.evidence.is_some() {
+                >= (if access.is_none()
+                    && gap.kind == NamedGapKind::ExactIdentifier
+                    && self.evidence.is_some()
+                {
                     4
                 } else {
                     2
@@ -788,14 +830,25 @@ impl NativeRetrieval<'_> {
             let identifiers =
                 revision_witnesses.map(|witnesses| witnesses.iter().cloned().collect::<Vec<_>>());
             let mut matches = Vec::new();
-            let mut filters = Vec::new();
-            if revision_witnesses.is_none() {
-                filters.push(self.objects.clone());
+            let mut complete_lookup = true;
+            let mut objects = self.objects.clone();
+            if access.is_some() {
+                // Scoped E may discover new rows only in native channels with a live admission check.
+                objects.object_kind = Some("atom_revision".into());
+                objects.atom_revisions = None;
             }
-            if let Some(filter) = &self.evidence {
-                filters.push(filter.clone());
-            }
-            for mut filter in filters {
+            let evidence = self.evidence.clone().map(|mut filter| {
+                if access.is_some() {
+                    filter.readable_refs = None; // Admit any newly discovered source before interpretation.
+                }
+                filter
+            });
+            for mut filter in revision_witnesses
+                .is_none()
+                .then_some(objects)
+                .into_iter()
+                .chain(evidence)
+            {
                 if identifiers.is_none() {
                     filter
                         .condition_literals
@@ -817,8 +870,14 @@ impl NativeRetrieval<'_> {
                 };
                 match self.deadline.run(lookup).await {
                     Ok(Ok(rows)) => matches.extend(rows),
-                    Ok(Err(_)) => self.degraded("named_gap_channel_unavailable"),
-                    Err(()) => self.degraded("retrieval_deadline_exhausted"),
+                    Ok(Err(_)) => {
+                        complete_lookup = false;
+                        self.degraded("named_gap_channel_unavailable");
+                    }
+                    Err(()) => {
+                        complete_lookup = false;
+                        self.degraded("retrieval_deadline_exhausted");
+                    }
                 }
             }
             matches.sort_by(|a, b| a.candidate_id.cmp(&b.candidate_id));
@@ -839,6 +898,23 @@ impl NativeRetrieval<'_> {
                             .all(|literal| row.text.contains(literal))
                     }
             });
+            if !complete_lookup {
+                matches.clear();
+            }
+            if let Some(access) = access.as_mut() {
+                let offered = matches.len();
+                let Some((reopened, allowed)) = self.scope_rows(snapshot, access, matches).await?
+                else {
+                    return Ok(self.invalidated("canonical_frontier_changed"));
+                };
+                snapshot = reopened;
+                // A restricted or unverified hit cannot prove uniqueness of the answer.
+                matches = if allowed.len() == offered {
+                    allowed
+                } else {
+                    Vec::new()
+                };
+            }
             if matches.len() == 1 {
                 // Do not admit a candidate if packaging would alter the frozen base.
                 let bytes: usize = self

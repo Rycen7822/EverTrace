@@ -16,7 +16,7 @@ use evertrace_domain::{error::ErrorCode, evidence::SourceRevision};
 use evertrace_store::{SearchHardFilter, SearchIndex, SearchProjectionRow, StoreError};
 use thiserror::Error;
 
-use super::retrieval::ScopedRelationRead;
+use super::retrieval::ScopedCandidateRead;
 
 /// One canonical source revision, resolved after the native read gate.
 pub(crate) struct SourceSequenceScope {
@@ -823,7 +823,7 @@ impl ProductionSearch {
                     Vec::new() // An explicit relation operand isn't a lexical query.
                 } else {
                     snapshot
-                        .fts(&context.protected_query, &filter, limit)
+                        .fts(scoped_lexical_query(&context), &filter, limit)
                         .await
                         .unwrap_or_else(|_| {
                             incomplete = true;
@@ -938,7 +938,9 @@ impl ProductionSearch {
                 frontiers.1,
             )));
         }
-        let view_context = (atom_relation || source_order.is_some()).then(|| context.clone());
+        let exact_followup = context.budget.follow_ups_remaining > 0;
+        let view_context =
+            (atom_relation || source_order.is_some() || exact_followup).then(|| context.clone());
         let mut result = if source_order.is_some() {
             SearchResult {
                 layer: RetrievalLayer::B,
@@ -982,7 +984,7 @@ impl ProductionSearch {
             }
         }
         if let Some(context) = view_context {
-            let read = atom_relation.then_some(ScopedRelationRead {
+            let read = (atom_relation || exact_followup).then_some(ScopedCandidateRead {
                 index: &self.index,
                 access,
                 checks_remaining,
@@ -1049,7 +1051,7 @@ impl ProductionSearch {
         context: &SearchContext,
         result: SearchResult,
         expires: Instant,
-        access: Option<ScopedRelationRead<'_>>,
+        access: Option<ScopedCandidateRead<'_>>,
         time_scope: Option<&TemporalReadScope<'_>>,
     ) -> Option<HumanSearchPage> {
         if result.projection_frontier != result.authoritative_frontier
@@ -1077,12 +1079,14 @@ impl ProductionSearch {
         {
             return None;
         }
+        let evidence = (time_scope.is_some() || result.budget.follow_ups_remaining > 0)
+            .then(|| self.evidence_filter(context, false, time_scope))
+            .flatten();
         let mut retrieval = super::retrieval::NativeRetrieval {
             context,
             result,
             objects: self.hard_filter(context, true, time_scope),
-            evidence: time_scope
-                .and_then(|scope| self.evidence_filter(context, false, Some(scope))),
+            evidence,
             deadline: &deadline,
             semantics: None,
             sequence_scope: None,
@@ -1215,7 +1219,9 @@ impl ProductionSearch {
             })
         });
         if has_unread_source {
-            retrieval.read_evidence(&snapshot, &[]).await?;
+            retrieval
+                .read_evidence(&snapshot, scoped_lexical_query(&context), &[])
+                .await?;
         }
         if !matches!(deadline.run(snapshot.is_current()).await, Ok(Ok(true))) {
             return Ok(deadline_result(
@@ -1476,7 +1482,15 @@ impl ProductionSearch {
             Err(StoreError::LanceDb)
         } else {
             match deadline
-                .run(snapshot.fts(&context.protected_query, &filter, fetch_limit))
+                .run(snapshot.fts(
+                    if self.candidate_grants.is_some() {
+                        scoped_lexical_query(&context)
+                    } else {
+                        &context.protected_query
+                    },
+                    &filter,
+                    fetch_limit,
+                ))
                 .await
             {
                 Ok(result) => result,
@@ -1755,6 +1769,18 @@ fn target_anchor_position(context: &SearchContext, row: &SearchProjectionRow) ->
         .target_anchors
         .iter()
         .position(|id| row.candidate_id.as_ref() == Some(id) || row.source_ref.as_ref() == Some(id))
+}
+
+fn scoped_lexical_query(context: &SearchContext) -> &str {
+    // The explicit slots stay in protected IR; only the primary clause is ranked as lexical text.
+    if context.budget.follow_ups_remaining != 0
+        && let Some((primary, _)) = context
+            .protected_query
+            .split_once(super::EXACT_SLOT_SEPARATOR)
+    {
+        return primary.trim();
+    }
+    &context.protected_query
 }
 
 fn exact_identifiers(context: &SearchContext) -> Vec<String> {
