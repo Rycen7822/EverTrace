@@ -3459,6 +3459,18 @@ impl ControlledRunResolver {
         Ok(bindings)
     }
 
+    pub(crate) fn root_goal_bytes(
+        &self,
+        receipt: &SourceReceipt,
+    ) -> Result<Vec<u8>, evertrace_capture::CasError> {
+        let digest = CasDigest::from_str(&receipt.cas_ref)?;
+        let (bytes, _) = self.cas.read_bounded(&digest, 128 * 1024, 65_536)?;
+        if receipt.protected_length != bytes.len() as u64 {
+            return Err(evertrace_capture::CasError::StoreCorrupt);
+        }
+        Ok(bytes)
+    }
+
     pub(crate) fn verified_root_goal(
         &self,
         receipt: &SourceReceipt,
@@ -3493,14 +3505,9 @@ impl ControlledRunResolver {
         {
             return Err(AutoresearchError::UntrustedRunEvidence);
         }
-        let digest = CasDigest::from_str(&receipt.cas_ref).map_err(|_| AutoresearchError::Cas)?;
-        let (bytes, _) = self
-            .cas
-            .read_bounded(&digest, 128 * 1024, 128 * 1024)
-            .map_err(|_| AutoresearchError::Cas)?;
-        if receipt.protected_length != bytes.len() as u64 {
-            return Err(AutoresearchError::UntrustedRunEvidence);
-        }
+        let bytes = self
+            .root_goal_bytes(receipt)
+            .map_err(AutoresearchError::RootGoalCas)?;
         let key = evertrace_capture::DeviceKeyStore::new(
             key_dir.ok_or(AutoresearchError::EvidenceIncomplete)?,
         )
@@ -5989,6 +5996,8 @@ pub enum AutoresearchError {
     AmbiguousMetricInput,
     #[error("artifact authority belongs to a later slice")]
     UnsupportedArtifactAuthority,
+    #[error("root goal evidence read failed: {0}")]
+    RootGoalCas(evertrace_capture::CasError),
     #[error("CAS evidence is unavailable or invalid")]
     Cas,
     #[error(transparent)]

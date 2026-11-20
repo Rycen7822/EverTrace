@@ -300,37 +300,52 @@ async fn phase_completion(
     let key_dir = runtime.device_key_dir.clone();
     let goal = stream.root_goal.clone();
     tokio::task::spawn_blocking(move || {
+        use crate::autoresearch::{AutoresearchError, ControlledRunResolver};
+        use evertrace_capture::CasError;
         let cas = evertrace_capture::CasStore::open_existing(cas_dir)?;
-        let resolver = crate::autoresearch::ControlledRunResolver::new(cas.clone());
+        let resolver = ControlledRunResolver::new(cas);
         let mut completed = Vec::new();
         for (observation, receipt, current_sequence) in roots {
-            let Ok(root) = resolver.verified_root_goal(&receipt, &observation, Some(&key_dir))
-            else {
-                continue;
+            let root = match resolver.verified_root_goal(&receipt, &observation, Some(&key_dir)) {
+                Ok(root) => root,
+                Err(AutoresearchError::RootGoalCas(error)) => return Err(error),
+                Err(_) => continue,
             };
             if root.objective() != goal || !root.completion_intent() {
                 continue;
             }
-            let grounded = prior.iter().any(|(old, seq)| {
+            let mut grounded = false;
+            let mut missing_prior = false;
+            for (old, seq) in &prior {
                 if old.source_ref != receipt.source_ref || *seq > current_sequence {
-                    return false;
+                    continue;
                 }
                 let carried_completion = objective_candidate
                     && anchor_roots.contains(&old.source_observation_id.to_string());
-                if old.source_observation_id == observation.source_observation_id {
-                    return carried_completion;
+                let matches = if old.source_observation_id == observation.source_observation_id {
+                    carried_completion
+                } else {
+                    match resolver.root_goal_bytes(old) {
+                        Ok(bytes) => {
+                            root.matches_bound_state(&bytes, false)
+                                || (carried_completion && root.matches_bound_state(&bytes, true))
+                        }
+                        Err(CasError::NotFound) => {
+                            missing_prior = true;
+                            false
+                        }
+                        Err(error) => return Err(error),
+                    }
+                };
+                if matches {
+                    grounded = true;
+                    break;
                 }
-                old.cas_ref
-                    .parse::<evertrace_capture::CasDigest>()
-                    .ok()
-                    .and_then(|digest| cas.read_bounded(&digest, 65_536, 65_536).ok())
-                    .is_some_and(|(bytes, _)| {
-                        root.matches_bound_state(&bytes, false)
-                            || (carried_completion && root.matches_bound_state(&bytes, true))
-                    })
-            });
+            }
             if grounded {
                 completed.push(observation.source_observation_id);
+            } else if missing_prior {
+                return Err(CasError::NotFound);
             }
         }
         Ok((completed.len() == 1).then(|| completed[0]))
@@ -855,6 +870,8 @@ pub(crate) async fn advance_activity(
         .await
         {
             Ok(value) => value,
+            // Do not consume this operation as a non-objective step while its completion is undecidable.
+            Err(evertrace_capture::CasError::NotFound) => continue,
             Err(evertrace_capture::CasError::LockBusy) => {
                 *after = previous;
                 progress.retryable = true;
