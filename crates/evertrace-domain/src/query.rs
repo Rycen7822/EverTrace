@@ -397,7 +397,7 @@ pub fn valid_object_reference(value: &str) -> bool {
         || parse_operation_revision(value).is_some()
 }
 
-fn valid_target(value: &str) -> bool {
+pub fn valid_target_reference(value: &str) -> bool {
     value.len() <= 512
         && (valid_object_reference(value) || EvidenceSurface::parse_candidate_ref(value).is_some())
 }
@@ -464,7 +464,10 @@ impl QueryFacetSet {
                 return Err(QueryError::Invalid);
             }
         }
-        if self.target_anchors.iter().any(|value| !valid_target(value))
+        if self
+            .target_anchors
+            .iter()
+            .any(|value| !valid_target_reference(value))
             || self.quantity_constraints.len() > MAX_FACET_ITEMS
             || self
                 .quantity_constraints
@@ -657,7 +660,10 @@ impl EvidenceNeed {
                 && (self.target.len() != 2
                     || requested_ordering(&self.temporal_scope.qualifiers).is_none()))
             || self.target.len() > MAX_FACET_ITEMS
-            || self.target.iter().any(|value| !valid_target(value))
+            || self
+                .target
+                .iter()
+                .any(|value| !valid_target_reference(value))
             || self.target.iter().collect::<BTreeSet<_>>().len() != self.target.len()
         {
             return Err(QueryError::Invalid);

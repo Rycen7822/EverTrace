@@ -158,7 +158,7 @@ impl McpActionService {
             query_facets: QueryFacetSet {
                 statement_role: evertrace_domain::query::StatementRole::Unknown,
                 parse_status: FacetParseStatus::Unknown,
-                target_anchors: Vec::new(),
+                target_anchors: scope.target_anchors.clone(),
                 exact_identifiers: Vec::new(),
                 condition_literals: Vec::new(),
                 relation_requirements: Vec::new(),
@@ -240,7 +240,7 @@ impl McpActionService {
         )
         .await
         .map_err(|_| McpServiceError::Store)?;
-        let found = ProductionSearch::new(self.search_index.clone())
+        let mut found = ProductionSearch::new(self.search_index.clone())
             .with_validated_frontier(scope.context.frontier)
             .with_method_proposals(methods)
             .with_procedure_revisions(searchable_procedure_revisions)
@@ -324,6 +324,7 @@ impl McpActionService {
                             deadline: scope.deadline,
                             request: scope.request,
                             context: candidate_context.expect("checked above"),
+                            target_anchors: scope.target_anchors,
                         },
                         query,
                         true,
@@ -361,6 +362,7 @@ impl McpActionService {
                     deadline: scope.deadline,
                     request: scope.request,
                     context: candidate_context.expect("checked above"),
+                    target_anchors: scope.target_anchors,
                 },
                 query,
                 true,
@@ -522,13 +524,35 @@ impl McpActionService {
         // truncated rather than presenting it; keep that output contract
         // while sharing the selection and route implementation above.
         review.omitted.extend(review.unreadable_methods);
+        // Only references in the final, authorized answer can close an explicit target.
+        let targets_resolved = context.query_facets.target_anchors.iter().all(|target| {
+            review.items.iter().any(|item| {
+                [
+                    item.object_ref.as_ref(),
+                    item.object_revision_ref.as_ref(),
+                    item.source_revision_ref.as_ref(),
+                ]
+                .into_iter()
+                .flatten()
+                .any(|reference| reference == target)
+            })
+        });
+        if !targets_resolved {
+            found
+                .degraded_reasons
+                .insert("search_target_unresolved".into());
+            if found.completeness == RetrievalCompleteness::Complete {
+                found.completeness = RetrievalCompleteness::Partial;
+            }
+        }
         let mut view = None;
-        if [
-            "retrieval_budget_exhausted",
-            "evidence_channel_budget_exhausted",
-        ]
-        .iter()
-        .any(|reason| found.degraded_reasons.contains(*reason))
+        if targets_resolved
+            && [
+                "retrieval_budget_exhausted",
+                "evidence_channel_budget_exhausted",
+            ]
+            .iter()
+            .any(|reason| found.degraded_reasons.contains(*reason))
             && found.authoritative_frontier == review_frontier
         {
             let reviewed = review
@@ -727,6 +751,7 @@ impl McpActionService {
         .iter()
         .any(|reason| found.degraded_reasons.contains(*reason));
         let unproven = trimmed
+            || found.degraded_reasons.contains("search_target_unresolved")
             || found.degraded_reasons.contains("search_access_unavailable")
             || found
                 .degraded_reasons

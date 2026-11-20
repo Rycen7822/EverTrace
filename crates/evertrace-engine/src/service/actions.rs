@@ -65,6 +65,7 @@ struct NormalSearchScope {
     deadline: std::time::Instant,
     request: evertrace_store::ScopeCurrentRequest,
     context: evertrace_store::NormalSearchReadContext,
+    target_anchors: Vec<String>,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -347,6 +348,14 @@ impl McpActionService {
                 )
                 .await;
             }
+            let mut seen = BTreeSet::new();
+            let target_anchors = refs
+                .into_iter()
+                .filter(|reference| {
+                    evertrace_domain::query::valid_target_reference(reference)
+                        && seen.insert(reference.clone())
+                })
+                .collect();
             let scope = NormalSearchScope {
                 binding,
                 anchor: anchor.expect("checked above"),
@@ -354,6 +363,7 @@ impl McpActionService {
                 deadline,
                 request,
                 context,
+                target_anchors,
             };
             return self.normal_search(request_id, scope, input).await;
         }

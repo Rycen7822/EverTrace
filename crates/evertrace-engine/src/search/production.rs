@@ -802,7 +802,10 @@ impl ProductionSearch {
                 .then(|| self.evidence_filter(&context, false, None))
                 .flatten();
             let limit = SEARCH_ACCESS_WINDOW + 1;
-            let identifiers = exact_identifiers(&context);
+            let mut identifiers = exact_identifiers(&context);
+            identifiers.extend(context.query_facets.target_anchors.iter().cloned());
+            identifiers.sort();
+            identifiers.dedup();
             let mut offered = Vec::new();
             let mut incomplete = false;
             for (channel, filter) in std::iter::once(atoms).chain(evidence).enumerate() {
@@ -816,6 +819,10 @@ impl ProductionSearch {
                     });
                 for (tier, rows) in [exact, fts].into_iter().enumerate() {
                     for (rank, row) in rows.into_iter().enumerate() {
+                        let order = target_anchor_position(&context, &row)
+                            .map_or((tier + 1, rank, channel, 0), |position| {
+                                (0, position, channel, rank)
+                            });
                         let reference = row.source_ref.ok_or(StoreError::StoreCorrupt)?;
                         let read = if channel == 0 {
                             OfferedRead::Atom {
@@ -825,11 +832,11 @@ impl ProductionSearch {
                         } else {
                             OfferedRead::Evidence(reference)
                         };
-                        offered.push(((tier, rank, channel), read));
+                        offered.push((order, read));
                     }
                 }
             }
-            // Exact first, then share the inspection window across ranked channels; no bodies cross the lease.
+            // Explicit targets, then exact and FTS share the same bounded access window.
             offered.sort_unstable_by_key(|(order, _)| *order);
             let mut seen = BTreeSet::new();
             let ordered = offered
@@ -1416,9 +1423,7 @@ impl ProductionSearch {
                 .as_deref()
                 .is_some_and(|id| id == context.protected_query)
                 || row.source_ref.as_deref() == Some(context.protected_query.as_str());
-            let anchor_position = context.query_facets.target_anchors.iter().position(|id| {
-                row.candidate_id.as_deref() == Some(id) || row.source_ref.as_deref() == Some(id)
-            });
+            let anchor_position = target_anchor_position(&context, row);
             let active = row
                 .candidate_id
                 .as_ref()
@@ -1641,6 +1646,14 @@ impl ProductionSearch {
             budget: context.budget,
         })
     }
+}
+
+fn target_anchor_position(context: &SearchContext, row: &SearchProjectionRow) -> Option<usize> {
+    context
+        .query_facets
+        .target_anchors
+        .iter()
+        .position(|id| row.candidate_id.as_ref() == Some(id) || row.source_ref.as_ref() == Some(id))
 }
 
 fn exact_identifiers(context: &SearchContext) -> Vec<String> {
