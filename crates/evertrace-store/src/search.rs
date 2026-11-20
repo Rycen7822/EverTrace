@@ -324,8 +324,27 @@ impl SearchSnapshot {
         filter: &SearchHardFilter,
         limit: usize,
     ) -> Result<Vec<SearchProjectionRow>, StoreError> {
+        self.structured_with_sources(identifiers, filter, limit, &[])
+            .await
+    }
+
+    /// Supplemental canonical endpoints belong to this exact lookup, not to the FTS index.
+    pub async fn structured_with_sources(
+        &self,
+        identifiers: &[String],
+        filter: &SearchHardFilter,
+        limit: usize,
+        supplemental: &[SearchProjectionRow],
+    ) -> Result<Vec<SearchProjectionRow>, StoreError> {
         if identifiers.is_empty() || limit == 0 {
             return Ok(Vec::new());
+        }
+        for row in supplemental {
+            row.validate_canonical_source()?;
+            if row.source_event_seq > self.frontier || self.frontier != self.authoritative_frontier
+            {
+                return Err(StoreError::StoreCorrupt);
+            }
         }
         let exact = identifiers
             .iter()
@@ -340,7 +359,7 @@ impl SearchSnapshot {
             .join(" OR ");
         let predicate = combine_filter(filter_sql(filter), Some(format!("({exact})")));
         let indexed = query_rows(&self.table, predicate, limit, None).await?;
-        if self.canonical_sources.is_empty() {
+        if self.canonical_sources.is_empty() && supplemental.is_empty() {
             return Ok(indexed);
         }
         let predicate = combine_filter(
@@ -348,8 +367,15 @@ impl SearchSnapshot {
             Some(format!("({exact})")),
         )
         .ok_or(StoreError::InvalidInput)?;
-        let json = serde_json::to_string(&self.canonical_sources)
-            .map_err(|_| StoreError::Serialization)?;
+        let sources = self
+            .canonical_sources
+            .iter()
+            .chain(supplemental)
+            .map(|row| (&row.row_id, row))
+            .collect::<std::collections::BTreeMap<_, _>>()
+            .into_values()
+            .collect::<Vec<_>>();
+        let json = serde_json::to_string(&sources).map_err(|_| StoreError::Serialization)?;
         let columns = SEARCH_COLUMNS
             .iter()
             .map(|column| format!("json_extract(value, '$.{column}') AS {column}"))

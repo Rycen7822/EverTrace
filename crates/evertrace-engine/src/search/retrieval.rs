@@ -7,7 +7,7 @@ use evertrace_store::{SearchHardFilter, SearchProjectionRow, SearchSnapshot};
 
 use super::{
     SearchError,
-    production::{RequestDeadline, hard_compatible},
+    production::{RelationSources, RequestDeadline, hard_compatible},
 };
 
 // Only the evidence FTS tier uses this preference; it is neither a grant nor
@@ -54,6 +54,7 @@ pub(super) struct NativeRetrieval<'a> {
     pub semantics: Option<&'a super::resolution::SemanticSearchResolution>,
     pub sequence_scope: Option<&'a super::SourceSequenceScope>,
     pub time_scope: Option<&'a super::TemporalReadScope<'a>>,
+    pub relation_sources: RelationSources<'a>,
 }
 
 impl NativeRetrieval<'_> {
@@ -214,17 +215,26 @@ impl NativeRetrieval<'_> {
         }
         Ok(())
     }
-    async fn lookup(&mut self, identifiers: &[String], origin: &str) -> Result<(), SearchError> {
-        let limit = self.remaining();
-        if limit == 0 {
-            self.degraded("retrieval_budget_exhausted");
-            return Ok(());
-        }
-        let mut filters = vec![self.objects.clone()];
-        if let Some(filter) = &self.evidence {
-            filters.push(filter.clone());
-        }
-        for filter in filters {
+    async fn lookup_relation_targets(
+        &mut self,
+        identifiers: &[String],
+        episodes: &[String],
+    ) -> Result<(), SearchError> {
+        let sources = match self.objects.readable_refs.as_ref() {
+            Some(refs) if !episodes.is_empty() => match (self.relation_sources)(episodes, refs) {
+                Ok(sources) => sources,
+                Err(_) => {
+                    self.degraded("relation_source_unavailable");
+                    Vec::new()
+                }
+            },
+            _ => Vec::new(),
+        };
+        for (filter, sources) in [
+            (Some(self.objects.clone()), sources.as_slice()),
+            (self.evidence.clone(), &[]),
+        ] {
+            let Some(filter) = filter else { continue };
             let limit = self.remaining();
             if limit == 0 {
                 self.degraded("retrieval_budget_exhausted");
@@ -232,13 +242,15 @@ impl NativeRetrieval<'_> {
             }
             match self
                 .deadline
-                .run(
-                    self.snapshot
-                        .structured(identifiers, &filter, limit.min(32) + 1),
-                )
+                .run(self.snapshot.structured_with_sources(
+                    identifiers,
+                    &filter,
+                    limit + 1,
+                    sources,
+                ))
                 .await
             {
-                Ok(Ok(rows)) => self.admit(rows, origin)?,
+                Ok(Ok(rows)) => self.admit(rows, "typed_relation")?,
                 Ok(Err(_)) => self.degraded("structured_channel_unavailable"),
                 Err(()) => self.degraded("retrieval_deadline_exhausted"),
             }
@@ -473,7 +485,25 @@ impl NativeRetrieval<'_> {
                 .collect::<BTreeSet<_>>()
                 .into_iter()
                 .collect::<Vec<_>>();
-            self.lookup(&targets, "typed_relation").await?;
+            // A current Workstream can lead to its open Episode even though the Episode
+            // has no FTS row. Do not materialize today's alias for historical queries.
+            let episodes = if self.objects.current_only {
+                edges
+                    .iter()
+                    .filter_map(|edge| {
+                        (edge.relation_kind.as_deref() == Some("episode_to_workstream")
+                            && edge
+                                .target_id
+                                .as_ref()
+                                .is_some_and(|id| sources.contains(id)))
+                        .then(|| edge.source_id.clone())
+                        .flatten()
+                    })
+                    .collect::<Vec<_>>()
+            } else {
+                Vec::new()
+            };
+            self.lookup_relation_targets(&targets, &episodes).await?;
             let refs = self.references();
             for edge in &edges {
                 if edge.source_id.as_ref().is_some_and(|id| refs.contains(id))

@@ -330,19 +330,44 @@ fn canonical_episode_sources(
     index: &std::collections::BTreeMap<&str, Vec<&ObjectRow>>,
     readable: &BTreeSet<String>,
     references: &[String],
+    deadline: std::time::Instant,
+    open_heads_only: bool,
 ) -> Result<Vec<evertrace_store::SearchProjectionRow>, HumanGovernanceError> {
+    use evertrace_store::projections::{READ_DEPENDENCY_BYTES, READ_DEPENDENCY_LIMIT};
     let mut lineage = std::collections::BTreeMap::new();
+    let mut seen = BTreeSet::new();
+    let mut bytes = 0u64;
     for reference in references {
         for row in index.get(reference.as_str()).into_iter().flatten() {
-            if row.object_kind.as_deref() == Some("work_episode") {
+            if std::time::Instant::now() >= deadline {
+                return Err(HumanGovernanceError::Store);
+            }
+            if row.object_kind.as_deref() == Some("work_episode")
+                && row
+                    .current_revision_id
+                    .as_ref()
+                    .is_some_and(|id| readable.contains(id))
+            {
                 for ancestor in row
                     .object_id
                     .as_deref()
+                    .filter(|id| seen.insert(*id))
                     .and_then(|id| index.get(id))
                     .into_iter()
                     .flatten()
                 {
-                    if ancestor.object_kind.as_deref() == Some("work_episode") {
+                    if std::time::Instant::now() >= deadline {
+                        return Err(HumanGovernanceError::Store);
+                    }
+                    if ancestor.object_kind.as_deref() == Some("work_episode")
+                        && !lineage.contains_key(&ancestor.row_id)
+                    {
+                        bytes = bytes.saturating_add(
+                            ancestor.payload_json.as_ref().map_or(0, |raw| raw.len()) as u64,
+                        );
+                        if lineage.len() >= READ_DEPENDENCY_LIMIT || bytes > READ_DEPENDENCY_BYTES {
+                            return Err(HumanGovernanceError::Store);
+                        }
                         lineage.insert(ancestor.row_id.clone(), (*ancestor).clone());
                     }
                 }
@@ -377,6 +402,15 @@ fn canonical_episode_sources(
             let head = heads.episodes.get(&id).ok_or(HumanGovernanceError::Store)?;
             let current =
                 row.current_revision_id.as_deref() == Some(head.revision_id.to_string().as_str());
+            if open_heads_only
+                && (!current
+                    || head.lifecycle_status != evertrace_domain::work::EpisodeLifecycle::Open)
+            {
+                continue;
+            }
+            if std::time::Instant::now() >= deadline {
+                return Err(HumanGovernanceError::Store);
+            }
             let source = evertrace_store::query::canonical_work_episode_source(row, current)
                 .map_err(|_| HumanGovernanceError::Store)?;
             sources.insert(source.row_id.clone(), source);
@@ -774,8 +808,25 @@ impl HumanGovernanceService {
             }
             source_references.extend(recall_sources.iter().cloned());
             source_references.extend(matched.references.iter().chain(&matched.contexts).cloned());
-            let canonical_sources =
-                canonical_episode_sources(snapshot.frontier, &index, &refs, &source_references)?;
+            let canonical_sources = canonical_episode_sources(
+                snapshot.frontier,
+                &index,
+                &refs,
+                &source_references,
+                deadline,
+                false,
+            )?;
+            let relation_sources = |targets: &[String], readable: &BTreeSet<String>| {
+                canonical_episode_sources(
+                    snapshot.frontier,
+                    &index,
+                    readable,
+                    targets,
+                    deadline,
+                    true,
+                )
+                .map_err(|_| crate::search::SearchError::Corrupt)
+            };
             let validity_query = matches!(context.query_facets.temporal_qualifiers.as_slice(), [qualifier] if qualifier.is_validity());
             let validity_timeline = context.query_facets.answer_shape
                 == Some(AnswerShape::Timeline)
@@ -892,6 +943,7 @@ impl HumanGovernanceService {
                     context,
                     query.selection == MemoryScopeSelection::Global,
                     time_scope.as_ref(),
+                    &relation_sources,
                 )
                 .await
                 .map_err(|_| HumanGovernanceError::Store)?;

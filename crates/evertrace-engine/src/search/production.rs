@@ -470,6 +470,10 @@ fn comparison_revision_path(
     selected
 }
 
+pub(crate) type RelationSources<'a> = &'a (
+        dyn Fn(&[String], &BTreeSet<String>) -> Result<Vec<SearchProjectionRow>, SearchError> + Sync
+    );
+
 pub struct ProductionSearch {
     index: SearchIndex,
     sequence_scope: Option<SourceSequenceScope>,
@@ -635,6 +639,7 @@ impl ProductionSearch {
         context: SearchContext,
         global_only: bool,
         time_scope: Option<&TemporalReadScope<'_>>,
+        relation_sources: RelationSources<'_>,
     ) -> Result<evertrace_domain::query::HumanSearchPage, SearchError> {
         use evertrace_domain::query::{HumanSearchPage, SourceBoundary};
         context.validate()?;
@@ -726,6 +731,7 @@ impl ProductionSearch {
             semantics: self.semantics.as_deref(),
             sequence_scope: self.sequence_scope.as_ref(),
             time_scope,
+            relation_sources,
         }
         .run()
         .await

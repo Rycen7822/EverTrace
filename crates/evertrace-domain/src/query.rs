@@ -688,6 +688,7 @@ impl EvidenceRole {
             | "attempt_to_workstream"
             | "attempt_to_episode"
             | "episode_to_task"
+            | "episode_to_workstream"
             | "episode_to_attempt"
             | "run_to_workstream"
             | "run_to_attempt"
