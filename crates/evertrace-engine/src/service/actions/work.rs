@@ -122,6 +122,7 @@ fn passive_result(
         scope: "explicit_work_evidence".into(),
         freshness: "current".into(),
         completeness: "partial".into(),
+        grounded_view: None,
         items,
         warnings,
         truncated: false,

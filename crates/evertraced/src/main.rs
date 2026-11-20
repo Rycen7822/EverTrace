@@ -33,10 +33,10 @@ use evertrace_engine::{
     HumanRowClass as EngineHumanRowClass, HumanSupportDetail as EngineHumanSupportDetail,
     HumanSurface as EngineHumanSurface, HumanSystemDetail as EngineHumanSystemDetail,
     McpActionService, McpBindingAuthority, McpBindingIssue, McpServiceAction, McpServiceRequest,
-    McpServiceResult, McpServiceStatus, RecallCueOutcome, RecallCueService, RecoveryActionOutcome,
-    RecoveryActionService, RecoveryBarrierLocator as EngineRecoveryLocator, RecoveryBarrierService,
-    RecoveryError, RecoveryRequest, RecoveryUnsupportedReason as EngineUnsupportedReason,
-    RuntimeMode, SessionImportWorker, open_writer,
+    RecallCueOutcome, RecallCueService, RecoveryActionOutcome, RecoveryActionService,
+    RecoveryBarrierLocator as EngineRecoveryLocator, RecoveryBarrierService, RecoveryError,
+    RecoveryRequest, RecoveryUnsupportedReason as EngineUnsupportedReason, RuntimeMode,
+    SessionImportWorker, open_writer,
     recall::spawn_recall_worker_with_config,
     repository::{observe_session_catalog_report, observe_session_source_report},
     session_import::{
@@ -59,7 +59,6 @@ use evertrace_protocol::{
         HumanSupportDetail, HumanSurface, HumanSystemDetail, NegativeReviewDecision,
         PROTOCOL_VERSION, ProposalHumanDecision,
     },
-    envelope::{McpItem, McpItems, McpResultEnvelope, McpStatus},
     error::ErrorCode,
     resolve_data_dir,
     response::{
@@ -816,8 +815,7 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
                             }
                             _ => 2_400,
                         };
-                        let mut result = map_mcp_result(result);
-                        mcp_output::bound_result(&mut result, output_action, target_bytes);
+                        let result = mcp_output::present_result(result, output_action, target_bytes);
                         Ok(Response::McpResult(Box::new(result)))
                     }
                     ProtocolCommand::McpReturned { request_id: original_request } => {
@@ -1555,62 +1553,6 @@ async fn stop_writer(
         return task.shutdown_and_join().await;
     }
     Ok(())
-}
-
-fn map_mcp_result(result: McpServiceResult) -> McpResultEnvelope {
-    let status = match result.status {
-        McpServiceStatus::Ok => McpStatus::Ok,
-        McpServiceStatus::NoMatch => McpStatus::NoMatch,
-        McpServiceStatus::NoRecallNeeded => McpStatus::NoRecallNeeded,
-        McpServiceStatus::Partial => McpStatus::Partial,
-        McpServiceStatus::DegradedIndex => McpStatus::DegradedIndex,
-        McpServiceStatus::ScopeUnresolved => McpStatus::ScopeUnresolved,
-        McpServiceStatus::Conflict => McpStatus::Conflict,
-        McpServiceStatus::InvalidInput => McpStatus::InvalidInput,
-        McpServiceStatus::NotFound => McpStatus::NotFound,
-    };
-    McpResultEnvelope {
-        schema_version: 1,
-        request_id: result.request_id,
-        status,
-        scope: result.scope,
-        freshness: result.freshness,
-        completeness: result.completeness,
-        items: {
-            let mut partitions = McpItems::default();
-            for item in result.items {
-                let partition = item.partition;
-                let item = McpItem {
-                    kind: item.kind,
-                    object_ref: item.object_ref,
-                    object_revision_ref: item.object_revision_ref,
-                    source_revision_ref: item.source_revision_ref,
-                    scope: item.scope,
-                    applicability: item.applicability,
-                    authority: item.authority,
-                    text: item.text,
-                    content_trust: item.content_trust,
-                    capture_completeness: item.capture_completeness,
-                    instruction_authority: item.instruction_authority,
-                };
-                match partition {
-                    evertrace_engine::McpItemPartition::NormativeConstraint => {
-                        partitions.normative_constraints.push(item)
-                    }
-                    evertrace_engine::McpItemPartition::Procedure => {
-                        partitions.procedures.push(item)
-                    }
-                    evertrace_engine::McpItemPartition::Evidence => partitions.evidence.push(item),
-                    evertrace_engine::McpItemPartition::Warning => partitions.warnings.push(item),
-                }
-            }
-            partitions
-        },
-        warnings: result.warnings,
-        truncated: result.truncated,
-        next_refs: result.next_refs,
-        audit_ref: None,
-    }
 }
 
 const fn map_unsupported_reason(reason: EngineUnsupportedReason) -> RecoveryUnsupportedReason {

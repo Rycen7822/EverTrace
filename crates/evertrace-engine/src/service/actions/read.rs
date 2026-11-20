@@ -522,7 +522,30 @@ impl McpActionService {
         // truncated rather than presenting it; keep that output contract
         // while sharing the selection and route implementation above.
         review.omitted.extend(review.unreadable_methods);
-        Ok(Self::search_result_from_review(
+        let mut view = None;
+        if [
+            "retrieval_budget_exhausted",
+            "evidence_channel_budget_exhausted",
+        ]
+        .iter()
+        .any(|reason| found.degraded_reasons.contains(*reason))
+            && found.authoritative_frontier == review_frontier
+        {
+            let reviewed = review
+                .items
+                .iter()
+                .filter(|item| {
+                    item.partition == McpItemPartition::Evidence
+                        && matches!(item.kind.as_str(), "atom_revision" | "evidence_surface")
+                })
+                .filter_map(|item| item.object_revision_ref.as_deref())
+                .collect::<BTreeSet<_>>();
+            view = ProductionSearch::new(self.search_index.clone())
+                .ground_reviewed(&context, found.clone(), &reviewed, scope.deadline)
+                .await
+                .map(Box::new);
+        }
+        let mut result = Self::search_result_from_review(
             request_id,
             label,
             scope.anchor.cwd_only,
@@ -530,7 +553,9 @@ impl McpActionService {
             review.items,
             review.omitted,
             blocked_candidates,
-        ))
+        );
+        result.grounded_view = view;
+        Ok(result)
     }
 
     async fn classify_search_candidates(
@@ -741,6 +766,7 @@ impl McpActionService {
             },
             completeness: completeness.into(),
             items,
+            grounded_view: None,
             warnings: {
                 let mut warnings = found.degraded_reasons.into_iter().collect::<Vec<_>>();
                 if cwd_only {
@@ -1352,6 +1378,7 @@ impl McpActionService {
             scope: scope_label(&scope),
             freshness: "current".into(),
             completeness: "complete".into(),
+            grounded_view: None,
             items: vec![classify_object_row(
                 row,
                 payload,
@@ -1621,6 +1648,7 @@ impl McpActionService {
             scope: scope_label(scope),
             freshness: "current".into(),
             completeness: completeness.into(),
+            grounded_view: None,
             items,
             warnings,
             truncated: !next_refs.is_empty(),

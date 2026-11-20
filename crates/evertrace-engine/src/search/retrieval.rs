@@ -398,6 +398,10 @@ impl NativeRetrieval<'_> {
         }
         self.read_evidence(&self.context.query_facets.exact_identifiers)
             .await?;
+        self.finish().await
+    }
+
+    pub(super) async fn finish(mut self) -> Result<HumanSearchPage, SearchError> {
         // C: preserve permission-checked bridge rows for D. Literal conditions
         // constrain answer evidence, not the existence of a connecting object.
         self.result.layer = RetrievalLayer::C;

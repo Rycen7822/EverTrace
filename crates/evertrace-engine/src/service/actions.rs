@@ -130,6 +130,8 @@ pub struct McpServiceResult {
     pub scope: String,
     pub freshness: String,
     pub completeness: String,
+    /// Alternate packaging for the matching verified evidence items; snippets remain the wire fallback.
+    pub grounded_view: Option<Box<evertrace_domain::query::GroundedEvidenceView>>,
     pub items: Vec<McpServiceItem>,
     pub warnings: Vec<String>,
     pub truncated: bool,
@@ -772,6 +774,7 @@ fn empty_result<const N: usize>(
         freshness: "unknown".into(),
         completeness: completeness.into(),
         items: Vec::new(),
+        grounded_view: None,
         warnings: warnings.into_iter().map(str::to_owned).collect(),
         truncated: false,
         next_refs: Vec::new(),

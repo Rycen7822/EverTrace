@@ -904,6 +904,18 @@ impl ProductionSearch {
             .try_into()
             .unwrap_or(u64::MAX);
         let mut result = self.search(context).await?;
+        if self
+            .candidate_grants
+            .as_ref()
+            .is_some_and(|grants| !grants.atom_revisions.is_disjoint(&result.omitted_refs))
+        {
+            result
+                .degraded_reasons
+                .insert("retrieval_budget_exhausted".into());
+            if result.completeness == RetrievalCompleteness::Complete {
+                result.completeness = RetrievalCompleteness::Partial;
+            }
+        }
         for (present, reason) in [
             (restricted, "source_read_restricted"),
             (exhausted, "search_access_window_exhausted"),
@@ -917,6 +929,72 @@ impl ProductionSearch {
             }
         }
         Ok(result)
+    }
+
+    /// Ordinary MCP can group already reviewed evidence without reopening the candidate pool.
+    pub(crate) async fn ground_reviewed(
+        &self,
+        context: &SearchContext,
+        mut result: SearchResult,
+        approved_refs: &BTreeSet<&str>,
+        expires: Instant,
+    ) -> Option<evertrace_domain::query::GroundedEvidenceView> {
+        if result.projection_frontier != result.authoritative_frontier
+            || result.completeness == RetrievalCompleteness::Unknown
+        {
+            return None;
+        }
+        result
+            .candidates
+            .retain(|candidate| approved_refs.contains(candidate.candidate_id.as_str()));
+        if result.candidates.is_empty() {
+            return None;
+        }
+        // Unreturned references did not pass the final output review.
+        result.omitted_refs.clear();
+        let started = Instant::now();
+        let latency = expires
+            .checked_duration_since(started)?
+            .as_micros()
+            .try_into()
+            .ok()?;
+        let deadline = RequestDeadline::new(started, latency);
+        let snapshot = deadline
+            .run(
+                self.index
+                    .snapshot_after_validated_frontier(result.projection_frontier),
+            )
+            .await
+            .ok()?
+            .ok()?;
+        if snapshot.frontier() != result.projection_frontier
+            || snapshot.authoritative_frontier() != result.authoritative_frontier
+        {
+            return None;
+        }
+        // This packaging pass has no expansion or follow-up authority of its own.
+        result.budget.hops_remaining = 0;
+        result.budget.follow_ups_remaining = 0;
+        let page = super::retrieval::NativeRetrieval {
+            snapshot: &snapshot,
+            context,
+            result,
+            objects: self.hard_filter(context, true, None),
+            evidence: None,
+            deadline: &deadline,
+            semantics: None,
+            sequence_scope: None,
+            time_scope: None,
+            relation_sources: None,
+        }
+        .finish()
+        .await
+        .ok()?;
+        if page.validate() {
+            page.grounded_view
+        } else {
+            None
+        }
     }
 
     pub async fn search_with_diagnostic_fts_failure(

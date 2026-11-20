@@ -1,4 +1,129 @@
-use evertrace_protocol::envelope::McpResultEnvelope;
+use evertrace_engine::{McpServiceResult, McpServiceStatus};
+use evertrace_protocol::{
+    envelope::{
+        ContentTrust, InstructionAuthority, McpItem, McpItems, McpResultEnvelope, McpStatus,
+    },
+    mcp::McpAction,
+};
+
+const GROUNDED_KIND: &str = "grounded_evidence_view";
+const SEARCH_HARD_BYTES: usize = 4_800;
+
+pub(crate) fn present_result(
+    mut result: McpServiceResult,
+    action: McpAction,
+    target_bytes: usize,
+) -> McpResultEnvelope {
+    let view = result.grounded_view.take();
+    let mut fallback = map_mcp_result(result);
+    if let Some(view) = view {
+        let refs = &view.candidate_set.candidate_refs;
+        let reviewed = fallback
+            .items
+            .evidence
+            .iter()
+            .filter_map(|item| item.object_revision_ref.as_ref())
+            .collect::<std::collections::BTreeSet<_>>();
+        if action == McpAction::Search
+            && fallback.freshness == "current"
+            && !refs.is_empty()
+            && refs.iter().all(|id| reviewed.contains(id))
+            && let Ok(text) = serde_json::to_string(&view)
+        {
+            let mut grouped = fallback.clone();
+            grouped.items.evidence.retain(|item| {
+                !item
+                    .object_revision_ref
+                    .as_ref()
+                    .is_some_and(|id| refs.contains(id))
+            });
+            grouped.items.evidence.insert(
+                0,
+                McpItem {
+                    kind: GROUNDED_KIND.into(),
+                    object_ref: None,
+                    object_revision_ref: None,
+                    source_revision_ref: None,
+                    scope: Some(grouped.scope.clone()),
+                    applicability: None,
+                    authority: None,
+                    text: Some(text),
+                    content_trust: ContentTrust::UntrustedSourceContent,
+                    capture_completeness: None,
+                    instruction_authority: InstructionAuthority::None,
+                },
+            );
+            bound_result(&mut grouped, action, target_bytes);
+            if envelope_bytes(&grouped) <= SEARCH_HARD_BYTES {
+                return grouped;
+            }
+        }
+        fallback.warnings.push("grounded_view_omitted".into());
+        fallback.status = McpStatus::Partial;
+        if fallback.completeness == "complete" {
+            fallback.completeness = "partial".into();
+        }
+        fallback.truncated = true;
+    }
+    bound_result(&mut fallback, action, target_bytes);
+    fallback
+}
+
+fn map_mcp_result(result: McpServiceResult) -> McpResultEnvelope {
+    let status = match result.status {
+        McpServiceStatus::Ok => McpStatus::Ok,
+        McpServiceStatus::NoMatch => McpStatus::NoMatch,
+        McpServiceStatus::NoRecallNeeded => McpStatus::NoRecallNeeded,
+        McpServiceStatus::Partial => McpStatus::Partial,
+        McpServiceStatus::DegradedIndex => McpStatus::DegradedIndex,
+        McpServiceStatus::ScopeUnresolved => McpStatus::ScopeUnresolved,
+        McpServiceStatus::Conflict => McpStatus::Conflict,
+        McpServiceStatus::InvalidInput => McpStatus::InvalidInput,
+        McpServiceStatus::NotFound => McpStatus::NotFound,
+    };
+    McpResultEnvelope {
+        schema_version: 1,
+        request_id: result.request_id,
+        status,
+        scope: result.scope,
+        freshness: result.freshness,
+        completeness: result.completeness,
+        items: {
+            let mut partitions = McpItems::default();
+            for item in result.items {
+                let partition = item.partition;
+                let item = McpItem {
+                    kind: item.kind,
+                    object_ref: item.object_ref,
+                    object_revision_ref: item.object_revision_ref,
+                    source_revision_ref: item.source_revision_ref,
+                    scope: item.scope,
+                    applicability: item.applicability,
+                    authority: item.authority,
+                    text: item.text,
+                    content_trust: item.content_trust,
+                    capture_completeness: item.capture_completeness,
+                    instruction_authority: item.instruction_authority,
+                };
+                match partition {
+                    evertrace_engine::McpItemPartition::NormativeConstraint => {
+                        partitions.normative_constraints.push(item)
+                    }
+                    evertrace_engine::McpItemPartition::Procedure => {
+                        partitions.procedures.push(item)
+                    }
+                    evertrace_engine::McpItemPartition::Evidence => partitions.evidence.push(item),
+                    evertrace_engine::McpItemPartition::Warning => partitions.warnings.push(item),
+                }
+            }
+            partitions
+        },
+        warnings: result.warnings,
+        truncated: result.truncated,
+        next_refs: result.next_refs,
+        audit_ref: None,
+    }
+}
 
 pub(crate) fn bound_result(
     envelope: &mut McpResultEnvelope,
@@ -8,7 +133,7 @@ pub(crate) fn bound_result(
     let hard_bytes = if action == evertrace_protocol::mcp::McpAction::Get {
         9_600
     } else {
-        4_800
+        SEARCH_HARD_BYTES
     };
     while envelope_bytes(envelope) > target_bytes {
         if !trim_one_item(envelope) {
@@ -77,11 +202,9 @@ fn trim_one_item(envelope: &mut McpResultEnvelope) -> bool {
         &mut envelope.items.procedures,
         &mut envelope.items.normative_constraints,
     ] {
-        if let Some(item) = partition
-            .iter_mut()
-            .rev()
-            .find(|item| item.text.as_ref().is_some_and(|text| !text.is_empty()))
-            && let Some(text) = &mut item.text
+        if let Some(item) = partition.iter_mut().rev().find(|item| {
+            item.kind != GROUNDED_KIND && item.text.as_ref().is_some_and(|text| !text.is_empty())
+        }) && let Some(text) = &mut item.text
         {
             let mut keep = text.len() / 2;
             while keep > 0 && !text.is_char_boundary(keep) {
@@ -90,7 +213,11 @@ fn trim_one_item(envelope: &mut McpResultEnvelope) -> bool {
             text.truncate(keep);
             return true;
         }
-        if let Some(removed) = partition.pop() {
+        if let Some(index) = partition
+            .iter()
+            .rposition(|item| item.kind != GROUNDED_KIND)
+        {
+            let removed = partition.remove(index);
             if let Some(reference) = removed.object_ref
                 && envelope.next_refs.len() < 32
                 && !envelope.next_refs.contains(&reference)
@@ -106,7 +233,6 @@ fn trim_one_item(envelope: &mut McpResultEnvelope) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use evertrace_protocol::envelope::{McpItem, McpItems, McpStatus};
 
     #[test]
     fn bounded_result_preserves_closed_safety_markers_and_continuation_refs() {
