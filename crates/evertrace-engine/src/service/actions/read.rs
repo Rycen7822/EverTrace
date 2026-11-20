@@ -1,5 +1,7 @@
 use std::{collections::BTreeMap, future::Future, pin::Pin};
 
+use crate::search::read_context::AtomReadAccess;
+
 use super::*;
 
 struct SearchCandidateReview {
@@ -215,14 +217,22 @@ impl McpActionService {
             None => None,
         };
         let method_deadline = scope.deadline;
+        let repository_report = scope
+            .binding
+            .repository_report
+            .as_deref()
+            .or(report.as_ref());
+        let atom_access = AtomReadAccess {
+            writer: &self.writer,
+            authority: crate::repository::RepositoryReadAuthority::observed(repository_report),
+            frontier: scope.context.frontier,
+            config_hash: self.runtime_snapshot.effective_config_hash,
+            deadline: method_deadline,
+        };
         let methods = crate::jobs::procedure::readable_revisions_from_rows(
             &self.writer,
             &scope.context.rows,
-            scope
-                .binding
-                .repository_report
-                .as_deref()
-                .or(report.as_ref()),
+            repository_report,
             self.runtime_snapshot.effective_config_hash,
             (scope.anchor.repository_id, scope.anchor.worktree_id),
             None,
@@ -234,7 +244,7 @@ impl McpActionService {
             .with_validated_frontier(scope.context.frontier)
             .with_method_proposals(methods)
             .with_procedure_revisions(searchable_procedure_revisions)
-            .search(context.clone())
+            .search_with_atom_access(context.clone(), &atom_access)
             .await
             .map_err(|_| McpServiceError::Store)?;
         let selected_candidates = found.candidates.iter().take(3).collect::<Vec<_>>();
@@ -417,25 +427,17 @@ impl McpActionService {
                     .filter(|reference| !reviewed_candidates.contains(*reference))
                     .cloned(),
             );
-            let authority = crate::repository::RepositoryReadAuthority::observed(
-                scope
-                    .binding
-                    .repository_report
-                    .as_deref()
-                    .or(report.as_ref()),
-            );
+            let fresh_atom_access = AtomReadAccess {
+                frontier: candidate_context.frontier,
+                ..atom_access
+            };
             for candidate in &selected_candidates {
                 if candidate.object_kind.as_deref() == Some("atom_revision")
                     && !blocked_candidates.contains(&candidate.candidate_id)
-                    && !crate::search::read_context::atom_source_readable(
-                        &self.writer,
-                        &authority,
-                        &candidate.candidate_id,
-                        candidate_context.frontier,
-                        self.runtime_snapshot.effective_config_hash,
-                        method_deadline,
-                    )
-                    .await
+                    && fresh_atom_access
+                        .check_current(&candidate.source_ref, &candidate.candidate_id)
+                        .await
+                        .is_err()
                 {
                     blocked_candidates.insert(candidate.candidate_id.clone());
                 }
@@ -684,10 +686,19 @@ impl McpActionService {
             RetrievalCompleteness::Conflicted => "conflicted",
             RetrievalCompleteness::Unknown => "unknown",
         };
-        let mut status = if found.candidates.is_empty() {
-            McpServiceStatus::NoMatch
-        } else if found.degraded_reasons.contains("search_projection_stale") {
+        let access_limited = found
+            .degraded_reasons
+            .contains("search_access_window_exhausted");
+        let unproven = access_limited
+            || found.degraded_reasons.contains("search_access_unavailable")
+            || found
+                .degraded_reasons
+                .contains("read_access_frontier_changed")
+            || found.projection_frontier < found.authoritative_frontier;
+        let mut status = if unproven {
             McpServiceStatus::Partial
+        } else if found.candidates.is_empty() {
+            McpServiceStatus::NoMatch
         } else if found.degraded_reasons.is_empty() {
             McpServiceStatus::Ok
         } else {
@@ -696,7 +707,11 @@ impl McpActionService {
         let mut omitted_refs = found.omitted_refs;
         omitted_refs.extend(classification_omitted);
         omitted_refs.retain(|reference| !blocked_candidates.contains(reference.as_str()));
-        if !blocked_candidates.is_empty() && items.is_empty() && omitted_refs.is_empty() {
+        if !unproven
+            && !blocked_candidates.is_empty()
+            && items.is_empty()
+            && omitted_refs.is_empty()
+        {
             status = McpServiceStatus::NoMatch;
         }
         if !omitted_refs.is_empty() {
@@ -719,12 +734,16 @@ impl McpActionService {
                 if cwd_only {
                     warnings.push("cwd_only_scope".into());
                 }
-                if !blocked_candidates.is_empty() {
+                if !blocked_candidates.is_empty()
+                    && !warnings
+                        .iter()
+                        .any(|reason| reason == "source_read_restricted")
+                {
                     warnings.push("source_read_restricted".into());
                 }
                 warnings
             },
-            truncated: !omitted_refs.is_empty(),
+            truncated: access_limited || !omitted_refs.is_empty(),
             next_refs: omitted_refs.into_iter().take(32).collect(),
         }
     }
@@ -1255,20 +1274,23 @@ impl McpActionService {
             )
             .await?
             .is_empty();
-        let authority = crate::repository::RepositoryReadAuthority::observed(repository_report);
+        let atom_access = AtomReadAccess {
+            writer: &self.writer,
+            authority: crate::repository::RepositoryReadAuthority::observed(repository_report),
+            frontier: scope.snapshot.frontier,
+            config_hash: self.runtime_snapshot.effective_config_hash,
+            deadline,
+        };
         if restricted
             || row.object_kind.as_deref() == Some("atom_revision")
-                && !crate::search::read_context::atom_source_readable(
-                    &self.writer,
-                    &authority,
-                    row.current_revision_id
-                        .as_deref()
-                        .ok_or(McpServiceError::Store)?,
-                    scope.snapshot.frontier,
-                    self.runtime_snapshot.effective_config_hash,
-                    deadline,
-                )
-                .await
+                && atom_access
+                    .check_revision(
+                        row.current_revision_id
+                            .as_deref()
+                            .ok_or(McpServiceError::Store)?,
+                    )
+                    .await
+                    .is_err()
         {
             return Ok(empty_result(
                 request_id,

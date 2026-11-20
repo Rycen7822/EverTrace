@@ -55,6 +55,10 @@ pub struct SearchHardFilter {
     /// Current publication eligibility, separate from deletion suppression.
     pub procedure_revisions: Option<BTreeSet<String>>,
     pub method_proposal_revisions: BTreeSet<String>,
+    /// A scoped lexical discovery can select one kind without changing its grants.
+    pub object_kind: Option<String>,
+    /// Exact Atom revisions admitted by the same-frontier source read gate.
+    pub atom_revisions: Option<BTreeSet<String>>,
     pub task_id: Option<String>,
     pub repository_id: Option<String>,
     pub worktree_id: Option<String>,
@@ -677,6 +681,26 @@ fn filter_sql_dialect(filter: &SearchHardFilter, dialect: FilterDialect) -> Opti
         };
         clauses.push(format!(
             "(object_kind IS NULL OR object_kind != 'procedure_revision' OR ({allowed}))"
+        ));
+    }
+    if let Some(kind) = &filter.object_kind {
+        clauses.push(format!("object_kind = {}", sql_literal(kind)));
+    }
+    if let Some(revisions) = &filter.atom_revisions {
+        let allowed = if revisions.is_empty() {
+            "FALSE".into()
+        } else {
+            format!(
+                "candidate_id IN ({})",
+                revisions
+                    .iter()
+                    .map(|id| sql_literal(id))
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            )
+        };
+        clauses.push(format!(
+            "(object_kind IS NULL OR object_kind != 'atom_revision' OR ({allowed}))"
         ));
     }
     if filter.global_only {

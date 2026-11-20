@@ -4,7 +4,9 @@ use std::time::Instant;
 
 use evertrace_domain::{
     error::ErrorCode,
-    query::{ExactFieldsQuery, ExactReadQuery, MetadataReadOutcome},
+    query::{
+        ExactFieldsQuery, ExactReadQuery, ExactRecordQuery, ExactRecordRef, MetadataReadOutcome,
+    },
 };
 use evertrace_store::ObjectRow;
 
@@ -61,45 +63,90 @@ pub(crate) async fn check_source_access(
 
 /// Use the existing bounded exact-read dependencies for an offered Atom revision.
 /// A bare object scope is not proof that the source of its text remains readable.
-pub(crate) async fn atom_source_readable(
-    writer: &WriterHandle,
-    authority: &RepositoryReadAuthority<'_>,
-    revision: &str,
-    frontier: u64,
-    config_hash: [u8; 32],
-    deadline: Instant,
-) -> bool {
-    let read = async {
-        let query = ExactReadQuery::Fields(ExactFieldsQuery {
-            revision_ref: revision.to_owned(),
+pub(crate) struct AtomReadAccess<'a> {
+    pub writer: &'a WriterHandle,
+    pub authority: RepositoryReadAuthority<'a>,
+    pub frontier: u64,
+    pub config_hash: [u8; 32],
+    pub deadline: Instant,
+}
+
+impl AtomReadAccess<'_> {
+    pub async fn check_revision(&self, revision: &str) -> Result<(), ErrorCode> {
+        self.check(
+            ExactReadQuery::Fields(ExactFieldsQuery {
+                revision_ref: revision.to_owned(),
+            }),
+            revision,
+        )
+        .await
+    }
+
+    /// A lagging index may offer an immutable revision; only its current alias can grant Search access.
+    pub(crate) async fn check_current(&self, atom: &str, revision: &str) -> Result<(), ErrorCode> {
+        let query = ExactReadQuery::Record(ExactRecordQuery {
+            reference: ExactRecordRef {
+                stable_key: atom.to_owned(),
+                revision_ref: None,
+            },
+            field: None,
+            range: None,
+            expected_data_identity: None,
+            expected_selection: None,
         });
-        let (cancelled, _cancel_on_drop) = evertrace_store::StoreReadHandle::cancellation_scope();
-        let Ok(MetadataReadOutcome::Page(context)) = writer
-            .read_stored_fields_context(Box::new(query), cancelled, deadline, config_hash)
-            .await
-        else {
-            return false;
-        };
-        if context.state.frontier != frontier
-            || context.source_suppressed
-            || context.selected.as_ref().is_none_or(|row| {
-                row.current_revision_id.as_deref() != Some(revision)
-                    || row.object_kind.as_deref() != Some("atom_revision")
-            })
-        {
-            return false;
-        }
-        let refs = context.rows.iter().collect::<Vec<_>>();
-        check_source_access(writer, authority, &context.rows, &refs, deadline)
-            .await
-            .is_ok()
-            && writer
+        self.check(query, revision).await
+    }
+
+    async fn check(&self, query: ExactReadQuery, revision: &str) -> Result<(), ErrorCode> {
+        let read = async {
+            let (cancelled, _cancel_on_drop) =
+                evertrace_store::StoreReadHandle::cancellation_scope();
+            let MetadataReadOutcome::Page(context) = self
+                .writer
+                .read_stored_fields_context(
+                    Box::new(query),
+                    cancelled,
+                    self.deadline,
+                    self.config_hash,
+                )
+                .await
+                .map_err(|_| ErrorCode::StoreCorrupt)?
+            else {
+                return Err(ErrorCode::ResourceExhausted);
+            };
+            if context.state.frontier != self.frontier
+                || context.selected.as_ref().is_none_or(|row| {
+                    row.current_revision_id.as_deref() != Some(revision)
+                        || row.object_kind.as_deref() != Some("atom_revision")
+                })
+            {
+                return Err(ErrorCode::StoreCorrupt);
+            }
+            if context.source_suppressed {
+                return Err(ErrorCode::Untrusted);
+            }
+            let refs = context.rows.iter().collect::<Vec<_>>();
+            check_source_access(
+                self.writer,
+                &self.authority,
+                &context.rows,
+                &refs,
+                self.deadline,
+            )
+            .await?;
+            let state = self
+                .writer
                 .read_handle()
                 .state()
                 .await
-                .is_ok_and(|state| state == (frontier, context.state.data_identity))
-    };
-    tokio::time::timeout_at(tokio::time::Instant::from_std(deadline), read)
-        .await
-        .unwrap_or(false)
+                .map_err(|_| ErrorCode::StoreCorrupt)?;
+            if state != (self.frontier, context.state.data_identity) {
+                return Err(ErrorCode::StoreCorrupt);
+            }
+            Ok(())
+        };
+        tokio::time::timeout_at(tokio::time::Instant::from_std(self.deadline), read)
+            .await
+            .map_err(|_| ErrorCode::ResourceExhausted)?
+    }
 }
