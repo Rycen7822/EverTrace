@@ -21,45 +21,8 @@ pub(super) async fn check_source_access(
     deadline: Instant,
 ) -> Result<(), ErrorCode> {
     let authority = crate::repository::RepositoryReadAuthority::retained(report);
-    for chunk in rows.chunks(usize::from(evertrace_domain::query::METADATA_READ_LIMIT)) {
-        if Instant::now() >= deadline {
-            return Err(ErrorCode::ResourceExhausted);
-        }
-        if !crate::session_import::source_rows_read_assessment(
-            writer,
-            &authority,
-            all_rows,
-            chunk,
-            None,
-            Some(deadline),
-        )
+    crate::search::read_context::check_source_access(writer, &authority, all_rows, rows, deadline)
         .await
-        .map_err(|_| ErrorCode::StoreCorrupt)?
-        .0
-        .is_empty()
-        {
-            return Err(ErrorCode::Untrusted);
-        }
-    }
-    let scopes = crate::repository::row_repository_contexts_from_scopes(all_rows.iter(), rows)
-        .map_err(|_| ErrorCode::StoreCorrupt)?;
-    if !crate::repository::repository_read_assessment(
-        writer,
-        scopes.values().flatten().copied().collect(),
-        &authority,
-        deadline,
-    )
-    .await
-    .map_err(|_| ErrorCode::StoreCorrupt)?
-    .0
-    .is_empty()
-    {
-        return Err(ErrorCode::Untrusted);
-    }
-    if Instant::now() >= deadline {
-        return Err(ErrorCode::ResourceExhausted);
-    }
-    Ok(())
 }
 
 /// A storage byte window, not the Python title/excerpt policy. Preserve scalar types and array positions.

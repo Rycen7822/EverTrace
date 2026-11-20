@@ -417,6 +417,29 @@ impl McpActionService {
                     .filter(|reference| !reviewed_candidates.contains(*reference))
                     .cloned(),
             );
+            let authority = crate::repository::RepositoryReadAuthority::observed(
+                scope
+                    .binding
+                    .repository_report
+                    .as_deref()
+                    .or(report.as_ref()),
+            );
+            for candidate in &selected_candidates {
+                if candidate.object_kind.as_deref() == Some("atom_revision")
+                    && !blocked_candidates.contains(&candidate.candidate_id)
+                    && !crate::search::read_context::atom_source_readable(
+                        &self.writer,
+                        &authority,
+                        &candidate.candidate_id,
+                        candidate_context.frontier,
+                        self.runtime_snapshot.effective_config_hash,
+                        method_deadline,
+                    )
+                    .await
+                {
+                    blocked_candidates.insert(candidate.candidate_id.clone());
+                }
+            }
             let method_hits = found
                 .candidates
                 .iter()
@@ -1184,6 +1207,12 @@ impl McpActionService {
             Some(report) => report.read().await.clone(),
             None => None,
         };
+        let repository_report = scope
+            .binding
+            .repository_report
+            .as_deref()
+            .or(report.as_ref());
+        let deadline = std::time::Instant::now() + std::time::Duration::from_micros(750_000);
         if row.object_kind.as_deref() == Some("revision_proposal_revision") {
             let selected = row.current_revision_id.iter().cloned().collect();
             let fresh = self
@@ -1194,11 +1223,7 @@ impl McpActionService {
             let methods = crate::jobs::procedure::readable_revisions(
                 &self.writer,
                 &fresh,
-                scope
-                    .binding
-                    .repository_report
-                    .as_deref()
-                    .or(report.as_ref()),
+                repository_report,
                 self.runtime_snapshot.effective_config_hash,
                 (scope.anchor.repository_id, scope.anchor.worktree_id),
                 Some(&selected),
@@ -1221,20 +1246,29 @@ impl McpActionService {
                 ));
             }
         }
-        if !self
+        let restricted = !self
             .blocked_read_rows(
-                scope
-                    .binding
-                    .repository_report
-                    .as_deref()
-                    .or(report.as_ref()),
+                repository_report,
                 &scope.snapshot,
                 &[row],
                 scope.anchor.repository_id,
             )
-            .await
-            .map_err(|_| McpServiceError::Store)?
-            .is_empty()
+            .await?
+            .is_empty();
+        let authority = crate::repository::RepositoryReadAuthority::observed(repository_report);
+        if restricted
+            || row.object_kind.as_deref() == Some("atom_revision")
+                && !crate::search::read_context::atom_source_readable(
+                    &self.writer,
+                    &authority,
+                    row.current_revision_id
+                        .as_deref()
+                        .ok_or(McpServiceError::Store)?,
+                    scope.snapshot.frontier,
+                    self.runtime_snapshot.effective_config_hash,
+                    deadline,
+                )
+                .await
         {
             return Ok(empty_result(
                 request_id,
