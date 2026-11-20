@@ -212,7 +212,9 @@
 <p>仓库：{{ value.repository_instance_id }} · 实例类型：{{ value.kind }}</p>
 <p>生命周期：{{ value.lifecycle }} · Git 注册状态：{{ value.git_registration_state }}</p>
 <p class="memory-prose">所选修订记录的路径：{{ value.current_path or '未记录' }}</p>
-<p>所选修订的快照：{{ value.current_snapshot_id or '未记录' }}</p>
+{% if value.current_snapshot_id %}
+  {{ text_list('所选记录中的快照', [value.current_snapshot_id], record_kind='worktree_snapshot', exact_revision=true) }}
+{% else %}<p>所选记录中的快照：未记录。</p>{% endif %}
 <p>创建证据：{{ value.created_event_ref }} · 终止证据：{{ value.terminal_event_ref or '未记录' }}</p>
 <p>重建自：{{ value.recreated_from_worktree_instance_id or '未记录' }}</p>
 <h3>路径记录</h3>
