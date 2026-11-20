@@ -74,6 +74,11 @@ pub(crate) fn explicit_source_order(
 
 const EXACT_SLOT_SEPARATOR: &str = "; exact ";
 
+pub(crate) fn entity_list_topic(input: &str) -> Option<&str> {
+    let topic = input.trim_start().strip_prefix("list entities:")?.trim();
+    (!topic.is_empty()).then_some(topic)
+}
+
 /// Only explicitly delimited identifiers become required slots of an anchored search.
 pub(crate) fn explicit_exact_slots(input: &str, targets: &[String]) -> Option<Vec<String>> {
     let mut fields = input.split(EXACT_SLOT_SEPARATOR);

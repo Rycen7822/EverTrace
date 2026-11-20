@@ -1169,6 +1169,7 @@ impl NativeRetrieval<'_> {
         }
         let mut view = GroundedEvidenceView {
             candidate_count: None,
+            entity_list: None,
             candidate_latest: None,
             candidate_comparison: None,
             evidence_need: EvidenceNeed::from_context(self.context),
@@ -1186,6 +1187,14 @@ impl NativeRetrieval<'_> {
             completeness: self.result.completeness,
             omitted_refs: self.result.omitted_refs.clone(),
         };
+        view.entity_list = view.derive_entity_list(&self.result.candidates);
+        if view.entity_list.as_ref().is_some_and(|list| list.truncated) {
+            self.degraded("entity_list_budget_exhausted");
+            if self.result.completeness == RetrievalCompleteness::Complete {
+                self.result.completeness = RetrievalCompleteness::Partial;
+                view.completeness = RetrievalCompleteness::Partial;
+            }
+        }
         view.candidate_count =
             view.derive_candidate_count(&self.result.candidates, &matching_constraints);
         let count_gaps = view.count_temporal_gaps(&self.result.candidates);
@@ -1284,6 +1293,8 @@ impl NativeRetrieval<'_> {
         // A quote occurs twice; metadata and the typed operator occur once.
         2400 - if self.context.query_facets.answer_shape == Some(AnswerShape::TemporalComparison) {
             MAX_GROUNDED_COMPARISON_BYTES / 2
+        } else if self.context.query_facets.answer_shape == Some(AnswerShape::EntityList) {
+            MAX_GROUNDED_ENTITY_LIST_BYTES / 2
         } else if self.context.query_facets.answer_shape == Some(AnswerShape::Latest) {
             MAX_GROUNDED_LATEST_BYTES / 2
         } else if self.context.query_facets.count_unit().is_some() {

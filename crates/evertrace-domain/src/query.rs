@@ -775,6 +775,8 @@ pub struct GroundedEvidenceView {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub candidate_count: Option<GroundedCount>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub entity_list: Option<GroundedEntityList>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub candidate_latest: Option<GroundedLatest>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub candidate_comparison: Option<GroundedTemporalComparison>,
@@ -800,6 +802,30 @@ pub struct GroundedCount {
     pub statement_indices: BTreeSet<u32>,
 }
 
+/// Entity identities describe the bounded answer, not a count of all stored entities.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct GroundedEntityList {
+    pub operator_revision: u32,
+    pub entities: Vec<GroundedEntity>,
+    pub truncated: bool,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct GroundedEntity {
+    pub kind: String,
+    pub entity_ref: String,
+    pub statement_indices: BTreeSet<u32>,
+}
+
+impl GroundedEntityList {
+    fn wire_bytes(&self) -> usize {
+        serde_json::to_vec(self).map_or(usize::MAX, |bytes| bytes.len() + 15)
+    }
+}
+
+pub const MAX_GROUNDED_ENTITY_LIST_BYTES: usize = 1536;
 pub const MAX_GROUNDED_COUNT_BYTES: usize = 256;
 pub const MAX_GROUNDED_LATEST_BYTES: usize = 512;
 pub const MAX_GROUNDED_COMPARISON_BYTES: usize = 512;
@@ -957,6 +983,44 @@ impl GroundedEvidenceView {
             }
         }
         Some(operands)
+    }
+
+    pub fn derive_entity_list(&self, candidates: &[SearchCandidate]) -> Option<GroundedEntityList> {
+        if self.evidence_need.answer_shape != Some(AnswerShape::EntityList) {
+            return None;
+        }
+        // Normative context alone is not an entity returned by the ordinary answer.
+        let mut operands = self.quoted_operands(candidates, &BTreeSet::new())?;
+        operands.sort_unstable_by_key(|(index, _)| *index);
+        let mut entities: Vec<GroundedEntity> = Vec::new();
+        for (index, candidate) in operands {
+            let kind = match candidate.row_variant {
+                SearchCandidateVariant::Object => candidate.object_kind.as_deref()?,
+                SearchCandidateVariant::EvidenceSurface => "source_observation",
+            };
+            if let Some(entity) = entities
+                .iter_mut()
+                .find(|entry| entry.kind == kind && entry.entity_ref == candidate.source_ref)
+            {
+                entity.statement_indices.insert(index);
+            } else {
+                entities.push(GroundedEntity {
+                    kind: kind.to_owned(),
+                    entity_ref: candidate.source_ref.clone(),
+                    statement_indices: BTreeSet::from([index]),
+                });
+            }
+        }
+        let mut list = GroundedEntityList {
+            operator_revision: 1,
+            entities,
+            truncated: false,
+        };
+        while list.wire_bytes() > MAX_GROUNDED_ENTITY_LIST_BYTES {
+            list.entities.pop()?;
+            list.truncated = true;
+        }
+        Some(list)
     }
 
     pub fn derive_candidate_count(
@@ -1281,6 +1345,54 @@ impl GroundedEvidenceView {
         })
     }
 
+    fn validate_entity_list(&self) -> Result<(), QueryError> {
+        let Some(list) = &self.entity_list else {
+            return if self.evidence_need.answer_shape != Some(AnswerShape::EntityList) {
+                Ok(())
+            } else {
+                Err(QueryError::Invalid)
+            };
+        };
+        if self.evidence_need.answer_shape != Some(AnswerShape::EntityList)
+            || list.operator_revision != 1
+            || (list.truncated && self.completeness == RetrievalCompleteness::Complete)
+            || list.wire_bytes() > MAX_GROUNDED_ENTITY_LIST_BYTES
+        {
+            return Err(QueryError::Invalid);
+        }
+        let mut seen = BTreeSet::new();
+        let mut entities = BTreeSet::new();
+        let mut previous = None;
+        for entity in &list.entities {
+            let first = entity
+                .statement_indices
+                .first()
+                .ok_or(QueryError::Invalid)?;
+            if previous.is_some_and(|index| index >= first)
+                || entity.kind.is_empty()
+                || entity.kind.len() > 64
+                || !valid_object_reference(&entity.entity_ref)
+                || (entity.kind == "source_observation"
+                    && entity.entity_ref.parse::<SourceObservationId>().is_err())
+                || !entities.insert((&entity.kind, &entity.entity_ref))
+                || entity.statement_indices.iter().any(|index| {
+                    !seen.insert(*index)
+                        || self
+                            .active_evidence
+                            .get(*index as usize)
+                            .is_none_or(|statement| {
+                                statement.derivation_kind != DerivationKind::Quoted
+                                    || statement.support_refs.len() != 1
+                            })
+                })
+            {
+                return Err(QueryError::Invalid);
+            }
+            previous = Some(first);
+        }
+        Ok(())
+    }
+
     fn validate_follow_up_trace(&self) -> Result<(), QueryError> {
         let Some(gap) = &self.follow_up_gap else {
             return if self.candidate_set.generation == 1 {
@@ -1374,6 +1486,7 @@ impl GroundedEvidenceView {
             }
         }
         self.candidate_set.validate()?;
+        self.validate_entity_list()?;
         self.validate_follow_up_trace()?;
         if let Some(count) = &self.candidate_count {
             if self.evidence_need.answer_shape != Some(AnswerShape::Count)
@@ -3905,6 +4018,7 @@ impl HumanSearchPage {
                     && view.candidate_set.candidate_refs == refs
                     && view.completeness == self.result.completeness
                     && self.follow_up_boundary_valid(view)
+                    && view.derive_entity_list(&self.result.candidates) == view.entity_list
                     && self.count_derivation_valid(view)
                     && self.latest_derivation_valid(view)
                     && self.comparison_derivation_valid(view)

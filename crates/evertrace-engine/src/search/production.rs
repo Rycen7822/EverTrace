@@ -1772,6 +1772,11 @@ fn target_anchor_position(context: &SearchContext, row: &SearchProjectionRow) ->
 }
 
 fn scoped_lexical_query(context: &SearchContext) -> &str {
+    if context.query_facets.answer_shape == Some(AnswerShape::EntityList)
+        && let Some(topic) = super::entity_list_topic(&context.protected_query)
+    {
+        return topic;
+    }
     // The explicit slots stay in protected IR; only the primary clause is ranked as lexical text.
     if context.budget.follow_ups_remaining != 0
         && let Some((primary, _)) = context

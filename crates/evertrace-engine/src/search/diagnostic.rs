@@ -357,8 +357,9 @@ impl DiagnosticSession {
                 relation: None,
             })
             .collect();
-        let view = GroundedEvidenceView {
+        let mut view = GroundedEvidenceView {
             candidate_count: None,
+            entity_list: None,
             candidate_latest: None,
             candidate_comparison: None,
             evidence_need: EvidenceNeed::from_context(&self.context),
@@ -380,6 +381,12 @@ impl DiagnosticSession {
             completeness,
             omitted_refs: self.result.omitted_refs.clone(),
         };
+        view.entity_list = view.derive_entity_list(&self.result.candidates);
+        if view.entity_list.as_ref().is_some_and(|list| list.truncated)
+            && view.completeness == RetrievalCompleteness::Complete
+        {
+            view.completeness = RetrievalCompleteness::Partial;
+        }
         view.validate_at_frontier(self.result.projection_frontier)?;
         Ok(view)
     }

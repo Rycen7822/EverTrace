@@ -149,7 +149,12 @@ impl McpActionService {
         let relation = crate::search::explicit_atom_relation(&query, &scope.target_anchors);
         let atom_relation = relation.is_some();
         let source_order = crate::search::explicit_source_order(&query, &scope.target_anchors);
-        let exact_slots = crate::search::explicit_exact_slots(&query, &scope.target_anchors);
+        let entity_list = crate::search::entity_list_topic(&query).is_some();
+        let exact_slots = if entity_list {
+            None
+        } else {
+            crate::search::explicit_exact_slots(&query, &scope.target_anchors)
+        };
         let explicit_exact = exact_slots.is_some();
         let explicit_view = atom_relation || source_order.is_some() || explicit_exact;
         let mut context = SearchContext {
@@ -187,6 +192,8 @@ impl McpActionService {
                 source_boundary: None,
                 answer_shape: if source_order.is_some() {
                     Some(evertrace_domain::query::AnswerShape::TemporalComparison)
+                } else if entity_list {
+                    Some(evertrace_domain::query::AnswerShape::EntityList)
                 } else {
                     atom_relation.then_some(evertrace_domain::query::AnswerShape::SourceSnippet)
                 },
@@ -575,7 +582,7 @@ impl McpActionService {
         let mut view = None;
         if targets_resolved
             && found.authoritative_frontier == review_frontier
-            && (explicit_view || overflowed)
+            && (explicit_view || overflowed || entity_list)
         {
             let reviewed = review
                 .items
@@ -617,7 +624,15 @@ impl McpActionService {
                     .map(Box::new);
             }
         }
-        if explicit_view && view.is_none() {
+        if entity_list && !review.items.is_empty() {
+            found
+                .degraded_reasons
+                .insert("search_entity_list_partial".into());
+            if found.completeness == RetrievalCompleteness::Complete {
+                found.completeness = RetrievalCompleteness::Partial;
+            }
+        }
+        if (explicit_view || (entity_list && !review.items.is_empty())) && view.is_none() {
             found
                 .degraded_reasons
                 .insert("grounded_view_unavailable".into());
@@ -813,6 +828,7 @@ impl McpActionService {
                 "search_target_unresolved",
                 "search_relation_unresolved",
                 "search_exact_request_partial",
+                "search_entity_list_partial",
                 "search_temporal_comparison_unresolved",
                 "source_sequence_coverage_unverified",
                 "grounded_view_unavailable",
