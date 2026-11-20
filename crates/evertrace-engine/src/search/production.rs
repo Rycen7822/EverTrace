@@ -474,11 +474,18 @@ pub(crate) type RelationSources<'a> = &'a (
         dyn Fn(&[String], &BTreeSet<String>) -> Result<Vec<SearchProjectionRow>, SearchError> + Sync
     );
 
-const ATOM_ACCESS_WINDOW: usize = 32;
+const SEARCH_ACCESS_WINDOW: usize = 32;
 
-struct AtomGrants {
+struct CandidateGrants {
     frontiers: (u64, u64),
-    refs: BTreeSet<String>,
+    atom_revisions: BTreeSet<String>,
+    evidence_sources: BTreeSet<String>,
+}
+
+#[derive(Clone, Ord, PartialOrd, Eq, PartialEq)]
+enum OfferedRead {
+    Atom { revision: String, atom: String },
+    Evidence(String),
 }
 
 pub struct ProductionSearch {
@@ -488,7 +495,7 @@ pub struct ProductionSearch {
     method_proposal_revisions: BTreeSet<String>,
     validated_frontier: Option<u64>,
     readable_refs: Option<(u64, BTreeSet<String>)>,
-    atom_revisions: Option<AtomGrants>,
+    candidate_grants: Option<CandidateGrants>,
     semantics: Option<std::sync::Arc<super::resolution::SemanticSearchResolution>>,
     canonical_sources: Option<(u64, Vec<SearchProjectionRow>)>,
     recall_sources: BTreeSet<String>,
@@ -505,7 +512,7 @@ impl ProductionSearch {
             method_proposal_revisions: BTreeSet::new(),
             validated_frontier: None,
             readable_refs: None,
-            atom_revisions: None,
+            candidate_grants: None,
             semantics: None,
             canonical_sources: None,
             recall_sources: BTreeSet::new(),
@@ -599,9 +606,9 @@ impl ProductionSearch {
             method_proposal_revisions: self.method_proposal_revisions.clone(),
             object_kind: None,
             atom_revisions: self
-                .atom_revisions
+                .candidate_grants
                 .as_ref()
-                .map(|grants| grants.refs.clone()),
+                .map(|grants| grants.atom_revisions.clone()),
             task_id: context.task_id.map(|id| id.to_string()),
             repository_id: context.repository_id.map(|id| id.to_string()),
             worktree_id: context.worktree_id.map(|id| id.to_string()),
@@ -648,6 +655,47 @@ impl ProductionSearch {
         }
     }
 
+    fn evidence_filter(
+        &self,
+        context: &SearchContext,
+        global_only: bool,
+        time_scope: Option<&TemporalReadScope<'_>>,
+    ) -> Option<SearchHardFilter> {
+        use evertrace_domain::query::SourceBoundary;
+        match context.query_facets.source_boundary {
+            Some(SourceBoundary::ProjectPolicy | SourceBoundary::ObjectiveEvidence) => None,
+            role => {
+                let mut filter = self.hard_filter(context, false, time_scope);
+                filter.global_only = global_only;
+                filter.current_only = false;
+                filter.lifecycle = None;
+                filter.authority = None;
+                filter.source_kind = Some("evidence_surface".into());
+                filter.source_role = match role {
+                    None => None,
+                    Some(SourceBoundary::User) => Some("user"),
+                    Some(SourceBoundary::Assistant | SourceBoundary::AgentInferred) => {
+                        Some("assistant")
+                    }
+                    Some(SourceBoundary::Tool) => Some("tool"),
+                    Some(SourceBoundary::Host) => Some("host"),
+                    Some(SourceBoundary::Imported) => Some("imported"),
+                    _ => unreachable!(),
+                }
+                .map(str::to_owned);
+                if let Some(grants) = &self.candidate_grants {
+                    filter.readable_refs = Some(grants.evidence_sources.clone());
+                }
+                if let Some(scope) = &self.sequence_scope
+                    && let Some(refs) = &mut filter.readable_refs
+                {
+                    refs.retain(|reference| scope.positions.contains_key(reference));
+                }
+                Some(filter)
+            }
+        }
+    }
+
     pub(crate) async fn retrieve(
         &self,
         context: SearchContext,
@@ -655,7 +703,7 @@ impl ProductionSearch {
         time_scope: Option<&TemporalReadScope<'_>>,
         relation_sources: RelationSources<'_>,
     ) -> Result<evertrace_domain::query::HumanSearchPage, SearchError> {
-        use evertrace_domain::query::{HumanSearchPage, SourceBoundary};
+        use evertrace_domain::query::HumanSearchPage;
         context.validate()?;
         if self.readable_refs.is_none() {
             return Err(SearchError::Unsupported);
@@ -695,35 +743,7 @@ impl ProductionSearch {
         };
         let mut objects = self.hard_filter(&context, true, time_scope);
         objects.global_only = global_only;
-        let evidence = match context.query_facets.source_boundary {
-            Some(SourceBoundary::ProjectPolicy | SourceBoundary::ObjectiveEvidence) => None,
-            role => {
-                let mut filter = self.hard_filter(&context, false, time_scope);
-                filter.global_only = global_only;
-                filter.current_only = false;
-                filter.lifecycle = None;
-                filter.authority = None;
-                filter.source_kind = Some("evidence_surface".into());
-                filter.source_role = match role {
-                    None => None,
-                    Some(SourceBoundary::User) => Some("user"),
-                    Some(SourceBoundary::Assistant | SourceBoundary::AgentInferred) => {
-                        Some("assistant")
-                    }
-                    Some(SourceBoundary::Tool) => Some("tool"),
-                    Some(SourceBoundary::Host) => Some("host"),
-                    Some(SourceBoundary::Imported) => Some("imported"),
-                    _ => unreachable!(),
-                }
-                .map(str::to_owned);
-                if let Some(scope) = &self.sequence_scope
-                    && let Some(refs) = &mut filter.readable_refs
-                {
-                    refs.retain(|reference| scope.positions.contains_key(reference));
-                }
-                Some(filter)
-            }
-        };
+        let evidence = self.evidence_filter(&context, global_only, time_scope);
         let result = self
             .search_snapshot(
                 context.clone(),
@@ -745,7 +765,7 @@ impl ProductionSearch {
             semantics: self.semantics.as_deref(),
             sequence_scope: self.sequence_scope.as_ref(),
             time_scope,
-            relation_sources,
+            relation_sources: Some(relation_sources),
         }
         .run()
         .await
@@ -755,12 +775,12 @@ impl ProductionSearch {
         self.search_inner(context, false).await
     }
 
-    /// Resolve only the scoped lexical Atom window, outside the native read lease.
-    /// The subsequent native top-k filters against the exact granted revisions.
-    pub(crate) async fn search_with_atom_access(
+    /// Resolve the scoped lexical access window outside the native read lease.
+    /// Both ranking channels apply their admitted immutable references before top-k.
+    pub(crate) async fn search_with_access(
         mut self,
         mut context: SearchContext,
-        access: &super::read_context::AtomReadAccess<'_>,
+        access: &super::read_context::SearchReadAccess<'_>,
     ) -> Result<SearchResult, SearchError> {
         context.validate()?;
         if matches!(context.suppression, SuppressionSnapshot::Unavailable) {
@@ -775,24 +795,47 @@ impl ProductionSearch {
             if frontiers.1 != access.frontier {
                 return Ok((frontiers, Vec::new(), false));
             }
-            let mut filter = self.hard_filter(&context, true, None);
-            filter.object_kind = Some("atom_revision".into());
-            let limit = ATOM_ACCESS_WINDOW + 1;
-            let exact = snapshot
-                .structured(&exact_identifiers(&context), &filter, limit)
-                .await?;
-            let (fts, incomplete) =
-                match snapshot.fts(&context.protected_query, &filter, limit).await {
-                    Ok(fts) => (fts, false),
-                    Err(_) => (Vec::new(), true),
-                };
+            let mut atoms = self.hard_filter(&context, true, None);
+            atoms.object_kind = Some("atom_revision".into());
+            // The existing lagging-index path is limited to revalidated current objects.
+            let evidence = (frontiers.0 == frontiers.1)
+                .then(|| self.evidence_filter(&context, false, None))
+                .flatten();
+            let limit = SEARCH_ACCESS_WINDOW + 1;
+            let identifiers = exact_identifiers(&context);
+            let mut offered = Vec::new();
+            let mut incomplete = false;
+            for (channel, filter) in std::iter::once(atoms).chain(evidence).enumerate() {
+                let exact = snapshot.structured(&identifiers, &filter, limit).await?;
+                let fts = snapshot
+                    .fts(&context.protected_query, &filter, limit)
+                    .await
+                    .unwrap_or_else(|_| {
+                        incomplete = true;
+                        Vec::new()
+                    });
+                for (tier, rows) in [exact, fts].into_iter().enumerate() {
+                    for (rank, row) in rows.into_iter().enumerate() {
+                        let reference = row.source_ref.ok_or(StoreError::StoreCorrupt)?;
+                        let read = if channel == 0 {
+                            OfferedRead::Atom {
+                                revision: row.candidate_id.ok_or(StoreError::StoreCorrupt)?,
+                                atom: reference,
+                            }
+                        } else {
+                            OfferedRead::Evidence(reference)
+                        };
+                        offered.push(((tier, rank, channel), read));
+                    }
+                }
+            }
+            // Exact first, then share the inspection window across ranked channels; no bodies cross the lease.
+            offered.sort_unstable_by_key(|(order, _)| *order);
             let mut seen = BTreeSet::new();
-            // Drop the native lease and all discovery bodies before asking the writer for authority.
-            let ordered = exact
+            let ordered = offered
                 .into_iter()
-                .chain(fts)
-                .filter_map(|row| row.candidate_id.zip(row.source_ref))
-                .filter(|(revision, _)| seen.insert(revision.clone()))
+                .map(|(_, read)| read)
+                .filter(|read| seen.insert(read.clone()))
                 .take(limit)
                 .collect();
             Ok::<_, StoreError>((frontiers, ordered, incomplete))
@@ -817,13 +860,29 @@ impl ProductionSearch {
                 frontiers.1,
             ));
         }
-        let mut grants = BTreeSet::new();
+        let mut grants = CandidateGrants {
+            frontiers,
+            atom_revisions: BTreeSet::new(),
+            evidence_sources: BTreeSet::new(),
+        };
         let mut restricted = false;
-        let exhausted = offered.len() > ATOM_ACCESS_WINDOW;
-        for (revision, atom) in offered.into_iter().take(ATOM_ACCESS_WINDOW) {
-            match access.check_current(&atom, &revision).await {
+        let exhausted = offered.len() > SEARCH_ACCESS_WINDOW;
+        for read in offered.into_iter().take(SEARCH_ACCESS_WINDOW) {
+            let (verified, reference, target) = match read {
+                OfferedRead::Atom { revision, atom } => (
+                    access.check_current(&atom, &revision).await,
+                    revision,
+                    &mut grants.atom_revisions,
+                ),
+                OfferedRead::Evidence(source) => (
+                    access.check_evidence(&source).await,
+                    source,
+                    &mut grants.evidence_sources,
+                ),
+            };
+            match verified {
                 Ok(()) => {
-                    grants.insert(revision);
+                    target.insert(reference);
                 }
                 Err(ErrorCode::Untrusted) => restricted = true,
                 Err(_) => unavailable = true,
@@ -837,10 +896,7 @@ impl ProductionSearch {
                 ));
             }
         }
-        self.atom_revisions = Some(AtomGrants {
-            frontiers,
-            refs: grants,
-        });
+        self.candidate_grants = Some(grants);
         context.budget.latency_us_remaining = access
             .deadline
             .saturating_duration_since(Instant::now())
@@ -926,16 +982,80 @@ impl ProductionSearch {
                 ));
             }
         };
-        self.search_snapshot(
-            context,
-            force_fts_failure,
-            &snapshot,
-            &deadline,
-            false,
-            None,
-            None,
-        )
-        .await
+        let evidence = self
+            .candidate_grants
+            .as_ref()
+            .filter(|grants| !grants.evidence_sources.is_empty())
+            .and_then(|_| self.evidence_filter(&context, false, None));
+        let Some(evidence) = evidence else {
+            return self
+                .search_snapshot(
+                    context,
+                    force_fts_failure,
+                    &snapshot,
+                    &deadline,
+                    false,
+                    None,
+                    None,
+                )
+                .await;
+        };
+        let result = self
+            .search_snapshot(
+                context.clone(),
+                force_fts_failure,
+                &snapshot,
+                &deadline,
+                false,
+                Some(&evidence),
+                None,
+            )
+            .await?;
+        if result.completeness == RetrievalCompleteness::Unknown {
+            return Ok(result);
+        }
+        let mut retrieval = super::retrieval::NativeRetrieval {
+            snapshot: &snapshot,
+            context: &context,
+            result,
+            objects: self.hard_filter(&context, true, None),
+            evidence: Some(evidence),
+            deadline: &deadline,
+            semantics: self.semantics.as_deref(),
+            sequence_scope: self.sequence_scope.as_ref(),
+            time_scope: None,
+            relation_sources: None,
+        };
+        let has_unread_source = self.candidate_grants.as_ref().is_some_and(|grants| {
+            grants.evidence_sources.iter().any(|id| {
+                !retrieval.result.candidates.iter().any(|candidate| {
+                    candidate.row_variant
+                        == evertrace_domain::query::SearchCandidateVariant::EvidenceSurface
+                        && &candidate.source_ref == id
+                })
+            })
+        });
+        if has_unread_source {
+            retrieval.read_evidence(&[]).await?;
+        }
+        if !matches!(deadline.run(snapshot.is_current()).await, Ok(Ok(true))) {
+            return Ok(deadline_result(
+                context,
+                "read_access_frontier_changed",
+                snapshot.frontier(),
+                snapshot.authoritative_frontier(),
+            ));
+        }
+        let mut result = retrieval.result;
+        result.budget.latency_us_remaining = deadline.remaining().map_or(0, |remaining| {
+            remaining.as_micros().try_into().unwrap_or(u64::MAX)
+        });
+        if result.completeness == RetrievalCompleteness::Complete
+            && (!result.degraded_reasons.is_empty() || !result.omitted_refs.is_empty())
+        {
+            result.completeness = RetrievalCompleteness::Partial;
+        }
+        Ok(result)
     }
 
     async fn search_snapshot(
@@ -952,7 +1072,7 @@ impl ProductionSearch {
         let mut changed_frontiers = BTreeSet::new();
         let frontiers = (snapshot.frontier(), snapshot.authoritative_frontier());
         if self
-            .atom_revisions
+            .candidate_grants
             .as_ref()
             .is_some_and(|grants| grants.frontiers != frontiers)
             || self
@@ -1149,6 +1269,21 @@ impl ProductionSearch {
                     snapshot.frontier(),
                     snapshot.authoritative_frontier(),
                 ));
+            }
+        }
+        // Explicit source coordinates must compete as exact hits, before an object FTS window spends the shared budget.
+        if let Some(evidence) = anchor_evidence.filter(|_| self.candidate_grants.is_some()) {
+            match deadline
+                .run(snapshot.structured(&exact_identifiers, evidence, fetch_limit))
+                .await
+            {
+                Ok(Ok(rows)) => structured.extend(rows),
+                Ok(Err(_)) => {
+                    degraded_reasons.insert("evidence_structured_unavailable".into());
+                }
+                Err(()) => {
+                    degraded_reasons.insert("evidence_structured_deadline_exhausted".into());
+                }
             }
         }
         let fts_result = if force_fts_failure {

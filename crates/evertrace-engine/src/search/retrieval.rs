@@ -54,7 +54,7 @@ pub(super) struct NativeRetrieval<'a> {
     pub semantics: Option<&'a super::resolution::SemanticSearchResolution>,
     pub sequence_scope: Option<&'a super::SourceSequenceScope>,
     pub time_scope: Option<&'a super::TemporalReadScope<'a>>,
-    pub relation_sources: RelationSources<'a>,
+    pub relation_sources: Option<RelationSources<'a>>,
 }
 
 impl NativeRetrieval<'_> {
@@ -220,8 +220,8 @@ impl NativeRetrieval<'_> {
         identifiers: &[String],
         episodes: &[String],
     ) -> Result<(), SearchError> {
-        let sources = match self.objects.readable_refs.as_ref() {
-            Some(refs) if !episodes.is_empty() => match (self.relation_sources)(episodes, refs) {
+        let sources = match (self.objects.readable_refs.as_ref(), self.relation_sources) {
+            (Some(refs), Some(read)) if !episodes.is_empty() => match read(episodes, refs) {
                 Ok(sources) => sources,
                 Err(_) => {
                     self.degraded("relation_source_unavailable");
@@ -357,13 +357,10 @@ impl NativeRetrieval<'_> {
         gaps
     }
 
-    pub(super) async fn run(mut self) -> Result<HumanSearchPage, SearchError> {
-        if self.result.completeness == RetrievalCompleteness::Unknown {
-            return Ok(HumanSearchPage {
-                result: self.result,
-                grounded_view: None,
-            });
-        }
+    pub(super) async fn read_evidence(
+        &mut self,
+        identifiers: &[String],
+    ) -> Result<(), SearchError> {
         // B: original EvidenceSurface, not object metadata relabelled as evidence.
         self.result.layer = RetrievalLayer::B;
         if let Some(filter) = self.evidence.clone() {
@@ -373,11 +370,7 @@ impl NativeRetrieval<'_> {
             } else {
                 match self
                     .deadline
-                    .run(self.snapshot.structured(
-                        &self.context.query_facets.exact_identifiers,
-                        &filter,
-                        limit,
-                    ))
+                    .run(self.snapshot.structured(identifiers, &filter, limit))
                     .await
                 {
                     Ok(Ok(rows)) => self.admit(rows, "evidence_exact")?,
@@ -393,6 +386,18 @@ impl NativeRetrieval<'_> {
                 self.evidence_fts(&filter).await?;
             }
         }
+        Ok(())
+    }
+
+    pub(super) async fn run(mut self) -> Result<HumanSearchPage, SearchError> {
+        if self.result.completeness == RetrievalCompleteness::Unknown {
+            return Ok(HumanSearchPage {
+                result: self.result,
+                grounded_view: None,
+            });
+        }
+        self.read_evidence(&self.context.query_facets.exact_identifiers)
+            .await?;
         // C: preserve permission-checked bridge rows for D. Literal conditions
         // constrain answer evidence, not the existence of a connecting object.
         self.result.layer = RetrievalLayer::C;

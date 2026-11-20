@@ -61,9 +61,9 @@ pub(crate) async fn check_source_access(
     Ok(())
 }
 
-/// Use the existing bounded exact-read dependencies for an offered Atom revision.
-/// A bare object scope is not proof that the source of its text remains readable.
-pub(crate) struct AtomReadAccess<'a> {
+/// Use the existing bounded exact-read dependencies for scoped search candidates.
+/// A bare index scope is not proof that the source of its text remains readable.
+pub(crate) struct SearchReadAccess<'a> {
     pub writer: &'a WriterHandle,
     pub authority: RepositoryReadAuthority<'a>,
     pub frontier: u64,
@@ -71,22 +71,32 @@ pub(crate) struct AtomReadAccess<'a> {
     pub deadline: Instant,
 }
 
-impl AtomReadAccess<'_> {
+impl SearchReadAccess<'_> {
     pub async fn check_revision(&self, revision: &str) -> Result<(), ErrorCode> {
         self.check(
             ExactReadQuery::Fields(ExactFieldsQuery {
                 revision_ref: revision.to_owned(),
             }),
             revision,
+            "atom_revision",
         )
         .await
     }
 
     /// A lagging index may offer an immutable revision; only its current alias can grant Search access.
     pub(crate) async fn check_current(&self, atom: &str, revision: &str) -> Result<(), ErrorCode> {
+        self.check_record(atom, revision, "atom_revision").await
+    }
+
+    pub(crate) async fn check_evidence(&self, source: &str) -> Result<(), ErrorCode> {
+        self.check_record(source, source, "source_observation")
+            .await
+    }
+
+    async fn check_record(&self, key: &str, revision: &str, kind: &str) -> Result<(), ErrorCode> {
         let query = ExactReadQuery::Record(ExactRecordQuery {
             reference: ExactRecordRef {
-                stable_key: atom.to_owned(),
+                stable_key: key.to_owned(),
                 revision_ref: None,
             },
             field: None,
@@ -94,10 +104,15 @@ impl AtomReadAccess<'_> {
             expected_data_identity: None,
             expected_selection: None,
         });
-        self.check(query, revision).await
+        self.check(query, revision, kind).await
     }
 
-    async fn check(&self, query: ExactReadQuery, revision: &str) -> Result<(), ErrorCode> {
+    async fn check(
+        &self,
+        query: ExactReadQuery,
+        revision: &str,
+        kind: &str,
+    ) -> Result<(), ErrorCode> {
         let read = async {
             let (cancelled, _cancel_on_drop) =
                 evertrace_store::StoreReadHandle::cancellation_scope();
@@ -117,7 +132,7 @@ impl AtomReadAccess<'_> {
             if context.state.frontier != self.frontier
                 || context.selected.as_ref().is_none_or(|row| {
                     row.current_revision_id.as_deref() != Some(revision)
-                        || row.object_kind.as_deref() != Some("atom_revision")
+                        || row.object_kind.as_deref() != Some(kind)
                 })
             {
                 return Err(ErrorCode::StoreCorrupt);

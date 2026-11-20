@@ -1,6 +1,6 @@
 use std::{collections::BTreeMap, future::Future, pin::Pin};
 
-use crate::search::read_context::AtomReadAccess;
+use crate::search::read_context::SearchReadAccess;
 
 use super::*;
 
@@ -222,7 +222,7 @@ impl McpActionService {
             .repository_report
             .as_deref()
             .or(report.as_ref());
-        let atom_access = AtomReadAccess {
+        let read_access = SearchReadAccess {
             writer: &self.writer,
             authority: crate::repository::RepositoryReadAuthority::observed(repository_report),
             frontier: scope.context.frontier,
@@ -244,7 +244,7 @@ impl McpActionService {
             .with_validated_frontier(scope.context.frontier)
             .with_method_proposals(methods)
             .with_procedure_revisions(searchable_procedure_revisions)
-            .search_with_atom_access(context.clone(), &atom_access)
+            .search_with_access(context.clone(), &read_access)
             .await
             .map_err(|_| McpServiceError::Store)?;
         let selected_candidates = found.candidates.iter().take(3).collect::<Vec<_>>();
@@ -427,18 +427,26 @@ impl McpActionService {
                     .filter(|reference| !reviewed_candidates.contains(*reference))
                     .cloned(),
             );
-            let fresh_atom_access = AtomReadAccess {
+            let fresh_access = SearchReadAccess {
                 frontier: candidate_context.frontier,
-                ..atom_access
+                ..read_access
             };
             for candidate in &selected_candidates {
-                if candidate.object_kind.as_deref() == Some("atom_revision")
-                    && !blocked_candidates.contains(&candidate.candidate_id)
-                    && fresh_atom_access
-                        .check_current(&candidate.source_ref, &candidate.candidate_id)
-                        .await
-                        .is_err()
-                {
+                if blocked_candidates.contains(&candidate.candidate_id) {
+                    continue;
+                }
+                let proof = match candidate.row_variant {
+                    evertrace_domain::query::SearchCandidateVariant::EvidenceSurface => {
+                        fresh_access.check_evidence(&candidate.source_ref).await
+                    }
+                    _ if candidate.object_kind.as_deref() == Some("atom_revision") => {
+                        fresh_access
+                            .check_current(&candidate.source_ref, &candidate.candidate_id)
+                            .await
+                    }
+                    _ => continue,
+                };
+                if proof.is_err() {
                     blocked_candidates.insert(candidate.candidate_id.clone());
                 }
             }
@@ -686,10 +694,14 @@ impl McpActionService {
             RetrievalCompleteness::Conflicted => "conflicted",
             RetrievalCompleteness::Unknown => "unknown",
         };
-        let access_limited = found
-            .degraded_reasons
-            .contains("search_access_window_exhausted");
-        let unproven = access_limited
+        let trimmed = [
+            "search_access_window_exhausted",
+            "evidence_channel_budget_exhausted",
+            "retrieval_budget_exhausted",
+        ]
+        .iter()
+        .any(|reason| found.degraded_reasons.contains(*reason));
+        let unproven = trimmed
             || found.degraded_reasons.contains("search_access_unavailable")
             || found
                 .degraded_reasons
@@ -743,7 +755,7 @@ impl McpActionService {
                 }
                 warnings
             },
-            truncated: access_limited || !omitted_refs.is_empty(),
+            truncated: trimmed || !omitted_refs.is_empty(),
             next_refs: omitted_refs.into_iter().take(32).collect(),
         }
     }
@@ -1274,7 +1286,7 @@ impl McpActionService {
             )
             .await?
             .is_empty();
-        let atom_access = AtomReadAccess {
+        let atom_access = SearchReadAccess {
             writer: &self.writer,
             authority: crate::repository::RepositoryReadAuthority::observed(repository_report),
             frontier: scope.snapshot.frontier,
@@ -1677,6 +1689,11 @@ fn normal_search_candidate_matches_row(
         evertrace_domain::query::SearchCandidateVariant::EvidenceSurface => {
             row.object_kind.as_deref() == Some("evidence_surface")
                 && row.current_revision_id.as_deref() == Some(candidate.source_ref.as_str())
+                && matches!(
+                    row.payload_json.as_deref().and_then(|json| serde_json::from_str::<JournalPayload>(json).ok()),
+                    Some(JournalPayload::EvidenceSurfaceRecorded(surface))
+                        if surface.candidate_ref() == candidate.candidate_id && surface.protected_text == candidate.text
+                )
         }
     }
 }
@@ -1702,9 +1719,7 @@ fn classify_search_candidate_rows(
                 now,
             ))
         }
-        evertrace_domain::query::SearchCandidateVariant::EvidenceSurface
-            if candidate.object_kind.as_deref() == Some("evidence_surface") =>
-        {
+        evertrace_domain::query::SearchCandidateVariant::EvidenceSurface => {
             let content_trust = match candidate.content_trust.as_deref()? {
                 "user_statement" => ContentTrust::UserStatement,
                 "observed" => ContentTrust::Observed,
@@ -1732,6 +1747,5 @@ fn classify_search_candidate_rows(
                 text: Some(candidate.text.clone()),
             })
         }
-        evertrace_domain::query::SearchCandidateVariant::EvidenceSurface => None,
     }
 }
