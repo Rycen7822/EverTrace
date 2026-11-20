@@ -435,35 +435,82 @@ impl NativeRetrieval<'_> {
         gaps
     }
 
-    pub(super) async fn read_evidence(
+    pub(super) async fn read_exact_evidence(
         &mut self,
         snapshot: &SearchSnapshot,
         identifiers: &[String],
+        unique_operands: bool,
     ) -> Result<(), SearchError> {
-        // B: original EvidenceSurface, not object metadata relabelled as evidence.
         self.result.layer = RetrievalLayer::B;
-        if let Some(filter) = self.evidence.clone() {
+        if let Some(filter) = self.evidence.as_ref() {
             let limit = self.remaining();
             if limit == 0 {
                 self.degraded("evidence_channel_budget_exhausted");
             } else {
                 match self
                     .deadline
-                    .run(snapshot.structured(identifiers, &filter, limit))
+                    .run(snapshot.structured(
+                        identifiers,
+                        filter,
+                        limit + usize::from(unique_operands),
+                    ))
                     .await
                 {
-                    Ok(Ok(rows)) => self.admit(rows, "evidence_exact")?,
+                    Ok(Ok(mut rows)) => {
+                        if rows.len() > limit {
+                            self.degraded("evidence_channel_budget_exhausted");
+                            return Ok(()); // A prefix cannot prove that a requested source resolves uniquely.
+                        }
+                        if unique_operands {
+                            let ambiguous: Vec<_> = identifiers
+                                .iter()
+                                .filter(|id| {
+                                    rows.iter()
+                                        .filter(|row| {
+                                            row.candidate_id.as_ref() == Some(*id)
+                                                || row.source_ref.as_ref() == Some(*id)
+                                        })
+                                        .nth(1)
+                                        .is_some()
+                                })
+                                .collect();
+                            if !ambiguous.is_empty() {
+                                self.degraded("temporal_operand_ambiguous");
+                                rows.retain(|row| {
+                                    !ambiguous.iter().any(|id| {
+                                        row.candidate_id.as_ref() == Some(*id)
+                                            || row.source_ref.as_ref() == Some(*id)
+                                    })
+                                });
+                            }
+                        }
+                        self.admit(rows, "evidence_exact")?;
+                    }
                     Ok(Err(_)) => self.degraded("evidence_structured_unavailable"),
                     Err(()) => self.degraded("retrieval_deadline_exhausted"),
                 }
-                if let Some(mut preferred) = preferred_evidence_filter(self.context, &filter) {
-                    preferred.capture_completeness = Some("complete".into());
-                    self.evidence_fts(snapshot, &preferred).await?;
-                    preferred.capture_completeness = None;
-                    self.evidence_fts(snapshot, &preferred).await?;
-                }
-                self.evidence_fts(snapshot, &filter).await?;
             }
+        }
+        Ok(())
+    }
+
+    pub(super) async fn read_evidence(
+        &mut self,
+        snapshot: &SearchSnapshot,
+        identifiers: &[String],
+    ) -> Result<(), SearchError> {
+        // B: original EvidenceSurface, not object metadata relabelled as evidence.
+        let had_room = self.remaining() != 0;
+        self.read_exact_evidence(snapshot, identifiers, false)
+            .await?;
+        if had_room && let Some(filter) = self.evidence.clone() {
+            if let Some(mut preferred) = preferred_evidence_filter(self.context, &filter) {
+                preferred.capture_completeness = Some("complete".into());
+                self.evidence_fts(snapshot, &preferred).await?;
+                preferred.capture_completeness = None;
+                self.evidence_fts(snapshot, &preferred).await?;
+            }
+            self.evidence_fts(snapshot, &filter).await?;
         }
         Ok(())
     }

@@ -6,10 +6,11 @@ use std::{
 };
 
 use evertrace_domain::query::{
-    FacetParseStatus, HumanSearchPage, LifecycleBoundary, Polarity, QuantityConstraint, QueryError,
-    RetrievalCompleteness, RetrievalLayer, ScopeBoundary, SearchCandidate, SearchContext,
-    SearchResult, SourceBoundary, SuppressionSnapshot, TemporalMode, TemporalOrdering,
-    TemporalQualifier, production_retrieval_layer, requested_ordering,
+    AnswerShape, FacetParseStatus, HumanSearchPage, LifecycleBoundary, Polarity,
+    QuantityConstraint, QueryError, RetrievalCompleteness, RetrievalLayer, ScopeBoundary,
+    SearchCandidate, SearchContext, SearchResult, SourceBoundary, SuppressionSnapshot,
+    TemporalMode, TemporalOrdering, TemporalQualifier, production_retrieval_layer,
+    requested_ordering,
 };
 use evertrace_domain::{error::ErrorCode, evidence::SourceRevision};
 use evertrace_store::{SearchHardFilter, SearchIndex, SearchProjectionRow, StoreError};
@@ -787,6 +788,10 @@ impl ProductionSearch {
             return self.search(context).await.map(ungrounded);
         }
         let atom_relation = !context.query_facets.relation_requirements.is_empty();
+        let source_order = (context.query_facets.answer_shape
+            == Some(AnswerShape::TemporalComparison))
+        .then(|| requested_ordering(&context.query_facets.temporal_qualifiers))
+        .flatten();
         let discover = async {
             let snapshot = self
                 .index
@@ -809,9 +814,12 @@ impl ProductionSearch {
             identifiers.dedup();
             let mut offered = Vec::new();
             let mut incomplete = false;
-            for (channel, filter) in std::iter::once(atoms).chain(evidence).enumerate() {
+            let channels = std::iter::once((0, atoms))
+                .filter(|_| source_order.is_none())
+                .chain(evidence.map(|filter| (1, filter)));
+            for (channel, filter) in channels {
                 let exact = snapshot.structured(&identifiers, &filter, limit).await?;
-                let fts = if atom_relation {
+                let fts = if atom_relation || source_order.is_some() {
                     Vec::new() // An explicit relation operand isn't a lexical query.
                 } else {
                     snapshot
@@ -877,6 +885,7 @@ impl ProductionSearch {
             atom_revisions: BTreeSet::new(),
             evidence_sources: BTreeSet::new(),
         };
+        let mut temporal_sources = BTreeMap::new();
         let mut restricted = false;
         let checks_remaining = SEARCH_ACCESS_WINDOW.saturating_sub(offered.len());
         let exhausted = offered.len() > SEARCH_ACCESS_WINDOW;
@@ -887,11 +896,16 @@ impl ProductionSearch {
                     revision,
                     &mut grants.atom_revisions,
                 ),
-                OfferedRead::Evidence(source) => (
-                    access.check_evidence(&source).await,
-                    source,
-                    &mut grants.evidence_sources,
-                ),
+                OfferedRead::Evidence(source) => {
+                    let verified = if source_order.is_some() {
+                        access.checked_source_receipt(&source).await.map(|receipt| {
+                            temporal_sources.insert(source.clone(), receipt);
+                        })
+                    } else {
+                        access.check_evidence(&source).await
+                    };
+                    (verified, source, &mut grants.evidence_sources)
+                }
             };
             match verified {
                 Ok(()) => {
@@ -916,8 +930,29 @@ impl ProductionSearch {
             .as_micros()
             .try_into()
             .unwrap_or(u64::MAX);
-        let relation_context = atom_relation.then(|| context.clone());
-        let mut result = self.search(context).await?;
+        if source_order.is_some() && frontiers.0 != frontiers.1 {
+            return Ok(ungrounded(deadline_result(
+                context,
+                "search_projection_stale",
+                frontiers.0,
+                frontiers.1,
+            )));
+        }
+        let view_context = (atom_relation || source_order.is_some()).then(|| context.clone());
+        let mut result = if source_order.is_some() {
+            SearchResult {
+                layer: RetrievalLayer::B,
+                candidates: Vec::new(),
+                projection_frontier: frontiers.0,
+                authoritative_frontier: frontiers.1,
+                completeness: RetrievalCompleteness::Complete,
+                omitted_refs: BTreeSet::new(),
+                degraded_reasons: BTreeSet::new(),
+                budget: context.budget,
+            }
+        } else {
+            self.search(context).await?
+        };
         if self
             .candidate_grants
             .as_ref()
@@ -934,6 +969,10 @@ impl ProductionSearch {
             (restricted, "source_read_restricted"),
             (exhausted, "search_access_window_exhausted"),
             (unavailable, "search_access_unavailable"),
+            (
+                source_order == Some(TemporalOrdering::SourceSequence),
+                "source_sequence_coverage_unverified",
+            ),
         ] {
             if present {
                 result.degraded_reasons.insert(reason.into());
@@ -942,14 +981,38 @@ impl ProductionSearch {
                 }
             }
         }
-        if let Some(context) = relation_context {
-            let read = ScopedRelationRead {
+        if let Some(context) = view_context {
+            let read = atom_relation.then_some(ScopedRelationRead {
                 index: &self.index,
                 access,
                 checks_remaining,
+            });
+            let position = |reference: &str| {
+                temporal_sources
+                    .get(reference)
+                    .cloned()
+                    .map(|receipt| TemporalPosition::Source {
+                        receipt,
+                        coverage_complete: false,
+                        previous_revision: None,
+                        revision_order: None,
+                    })
             };
+            let time = source_order.map(|_| TemporalReadScope {
+                revision_bridge: None,
+                frontier: frontiers.1,
+                read: &position,
+                readable_refs: None, // The exact evidence filter uses these same-frontier access grants.
+                source_domain: true,
+            });
             if let Some(page) = self
-                .finish_mcp_view(&context, result.clone(), access.deadline, Some(read))
+                .finish_mcp_view(
+                    &context,
+                    result.clone(),
+                    access.deadline,
+                    read,
+                    time.as_ref(),
+                )
                 .await
             {
                 return Ok(page);
@@ -976,7 +1039,7 @@ impl ProductionSearch {
         result.omitted_refs.clear();
         result.budget.hops_remaining = 0;
         result.budget.follow_ups_remaining = 0;
-        self.finish_mcp_view(context, result, expires, None)
+        self.finish_mcp_view(context, result, expires, None, None)
             .await?
             .grounded_view
     }
@@ -987,6 +1050,7 @@ impl ProductionSearch {
         result: SearchResult,
         expires: Instant,
         access: Option<ScopedRelationRead<'_>>,
+        time_scope: Option<&TemporalReadScope<'_>>,
     ) -> Option<HumanSearchPage> {
         if result.projection_frontier != result.authoritative_frontier
             || result.completeness == RetrievalCompleteness::Unknown
@@ -1013,20 +1077,25 @@ impl ProductionSearch {
         {
             return None;
         }
-        let page = super::retrieval::NativeRetrieval {
+        let mut retrieval = super::retrieval::NativeRetrieval {
             context,
             result,
-            objects: self.hard_filter(context, true, None),
-            evidence: None,
+            objects: self.hard_filter(context, true, time_scope),
+            evidence: time_scope
+                .and_then(|scope| self.evidence_filter(context, false, Some(scope))),
             deadline: &deadline,
             semantics: None,
             sequence_scope: None,
-            time_scope: None,
+            time_scope,
             relation_sources: None,
+        };
+        if time_scope.is_some() {
+            retrieval
+                .read_exact_evidence(&snapshot, &context.query_facets.target_anchors, true)
+                .await
+                .ok()?;
         }
-        .finish(snapshot, access)
-        .await
-        .ok()?;
+        let page = retrieval.finish(snapshot, access).await.ok()?;
         page.validate().then_some(page)
     }
 

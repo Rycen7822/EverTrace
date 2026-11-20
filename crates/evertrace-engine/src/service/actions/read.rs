@@ -148,6 +148,8 @@ impl McpActionService {
         }
         let relation = crate::search::explicit_atom_relation(&query, &scope.target_anchors);
         let atom_relation = relation.is_some();
+        let source_order = crate::search::explicit_source_order(&query, &scope.target_anchors);
+        let explicit_view = atom_relation || source_order.is_some();
         let mut context = SearchContext {
             query_anchor: scope.anchor.search_anchor(),
             intent: SearchIntent::StageAssistance,
@@ -159,7 +161,7 @@ impl McpActionService {
                 .execution_context(scope.context.frontier, &scope.context.scope),
             query_facets: QueryFacetSet {
                 statement_role: evertrace_domain::query::StatementRole::Unknown,
-                parse_status: if atom_relation {
+                parse_status: if explicit_view {
                     FacetParseStatus::Complete
                 } else {
                     FacetParseStatus::Unknown
@@ -174,12 +176,18 @@ impl McpActionService {
                 polarity: Polarity::Positive,
                 explicit_exclusions: Vec::new(),
                 temporal_mode: TemporalMode::Current,
-                temporal_qualifiers: Vec::new(),
+                temporal_qualifiers: source_order
+                    .map(|domain| evertrace_domain::query::TemporalQualifier::OrderBy { domain })
+                    .into_iter()
+                    .collect(),
                 quantity_constraints: vec![QuantityConstraint::ResultLimit { limit: 3 }],
                 scope_boundary: None,
                 source_boundary: None,
-                answer_shape: atom_relation
-                    .then_some(evertrace_domain::query::AnswerShape::SourceSnippet),
+                answer_shape: if source_order.is_some() {
+                    Some(evertrace_domain::query::AnswerShape::TemporalComparison)
+                } else {
+                    atom_relation.then_some(evertrace_domain::query::AnswerShape::SourceSnippet)
+                },
                 lifecycle_boundary: LifecycleBoundary::Active,
             },
             task_id: scope.anchor.task_id,
@@ -565,7 +573,7 @@ impl McpActionService {
         let mut view = None;
         if targets_resolved
             && found.authoritative_frontier == review_frontier
-            && (atom_relation || overflowed)
+            && (explicit_view || overflowed)
         {
             let reviewed = review
                 .items
@@ -576,24 +584,27 @@ impl McpActionService {
                 })
                 .filter_map(|item| item.object_revision_ref.as_deref())
                 .collect::<BTreeSet<_>>();
-            if atom_relation {
-                if let Some(mut relation) = page.grounded_view
-                    && !relation.candidate_set.candidate_refs.is_empty()
-                    && relation
+            if explicit_view {
+                if let Some(mut grounded) = page.grounded_view
+                    && !grounded.candidate_set.candidate_refs.is_empty()
+                    && grounded
                         .candidate_set
                         .candidate_refs
                         .iter()
                         .all(|id| reviewed.contains(id.as_str()))
                 {
-                    if !relation.unresolved_gaps.is_empty() {
-                        found
-                            .degraded_reasons
-                            .insert("search_relation_unresolved".into());
+                    if !grounded.unresolved_gaps.is_empty() {
+                        let reason = if atom_relation {
+                            "search_relation_unresolved"
+                        } else {
+                            "search_temporal_comparison_unresolved"
+                        };
+                        found.degraded_reasons.insert(reason.into());
                     }
-                    relation
+                    grounded
                         .omitted_refs
                         .retain(|id| !blocked_candidates.contains(id));
-                    view = Some(Box::new(relation));
+                    view = Some(Box::new(grounded));
                 }
             } else {
                 view = ProductionSearch::new(self.search_index.clone())
@@ -602,7 +613,7 @@ impl McpActionService {
                     .map(Box::new);
             }
         }
-        if atom_relation && view.is_none() {
+        if explicit_view && view.is_none() {
             found
                 .degraded_reasons
                 .insert("grounded_view_unavailable".into());
@@ -797,6 +808,8 @@ impl McpActionService {
             || [
                 "search_target_unresolved",
                 "search_relation_unresolved",
+                "search_temporal_comparison_unresolved",
+                "source_sequence_coverage_unverified",
                 "grounded_view_unavailable",
                 "search_access_unavailable",
             ]

@@ -8,7 +8,7 @@ use evertrace_domain::{
         ExactFieldsQuery, ExactReadQuery, ExactRecordQuery, ExactRecordRef, MetadataReadOutcome,
     },
 };
-use evertrace_store::ObjectRow;
+use evertrace_store::{JournalPayload, ObjectRow, projections::StoredFieldsContext};
 
 use crate::{WriterHandle, repository::RepositoryReadAuthority};
 
@@ -61,6 +61,47 @@ pub(crate) async fn check_source_access(
     Ok(())
 }
 
+pub(crate) fn source_receipt<'a>(
+    reference: &str,
+    find_row: impl Fn(&str) -> Option<&'a ObjectRow>,
+) -> Option<Box<evertrace_domain::evidence::SourceReceipt>> {
+    // Resolve stable public source/span identities, not an indexed timestamp.
+    let observation_id = reference
+        .parse::<evertrace_domain::ids::SourceObservationId>()
+        .ok()
+        .or_else(|| {
+            evertrace_domain::evidence::EvidenceSurface::parse_candidate_ref(reference)
+                .map(|value| value.0)
+        })?;
+    let reference = observation_id.to_string();
+    let key = format!("object:evidence:source_observation:{reference}");
+    let row = find_row(&key)?;
+    let JournalPayload::SourceObservationRecorded(observation) =
+        serde_json::from_str(row.payload_json.as_deref()?).ok()?
+    else {
+        return None;
+    };
+    let key = format!(
+        "object:evidence:source_receipt:{}",
+        observation.source_receipt_ref
+    );
+    let row = find_row(&key)?;
+    let JournalPayload::SourceReceiptRecorded(receipt) =
+        serde_json::from_str(row.payload_json.as_deref()?).ok()?
+    else {
+        return None;
+    };
+    if receipt.source_observation_id.to_string() != reference
+        || receipt.source_receipt_id != observation.source_receipt_ref
+        || receipt.source_instance_id != observation.source_instance_id
+        || receipt.source_revision != observation.source_revision
+        || receipt.validate().is_err()
+    {
+        return None;
+    }
+    Some(receipt)
+}
+
 /// Use the existing bounded exact-read dependencies for scoped search candidates.
 /// A bare index scope is not proof that the source of its text remains readable.
 pub(crate) struct SearchReadAccess<'a> {
@@ -81,19 +122,41 @@ impl SearchReadAccess<'_> {
             "atom_revision",
         )
         .await
+        .map(drop)
     }
 
     /// A lagging index may offer an immutable revision; only its current alias can grant Search access.
     pub(crate) async fn check_current(&self, atom: &str, revision: &str) -> Result<(), ErrorCode> {
-        self.check_record(atom, revision, "atom_revision").await
+        self.check_record(atom, revision, "atom_revision")
+            .await
+            .map(drop)
     }
 
     pub(crate) async fn check_evidence(&self, source: &str) -> Result<(), ErrorCode> {
         self.check_record(source, source, "source_observation")
             .await
+            .map(drop)
     }
 
-    async fn check_record(&self, key: &str, revision: &str, kind: &str) -> Result<(), ErrorCode> {
+    pub(super) async fn checked_source_receipt(
+        &self,
+        source: &str,
+    ) -> Result<Box<evertrace_domain::evidence::SourceReceipt>, ErrorCode> {
+        let context = self
+            .check_record(source, source, "source_observation")
+            .await?;
+        source_receipt(source, |key| {
+            context.rows.iter().find(|row| row.row_id == key)
+        })
+        .ok_or(ErrorCode::StoreCorrupt)
+    }
+
+    async fn check_record(
+        &self,
+        key: &str,
+        revision: &str,
+        kind: &str,
+    ) -> Result<Box<StoredFieldsContext>, ErrorCode> {
         let query = ExactReadQuery::Record(ExactRecordQuery {
             reference: ExactRecordRef {
                 stable_key: key.to_owned(),
@@ -112,7 +175,7 @@ impl SearchReadAccess<'_> {
         query: ExactReadQuery,
         revision: &str,
         kind: &str,
-    ) -> Result<(), ErrorCode> {
+    ) -> Result<Box<StoredFieldsContext>, ErrorCode> {
         let read = async {
             let (cancelled, _cancel_on_drop) =
                 evertrace_store::StoreReadHandle::cancellation_scope();
@@ -158,7 +221,7 @@ impl SearchReadAccess<'_> {
             if state != (self.frontier, context.state.data_identity) {
                 return Err(ErrorCode::StoreCorrupt);
             }
-            Ok(())
+            Ok(context)
         };
         tokio::time::timeout_at(tokio::time::Instant::from_std(self.deadline), read)
             .await

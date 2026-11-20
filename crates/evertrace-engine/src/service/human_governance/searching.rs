@@ -53,45 +53,12 @@ fn source_receipt(
     index: &std::collections::BTreeMap<&str, Vec<&ObjectRow>>,
     reference: &str,
 ) -> Option<Box<evertrace_domain::evidence::SourceReceipt>> {
-    // Resolve stable public source/span identities, not an indexed timestamp.
-    let observation_id = reference
-        .parse::<evertrace_domain::ids::SourceObservationId>()
-        .ok()
-        .or_else(|| {
-            evertrace_domain::evidence::EvidenceSurface::parse_candidate_ref(reference)
-                .map(|value| value.0)
-        })?;
-    let reference = observation_id.to_string();
-    let key = format!("object:evidence:source_observation:{reference}");
-    let [row] = index.get(key.as_str())?.as_slice() else {
-        return None;
-    };
-    let JournalPayload::SourceObservationRecorded(observation) =
-        serde_json::from_str(row.payload_json.as_deref()?).ok()?
-    else {
-        return None;
-    };
-    let key = format!(
-        "object:evidence:source_receipt:{}",
-        observation.source_receipt_ref
-    );
-    let [row] = index.get(key.as_str())?.as_slice() else {
-        return None;
-    };
-    let JournalPayload::SourceReceiptRecorded(receipt) =
-        serde_json::from_str(row.payload_json.as_deref()?).ok()?
-    else {
-        return None;
-    };
-    if receipt.source_observation_id.to_string() != reference
-        || receipt.source_receipt_id != observation.source_receipt_ref
-        || receipt.source_instance_id != observation.source_instance_id
-        || receipt.source_revision != observation.source_revision
-        || receipt.validate().is_err()
-    {
-        return None;
-    }
-    Some(receipt)
+    crate::search::read_context::source_receipt(reference, |key| {
+        let [row] = index.get(key)?.as_slice() else {
+            return None;
+        };
+        Some(*row)
+    })
 }
 fn source_predecessor(
     index: &std::collections::BTreeMap<&str, Vec<&ObjectRow>>,
