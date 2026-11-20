@@ -245,6 +245,9 @@ enum WriterRequest {
         indexes: bool,
         reply: oneshot::Sender<Result<ProjectionSnapshot, WriterActorError>>,
     },
+    CurrentObjectsForRead {
+        reply: oneshot::Sender<Result<Option<ProjectionSnapshot>, WriterActorError>>,
+    },
     ProjectCurrent {
         indexes: bool,
         reply:
@@ -1232,6 +1235,17 @@ impl WriterHandle {
                 indexes: false,
                 reply,
             })
+            .await
+            .map_err(|_| WriterActorError::Stopped)?;
+        response.await.map_err(|_| WriterActorError::Stopped)?
+    }
+
+    pub(crate) async fn current_objects_for_read(
+        &self,
+    ) -> Result<Option<ProjectionSnapshot>, WriterActorError> {
+        let (reply, response) = oneshot::channel();
+        self.sender
+            .send(WriterRequest::CurrentObjectsForRead { reply })
             .await
             .map_err(|_| WriterActorError::Stopped)?;
         response.await.map_err(|_| WriterActorError::Stopped)?
@@ -2324,6 +2338,13 @@ async fn run_writer(
                     if fatal {
                         return Err(WriterActorError::Store);
                     }
+                }
+                WriterRequest::CurrentObjectsForRead { reply } => {
+                    if reply.is_closed() {
+                        continue;
+                    }
+                    let writer = writer.as_ref().ok_or(WriterActorError::Stopped)?;
+                    let _ = reply.send(writer.current_objects_for_read().map_err(map_store_error));
                 }
                 WriterRequest::ProjectCurrent { indexes, reply } => {
                     if reply.is_closed() {

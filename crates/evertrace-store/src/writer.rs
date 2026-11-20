@@ -1596,6 +1596,28 @@ impl JournalWriter {
         }
     }
 
+    /// Read the already-validated current objects, without advancing a lagging projection.
+    pub fn current_objects_for_read(&self) -> Result<Option<ProjectionSnapshot>, StoreError> {
+        self.validate_projection_directories(false)?;
+        let live = self.physical_stamp()?;
+        let source_prefix_proven = self
+            .projection_validation
+            .lock()
+            .map_err(|_| StoreError::StoreCorrupt)?[0]
+            .as_ref()
+            .filter(|stamp| stamp.frontier == live.frontier && stamp.objects_bound(&live))
+            .map(|stamp| stamp.source_prefix_proven);
+        let Some(source_prefix_proven) = source_prefix_proven else {
+            return Ok(None);
+        };
+        let snapshot = self.load_validated_objects(live.frontier, source_prefix_proven)?;
+        self.validate_projection_directories(false)?;
+        if self.physical_stamp()? != live {
+            return Err(StoreError::StoreCorrupt);
+        }
+        Ok(Some(snapshot))
+    }
+
     /// Synchronize objects without returning their rows to the caller.
     pub async fn sync_objects_frontier(&self) -> Result<u64, StoreError> {
         Ok(self
@@ -2701,6 +2723,27 @@ impl JournalWriter {
         Ok(())
     }
 
+    fn load_validated_objects(
+        &self,
+        frontier: u64,
+        source_prefix_proven: bool,
+    ) -> Result<ProjectionSnapshot, StoreError> {
+        let rows = {
+            let state = self.lock_sqlite()?;
+            if source_prefix_proven {
+                state.object_rows_without_source_facts()?
+            } else {
+                state.object_rows()?
+            }
+        };
+        if source_prefix_proven {
+            self.admission_state
+                .snapshot_with_source_prefix(rows, frontier)
+        } else {
+            Ok(ProjectionSnapshot { frontier, rows })
+        }
+    }
+
     async fn project_validated(
         &self,
         indexes: bool,
@@ -2759,23 +2802,10 @@ impl JournalWriter {
                 let projection = if output_kind == ProjectionReturn::None {
                     None
                 } else if output_kind == ProjectionReturn::Snapshot {
-                    let rows = {
-                        let state = self.lock_sqlite()?;
-                        if stamp.source_prefix_proven {
-                            state.object_rows_without_source_facts()?
-                        } else {
-                            state.object_rows()?
-                        }
-                    };
-                    Some(ProjectionOutput::Snapshot(if stamp.source_prefix_proven {
-                        self.admission_state
-                            .snapshot_with_source_prefix(rows, stamp.frontier)?
-                    } else {
-                        ProjectionSnapshot {
-                            frontier: stamp.frontier,
-                            rows,
-                        }
-                    }))
+                    Some(ProjectionOutput::Snapshot(self.load_validated_objects(
+                        stamp.frontier,
+                        stamp.source_prefix_proven,
+                    )?))
                 } else {
                     let rows = {
                         let state = self.lock_sqlite()?;

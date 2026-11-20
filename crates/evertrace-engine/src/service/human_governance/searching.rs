@@ -682,9 +682,52 @@ impl HumanGovernanceService {
         let future = async {
             let snapshot = self
                 .writer
-                .project_objects()
+                .current_objects_for_read()
                 .await
                 .map_err(|_| HumanGovernanceError::Store)?;
+            let search = evertrace_store::SearchIndex::open_with_read_handle(
+                runtime
+                    .data_dir()
+                    .map_err(|_| HumanGovernanceError::Store)?,
+                self.writer.read_handle(),
+            )
+            .await
+            .map_err(|_| HumanGovernanceError::Store)?;
+            let budget = || RetrievalBudget {
+                candidates_remaining: 32,
+                tokens_remaining: 16_384,
+                latency_us_remaining: u64::try_from(
+                    deadline
+                        .saturating_duration_since(std::time::Instant::now())
+                        .as_micros(),
+                )
+                .unwrap_or(u64::MAX),
+                hops_remaining: 2,
+                follow_ups_remaining: 1,
+            };
+            let Some(snapshot) = snapshot else {
+                let pinned = search
+                    .snapshot()
+                    .await
+                    .map_err(|_| HumanGovernanceError::Store)?;
+                let mut degraded_reasons = BTreeSet::from(["current_objects_unavailable".into()]);
+                if pinned.frontier() != pinned.authoritative_frontier() {
+                    degraded_reasons.insert("search_projection_stale".into());
+                }
+                return Ok(HumanSearchPage {
+                    result: SearchResult {
+                        layer: RetrievalLayer::A,
+                        projection_frontier: pinned.frontier(),
+                        authoritative_frontier: pinned.authoritative_frontier(),
+                        candidates: Vec::new(),
+                        completeness: RetrievalCompleteness::Unknown,
+                        degraded_reasons,
+                        omitted_refs: BTreeSet::new(),
+                        budget: budget(),
+                    },
+                    grounded_view: None,
+                });
+            };
             let index = export::presentation_index(&snapshot, deadline)
                 .map_err(|_| HumanGovernanceError::Store)?;
             let mut refs = BTreeSet::new();
@@ -734,13 +777,8 @@ impl HumanGovernanceService {
                 Some(ScopeBoundary::Worktree { worktree_id }) => (None, None, Some(worktree_id)),
                 None => (None, None, None),
             };
-            let latency = u64::try_from(
-                deadline
-                    .saturating_duration_since(std::time::Instant::now())
-                    .as_micros(),
-            )
-            .unwrap_or(u64::MAX);
-            if latency == 0 {
+            let budget = budget();
+            if budget.latency_us_remaining == 0 {
                 return Err(HumanGovernanceError::Store);
             }
             let context = SearchContext {
@@ -758,22 +796,8 @@ impl HumanGovernanceService {
                     generation: suppression.generation,
                     ref_hashes: suppression.suppression_ref_hashes(),
                 },
-                budget: RetrievalBudget {
-                    candidates_remaining: 32,
-                    tokens_remaining: 16_384,
-                    latency_us_remaining: latency,
-                    hops_remaining: 2,
-                    follow_ups_remaining: 1,
-                },
+                budget,
             };
-            let search = evertrace_store::SearchIndex::open_with_read_handle(
-                runtime
-                    .data_dir()
-                    .map_err(|_| HumanGovernanceError::Store)?,
-                self.writer.read_handle(),
-            )
-            .await
-            .map_err(|_| HumanGovernanceError::Store)?;
             let report = match &self.session_report {
                 Some(value) => value.read().await.clone(),
                 None => None,
