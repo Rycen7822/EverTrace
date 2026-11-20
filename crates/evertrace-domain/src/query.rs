@@ -3937,11 +3937,40 @@ impl HumanSearchPage {
                                     })
                             }
                             NamedGapKind::TemporalEvidence => {
-                                delta.row_variant == SearchCandidateVariant::EvidenceSurface
+                                Self::follow_up_bridge_valid(view, gap, delta, base)
                             }
                             _ => true,
                         }
                 })
+    }
+
+    fn follow_up_bridge_valid(
+        view: &GroundedEvidenceView,
+        gap: &NamedGap,
+        delta: &SearchCandidate,
+        base: &[SearchCandidate],
+    ) -> bool {
+        // A replacement bridge witnesses exactly the intermediate revision of a two-hop path.
+        let Some(bridge) = &delta.revision_order else {
+            return false;
+        };
+        if delta.row_variant != SearchCandidateVariant::EvidenceSurface || bridge.sequence != 1 {
+            return false;
+        }
+        view.evidence_need.target.iter().all(|reference| {
+            let mut matching = base
+                .iter()
+                .filter(|candidate| candidate.matches_reference(reference));
+            let Some(endpoint) = matching.next() else {
+                return false;
+            };
+            let rank = if *reference == gap.identifier { 2 } else { 0 };
+            matching.next().is_none()
+                && endpoint.row_variant == SearchCandidateVariant::EvidenceSurface
+                && endpoint.revision_order.as_ref().is_some_and(|position| {
+                    position.anchor == bridge.anchor && position.sequence == rank
+                })
+        })
     }
 
     fn count_derivation_valid(&self, view: &GroundedEvidenceView) -> bool {
