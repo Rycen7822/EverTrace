@@ -13,7 +13,7 @@
 {% elif content.kind == 'recovery_bundle' %}
 <h2>恢复包</h2>
 <p>捕获状态：{{ value.capture_status }} · 顺序完整性：{{ value.ordering_integrity }}</p>
-<p>来源工作树：{{ value.source_worktree_instance_id }} · 来源快照：{{ value.source_snapshot_id }}</p>
+<p>来源工作树：{{ value.source_worktree_instance_id }} · 来源快照：{{ exact_work_link('worktree_snapshot', value.source_snapshot_id) }}</p>
 <p>已捕获字节：{{ value.captured_bytes }} · 捕获时刻：{{ value.captured_at_us }}</p>
 <p>adapter manifest：{{ value.adapter_manifest_id }} · 变更清单版本：{{ value.eligible_mutation_manifest_version }}</p>
 <p>变更域：{{ value.eligible_mutation_domain }}</p>

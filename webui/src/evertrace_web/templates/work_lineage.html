@@ -3,12 +3,6 @@
 {% if entries %}<ul>{% for entry in entries %}<li class="memory-prose">{{ entry }}</li>{% endfor %}</ul>
 {% else %}<p class="muted">空列表。</p>{% endif %}
 {% endmacro %}
-{% macro snapshot_link(snapshot) %}
-{% if snapshot %}
-<button class="text-button" type="button" data-link-key="{{ snapshot }}"
-  data-object="{{ snapshot }}" data-revision="{{ snapshot }}" data-kind="worktree_snapshot">读取快照 {{ snapshot }}</button>
-{% else %}未记录{% endif %}
-{% endmacro %}
 {% if content.kind == 'work_binding' %}
 <h2>工作归属 · 所选修订</h2>
 <dl>
@@ -40,8 +34,10 @@
   <dt>事件类型</dt><dd>{{ value.kind }}</dd>
   <dt>原谱系判断</dt><dd data-lineage-assessment>{{ value.lineage_assessment }}</dd>
   <dt>来源水位</dt><dd>{{ value.source_watermark }}</dd>
-  <dt>源工作树 / 快照</dt><dd>{{ value.from_worktree_instance_id }} / {{ snapshot_link(value.from_snapshot_id) }}</dd>
-  <dt>目标工作树 / 快照</dt><dd>{{ value.to_worktree_instance_id }} / {{ snapshot_link(value.to_snapshot_id) }}</dd>
+  <dt>源工作树 / 快照</dt>
+  <dd>{{ value.from_worktree_instance_id }} / {{ exact_work_link('worktree_snapshot', value.from_snapshot_id) }}</dd>
+  <dt>目标工作树 / 快照</dt>
+  <dd>{{ value.to_worktree_instance_id }} / {{ exact_work_link('worktree_snapshot', value.to_snapshot_id) }}</dd>
   <dt>纠正原因</dt><dd class="memory-prose">{{ value.correction_reason or '无' }}</dd>
 </dl>
 {{ refs('原判断证据', value.evidence_refs) }}
@@ -58,8 +54,10 @@
   <dt>集成类型</dt><dd>{{ value.kind }}</dd>
   <dt>原集成判断</dt><dd data-lineage-assessment>{{ value.assessment }}</dd>
   <dt>是否记录冲突解决</dt><dd>{{ '是' if value.conflict_resolution_detected else '否' }}</dd>
-  <dt>源工作树 / 快照</dt><dd>{{ value.source_worktree_instance_id }} / {{ snapshot_link(value.source_snapshot_id) }}</dd>
-  <dt>目标工作树 / 快照</dt><dd>{{ value.destination_worktree_instance_id }} / {{ snapshot_link(value.destination_snapshot_id) }}</dd>
+  <dt>源工作树 / 快照</dt>
+  <dd>{{ value.source_worktree_instance_id }} / {{ exact_work_link('worktree_snapshot', value.source_snapshot_id) }}</dd>
+  <dt>目标工作树 / 快照</dt>
+  <dd>{{ value.destination_worktree_instance_id }} / {{ exact_work_link('worktree_snapshot', value.destination_snapshot_id) }}</dd>
 </dl>
 {{ refs('Commit 引用', value.commit_refs) }}
 {{ refs('Patch 等价性引用', value.patch_equivalence_refs) }}

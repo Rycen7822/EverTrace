@@ -13,6 +13,12 @@
   {% else %}<p class="muted">未记录。</p>{% endif %}
 </section>
 {% endmacro %}
+{% macro exact_work_link(kind, reference) %}
+{% if reference %}
+<button class="text-button" type="button" data-link-key="{{ reference }}"
+  data-object="{{ reference }}" data-revision="{{ reference }}" data-kind="{{ kind }}">读取 {{ reference }}</button>
+{% else %}未记录{% endif %}
+{% endmacro %}
 {% macro phase_fields(title, phase, analysis_entry=none) %}
 <section class="semantic-section">
   <h3>{{ title }}</h3>

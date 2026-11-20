@@ -4,11 +4,12 @@
 <dl>
   <dt>应用 / 所选修订</dt><dd>{{ value.recovery_application_id }} / {{ value.revision_id }}</dd>
   <dt>父修订</dt><dd>{{ value.parent_revision_id or '初始修订，无父修订' }}</dd>
-  <dt>恢复包 / 目标工作树</dt><dd>{{ value.recovery_bundle_id }} / {{ value.target_worktree_instance_id }}</dd>
+  <dt>恢复包 / 目标工作树</dt><dd>{{ exact_work_link('recovery_bundle', value.recovery_bundle_id) }} / {{ value.target_worktree_instance_id }}</dd>
   <dt>应用种类</dt><dd>{{ value.application_kind }}</dd>
   <dt>原应用状态</dt><dd data-recovery-status>{{ value.application_status }}</dd>
   <dt>原输入交付</dt><dd data-recovery-delivery>{{ value.input_delivery_kind }} / {{ value.input_delivery_state }}</dd>
-  <dt>原前 / 后快照</dt><dd>{{ value.pre_application_snapshot_id }} / {{ value.post_application_snapshot_id or '未记录' }}</dd>
+  <dt>原应用前快照</dt><dd>{{ exact_work_link('worktree_snapshot', value.pre_application_snapshot_id) }}</dd>
+  <dt>原应用后快照</dt><dd>{{ exact_work_link('worktree_snapshot', value.post_application_snapshot_id) }}</dd>
   <dt>Operation / 原修订号</dt><dd>{{ value.operation_id or '未绑定' }} / {{ value.operation_revision or '未绑定' }}</dd>
   <dt>原执行 lane / 采集凭证修订</dt><dd>{{ value.execution_lane_id or '未绑定' }} / {{ value.capture_receipt_revision_id or '未绑定' }}</dd>
   <dt>已验证 claims 版本 / 原记录时间</dt><dd>{{ value.ticket_claims_version }} / {{ value.created_at_us }}</dd>
