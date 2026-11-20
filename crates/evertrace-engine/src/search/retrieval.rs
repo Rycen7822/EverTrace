@@ -698,8 +698,9 @@ impl NativeRetrieval<'_> {
             )?;
         }
         self.check_temporal_completeness();
-        // A discovered edge only resolves an answer slot if its exact trace fits in the reply.
+        // A slot is supported only if every admitted edge of that kind fits in the reply.
         witnessed.clear();
+        let mut incomplete = BTreeSet::new();
         let mut projected = Vec::new();
         let mut answer_bytes = self
             .result
@@ -728,6 +729,7 @@ impl NativeRetrieval<'_> {
                 })
                 .map_err(|_| SearchError::Corrupt)?;
                 if answer_bytes + statement.len() > answer_limit {
+                    incomplete.insert(kind);
                     self.degraded("relation_trace_pack_budget_exhausted");
                     continue;
                 }
@@ -748,9 +750,11 @@ impl NativeRetrieval<'_> {
                     kind,
                 ));
             } else {
+                incomplete.insert(kind);
                 self.degraded("relation_endpoint_omitted_or_ambiguous");
             }
         }
+        witnessed.retain(|kind| !incomplete.contains(kind));
         let gaps = self
             .gaps(&witnessed)
             .into_iter()
