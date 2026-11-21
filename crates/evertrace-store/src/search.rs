@@ -68,6 +68,8 @@ pub struct SearchHardFilter {
     pub task_id: Option<String>,
     pub repository_id: Option<String>,
     pub worktree_id: Option<String>,
+    /// Canonically resolved global Core Atom revisions for the structured normative channel only.
+    pub inherited_global_constraints: BTreeSet<String>,
     pub source_kind: Option<String>,
     pub source_role: Option<String>,
     pub source_roles: BTreeSet<String>,
@@ -725,7 +727,7 @@ fn filter_sql_dialect(filter: &SearchHardFilter, dialect: FilterDialect) -> Opti
     if filter.current_only {
         clauses.push("currentness = 'current'".into());
     }
-    let scope = [
+    let mut scope = [
         ("task_id", filter.task_id.as_ref()),
         ("repository_id", filter.repository_id.as_ref()),
         ("worktree_id", filter.worktree_id.as_ref()),
@@ -734,6 +736,18 @@ fn filter_sql_dialect(filter: &SearchHardFilter, dialect: FilterDialect) -> Opti
     .filter_map(|(column, value)| value.map(|value| format!("{column} = {}", sql_literal(value))))
     .collect::<Vec<_>>();
     if !scope.is_empty() {
+        if !filter.inherited_global_constraints.is_empty() {
+            let refs = filter
+                .inherited_global_constraints
+                .iter()
+                .map(|id| sql_literal(id))
+                .collect::<Vec<_>>()
+                .join(", ");
+            scope.push(format!(
+                "(object_kind = 'atom_revision' AND currentness = 'current' AND task_id IS NULL \
+                 AND repository_id IS NULL AND worktree_id IS NULL AND candidate_id IN ({refs}))"
+            ));
+        }
         clauses.push(format!("({})", scope.join(" OR ")));
     }
     for (column, value) in [

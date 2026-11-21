@@ -489,6 +489,24 @@ struct MatchedSources {
 }
 
 impl HumanGovernanceService {
+    async fn inherited_repository_readable(
+        &self,
+        repository: evertrace_domain::ids::RepositoryId,
+        report: Option<&evertrace_codex::HostProbeReport>,
+        deadline: std::time::Instant,
+    ) -> Result<bool, HumanGovernanceError> {
+        let authority = crate::repository::RepositoryReadAuthority::observed(report);
+        let (blocked, _) = crate::repository::repository_read_assessment(
+            &self.writer,
+            BTreeSet::from([repository]),
+            &authority,
+            deadline,
+        )
+        .await
+        .map_err(|_| HumanGovernanceError::Store)?;
+        Ok(blocked.is_empty() && std::time::Instant::now() < deadline)
+    }
+
     async fn source_dependency_access(
         &self,
         snapshot: &ProjectionSnapshot,
@@ -863,16 +881,34 @@ impl HumanGovernanceService {
                 Some(value) => value.read().await.clone(),
                 None => None,
             };
-            let (semantics, mut checks) = crate::search::SemanticSearchResolution::for_human_read(
-                &snapshot,
-                &refs,
-                &index,
-                &context,
-                report.as_ref(),
-                now_us()?,
-                deadline,
-            )
-            .map_err(|_| HumanGovernanceError::Store)?;
+            let (mut semantics, mut checks) =
+                crate::search::SemanticSearchResolution::for_human_read(
+                    &snapshot,
+                    &refs,
+                    &index,
+                    &context,
+                    report.as_ref(),
+                    now_us()?,
+                    deadline,
+                )
+                .map_err(|_| HumanGovernanceError::Store)?;
+            let mut inherited_repository = None;
+            if let Some(repository) = repository_id.filter(|_| {
+                !semantics.inherited_global_constraints.is_empty()
+                    && !context.query_facets.temporal_mode.has_temporal_predicate()
+            }) {
+                if self
+                    .inherited_repository_readable(repository, report.as_ref(), deadline)
+                    .await?
+                {
+                    inherited_repository = Some(repository);
+                } else {
+                    semantics.incomplete = true;
+                }
+            }
+            if inherited_repository.is_none() {
+                semantics.inherited_global_constraints.clear();
+            }
             let semantics = std::sync::Arc::new(semantics);
             let facets = &context.query_facets;
             let wiki = if query.selection == MemoryScopeSelection::All
@@ -1104,14 +1140,22 @@ impl HumanGovernanceService {
                     break;
                 }
             }
-            let current = search
-                .snapshot_after_validated_frontier(snapshot.frontier)
-                .await
-                .map_err(|_| HumanGovernanceError::Store)?;
             let current_report = match &self.session_report {
                 Some(value) => value.read().await.clone(),
                 None => None,
             };
+            if let Some(repository) = inherited_repository
+                && !self
+                    .inherited_repository_readable(repository, current_report.as_ref(), deadline)
+                    .await?
+            {
+                access_changed = true;
+            }
+            // The writer's authority read above must not wait while a search snapshot lease is held.
+            let current = search
+                .snapshot_after_validated_frontier(snapshot.frontier)
+                .await
+                .map_err(|_| HumanGovernanceError::Store)?;
             let policy = |value: Option<&evertrace_codex::HostProbeReport>| {
                 value.map(|value| {
                     (

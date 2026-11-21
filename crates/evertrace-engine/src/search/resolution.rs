@@ -26,6 +26,7 @@ use super::SearchError;
 pub(crate) struct SemanticSearchResolution {
     pub frontier: u64,
     pub states: BTreeMap<String, SemanticResolution>,
+    pub(crate) inherited_global_constraints: BTreeSet<String>,
     pub incomplete: bool,
 }
 
@@ -40,8 +41,11 @@ impl SemanticSearchResolution {
         deadline: Instant,
     ) -> Result<(Self, BTreeSet<String>), SearchError> {
         let view = SemanticCurrentView::from_snapshot(snapshot)?;
-        let (unavailable_core_revisions, mut dependencies) =
-            core_read_state(snapshot, readable, index, deadline)?;
+        let CoreReadState {
+            unavailable: unavailable_core_revisions,
+            global,
+            checks: mut dependencies,
+        } = core_read_state(snapshot, readable, index, deadline)?;
         // A human read has no managed execution binding. Unknown phase/verifier
         // fields stay absent rather than borrowing another session's state.
         let mut context = ResolverContext {
@@ -136,10 +140,20 @@ impl SemanticSearchResolution {
                     }
                 });
         }
+        let inherited_global_constraints = global
+            .into_iter()
+            .filter(|id| {
+                states.get(id)
+                    == Some(&SemanticResolution::Normative(
+                        NormativeResolutionState::Active,
+                    ))
+            })
+            .collect();
         Ok((
             Self {
                 frontier: snapshot.frontier,
                 states,
+                inherited_global_constraints,
                 incomplete,
             },
             dependencies,
@@ -157,14 +171,21 @@ impl SemanticSearchResolution {
     }
 }
 
+#[derive(Default)]
+struct CoreReadState {
+    unavailable: BTreeSet<RevisionId>,
+    global: BTreeSet<String>,
+    checks: BTreeSet<String>,
+}
+
 fn core_read_state(
     snapshot: &ProjectionSnapshot,
     readable: &BTreeSet<String>,
     index: &BTreeMap<&str, Vec<&ObjectRow>>,
     deadline: Instant,
-) -> Result<(BTreeSet<RevisionId>, BTreeSet<String>), SearchError> {
+) -> Result<CoreReadState, SearchError> {
     let mut members = BTreeMap::new();
-    let mut unavailable = BTreeSet::new();
+    let mut state = CoreReadState::default();
     for row in snapshot
         .data_rows()
         .filter(|row| row.object_kind.as_deref() == Some("core_membership"))
@@ -176,11 +197,10 @@ fn core_read_state(
             return Err(SearchError::Corrupt);
         };
         if readable.contains(&member.atom_revision_id.to_string()) {
-            unavailable.insert(member.atom_revision_id);
+            state.unavailable.insert(member.atom_revision_id);
             members.insert(member.membership_revision_id, member);
         }
     }
-    let mut checks = BTreeSet::new();
     for row in snapshot
         .data_rows()
         .filter(|row| row.object_kind.as_deref() == Some("l3_core_projection"))
@@ -235,12 +255,15 @@ fn core_read_state(
                 required.extend([authorization, source.to_string()]);
             }
             if required.iter().all(|id| readable.contains(id)) {
-                unavailable.remove(&member.atom_revision_id);
-                checks.extend(required);
+                state.unavailable.remove(&member.atom_revision_id);
+                state.checks.extend(required);
+                if member.scope_identity == evertrace_domain::semantic::CoreScopeIdentity::Global {
+                    state.global.insert(member.atom_revision_id.to_string());
+                }
             }
         }
     }
-    Ok((unavailable, checks))
+    Ok(state)
 }
 
 fn decode(row: &ObjectRow) -> Result<JournalPayload, SearchError> {

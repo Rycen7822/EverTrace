@@ -636,6 +636,7 @@ impl ProductionSearch {
             task_id: context.task_id.map(|id| id.to_string()),
             repository_id: context.repository_id.map(|id| id.to_string()),
             worktree_id: context.worktree_id.map(|id| id.to_string()),
+            inherited_global_constraints: BTreeSet::new(),
             source_kind: None,
             source_role,
             source_roles: BTreeSet::new(),
@@ -1411,8 +1412,11 @@ impl ProductionSearch {
             }
             let references = semantics.active_references();
             if !references.is_empty() {
+                let mut normative = filter.clone();
+                normative.inherited_global_constraints =
+                    semantics.inherited_global_constraints.clone();
                 match deadline
-                    .run(snapshot.structured(&references, &filter, 33))
+                    .run(snapshot.structured(&references, &normative, 33))
                     .await
                 {
                     Ok(Ok(mut rows)) => {
@@ -1573,7 +1577,19 @@ impl ProductionSearch {
         rows.dedup_by(|left, right| left.row_id == right.row_id);
         let mut ranked = Vec::with_capacity(rows.len());
         for row in &rows {
-            if row.candidate_id.is_none() || !hard_compatible(row, &context, time_scope)? {
+            let inherited = row.object_kind.as_deref() == Some("atom_revision")
+                && row.currentness.as_deref() == Some("current")
+                && row.task_id.is_none()
+                && row.repository_id.is_none()
+                && row.worktree_id.is_none()
+                && row.candidate_id.as_ref().is_some_and(|id| {
+                    self.semantics.as_ref().is_some_and(|semantics| {
+                        semantics.inherited_global_constraints.contains(id)
+                    })
+                });
+            if row.candidate_id.is_none()
+                || !hard_compatible_with_inheritance(row, &context, time_scope, inherited)?
+            {
                 continue;
             }
             let exact = row.candidate_id.as_deref() == Some(context.protected_query.as_str())
@@ -1936,6 +1952,15 @@ pub(super) fn hard_compatible(
     context: &SearchContext,
     time_scope: Option<&TemporalReadScope<'_>>,
 ) -> Result<bool, QueryError> {
+    hard_compatible_with_inheritance(row, context, time_scope, false)
+}
+
+fn hard_compatible_with_inheritance(
+    row: &SearchProjectionRow,
+    context: &SearchContext,
+    time_scope: Option<&TemporalReadScope<'_>>,
+    inherited_global_constraint: bool,
+) -> Result<bool, QueryError> {
     if let Some(hash) = row.suppression_ref_hash.as_deref()
         && context.suppression.suppresses(hash)?
     {
@@ -1953,7 +1978,7 @@ pub(super) fn hard_compatible(
         || context
             .worktree_id
             .is_some_and(|id| row.worktree_id.as_deref() == Some(id.to_string().as_str()));
-    if has_route && !route_matches
+    if !inherited_global_constraint && has_route && !route_matches
         || !source_compatible(row, context.query_facets.source_boundary)
         || row.row_variant == "object"
             && context.intent != evertrace_domain::query::SearchIntent::HistoryLookup
@@ -1968,20 +1993,21 @@ pub(super) fn hard_compatible(
                 LifecycleBoundary::Terminal => row.lifecycle.as_deref() != Some("terminal"),
                 LifecycleBoundary::Any => false,
             }
-        || context
-            .query_facets
-            .scope_boundary
-            .is_some_and(|boundary| match boundary {
-                ScopeBoundary::Task { task_id } => {
-                    row.task_id.as_deref() != Some(task_id.to_string().as_str())
-                }
-                ScopeBoundary::Repository { repository_id } => {
-                    row.repository_id.as_deref() != Some(repository_id.to_string().as_str())
-                }
-                ScopeBoundary::Worktree { worktree_id } => {
-                    row.worktree_id.as_deref() != Some(worktree_id.to_string().as_str())
-                }
-            })
+        || !inherited_global_constraint
+            && context
+                .query_facets
+                .scope_boundary
+                .is_some_and(|boundary| match boundary {
+                    ScopeBoundary::Task { task_id } => {
+                        row.task_id.as_deref() != Some(task_id.to_string().as_str())
+                    }
+                    ScopeBoundary::Repository { repository_id } => {
+                        row.repository_id.as_deref() != Some(repository_id.to_string().as_str())
+                    }
+                    ScopeBoundary::Worktree { worktree_id } => {
+                        row.worktree_id.as_deref() != Some(worktree_id.to_string().as_str())
+                    }
+                })
         || context
             .query_facets
             .explicit_exclusions
