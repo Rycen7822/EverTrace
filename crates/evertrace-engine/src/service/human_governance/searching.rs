@@ -1,4 +1,5 @@
 use super::*;
+use crate::repository::RepositoryReadAuthority;
 use evertrace_domain::{
     query::*,
     semantic::{NormativeResolutionState, SemanticResolution},
@@ -237,6 +238,50 @@ fn source_receipt(
         Some(*row)
     })
 }
+// Only an explicitly selected and readable source can explain absent searchable text.
+fn unavailable_exact_source_text(
+    query: &HumanSearchQuery,
+    protected_query: &str,
+    readable: &BTreeSet<String>,
+    index: &std::collections::BTreeMap<&str, Vec<&ObjectRow>>,
+) -> Option<String> {
+    if query.facets.answer_shape != Some(AnswerShape::SourceSnippet) {
+        return None;
+    }
+    let reference = protected_query.trim();
+    reference
+        .parse::<evertrace_domain::ids::SourceObservationId>()
+        .ok()?;
+    if !readable.contains(reference) {
+        return None;
+    }
+    let receipt = source_receipt(index, reference)?;
+    let in_scope = match query.selection {
+        MemoryScopeSelection::All => true,
+        MemoryScopeSelection::Global => {
+            receipt.task_id.is_none()
+                && receipt.repository_instance_id.is_none()
+                && receipt.worktree_instance_id.is_none()
+        }
+        MemoryScopeSelection::Task { task_id } => receipt.task_id == Some(task_id),
+        MemoryScopeSelection::Repository { repository_id } => {
+            receipt.repository_instance_id == Some(repository_id)
+        }
+        MemoryScopeSelection::Worktree { worktree_id } => {
+            receipt.worktree_instance_id == Some(worktree_id)
+        }
+        MemoryScopeSelection::Unassigned => false,
+    };
+    use evertrace_domain::evidence::ProtectedPresentation;
+    (in_scope
+        && (receipt.unsupported_record_classification.is_some()
+            || matches!(
+                receipt.protected_presentation,
+                Some(ProtectedPresentation::Unavailable { .. })
+            )))
+    .then(|| reference.to_owned())
+}
+
 fn source_predecessor(
     index: &std::collections::BTreeMap<&str, Vec<&ObjectRow>>,
     receipt: &evertrace_domain::evidence::SourceReceipt,
@@ -666,13 +711,12 @@ struct MatchedSources {
 }
 
 impl HumanGovernanceService {
-    async fn inherited_repository_readable(
+    async fn search_repository_readable(
         &self,
         repository: evertrace_domain::ids::RepositoryId,
-        report: Option<&evertrace_codex::HostProbeReport>,
+        authority: RepositoryReadAuthority<'_>,
         deadline: std::time::Instant,
     ) -> Result<bool, HumanGovernanceError> {
-        let authority = crate::repository::RepositoryReadAuthority::observed(report);
         let (blocked, _) = crate::repository::repository_read_assessment(
             &self.writer,
             BTreeSet::from([repository]),
@@ -1021,7 +1065,11 @@ impl HumanGovernanceService {
             }
             if let Some(repository) = cursor.inherited_repository
                 && !self
-                    .inherited_repository_readable(repository, report.as_ref(), deadline)
+                    .search_repository_readable(
+                        repository,
+                        RepositoryReadAuthority::observed(report.as_ref()),
+                        deadline,
+                    )
                     .await?
             {
                 return conflict();
@@ -1200,6 +1248,35 @@ impl HumanGovernanceService {
                     hit_page: None,
                 });
             };
+            let report = self.search_report().await;
+            let selected_repository = match query.selection {
+                MemoryScopeSelection::Repository { repository_id } => Some(repository_id),
+                _ => None,
+            };
+            if let Some(repository) = selected_repository
+                && !self
+                    .search_repository_readable(
+                        repository,
+                        RepositoryReadAuthority::retained(report.as_ref()),
+                        deadline,
+                    )
+                    .await?
+            {
+                // Report inaccessible selection, not whether any hidden candidate matches the query.
+                let pinned = search
+                    .snapshot_after_validated_frontier(snapshot.frontier)
+                    .await
+                    .map_err(|_| HumanGovernanceError::Store)?;
+                let mut page =
+                    cursor_unavailable(pinned.authoritative_frontier(), "source_read_restricted");
+                page.result.projection_frontier = pinned.frontier();
+                if pinned.frontier() != pinned.authoritative_frontier() {
+                    page.result
+                        .degraded_reasons
+                        .insert("search_projection_stale".into());
+                }
+                return Ok(page);
+            }
             let index = export::presentation_index(&snapshot, deadline)
                 .map_err(|_| HumanGovernanceError::Store)?;
             let mut refs = BTreeSet::new();
@@ -1254,6 +1331,8 @@ impl HumanGovernanceService {
             if budget.latency_us_remaining == 0 {
                 return Err(HumanGovernanceError::Store);
             }
+            let exact_text_gap =
+                unavailable_exact_source_text(&query, &protected.text, &refs, &index);
             let context = SearchContext {
                 query_anchor: QueryAnchor::unavailable(),
                 execution: None,
@@ -1271,7 +1350,6 @@ impl HumanGovernanceService {
                 },
                 budget,
             };
-            let report = self.search_report().await;
             let (mut semantics, mut checks) =
                 crate::search::SemanticSearchResolution::for_human_read(
                     &snapshot,
@@ -1283,19 +1361,15 @@ impl HumanGovernanceService {
                     deadline,
                 )
                 .map_err(|_| HumanGovernanceError::Store)?;
-            let mut inherited_repository = None;
-            if let Some(repository) = repository_id.filter(|_| {
+            let mut inherited_repository = repository_id.filter(|_| {
                 !semantics.inherited_global_constraints.is_empty()
                     && !context.query_facets.temporal_mode.has_temporal_predicate()
-            }) {
-                if self
-                    .inherited_repository_readable(repository, report.as_ref(), deadline)
-                    .await?
-                {
-                    inherited_repository = Some(repository);
-                } else {
-                    semantics.incomplete = true;
-                }
+            });
+            // The selection was already checked. Only an observed authority may
+            // additionally supply inherited normative context.
+            if inherited_repository.is_some() && report.is_none() {
+                semantics.incomplete = true;
+                inherited_repository = None;
             }
             if inherited_repository.is_none() {
                 semantics.inherited_global_constraints.clear();
@@ -1495,6 +1569,12 @@ impl HumanGovernanceService {
                     .omitted_refs
                     .extend(matched.omitted.iter().cloned());
             }
+            // The empty-result explanation is neither a hit nor a paging operand.
+            let exact_text_gap = exact_text_gap.filter(|_| {
+                page.result.candidates.is_empty()
+                    && page.hit_window.as_ref().is_none_or(Vec::is_empty)
+            });
+            checks.extend(exact_text_gap.iter().cloned());
             // Trust/report state can change without a new journal event. Recheck
             // returned and interpretation dependencies before exposing fields.
             let mut recheck = |id: &str| {
@@ -1532,9 +1612,13 @@ impl HumanGovernanceService {
                 .search_checks_readable(&snapshot, &index, &checks, deadline)
                 .await;
             let current_report = self.search_report().await;
-            if let Some(repository) = inherited_repository
+            if let Some(repository) = selected_repository
                 && !self
-                    .inherited_repository_readable(repository, current_report.as_ref(), deadline)
+                    .search_repository_readable(
+                        repository,
+                        RepositoryReadAuthority::retained(current_report.as_ref()),
+                        deadline,
+                    )
                     .await?
             {
                 access_changed = true;
@@ -1564,11 +1648,11 @@ impl HumanGovernanceService {
                     "search_cursor_conflict",
                 ));
             }
-            if access_changed
+            let boundary_changed = access_changed
                 || policy != search_policy(report.as_ref())
                 || current.frontier() != snapshot.frontier
-                || current.authoritative_frontier() != snapshot.frontier
-            {
+                || current.authoritative_frontier() != snapshot.frontier;
+            if boundary_changed {
                 page.result.candidates.clear();
                 page.result.omitted_refs.clear();
                 page.result.completeness = RetrievalCompleteness::Unknown;
@@ -1583,10 +1667,20 @@ impl HumanGovernanceService {
                     .degraded_reasons
                     .insert("recall_source_context_unavailable".into());
             }
-            if unavailable || recall_incomplete || matched.unknown || !matched.omitted.is_empty() {
+            let projection_gap =
+                unavailable || recall_incomplete || matched.unknown || !matched.omitted.is_empty();
+            if projection_gap {
                 page.result
                     .degraded_reasons
                     .insert("some_projection_access_unavailable".into());
+            }
+            let text_gap = !boundary_changed && exact_text_gap.is_some();
+            if text_gap {
+                page.result
+                    .degraded_reasons
+                    .insert("search_source_text_unavailable".into());
+            }
+            if projection_gap || text_gap {
                 if page.result.completeness == RetrievalCompleteness::Complete {
                     page.result.completeness = RetrievalCompleteness::Partial;
                 }
