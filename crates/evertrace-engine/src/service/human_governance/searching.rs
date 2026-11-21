@@ -7,10 +7,10 @@ use evertrace_domain::{
 
 use crate::search::read_context::{
     RelationArchiveBudget, check_relation_archive, current_operation_binding,
-    operation_binding_sources,
+    operation_binding_read,
 };
 
-const SEARCH_HIT_ORDER_REVISION: u32 = 11;
+const SEARCH_HIT_ORDER_REVISION: u32 = 12;
 
 type SearchPolicy = Option<(String, Option<evertrace_codex::policy::PolicyEvidence>)>;
 
@@ -1081,14 +1081,13 @@ impl HumanGovernanceService {
                     return false;
                 }
                 if row.object_kind.as_deref() == Some("work_binding") {
-                    let (Some(sources), Some(runtime)) = (
-                        operation_binding_sources(row, index),
-                        &self.runtime_snapshot,
-                    ) else {
+                    let (Some(proof), Some(runtime)) =
+                        (operation_binding_read(row, index), &self.runtime_snapshot)
+                    else {
                         return false;
                     };
                     if !check_relation_archive(
-                        &sources,
+                        &proof.sources,
                         &self.writer,
                         &runtime.cas_dir,
                         index,
@@ -1504,37 +1503,50 @@ impl HumanGovernanceService {
                 relation_archive_gap = true;
             }
             let mut binding_source = None;
-            if query.selection == MemoryScopeSelection::All
-                && let Some(row) = current_operation_binding(
-                    &search,
-                    &index,
-                    &protected.facets,
-                    snapshot.frontier,
-                    deadline,
-                )
-                .await
+            let mut physical_operands = Vec::new();
+            if !matches!(
+                query.selection,
+                MemoryScopeSelection::Global | MemoryScopeSelection::Unassigned
+            ) && let Some(row) = current_operation_binding(
+                &search,
+                &index,
+                &protected.facets,
+                snapshot.frontier,
+                deadline,
+            )
+            .await
                 && self
                     .readable_search_row(&snapshot, row, &index, deadline)
                     .await
                     .is_ok()
-                && let Some(sources) = operation_binding_sources(row, &index)
+                && let Some(proof) = operation_binding_read(row, &index)
             {
-                if check_relation_archive(
-                    &sources,
-                    &self.writer,
-                    &runtime.cas_dir,
-                    &index,
-                    &mut relation_archive_budget,
-                    deadline,
-                )
-                .await
+                let mut source = evertrace_store::query::canonical_work_binding_source(row)
+                    .map_err(|_| HumanGovernanceError::Store)?;
+                if let Some(operands) = proof.scoped_operands(query.selection, &mut source)
+                    && operands.iter().all(|operand| {
+                        operand
+                            .candidate_id
+                            .as_ref()
+                            .is_some_and(|id| refs.contains(id))
+                    })
                 {
-                    let source = evertrace_store::query::canonical_work_binding_source(row)
-                        .map_err(|_| HumanGovernanceError::Store)?;
-                    refs.extend(source.candidate_id.iter().cloned());
-                    binding_source = Some(source);
-                } else {
-                    relation_archive_gap = true;
+                    if check_relation_archive(
+                        &proof.sources,
+                        &self.writer,
+                        &runtime.cas_dir,
+                        &index,
+                        &mut relation_archive_budget,
+                        deadline,
+                    )
+                    .await
+                    {
+                        refs.extend(source.candidate_id.iter().cloned());
+                        binding_source = Some(source);
+                        physical_operands = operands;
+                    } else {
+                        relation_archive_gap = true;
+                    }
                 }
             }
             let suppression = ObjectDeletionCurrentView::from_snapshot(&snapshot)
@@ -1645,7 +1657,7 @@ impl HumanGovernanceService {
             }
             source_references.extend(recall_sources.iter().cloned());
             source_references.extend(matched.references.iter().chain(&matched.contexts).cloned());
-            let canonical_sources = canonical_episode_sources(
+            let mut canonical_sources = canonical_episode_sources(
                 snapshot.frontier,
                 &index,
                 &refs,
@@ -1653,6 +1665,7 @@ impl HumanGovernanceService {
                 deadline,
                 false,
             )?;
+            canonical_sources.extend(physical_operands);
             let relation_sources = |targets: &[String], readable: &BTreeSet<String>| {
                 let mut sources = canonical_episode_sources(
                     snapshot.frontier,

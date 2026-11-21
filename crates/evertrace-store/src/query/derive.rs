@@ -169,6 +169,19 @@ pub fn canonical_work_binding_source(
     Ok(source)
 }
 
+/// Use the same bounded text and revision ID as the indexed physical object.
+pub fn canonical_physical_source(
+    row: &crate::ObjectRow,
+) -> Result<SearchProjectionRow, StoreError> {
+    if !matches!(
+        row.object_kind.as_deref(),
+        Some("operation" | "scope_effect")
+    ) {
+        return Err(StoreError::InvalidInput);
+    }
+    exact_identifier_row(row, row.source_event_seq, true)?.ok_or(StoreError::StoreCorrupt)
+}
+
 /// Structured canonical Work sources are request-local, never an open-Episode FTS row.
 pub fn canonical_work_episode_source(
     row: &crate::ObjectRow,

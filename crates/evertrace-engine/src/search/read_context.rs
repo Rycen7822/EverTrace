@@ -519,10 +519,59 @@ pub(crate) async fn current_operation_binding<'a>(
     Some(*row)
 }
 
-pub(crate) fn operation_binding_sources(
+pub(crate) struct OperationBindingRead<'a> {
+    operation: &'a ObjectRow,
+    effects: Vec<(&'a ObjectRow, evertrace_domain::evidence::ScopeEffect)>,
+    covers_operation: bool,
+    pub sources: BTreeSet<String>,
+}
+
+impl OperationBindingRead<'_> {
+    /// Exact-only operands for a single physical shard. Indexed rows and durable coordinates stay unchanged.
+    pub(crate) fn scoped_operands(
+        &self,
+        selection: evertrace_domain::query::MemoryScopeSelection,
+        binding: &mut evertrace_store::SearchProjectionRow,
+    ) -> Option<Vec<evertrace_store::SearchProjectionRow>> {
+        use evertrace_domain::query::MemoryScopeSelection as Scope;
+        if selection == Scope::All {
+            return Some(Vec::new());
+        }
+        if !self.covers_operation {
+            return None;
+        }
+        let (_, first) = self.effects.first()?;
+        let (repo, tree) = (first.repository_instance_id, first.worktree_instance_id);
+        if self.effects.iter().any(|(_, effect)| {
+            effect.repository_instance_id != repo || effect.worktree_instance_id != tree
+        }) {
+            return None;
+        }
+        match selection {
+            Scope::Repository { repository_id } if repo == Some(repository_id) => {}
+            Scope::Worktree { worktree_id } if repo.is_some() && tree == Some(worktree_id) => {}
+            Scope::Task { task_id }
+                if binding.task_id.as_deref() == Some(task_id.to_string().as_str()) => {}
+            _ => return None,
+        }
+        binding.repository_id = repo.map(|id| id.to_string());
+        binding.worktree_id = tree.map(|id| id.to_string());
+        let mut rows = Vec::new();
+        for row in std::iter::once(self.operation).chain(self.effects.iter().map(|(row, _)| *row)) {
+            let mut source = evertrace_store::query::canonical_physical_source(row).ok()?;
+            source.task_id.clone_from(&binding.task_id);
+            source.repository_id.clone_from(&binding.repository_id);
+            source.worktree_id.clone_from(&binding.worktree_id);
+            rows.push(source);
+        }
+        Some(rows)
+    }
+}
+
+pub(crate) fn operation_binding_read<'a>(
     row: &ObjectRow,
-    index: &BTreeMap<&str, Vec<&ObjectRow>>,
-) -> Option<BTreeSet<String>> {
+    index: &BTreeMap<&str, Vec<&'a ObjectRow>>,
+) -> Option<OperationBindingRead<'a>> {
     use evertrace_domain::{
         evidence::PairingState, ids::SourceObservationId, work::AssignmentStatus,
     };
@@ -537,13 +586,13 @@ pub(crate) fn operation_binding_sources(
         return None;
     }
     let operation_ref = binding.operation_id.to_string();
-    let operation = index
+    let operation_row = *index
         .get(operation_ref.as_str())?
         .iter()
         .filter(|row| row.object_kind.as_deref() == Some("operation"))
         .max_by_key(|row| row.source_event_seq)?;
     let JournalPayload::OperationDerived(operation) =
-        serde_json::from_str(operation.payload_json.as_deref()?).ok()?
+        serde_json::from_str(operation_row.payload_json.as_deref()?).ok()?
     else {
         return None;
     };
@@ -560,6 +609,7 @@ pub(crate) fn operation_binding_sources(
             .chain(&operation.result_source_observation_refs)
             .map(ToString::to_string),
     );
+    let mut effects = Vec::new();
     for id in &binding.scope_effect_refs {
         let reference = id.to_string();
         let [row] = index.get(reference.as_str())?.as_slice() else {
@@ -576,12 +626,24 @@ pub(crate) fn operation_binding_sources(
         {
             return None;
         }
-        sources.extend(effect.evidence_refs.into_iter().map(|id| id.to_string()));
+        sources.extend(effect.evidence_refs.iter().map(ToString::to_string));
+        effects.push((*row, *effect));
     }
-    sources
-        .iter()
-        .all(|reference| reference.parse::<SourceObservationId>().is_ok())
-        .then_some(sources)
+    (row.task_id.as_deref()
+        == binding
+            .primary_binding
+            .task_id
+            .map(|id| id.to_string())
+            .as_deref()
+        && sources
+            .iter()
+            .all(|reference| reference.parse::<SourceObservationId>().is_ok()))
+    .then_some(OperationBindingRead {
+        operation: operation_row,
+        effects,
+        covers_operation: operation.scope_effect_ids.len() == binding.scope_effect_refs.len(),
+        sources,
+    })
 }
 
 /// Assess only the canonical source and repository closure; observation recording belongs to callers.

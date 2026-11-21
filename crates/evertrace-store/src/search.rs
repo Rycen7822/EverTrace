@@ -922,7 +922,7 @@ impl SearchProjectionRow {
         if self.row_variant != "object"
             || !matches!(
                 self.object_kind.as_deref(),
-                Some("work_episode" | "work_binding")
+                Some("work_episode" | "work_binding" | "operation" | "scope_effect")
             )
         {
             return Err(StoreError::StoreCorrupt);
