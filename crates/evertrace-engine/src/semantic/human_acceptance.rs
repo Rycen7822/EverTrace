@@ -11,8 +11,8 @@ use evertrace_domain::{
     config::GlobalPromotionConfig,
     evidence::{
         CaptureCompleteness, ContentTrust, CorrelationAdmission, EvidenceSourceKind,
-        HostCorrelationEvidence, IdentityStrength, ObservationRole, SourceArchiveMode,
-        SourceRevisionMode, SourceRole, hex, payload_fingerprint,
+        HostCorrelationEvidence, IdentityStrength, ObservationRole, SourceRevisionMode, SourceRole,
+        hex, payload_fingerprint,
     },
     ids::{CommandId, CoreMembershipId, RequestId, RevisionProposalId},
     procedure::{ProcedurePublicationState, ProcedureScope},
@@ -22,7 +22,8 @@ use evertrace_domain::{
         AcceptedProposalTarget, AtomProposalPayload, AtomScope, CoreMembershipProposalPayload,
         ProposalAcceptanceAuthority, ProposalCreatedBy, ProposalEligibility, ProposalOperation,
         ProposalPayload, ProposalStatus, ProposalTargetId, RevisionProposal,
-        SupportThresholdSnapshot, TUI_ACCEPTANCE_EVENT_MANIFEST_REF, tui_acceptance_event_payload,
+        SupportThresholdSnapshot, TUI_ACCEPTANCE_EVENT_MANIFEST_REF,
+        tui_acceptance_capture_matches, tui_acceptance_event_payload,
     },
 };
 use evertrace_store::{
@@ -294,7 +295,8 @@ impl HumanAcceptanceService {
                 .await
                 .map_err(|_| HumanGovernanceError::Store)?
             {
-                let accepted = verify_acceptance_cohort(&committed.payloads, &verified, reviewed)?;
+                let accepted =
+                    verify_acceptance_payload_cohort(&committed.payloads, &verified, reviewed)?;
                 if view.proposals.get(&proposal_id) != Some(&accepted) {
                     return Err(HumanGovernanceError::Store);
                 }
@@ -1065,14 +1067,7 @@ impl HumanAcceptanceService {
             .map_err(|_| HumanGovernanceError::Store)?;
         let verified =
             verify_capture_frame(frame, &cas).map_err(|_| HumanGovernanceError::Store)?;
-        if verified.body.eligible_event_manifest_ref != TUI_ACCEPTANCE_EVENT_MANIFEST_REF
-            || verified.body.source_role != SourceRole::User
-            || verified.body.content_trust != ContentTrust::UserStatement
-            || verified.body.capture_completeness != CaptureCompleteness::Complete
-            || verified.body.observation_role != ObservationRole::Message
-        {
-            return Err(HumanGovernanceError::InvalidInput);
-        }
+        validate_acceptance_capture_payload(&verified, proposal, &payload, "tui-accept")?;
         let context = acceptance_context(proposal, view, &verified)?;
         let occurred_at_us = now_us()?;
         let command_context = ProposalCommandContext {
@@ -1210,7 +1205,7 @@ impl HumanAcceptanceService {
             .await
             .map_err(|_| HumanGovernanceError::Store)?
             .ok_or(HumanGovernanceError::Store)?;
-        let accepted = verify_acceptance_cohort(&committed.payloads, &verified, proposal)?;
+        let accepted = verify_acceptance_payload_cohort(&committed.payloads, &verified, proposal)?;
         let fresh = self
             .writer
             .project()
@@ -2269,15 +2264,6 @@ fn validate_current_edit_cohort(
     }
 }
 
-fn verify_acceptance_cohort(
-    payloads: &[JournalPayload],
-    verified: &crate::capture::VerifiedCapture,
-    reviewed: &RevisionProposal,
-) -> Result<RevisionProposal, HumanGovernanceError> {
-    validate_acceptance_capture(verified, reviewed)?;
-    verify_acceptance_payload_cohort(payloads, verified, reviewed)
-}
-
 fn verify_acceptance_payload_cohort(
     payloads: &[JournalPayload],
     verified: &crate::capture::VerifiedCapture,
@@ -2415,39 +2401,13 @@ fn validate_acceptance_capture_payload(
     canonical: &str,
     record_prefix: &str,
 ) -> Result<(), HumanGovernanceError> {
-    let expected_record = format!(
-        "{record_prefix}-{}-{}",
-        source.proposal_id, source.proposal_revision_id
-    );
-    let expected_instance = format!("tui-acceptance:{}", source.proposal_id);
-    let expected_fingerprint = hex(&payload_fingerprint(1, canonical.as_bytes(), None)
-        .map_err(|_| HumanGovernanceError::Store)?);
-    if verified.body.source_instance_id.as_str() != expected_instance
-        || verified.body.source_revision.as_str() != source.proposal_revision_id.to_string()
-        || verified.body.source_record_identity.as_str() != expected_record
-        || verified.body.source_ref != source.proposal_id.to_string()
-        || verified.body.source_session_ref != "human-governance"
-        || verified.body.source_sequence != 1
-        || verified.body.source_sequence_origin != Some(1)
-        || verified.body.identity_strength != IdentityStrength::StableNative
-        || verified.body.source_kind != EvidenceSourceKind::Other
-        || verified.body.identity_domain != TUI_ACCEPTANCE_EVENT_MANIFEST_REF
-        || verified.body.adapter_revision != 1
-        || verified.body.adapter_manifest_ref != TUI_ACCEPTANCE_EVENT_MANIFEST_REF
-        || verified.body.eligible_event_manifest_ref != TUI_ACCEPTANCE_EVENT_MANIFEST_REF
-        || verified.body.parser_revision != 1
-        || verified.body.canonicalization_revision != 1
-        || verified.body.source_role != SourceRole::User
-        || verified.body.content_trust != ContentTrust::UserStatement
-        || verified.body.capture_completeness != CaptureCompleteness::Complete
-        || verified.body.observation_role != ObservationRole::Message
-        || verified.body.archive_mode != SourceArchiveMode::Exact
-        || verified.body.protected_secret_digest.is_some()
-        || !verified.body.redaction_spans.is_empty()
-        || verified.body.protected_length != canonical.len() as u64
-        || verified.body.original_length != canonical.len() as u64
-        || verified.observation.payload_fingerprint != expected_fingerprint
-    {
+    if !tui_acceptance_capture_matches(
+        source,
+        canonical,
+        record_prefix,
+        &verified.receipt,
+        &verified.observation,
+    ) {
         return Err(HumanGovernanceError::Store);
     }
     Ok(())

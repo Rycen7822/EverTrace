@@ -2,7 +2,10 @@ use serde::{Deserialize, Serialize};
 
 use crate::{
     canonical::{CanonicalValue, sha256},
-    evidence::hex,
+    evidence::{
+        CaptureCompleteness, ContentTrust, EvidenceSourceKind, IdentityStrength, ObservationRole,
+        SourceArchiveMode, SourceObservation, SourceReceipt, SourceRole, hex, payload_fingerprint,
+    },
     ids::{AtomId, CoreMembershipId, ProcedureId, RevisionProposalId},
     procedure::{ProcedureAutoFullAudit, ProcedureDraft},
     revision::RevisionId,
@@ -26,6 +29,47 @@ pub fn tui_acceptance_event_payload(
         "{TUI_ACCEPTANCE_EVENT_MANIFEST_REF}|accept|{proposal_id}|{reviewed_proposal_revision_id}|{}",
         hex(reviewed_fingerprint)
     )
+}
+
+/// Match the historical human-review capture envelope without re-encoding or granting authority.
+pub fn tui_acceptance_capture_matches(
+    source: &RevisionProposal,
+    canonical: &str,
+    record_prefix: &str,
+    receipt: &SourceReceipt,
+    observation: &SourceObservation,
+) -> bool {
+    receipt.eligible_event_manifest_ref == TUI_ACCEPTANCE_EVENT_MANIFEST_REF
+        && receipt.identity_domain == TUI_ACCEPTANCE_EVENT_MANIFEST_REF
+        && receipt.adapter_manifest_ref == TUI_ACCEPTANCE_EVENT_MANIFEST_REF
+        && receipt.source_instance_id.as_str() == format!("tui-acceptance:{}", source.proposal_id)
+        && receipt.source_revision.as_str() == source.proposal_revision_id.to_string()
+        && receipt.source_record_identity.as_str()
+            == format!(
+                "{record_prefix}-{}-{}",
+                source.proposal_id, source.proposal_revision_id
+            )
+        && receipt.source_ref == source.proposal_id.to_string()
+        && receipt.source_session_ref == "human-governance"
+        && receipt.source_sequence == 1
+        && receipt.source_sequence_origin == Some(1)
+        && receipt.identity_strength == IdentityStrength::StableNative
+        && receipt.source_kind == EvidenceSourceKind::Other
+        && receipt.adapter_revision == 1
+        && receipt.parser_revision == 1
+        && receipt.canonicalization_revision == 1
+        && receipt.capture_completeness == CaptureCompleteness::Complete
+        && observation.capture_completeness == CaptureCompleteness::Complete
+        && observation.source_role == SourceRole::User
+        && observation.content_trust == ContentTrust::UserStatement
+        && observation.observation_role == ObservationRole::Message
+        && receipt.archive_mode == SourceArchiveMode::Exact
+        && receipt.protected_secret_digest.is_none()
+        && receipt.redaction_spans.is_empty()
+        && receipt.protected_length == canonical.len() as u64
+        && receipt.original_length == canonical.len() as u64
+        && payload_fingerprint(1, canonical.as_bytes(), None)
+            .is_ok_and(|expected| observation.payload_fingerprint == hex(&expected))
 }
 
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]

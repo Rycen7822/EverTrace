@@ -2,9 +2,8 @@ use std::collections::{BTreeMap, BTreeSet};
 
 use evertrace_domain::{
     evidence::{
-        CaptureCompleteness, ContentTrust, EvidenceSourceKind, IdentityStrength, ObservationRole,
-        SourceArchiveMode, SourceObservation, SourceReceipt, SourceRevisionMode, SourceRole, hex,
-        payload_fingerprint,
+        CaptureCompleteness, ContentTrust, ObservationRole, SourceObservation, SourceReceipt,
+        SourceRevisionMode, SourceRole, hex, payload_fingerprint,
     },
     ids::{
         AtomId, RepositoryId, ResultEvidenceId, RevisionProposalId, SemanticDigestId,
@@ -20,7 +19,8 @@ use evertrace_domain::{
         ProcedureProposalPayload, ProposalAcceptanceAuthority, ProposalCreatedBy,
         ProposalEligibility, ProposalOperation, ProposalPayload, ProposalStatus, ProposalTargetId,
         ProposalTargetKind, RevisionProposal, TUI_ACCEPTANCE_EVENT_MANIFEST_REF,
-        UserAuthorizationMode, VerifierStatus, tui_acceptance_event_payload,
+        UserAuthorizationMode, VerifierStatus, tui_acceptance_capture_matches,
+        tui_acceptance_event_payload,
     },
     work::{ArtifactPayloadStatus, Task, WorkArtifact},
 };
@@ -865,49 +865,15 @@ fn validate_accepted_edit_boundary(
         .validate_edit_candidate(reviewed)
         .map_err(|_| error)?;
     let edit_canonical = original.edit_intent_toml(reviewed).map_err(|_| error)?;
-    let edit_fingerprint = hex(&payload_fingerprint(
-        observation.1.canonicalization_revision,
-        edit_canonical.as_bytes(),
-        None,
-    )
-    .map_err(|_| error)?);
-    if observation.1.payload_fingerprint != edit_fingerprint {
-        return Err(error);
-    }
-    let canonical = edit_canonical;
-    let expected_fingerprint = edit_fingerprint;
-    let expected_record = format!(
-        "tui-accept-{}-{}",
-        original.proposal_id, original.proposal_revision_id
-    );
-    let expected_instance = format!("tui-acceptance:{}", original.proposal_id);
-    if receipt.1.source_instance_id.as_str() != expected_instance
-        || receipt.1.source_revision.as_str() != original.proposal_revision_id.to_string()
-        || receipt.1.source_record_identity.as_str() != expected_record
-        || receipt.1.source_session_ref != "human-governance"
-        || receipt.1.source_sequence != 1
-        || receipt.1.source_sequence_origin != Some(1)
-        || receipt.1.identity_strength != IdentityStrength::StableNative
-        || receipt.1.source_kind != EvidenceSourceKind::Other
-        || receipt.1.identity_domain != TUI_ACCEPTANCE_EVENT_MANIFEST_REF
-        || receipt.1.source_revision_mode != SourceRevisionMode::Append
+    if receipt.1.source_revision_mode != SourceRevisionMode::Append
         || receipt.1.previous_source_revision.is_some()
-        || receipt.1.adapter_revision != 1
-        || receipt.1.adapter_manifest_ref != TUI_ACCEPTANCE_EVENT_MANIFEST_REF
-        || receipt.1.eligible_event_manifest_ref != TUI_ACCEPTANCE_EVENT_MANIFEST_REF
-        || receipt.1.parser_revision != 1
-        || receipt.1.canonicalization_revision != 1
-        || receipt.1.capture_completeness != CaptureCompleteness::Complete
-        || receipt.1.archive_mode != SourceArchiveMode::Exact
-        || receipt.1.protected_secret_digest.is_some()
-        || !receipt.1.redaction_spans.is_empty()
-        || receipt.1.protected_length != canonical.len() as u64
-        || receipt.1.original_length != canonical.len() as u64
-        || observation.1.source_role != SourceRole::User
-        || observation.1.content_trust != ContentTrust::UserStatement
-        || observation.1.capture_completeness != CaptureCompleteness::Complete
-        || observation.1.observation_role != ObservationRole::Message
-        || observation.1.payload_fingerprint != expected_fingerprint
+        || !tui_acceptance_capture_matches(
+            original,
+            &edit_canonical,
+            "tui-accept",
+            receipt.1,
+            observation.1,
+        )
     {
         return Err(error);
     }

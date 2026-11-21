@@ -34,7 +34,7 @@ pub use proposal::{
     ProcedureProposalPayload, ProposalAcceptance, ProposalAcceptanceAuthority, ProposalCreatedBy,
     ProposalEligibility, ProposalOperation, ProposalPayload, ProposalStatus, ProposalTargetId,
     ProposalTargetKind, ProposalWaitingOn, RevisionProposal, TUI_ACCEPTANCE_EVENT_MANIFEST_REF,
-    tui_acceptance_event_payload,
+    tui_acceptance_capture_matches, tui_acceptance_event_payload,
 };
 pub use scenario_core::{
     ActiveScenarioLineage, CoreMembership, CoreScopeIdentity, GlobalSuccessorSupportContract,
