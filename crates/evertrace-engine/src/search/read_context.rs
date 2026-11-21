@@ -450,7 +450,7 @@ pub(crate) async fn current_operation_binding<'a>(
     frontier: u64,
     deadline: Instant,
 ) -> Option<&'a ObjectRow> {
-    use evertrace_domain::{ids::OperationId, query::TemporalMode, work::AssignmentStatus};
+    use evertrace_domain::{ids::OperationId, query::TemporalMode};
     if facets.temporal_mode != TemporalMode::Current
         || !facets.temporal_qualifiers.is_empty()
         || !facets
@@ -464,6 +464,15 @@ pub(crate) async fn current_operation_binding<'a>(
         return None;
     };
     let operation_id = operation.parse::<OperationId>().ok()?;
+    let refs = operation_binding_references(search, operation, frontier).await?;
+    select_operation_binding(operation_id, &refs, index, frontier, deadline)
+}
+
+pub(crate) async fn operation_binding_references(
+    search: &evertrace_store::SearchIndex,
+    operation: &str,
+    frontier: u64,
+) -> Option<Vec<String>> {
     let neighbours = {
         let snapshot = search
             .snapshot_after_validated_frontier(frontier)
@@ -474,7 +483,7 @@ pub(crate) async fn current_operation_binding<'a>(
         }
         snapshot
             .adjacent_relations(
-                std::slice::from_ref(operation),
+                &[operation.to_owned()],
                 &["operation_to_binding_revision".into()],
                 65,
             )
@@ -484,18 +493,35 @@ pub(crate) async fn current_operation_binding<'a>(
     if neighbours.len() > 64 {
         return None;
     }
+    neighbours
+        .into_iter()
+        .map(|edge| {
+            (edge.source_id.as_deref() == Some(operation))
+                .then_some(edge.target_id)
+                .flatten()
+        })
+        .collect()
+}
+
+pub(crate) fn select_operation_binding<'a>(
+    operation_id: evertrace_domain::ids::OperationId,
+    references: &[String],
+    index: &BTreeMap<&str, Vec<&'a ObjectRow>>,
+    frontier: u64,
+    deadline: Instant,
+) -> Option<&'a ObjectRow> {
+    use evertrace_domain::work::AssignmentStatus;
     let mut rows = Vec::new();
     let mut bytes = evertrace_store::projections::READ_DEPENDENCY_BYTES;
-    for edge in neighbours {
-        if Instant::now() >= deadline || edge.source_id.as_ref() != Some(operation) {
+    for reference in references {
+        if Instant::now() >= deadline {
             return None;
         }
-        let reference = edge.target_id?;
         let [row] = index.get(reference.as_str())?.as_slice() else {
             return None;
         };
         if row.object_kind.as_deref() != Some("work_binding")
-            || row.object_id.as_ref() != Some(&reference)
+            || row.object_id.as_ref() != Some(reference)
         {
             return None;
         }
@@ -517,6 +543,26 @@ pub(crate) async fn current_operation_binding<'a>(
         return None;
     };
     Some(*row)
+}
+
+pub(crate) fn physical_read_index(rows: &[ObjectRow]) -> BTreeMap<&str, Vec<&ObjectRow>> {
+    let mut index = BTreeMap::<&str, Vec<&ObjectRow>>::new();
+    for row in rows {
+        for key in [
+            Some(row.row_id.as_str()),
+            row.object_id.as_deref(),
+            row.current_revision_id.as_deref(),
+        ]
+        .into_iter()
+        .flatten()
+        {
+            let entries = index.entry(key).or_default();
+            if entries.last().is_none_or(|last| last.row_id != row.row_id) {
+                entries.push(row);
+            }
+        }
+    }
+    index
 }
 
 pub(crate) struct OperationBindingRead<'a> {
@@ -913,7 +959,7 @@ impl SearchReadAccess<'_> {
         .ok_or(ErrorCode::StoreCorrupt)
     }
 
-    async fn check_record(
+    pub(crate) async fn check_record(
         &self,
         key: &str,
         revision: &str,

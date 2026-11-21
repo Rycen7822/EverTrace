@@ -1,6 +1,6 @@
 use std::{collections::BTreeMap, future::Future, pin::Pin};
 
-use crate::search::read_context::SearchReadAccess;
+use crate::search::read_context::{RelationArchiveBudget, SearchReadAccess};
 
 use super::*;
 
@@ -148,6 +148,15 @@ impl McpActionService {
         }
         let relation = crate::search::explicit_atom_relation(&query, &scope.target_anchors);
         let atom_relation = relation.is_some();
+        let physical = crate::search::explicit_operation_binding(&query, &scope.target_anchors);
+        let mut relation_requirements: Vec<String> =
+            relation.map(|(_, kind)| kind.into()).into_iter().collect();
+        if physical.is_some() {
+            relation_requirements.extend([
+                "operation_to_scope_effect".into(),
+                "binding_to_scope_effect".into(),
+            ]);
+        }
         let source_shape = crate::search::explicit_source_shape(&query, &scope.target_anchors);
         let count_unit = crate::search::explicit_count_unit(&query, &scope.target_anchors);
         let exact_shape = source_shape.is_some() || count_unit.is_some();
@@ -158,7 +167,7 @@ impl McpActionService {
             crate::search::explicit_exact_slots(&query, &scope.target_anchors)
         };
         let explicit_exact = exact_slots.is_some();
-        let explicit_view = atom_relation || exact_shape || explicit_exact;
+        let explicit_view = atom_relation || physical.is_some() || exact_shape || explicit_exact;
         // A typed Episode target asks for stored work evidence, not stage guidance. Do not infer that intent from prose.
         let episode = (!explicit_view && !entity_list)
             .then(|| match scope.target_anchors.as_slice() {
@@ -191,7 +200,11 @@ impl McpActionService {
                 .execution_context(scope.context.frontier, &scope.context.scope),
             query_facets: QueryFacetSet {
                 statement_role: evertrace_domain::query::StatementRole::Unknown,
-                parse_status: if atom_relation || exact_shape || episode_history {
+                parse_status: if atom_relation
+                    || physical.is_some()
+                    || exact_shape
+                    || episode_history
+                {
                     FacetParseStatus::Complete
                 } else {
                     FacetParseStatus::Unknown
@@ -205,7 +218,7 @@ impl McpActionService {
                 ),
                 exact_identifiers: exact_slots.unwrap_or_default(),
                 condition_literals: Vec::new(),
-                relation_requirements: relation.map(|(_, kind)| kind.into()).into_iter().collect(),
+                relation_requirements,
                 polarity: Polarity::Positive,
                 explicit_exclusions: Vec::new(),
                 temporal_mode: TemporalMode::Current,
@@ -227,7 +240,8 @@ impl McpActionService {
                 } else if entity_list {
                     Some(evertrace_domain::query::AnswerShape::EntityList)
                 } else {
-                    atom_relation.then_some(evertrace_domain::query::AnswerShape::SourceSnippet)
+                    (atom_relation || physical.is_some())
+                        .then_some(evertrace_domain::query::AnswerShape::SourceSnippet)
                 },
                 lifecycle_boundary: if episode_history {
                     LifecycleBoundary::Terminal
@@ -243,7 +257,11 @@ impl McpActionService {
                 candidates_remaining: 3,
                 tokens_remaining: 1_200,
                 latency_us_remaining: latency_us,
-                hops_remaining: if atom_relation { 2 } else { 0 },
+                hops_remaining: if atom_relation || physical.is_some() {
+                    2
+                } else {
+                    0
+                },
                 follow_ups_remaining: u8::from(explicit_exact),
             },
         };
@@ -285,7 +303,7 @@ impl McpActionService {
             .with_validated_frontier(scope.context.frontier);
         if episode_history {
             search = search.with_exact_object_kind("work_episode");
-        } else {
+        } else if physical.is_none() {
             let include_probationary = self.operation_config.as_ref().map_or_else(
                 || evertrace_domain::config::ProcedureConfig::default().include_probationary,
                 |config| config.config().procedure.include_probationary,
@@ -311,10 +329,34 @@ impl McpActionService {
                 .with_method_proposals(methods)
                 .with_procedure_revisions(procedures);
         }
-        let page = search
-            .search_with_access(context.clone(), &read_access)
-            .await
-            .map_err(|_| McpServiceError::Store)?;
+        let mut archive_budget = RelationArchiveBudget::default();
+        let page = if let Some(operation) = physical {
+            let Some(page) = self
+                .physical_binding_page(
+                    &scope,
+                    &read_access,
+                    operation,
+                    &mut archive_budget,
+                    search,
+                    context.clone(),
+                )
+                .await?
+            else {
+                return Ok(empty_result(
+                    request_id,
+                    McpServiceStatus::Partial,
+                    &label,
+                    "partial",
+                    ["search_relation_unresolved"],
+                ));
+            };
+            page
+        } else {
+            search
+                .search_with_access(context.clone(), &read_access)
+                .await
+                .map_err(|_| McpServiceError::Store)?
+        };
         let mut found = page.result;
         let selected_candidates = found.candidates.iter().take(3).collect::<Vec<_>>();
         let candidate_ids = selected_candidates
@@ -525,6 +567,19 @@ impl McpActionService {
                     blocked_candidates.insert(candidate.candidate_id.clone());
                 }
             }
+            if let Some(operation) = physical
+                && (fresh_access.frontier != read_access.frontier
+                    || Box::pin(self.physical_binding_operands(
+                        &scope,
+                        &fresh_access,
+                        operation,
+                        &mut archive_budget,
+                    ))
+                    .await
+                    .is_none())
+            {
+                blocked_candidates.extend(candidate_ids.iter().cloned());
+            }
             let method_hits = found
                 .candidates
                 .iter()
@@ -634,7 +689,12 @@ impl McpActionService {
                 .iter()
                 .filter(|item| {
                     item.partition == McpItemPartition::Evidence
-                        && matches!(item.kind.as_str(), "atom_revision" | "evidence_surface")
+                        && (matches!(item.kind.as_str(), "atom_revision" | "evidence_surface")
+                            || physical.is_some()
+                                && matches!(
+                                    item.kind.as_str(),
+                                    "operation" | "scope_effect" | "work_binding"
+                                ))
                 })
                 .filter_map(|item| item.object_revision_ref.as_deref())
                 .collect::<BTreeSet<_>>();
@@ -699,6 +759,170 @@ impl McpActionService {
         );
         result.grounded_view = view;
         Ok(result)
+    }
+
+    // Keep the explicit relation retrieval future off the common Search stack.
+    fn physical_binding_page<'a>(
+        &'a self,
+        scope: &'a NormalSearchScope,
+        access: &'a SearchReadAccess<'_>,
+        operation: evertrace_domain::ids::OperationId,
+        archive_budget: &'a mut RelationArchiveBudget,
+        search: ProductionSearch,
+        context: SearchContext,
+    ) -> Pin<
+        Box<
+            dyn Future<
+                    Output = Result<
+                        Option<evertrace_domain::query::HumanSearchPage>,
+                        McpServiceError,
+                    >,
+                > + Send
+                + 'a,
+        >,
+    > {
+        Box::pin(async move {
+            let Some((operands, binding)) = self
+                .physical_binding_operands(scope, access, operation, archive_budget)
+                .await
+            else {
+                return Ok(None);
+            };
+            let refs = operands
+                .iter()
+                .chain(std::iter::once(&binding))
+                .filter_map(|row| row.candidate_id.clone())
+                .collect();
+            let sources = |targets: &[String], readable: &BTreeSet<String>| {
+                Ok(binding
+                    .candidate_id
+                    .as_ref()
+                    .filter(|id| targets.contains(id) && readable.contains(*id))
+                    .map(|_| binding.clone())
+                    .into_iter()
+                    .collect())
+            };
+            let (page, _) = search
+                .with_readable_refs(access.frontier, refs)
+                .with_canonical_sources(access.frontier, operands)
+                .retrieve(context, false, None, &sources)
+                .await
+                .map_err(|_| McpServiceError::Store)?;
+            Ok(Some(page))
+        })
+    }
+
+    async fn physical_binding_operands(
+        &self,
+        scope: &NormalSearchScope,
+        access: &SearchReadAccess<'_>,
+        operation: evertrace_domain::ids::OperationId,
+        archive_budget: &mut RelationArchiveBudget,
+    ) -> Option<(
+        Vec<evertrace_store::SearchProjectionRow>,
+        evertrace_store::SearchProjectionRow,
+    )> {
+        use crate::search::read_context::{
+            check_relation_archive, operation_binding_read, operation_binding_references,
+            physical_read_index, select_operation_binding,
+        };
+        use evertrace_domain::query::MemoryScopeSelection as Selection;
+        let read = async {
+            let operation_key = operation.to_string();
+            let references =
+                operation_binding_references(&self.search_index, &operation_key, access.frontier)
+                    .await?;
+            if references.is_empty() || references.len() >= 64 {
+                return None;
+            }
+            let anchor = &scope.anchor;
+            let selected_scope = if let Some(worktree_id) = anchor.worktree_id {
+                Selection::Worktree { worktree_id }
+            } else if let Some(repository_id) = anchor.repository_id {
+                Selection::Repository { repository_id }
+            } else {
+                Selection::Task {
+                    task_id: anchor.task_id?,
+                }
+            };
+            let loaded = self
+                .writer
+                .normal_search_candidate_context(
+                    scope.request.clone(),
+                    evertrace_store::NormalSearchCandidateRequest {
+                        identifiers: std::iter::once(operation_key)
+                            .chain(references.iter().cloned())
+                            .collect(),
+                        task_id: anchor.task_id,
+                        repository_id: anchor.repository_id,
+                        worktree_id: anchor.worktree_id,
+                        include_procedure_route: false,
+                        include_derived_candidate_rows: false,
+                    },
+                )
+                .await
+                .ok()?;
+            if loaded.frontier != access.frontier {
+                return None;
+            }
+            let index = physical_read_index(&loaded.rows);
+            let row = select_operation_binding(
+                operation,
+                &references,
+                &index,
+                loaded.frontier,
+                access.deadline,
+            )?;
+            let mut binding = evertrace_store::query::canonical_work_binding_source(row).ok()?;
+            let reference = binding.candidate_id.as_deref()?;
+            let closure = access
+                .check_record(reference, reference, "work_binding")
+                .await
+                .ok()?;
+            let row = closure.selected.as_ref()?;
+            let index = physical_read_index(&closure.rows);
+            let proof = operation_binding_read(row, &index)?;
+            let operands = proof.scoped_operands(selected_scope, &mut binding)?;
+            if operands.len() != 2 {
+                return None;
+            }
+            if anchor
+                .task_id
+                .is_some_and(|id| binding.task_id.as_deref() != Some(id.to_string().as_str()))
+                || anchor.repository_id.is_some_and(|id| {
+                    binding.repository_id.as_deref() != Some(id.to_string().as_str())
+                })
+            {
+                return None;
+            }
+            for operand in &operands {
+                access
+                    .check_current(
+                        operand.source_ref.as_deref()?,
+                        operand.candidate_id.as_deref()?,
+                        operand.object_kind.as_deref()?,
+                    )
+                    .await
+                    .ok()?;
+            }
+            if !check_relation_archive(
+                &proof.sources,
+                &self.writer,
+                &self.runtime_snapshot.cas_dir,
+                &index,
+                archive_budget,
+                access.deadline,
+            )
+            .await
+            {
+                return None;
+            }
+            Some((operands, binding))
+        };
+        tokio::time::timeout_at(tokio::time::Instant::from_std(access.deadline), read)
+            .await
+            .ok()
+            .flatten()
     }
 
     async fn classify_search_candidates(

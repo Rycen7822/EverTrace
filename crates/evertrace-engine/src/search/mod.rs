@@ -44,6 +44,25 @@ pub(crate) fn explicit_atom_relation<'a>(
         .then_some((operand, "atom_contradicts"))
 }
 
+/// Exact phrase with one existing `refs` operand, never inferred from general prose.
+pub(crate) fn explicit_operation_binding(
+    input: &str,
+    targets: &[String],
+) -> Option<evertrace_domain::ids::OperationId> {
+    let [target] = targets else {
+        return None;
+    };
+    if !input
+        .trim()
+        .trim_end_matches('?')
+        .trim_end()
+        .eq_ignore_ascii_case("trace operation binding")
+    {
+        return None;
+    }
+    target.parse().ok()
+}
+
 fn source_target(reference: &str) -> bool {
     use evertrace_domain::{evidence::EvidenceSurface, ids::SourceObservationId};
     reference.parse::<SourceObservationId>().is_ok()

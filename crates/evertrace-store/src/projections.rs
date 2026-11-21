@@ -6206,6 +6206,58 @@ impl JournalAdmissionState {
         )
     }
 
+    fn physical_binding_reference_row(
+        &self,
+        reference: &str,
+    ) -> Result<Option<ObjectRow>, StoreError> {
+        if let Ok(id) = reference.parse::<WorkBindingRevisionId>()
+            && let Some((value, seq)) = self.work_bindings.get(&id)
+        {
+            return inbox_work_row(
+                &JournalPayload::WorkBindingRecorded(Box::new(value.clone())),
+                *seq,
+            )
+            .map(Some);
+        }
+        if let Ok(id) = reference.parse::<ScopeEffectId>()
+            && let Some((value, seq)) = self.scope_effects.get(&id)
+        {
+            return physical_object_row(
+                ObjectFamily::Work,
+                "scope_effect",
+                reference.into(),
+                reference.into(),
+                &JournalPayload::ScopeEffectDerived(Box::new(value.clone())),
+                *seq,
+            )
+            .map(Some);
+        }
+        let operation =
+            if let Some(key) = evertrace_domain::query::parse_operation_revision(reference) {
+                self.operation_revisions.get(&key)
+            } else {
+                reference
+                    .parse::<OperationId>()
+                    .ok()
+                    .and_then(|id| self.operations.get(&id))
+            };
+        let Some((value, seq)) = operation else {
+            return Ok(None);
+        };
+        let id = value.operation_id.to_string();
+        let revision = format!("{id}@{}", value.operation_revision);
+        let mut row = physical_object_row(
+            ObjectFamily::Work,
+            "operation",
+            id,
+            revision.clone(),
+            &JournalPayload::OperationDerived(Box::new(value.clone())),
+            *seq,
+        )?;
+        row.row_id = format!("object:work:operation:{revision}");
+        Ok(Some(row))
+    }
+
     fn reference_rows_unfiltered(
         &self,
         references: &BTreeSet<String>,
@@ -6221,6 +6273,13 @@ impl JournalAdmissionState {
         // alias alongside an offered revision also lets the return gate reject a stale body.
         let mut episode_revisions = BTreeSet::new();
         for reference in references {
+            if matches!(
+                reference.split_once(':').map(|(kind, _)| kind),
+                Some("op" | "se" | "wb")
+            ) {
+                rows.extend(self.physical_binding_reference_row(reference)?);
+                continue;
+            }
             let episode = reference
                 .parse::<WorkEpisodeId>()
                 .ok()
@@ -6655,21 +6714,6 @@ impl JournalAdmissionState {
             ObjectFamily::Work,
             "integration_event"
         );
-        if let Ok(id) = reference.parse::<WorkBindingRevisionId>()
-            && let Some((value, seq)) = self.work_bindings.get(&id)
-        {
-            rows.push(inbox_work_row(
-                &JournalPayload::WorkBindingRecorded(Box::new(value.clone())),
-                *seq,
-            )?);
-        }
-        exact_fact!(
-            ScopeEffectId,
-            scope_effects,
-            ScopeEffectDerived,
-            ObjectFamily::Work,
-            "scope_effect"
-        );
         let occurrence =
             if let Some(key) = evertrace_domain::query::parse_host_occurrence_revision(reference) {
                 self.host_occurrence_revisions.get(&key)
@@ -6759,29 +6803,6 @@ impl JournalAdmissionState {
                 *seq,
             )?);
         }
-        if let Some((id, revision)) = evertrace_domain::query::parse_operation_revision(reference) {
-            if let Some((value, seq)) = self.operation_revisions.get(&(id, revision)) {
-                rows.push(physical_object_row(
-                    ObjectFamily::Work,
-                    "operation",
-                    id.to_string(),
-                    reference.into(),
-                    &JournalPayload::OperationDerived(Box::new(value.clone())),
-                    *seq,
-                )?);
-            }
-        } else if let Ok(id) = reference.parse::<OperationId>()
-            && let Some((value, seq)) = self.operations.get(&id)
-        {
-            rows.push(physical_object_row(
-                ObjectFamily::Work,
-                "operation",
-                reference.into(),
-                format!("{}@{}", value.operation_id, value.operation_revision),
-                &JournalPayload::OperationDerived(Box::new(value.clone())),
-                *seq,
-            )?);
-        }
         if let Ok(id) = reference.parse::<OperationBurstId>()
             && let Some((value, seq)) = self.operation_bursts.get(&id)
         {
@@ -6795,12 +6816,9 @@ impl JournalAdmissionState {
                 rows.push(row);
             }
         }
-        // These immutable primary facts use the revision, not their public identity, as the canonical row key.
+        // Immutable HostOccurrence facts use the revision as their canonical row key.
         for row in &mut rows {
-            if matches!(
-                row.object_kind.as_deref(),
-                Some("host_occurrence" | "operation")
-            ) {
+            if row.object_kind.as_deref() == Some("host_occurrence") {
                 row.row_id = format!(
                     "object:{}:{}:{}",
                     row.object_family.ok_or(StoreError::StoreCorrupt)?.as_str(),
