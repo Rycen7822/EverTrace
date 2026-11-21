@@ -698,6 +698,7 @@ pub enum EvidenceRole {
 
 pub const TRANSITION_FROM_SNAPSHOT: &str = "worktree_transition_from_snapshot";
 pub const TRANSITION_TO_SNAPSHOT: &str = "worktree_transition_to_snapshot";
+pub const SNAPSHOT_VERIFICATION_RESULT: &str = "snapshot_to_verification_result";
 
 impl EvidenceRole {
     pub fn for_relation(kind: &str) -> Option<Self> {
@@ -723,6 +724,7 @@ impl EvidenceRole {
             | "operation_to_scope_effect"
             | TRANSITION_FROM_SNAPSHOT
             | TRANSITION_TO_SNAPSHOT
+            | SNAPSHOT_VERIFICATION_RESULT
             | "binding_to_scope_effect"
             | "binding_to_primary_task"
             | "binding_to_primary_workstream"
@@ -1621,6 +1623,12 @@ impl GroundedEvidenceView {
                             .target_ref
                             .parse::<crate::ids::WorktreeSnapshotId>()
                             .is_err()))
+                    || (kind == SNAPSHOT_VERIFICATION_RESULT
+                        && (clause
+                            .source_ref
+                            .parse::<crate::ids::WorktreeSnapshotId>()
+                            .is_err()
+                            || clause.target_ref.parse::<RevisionId>().is_err()))
                     || statement.support_refs
                         != BTreeSet::from([clause.source_ref, clause.target_ref])
                     || frontier.is_some_and(|expected| clause.frontier != expected)

@@ -678,7 +678,10 @@ impl NativeRetrieval<'_> {
             .collect();
         let persisted_kinds = kinds
             .iter()
-            .filter(|kind| !super::read_context::LINEAGE_RELATIONS.contains(&kind.as_str()))
+            .filter(|kind| {
+                !super::read_context::LINEAGE_RELATIONS.contains(&kind.as_str())
+                    && kind.as_str() != SNAPSHOT_VERIFICATION_RESULT
+            })
             .cloned()
             .collect::<Vec<_>>();
         let mut relation_links = BTreeSet::new();
@@ -887,6 +890,9 @@ impl NativeRetrieval<'_> {
                 incomplete.insert(kind);
                 self.degraded("relation_endpoint_omitted_or_ambiguous");
             }
+        }
+        if self.lineage.is_some_and(|read| read.verification_missing) {
+            incomplete.insert(SNAPSHOT_VERIFICATION_RESULT.into());
         }
         if incomplete.contains(ATTEMPT_RUN_RELATION)
             && kinds.iter().any(|kind| kind == RUN_RESULT_RELATION)

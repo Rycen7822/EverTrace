@@ -5703,6 +5703,10 @@ pub fn assess_result_cohort(
     })
 }
 
+const RESULT_REPARSE_INPUT_BYTES: u64 = 64 * 1024;
+pub(crate) const RESULT_REPARSE_DECODED_BYTES: u64 = 16 * RESULT_REPARSE_INPUT_BYTES;
+pub(crate) const RESULT_REPARSE_ENCODED_BYTES: u64 = 2 * RESULT_REPARSE_DECODED_BYTES;
+
 /// Reparse only an otherwise eligible cohort using the original parser and verified protected inputs.
 /// CAS enforces the request-local decode budget (64 KiB per input, 1 MiB per member) before reading payloads.
 pub fn read_result_cohort(
@@ -5728,19 +5732,17 @@ pub fn read_result_cohort(
             return Ok(assessment);
         }
     };
-    const INPUT_BYTES: u64 = 64 * 1024;
     for (index, (result, run)) in members.iter().enumerate() {
         let mut inputs = Vec::new();
-        let mut decoded_budget = 16 * INPUT_BYTES;
-        // Leave room for compression overhead and envelope headers, but also bound file reads.
-        let mut encoded_budget = 2 * decoded_budget;
+        let mut decoded_budget = RESULT_REPARSE_DECODED_BYTES;
+        let mut encoded_budget = RESULT_REPARSE_ENCODED_BYTES;
         let mut reason = None;
         for id in &result.raw_cas_refs {
             match cas.read_bounded_checked(
                 &CasDigest::from_str(&hex(&id.as_digest()))
                     .map_err(|_| AutoresearchError::InvalidInput)?,
-                encoded_budget.min(2 * INPUT_BYTES),
-                decoded_budget.min(INPUT_BYTES),
+                encoded_budget.min(2 * RESULT_REPARSE_INPUT_BYTES),
+                decoded_budget.min(RESULT_REPARSE_INPUT_BYTES),
                 &mut *check,
             ) {
                 Ok((bytes, encoded)) => {

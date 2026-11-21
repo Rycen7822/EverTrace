@@ -61,10 +61,15 @@ fn lineage_anchor(
         revision: revision.to_owned(),
         current,
         requested,
+        verification: facets
+            .relation_requirements
+            .iter()
+            .any(|kind| kind == SNAPSHOT_VERIFICATION_RESULT),
+        current_only: facets.temporal_mode == TemporalMode::Current,
     })
 }
 
-fn research_anchor<'a>(
+fn closed_exact_anchor<'a>(
     selection: MemoryScopeSelection,
     text: &str,
     facets: &'a QueryFacetSet,
@@ -74,16 +79,25 @@ fn research_anchor<'a>(
     };
     (matches!(selection, MemoryScopeSelection::Repository { .. })
         && text == anchor
-        && anchor.parse::<evertrace_domain::ids::AttemptId>().is_ok()
         && matches!(facets.exact_identifiers.as_slice(), [exact] if exact == anchor)
         && facets.parse_status == FacetParseStatus::Complete
-        && facets.temporal_mode == TemporalMode::Current
         && facets.temporal_qualifiers.is_empty()
         && facets.statement_role == StatementRole::Unknown
         && facets.answer_shape == Some(AnswerShape::SourceSnippet)
         && facets.source_boundary.is_none()
         && facets.condition_literals.is_empty()
-        && facets.explicit_exclusions.is_empty()
+        && facets.explicit_exclusions.is_empty())
+    .then_some(anchor)
+}
+
+fn research_anchor<'a>(
+    selection: MemoryScopeSelection,
+    text: &str,
+    facets: &'a QueryFacetSet,
+) -> Option<&'a str> {
+    let anchor = closed_exact_anchor(selection, text, facets)?;
+    (anchor.parse::<evertrace_domain::ids::AttemptId>().is_ok()
+        && facets.temporal_mode == TemporalMode::Current
         && (facets.relation_requirements.is_empty()
             || facets
                 .relation_requirements
@@ -1348,20 +1362,25 @@ impl HumanGovernanceService {
         &self,
         query: &LineageQuery,
         frontier: u64,
+        index: &export::SearchReadIndex<'_>,
         report: Option<&evertrace_codex::HostProbeReport>,
+        budget: &mut RelationArchiveBudget,
         deadline: std::time::Instant,
     ) -> Option<LineageRead> {
-        Box::pin(
-            crate::search::read_context::SearchReadAccess {
-                writer: &self.writer,
-                authority: RepositoryReadAuthority::retained(report),
-                frontier,
-                config_hash: self.effective_config_hash,
-                deadline,
-            }
-            .lineage(query),
-        )
-        .await
+        let access = crate::search::read_context::SearchReadAccess {
+            writer: &self.writer,
+            authority: RepositoryReadAuthority::retained(report),
+            frontier,
+            config_hash: self.effective_config_hash,
+            deadline,
+        };
+        let mut lineage = Box::pin(access.lineage(query)).await?;
+        if query.verification {
+            let runtime = self.runtime_snapshot.as_ref()?;
+            Box::pin(access.verify_lineage(query, &mut lineage, index, &runtime.cas_dir, budget))
+                .await;
+        }
+        Some(lineage)
     }
 
     async fn resume_hits(
@@ -1422,12 +1441,17 @@ impl HumanGovernanceService {
                 export::SearchReadIndex::new(&snapshot, &query.facets, query.selection, deadline)
                     .map_err(|_| HumanGovernanceError::Store)?;
             let mut checks = BTreeSet::new();
+            let lineage_query = lineage_anchor(query.selection, &query.facets, &index);
             let mut lineage_checks = BTreeSet::new();
             for hit in cursor.after.iter().chain(&cursor.remaining) {
                 if matches!(
                     hit.object_kind.as_deref(),
                     Some("worktree_transition" | "worktree_snapshot")
-                ) {
+                ) || (hit.object_kind.as_deref() == Some("result_evidence")
+                    && lineage_query
+                        .as_ref()
+                        .is_some_and(|query| query.verification))
+                {
                     lineage_checks.insert(hit.access_reference());
                     continue;
                 }
@@ -1474,13 +1498,15 @@ impl HumanGovernanceService {
             }
             let current_report = self.search_report().await;
             if !lineage_checks.is_empty() {
-                let Some(query) = lineage_anchor(query.selection, &query.facets, &index) else {
+                let Some(query) = &lineage_query else {
                     return conflict();
                 };
                 let Some(lineage) = Box::pin(self.read_lineage(
-                    &query,
+                    query,
                     cursor.frontier,
+                    &index,
                     current_report.as_ref(),
+                    &mut cursor.relation_archive_budget,
                     deadline,
                 ))
                 .await
@@ -1731,6 +1757,24 @@ impl HumanGovernanceService {
             } else {
                 None
             };
+            let pinned_lineage = lineage_anchor(query.selection, &protected.facets, &index);
+            let exact_lineage =
+                closed_exact_anchor(query.selection, &protected.text, &protected.facets)
+                    .is_some_and(|anchor| {
+                        (parse_transition_revision(anchor).is_some()
+                            || anchor
+                                .parse::<evertrace_domain::ids::WorktreeTransitionId>()
+                                .is_ok())
+                            && protected
+                                .facets
+                                .relation_requirements
+                                .iter()
+                                .any(|kind| LINEAGE_RELATIONS.contains(&kind.as_str()))
+                            && protected.facets.relation_requirements.iter().all(|kind| {
+                                LINEAGE_RELATIONS.contains(&kind.as_str())
+                                    || kind == SNAPSHOT_VERIFICATION_RESULT
+                            })
+                    });
             let mut refs = BTreeSet::new();
             let mut proposals = BTreeSet::new();
             let mut unavailable = research
@@ -1741,6 +1785,8 @@ impl HumanGovernanceService {
             let rows: Box<dyn Iterator<Item = &ObjectRow> + Send> =
                 if let Some((_, keys, _)) = &research {
                     Box::new(keys.iter().filter_map(|key| research_head(&index, key)))
+                } else if exact_lineage {
+                    Box::new(std::iter::empty())
                 } else {
                     Box::new(snapshot.data_rows())
                 };
@@ -1855,11 +1901,17 @@ impl HumanGovernanceService {
                     }
                 }
             }
-            let pinned_lineage = lineage_anchor(query.selection, &protected.facets, &index);
             let lineage = if let Some(query) = &pinned_lineage {
-                Box::pin(self.read_lineage(query, snapshot.frontier, report.as_ref(), deadline))
-                    .await
-                    .map(std::sync::Arc::new)
+                Box::pin(self.read_lineage(
+                    query,
+                    snapshot.frontier,
+                    &index,
+                    report.as_ref(),
+                    &mut relation_archive_budget,
+                    deadline,
+                ))
+                .await
+                .map(std::sync::Arc::new)
             } else {
                 None
             };
@@ -2232,7 +2284,9 @@ impl HumanGovernanceService {
                 access_changed |= Box::pin(self.read_lineage(
                     query,
                     snapshot.frontier,
+                    &index,
                     current_report.as_ref(),
+                    &mut relation_archive_budget,
                     deadline,
                 ))
                 .await

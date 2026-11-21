@@ -822,12 +822,15 @@ pub(crate) struct LineageQuery {
     pub revision: String,
     pub current: bool,
     pub requested: [bool; 2],
+    pub verification: bool,
+    pub current_only: bool,
 }
 
 #[derive(PartialEq)]
 pub(crate) struct LineageRead {
     pub rows: Vec<evertrace_store::SearchProjectionRow>,
     pub edges: Vec<(String, String, String)>,
+    pub verification_missing: bool,
 }
 
 impl LineageRead {
@@ -882,6 +885,7 @@ impl SearchReadAccess<'_> {
                 .ok()?,
             ],
             edges: Vec::new(),
+            verification_missing: false,
         };
         if transition.lineage_assessment != LineageAssessment::Proven {
             return Some(result);
@@ -940,6 +944,183 @@ impl SearchReadAccess<'_> {
                 .push((query.revision.clone(), reference, kind.to_owned()));
         }
         Some(result)
+    }
+
+    /// Select frozen scorer outputs only for the exact snapshots already admitted at hop one.
+    pub(crate) async fn verify_lineage(
+        &self,
+        query: &LineageQuery,
+        lineage: &mut LineageRead,
+        index: &BTreeMap<&str, Vec<&ObjectRow>>,
+        cas_dir: &std::path::Path,
+        budget: &mut RelationArchiveBudget,
+    ) {
+        use evertrace_domain::{query::SNAPSHOT_VERIFICATION_RESULT, semantic::ResultScope};
+        const ROW_PREFIX: &str = "object:work:result_evidence:";
+        const CANDIDATE_LIMIT: usize = 32;
+        let snapshots: BTreeMap<_, _> = lineage
+            .rows
+            .iter()
+            .filter(|row| row.object_kind.as_deref() == Some("worktree_snapshot"))
+            .filter_map(|row| Some((row.source_ref.clone()?, row.worktree_id.clone()?)))
+            .collect();
+        if snapshots.is_empty() {
+            return;
+        }
+        let mut verified = BTreeSet::new();
+        let mut checks_remaining = CANDIDATE_LIMIT.saturating_sub(lineage.rows.len());
+        let mut metadata_bytes = evertrace_store::projections::READ_DEPENDENCY_BYTES;
+        for (count, (_, rows)) in index
+            .range(ROW_PREFIX..)
+            .take_while(|(key, _)| key.starts_with(ROW_PREFIX))
+            .enumerate()
+        {
+            if count == evertrace_store::projections::READ_DEPENDENCY_LIMIT
+                || Instant::now() >= self.deadline
+            {
+                lineage.verification_missing = true;
+                break;
+            }
+            let [row] = rows.as_slice() else {
+                lineage.verification_missing = true;
+                continue;
+            };
+            let Some(raw) = row.payload_json.as_deref() else {
+                lineage.verification_missing = true;
+                continue;
+            };
+            let Some(remaining) = metadata_bytes.checked_sub(raw.len() as u64) else {
+                lineage.verification_missing = true;
+                break;
+            };
+            metadata_bytes = remaining;
+            let Ok(JournalPayload::ResultEvidenceRecorded(result)) = serde_json::from_str(raw)
+            else {
+                lineage.verification_missing = true;
+                continue;
+            };
+            let run_revision = result.experiment_run_revision_id.to_string();
+            let Some(run_row) =
+                index
+                    .get(run_revision.as_str())
+                    .into_iter()
+                    .flatten()
+                    .find(|row| {
+                        row.object_kind.as_deref() == Some("experiment_run")
+                            && row.current_revision_id.as_deref() == Some(run_revision.as_str())
+                    })
+            else {
+                continue;
+            };
+            let Some(run_json) = run_row.payload_json.as_deref() else {
+                continue;
+            };
+            let Some(remaining) = metadata_bytes.checked_sub(run_json.len() as u64) else {
+                lineage.verification_missing = true;
+                break;
+            };
+            metadata_bytes = remaining;
+            let Ok(JournalPayload::ExperimentRunRecorded(run)) = serde_json::from_str(run_json)
+            else {
+                lineage.verification_missing = true;
+                continue;
+            };
+            let snapshot = run.code_snapshot_id.to_string();
+            let Some(tree) = snapshots.get(&snapshot) else {
+                continue;
+            };
+            // Denied or incomplete nominees also spend a check; they cannot make the access window unbounded.
+            let Some(remaining) = checks_remaining.checked_sub(1) else {
+                lineage.verification_missing = true;
+                break;
+            };
+            checks_remaining = remaining;
+            let key = result.result_evidence_id.to_string();
+            let revision = result.revision_id.to_string();
+            let current = index
+                .get(key.as_str())
+                .into_iter()
+                .flatten()
+                .filter(|row| row.object_kind.as_deref() == Some("result_evidence"))
+                .max_by_key(|row| row.source_event_seq)
+                .is_some_and(|row| row.current_revision_id.as_ref() == Some(&revision));
+            if query.current_only && !current {
+                continue;
+            }
+            if result.result_scope != ResultScope::Complete
+                || self
+                    .check_exact_record(&key, &revision, "result_evidence")
+                    .await
+                    .is_err()
+                || !check_research_archive(
+                    run_row,
+                    self.writer,
+                    cas_dir,
+                    index,
+                    budget,
+                    self.deadline,
+                )
+                .await
+                || !self
+                    .reparse_snapshot_result(result, run, cas_dir, budget)
+                    .await
+            {
+                lineage.verification_missing = true;
+                continue;
+            }
+            let Ok(mut source) =
+                evertrace_store::query::canonical_lineage_source(row, query.repository, current)
+            else {
+                lineage.verification_missing = true;
+                continue;
+            };
+            source.worktree_id = Some(tree.clone());
+            lineage.rows.push(source);
+            verified.insert(snapshot.clone());
+            lineage
+                .edges
+                .push((snapshot, revision, SNAPSHOT_VERIFICATION_RESULT.into()));
+        }
+        lineage.verification_missing |= verified.len() != snapshots.len();
+    }
+
+    async fn reparse_snapshot_result(
+        &self,
+        result: Box<evertrace_domain::semantic::ResultEvidence>,
+        run: Box<evertrace_domain::work::ExperimentRun>,
+        cas_dir: &std::path::Path,
+        budget: &mut RelationArchiveBudget,
+    ) -> bool {
+        use crate::autoresearch::{
+            RESULT_REPARSE_DECODED_BYTES, RESULT_REPARSE_ENCODED_BYTES, read_result_cohort,
+        };
+        let Some(encoded) = budget.encoded.checked_sub(RESULT_REPARSE_ENCODED_BYTES) else {
+            return false;
+        };
+        let Some(decoded) = budget.decoded.checked_sub(RESULT_REPARSE_DECODED_BYTES) else {
+            return false;
+        };
+        *budget = RelationArchiveBudget { encoded, decoded };
+        let cas_dir = cas_dir.to_owned();
+        let deadline = self.deadline;
+        self.writer
+            .read_handle()
+            .read_blocking(move |cancel| {
+                let verified = read_result_cohort(&cas_dir, &[(&result, &run)], &mut || {
+                    cancel
+                        .check()
+                        .map_err(|_| evertrace_capture::CasError::ReadCancelled)?;
+                    if Instant::now() < deadline {
+                        Ok(())
+                    } else {
+                        Err(evertrace_capture::CasError::ReadCancelled)
+                    }
+                })
+                .is_ok_and(|assessment| assessment.compatible);
+                Ok(verified)
+            })
+            .await
+            .unwrap_or_default()
     }
 }
 

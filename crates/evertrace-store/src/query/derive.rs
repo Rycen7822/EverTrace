@@ -221,6 +221,7 @@ pub fn canonical_lineage_source(
         JournalPayload::WorktreeSnapshotRecorded(snapshot) if snapshot.validate().is_ok() => (
             serde_json::json!({"capture_status":snapshot.capture_status}).to_string(), Some(snapshot.worktree_instance_id),
         ),
+        JournalPayload::ResultEvidenceRecorded(result) if result.validate().is_ok() => ("research_verification".into(), None),
         _ => return Err(StoreError::StoreCorrupt),
     };
     let mut source = object_identifier_row(
