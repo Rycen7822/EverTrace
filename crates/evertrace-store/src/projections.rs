@@ -3994,6 +3994,14 @@ pub fn read_dependencies_for(row: &ObjectRow, payload: &JournalPayload) -> BTree
         }
         JournalPayload::WorkEpisodeRecorded(value) => {
             refs.insert(value.workstream_id.to_string());
+            if value.lifecycle_status == evertrace_domain::work::EpisodeLifecycle::Closed {
+                refs.extend(
+                    value
+                        .exit_worktree_snapshot_id
+                        .or(value.entry_worktree_snapshot_id)
+                        .map(|id| id.to_string()),
+                );
+            }
             if value.phase_contract.phase_kind == evertrace_domain::work::PhaseKind::Analyze {
                 refs.extend(
                     value
@@ -6195,13 +6203,28 @@ impl JournalAdmissionState {
         let matches = |id: &str| references.contains(id);
         let mut rows = Vec::new();
 
-        // Capture candidates and their closure use stable, typed ids. Read
-        // those three high-cardinality maps by key: a normal Search has at
-        // most three selected candidates, rather than a reason to format and
-        // compare every receipt/observation/surface in the current journal.
-        // Keep the remaining family walks below because their identifiers can
-        // name either an object or one of its historical revisions.
+        // Seek high-cardinality source and Episode references by typed key; reading the current
+        // alias alongside an offered revision also lets the return gate reject a stale body.
+        let mut episode_revisions = BTreeSet::new();
         for reference in references {
+            let episode = reference
+                .parse::<WorkEpisodeId>()
+                .ok()
+                .and_then(|id| self.episodes.get(&id))
+                .or_else(|| {
+                    reference
+                        .parse::<RevisionId>()
+                        .ok()
+                        .and_then(|id| self.episode_revisions.get(&id))
+                });
+            if let Some((episode, seq)) = episode
+                && episode_revisions.insert(episode.revision_id)
+            {
+                rows.push(inbox_work_row(
+                    &JournalPayload::WorkEpisodeRecorded(Box::new(episode.clone())),
+                    *seq,
+                )?);
+            }
             if let Ok(id) = reference.parse::<SourceReceiptId>()
                 && let Some((value, seq)) = self.source_receipts.get(&id)
             {
@@ -6536,12 +6559,6 @@ impl JournalAdmissionState {
                         .validation_row(revision, PROJECTION_GENERATION)?,
                 );
             }
-            if let Some((value, seq)) = self.episode_revisions.get(&revision) {
-                rows.push(inbox_work_row(
-                    &JournalPayload::WorkEpisodeRecorded(Box::new(value.clone())),
-                    *seq,
-                )?);
-            }
             if let Some((value, seq)) = self.operation_burst_revisions.get(&revision) {
                 rows.push(burst_row(value, *seq)?);
             }
@@ -6746,14 +6763,6 @@ impl JournalAdmissionState {
             && let Some((value, seq)) = self.operation_bursts.get(&id)
         {
             rows.push(burst_row(value, *seq)?);
-        }
-        if let Ok(id) = reference.parse::<WorkEpisodeId>()
-            && let Some((value, seq)) = self.episodes.get(&id)
-        {
-            rows.push(inbox_work_row(
-                &JournalPayload::WorkEpisodeRecorded(Box::new(value.clone())),
-                *seq,
-            )?);
         }
         if let Some((value, seq)) = self.checkpoints.get(reference) {
             if let Some(row) = self.scope_fact_row(

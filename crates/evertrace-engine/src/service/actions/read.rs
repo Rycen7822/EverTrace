@@ -159,13 +159,30 @@ impl McpActionService {
         };
         let explicit_exact = exact_slots.is_some();
         let explicit_view = atom_relation || exact_shape || explicit_exact;
+        // A typed Episode target asks for stored work evidence, not stage guidance. Do not infer that intent from prose.
+        let episode = (!explicit_view && !entity_list)
+            .then(|| match scope.target_anchors.as_slice() {
+                [] => query.trim(),
+                [target] => target.as_str(),
+                _ => "",
+            })
+            .and_then(|reference| {
+                reference
+                    .parse::<evertrace_domain::ids::WorkEpisodeId>()
+                    .ok()
+            });
+        let episode_history = episode.is_some();
         let mut quantity = vec![QuantityConstraint::ResultLimit { limit: 3 }];
         if let Some(unit) = count_unit {
             quantity.push(QuantityConstraint::DistinctCount { unit });
         }
         let mut context = SearchContext {
             query_anchor: scope.anchor.search_anchor(),
-            intent: SearchIntent::StageAssistance,
+            intent: if episode_history {
+                SearchIntent::HistoryLookup
+            } else {
+                SearchIntent::StageAssistance
+            },
             raw_query: query.clone(),
             protected_query: String::new(),
             protected_facets: BTreeSet::new(),
@@ -174,13 +191,16 @@ impl McpActionService {
                 .execution_context(scope.context.frontier, &scope.context.scope),
             query_facets: QueryFacetSet {
                 statement_role: evertrace_domain::query::StatementRole::Unknown,
-                parse_status: if atom_relation || exact_shape {
+                parse_status: if atom_relation || exact_shape || episode_history {
                     FacetParseStatus::Complete
                 } else {
                     FacetParseStatus::Unknown
                 },
                 target_anchors: relation.map_or_else(
-                    || scope.target_anchors.clone(),
+                    || {
+                        episode
+                            .map_or_else(|| scope.target_anchors.clone(), |id| vec![id.to_string()])
+                    },
                     |(target, _)| vec![target.into()],
                 ),
                 exact_identifiers: exact_slots.unwrap_or_default(),
@@ -209,7 +229,11 @@ impl McpActionService {
                 } else {
                     atom_relation.then_some(evertrace_domain::query::AnswerShape::SourceSnippet)
                 },
-                lifecycle_boundary: LifecycleBoundary::Active,
+                lifecycle_boundary: if episode_history {
+                    LifecycleBoundary::Terminal
+                } else {
+                    LifecycleBoundary::Active
+                },
             },
             task_id: scope.anchor.task_id,
             repository_id: scope.anchor.repository_id,
@@ -240,17 +264,6 @@ impl McpActionService {
                 ["search_deadline_exhausted"],
             ));
         }
-        let include_probationary = self.operation_config.as_ref().map_or_else(
-            || evertrace_domain::config::ProcedureConfig::default().include_probationary,
-            |config| config.config().procedure.include_probationary,
-        );
-        let searchable_procedure_revisions =
-            crate::procedure::ProcedureUsageCurrentView::from_promotion_rows(
-                scope.context.frontier,
-                &scope.context.rows,
-            )
-            .map_err(|_| McpServiceError::Store)?
-            .searchable_procedure_revisions(include_probationary);
         let report = match &self.session_report {
             Some(report) => report.read().await.clone(),
             None => None,
@@ -268,21 +281,37 @@ impl McpActionService {
             config_hash: self.runtime_snapshot.effective_config_hash,
             deadline: method_deadline,
         };
-        let methods = crate::jobs::procedure::readable_revisions_from_rows(
-            &self.writer,
-            &scope.context.rows,
-            repository_report,
-            self.runtime_snapshot.effective_config_hash,
-            (scope.anchor.repository_id, scope.anchor.worktree_id),
-            None,
-            method_deadline,
-        )
-        .await
-        .map_err(|_| McpServiceError::Store)?;
-        let page = ProductionSearch::new(self.search_index.clone())
-            .with_validated_frontier(scope.context.frontier)
-            .with_method_proposals(methods)
-            .with_procedure_revisions(searchable_procedure_revisions)
+        let mut search = ProductionSearch::new(self.search_index.clone())
+            .with_validated_frontier(scope.context.frontier);
+        if episode_history {
+            search = search.with_exact_object_kind("work_episode");
+        } else {
+            let include_probationary = self.operation_config.as_ref().map_or_else(
+                || evertrace_domain::config::ProcedureConfig::default().include_probationary,
+                |config| config.config().procedure.include_probationary,
+            );
+            let procedures = crate::procedure::ProcedureUsageCurrentView::from_promotion_rows(
+                scope.context.frontier,
+                &scope.context.rows,
+            )
+            .map_err(|_| McpServiceError::Store)?
+            .searchable_procedure_revisions(include_probationary);
+            let methods = crate::jobs::procedure::readable_revisions_from_rows(
+                &self.writer,
+                &scope.context.rows,
+                repository_report,
+                self.runtime_snapshot.effective_config_hash,
+                (scope.anchor.repository_id, scope.anchor.worktree_id),
+                None,
+                method_deadline,
+            )
+            .await
+            .map_err(|_| McpServiceError::Store)?;
+            search = search
+                .with_method_proposals(methods)
+                .with_procedure_revisions(procedures);
+        }
+        let page = search
             .search_with_access(context.clone(), &read_access)
             .await
             .map_err(|_| McpServiceError::Store)?;
@@ -1868,12 +1897,46 @@ fn classify_search_candidate_rows(
             if row.object_kind.as_deref() == Some("procedure_revision") {
                 return None;
             }
-            Some(classify_object_row(
-                row,
-                Some(candidate.text.clone()),
-                is_current,
-                now,
-            ))
+            let text = if candidate.object_kind.as_deref() == Some("work_episode") {
+                let JournalPayload::WorkEpisodeRecorded(episode) =
+                    serde_json::from_str(row.payload_json.as_deref()?).ok()?
+                else {
+                    return None;
+                };
+                if episode.lifecycle_status == evertrace_domain::work::EpisodeLifecycle::Closed {
+                    let mut label = "[CLOSED EPISODE]".to_owned();
+                    if let Some(worktree_id) = &row.worktree_id {
+                        let tree = rows.iter().find(|r| {
+                            r.object_kind.as_deref() == Some("worktree")
+                                && r.object_id.as_ref() == Some(worktree_id)
+                        })?;
+                        let JournalPayload::WorktreeInstanceRecorded(tree) =
+                            serde_json::from_str(tree.payload_json.as_deref()?).ok()?
+                        else {
+                            return None;
+                        };
+                        let pinned = episode
+                            .exit_worktree_snapshot_id
+                            .or(episode.entry_worktree_snapshot_id);
+                        if let Some(snapshot) = pinned {
+                            label.push_str(&format!(
+                                " [WORKTREE {:?}; SNAPSHOT {snapshot}]",
+                                tree.lifecycle
+                            ));
+                        } else if tree.lifecycle
+                            != evertrace_domain::repository::WorktreeLifecycle::Active
+                        {
+                            return None;
+                        }
+                    }
+                    format!("{label} {}", candidate.text)
+                } else {
+                    candidate.text.clone()
+                }
+            } else {
+                candidate.text.clone()
+            };
+            Some(classify_object_row(row, Some(text), is_current, now))
         }
         evertrace_domain::query::SearchCandidateVariant::EvidenceSurface => {
             let content_trust = match candidate.content_trust.as_deref()? {

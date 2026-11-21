@@ -502,6 +502,7 @@ enum OfferedRead {
 
 pub struct ProductionSearch {
     index: SearchIndex,
+    exact_object_kind: Option<&'static str>,
     sequence_scope: Option<SourceSequenceScope>,
     procedure_revisions: Option<BTreeSet<String>>,
     method_proposal_revisions: BTreeSet<String>,
@@ -519,6 +520,7 @@ impl ProductionSearch {
     pub const fn new(index: SearchIndex) -> Self {
         Self {
             index,
+            exact_object_kind: None,
             sequence_scope: None,
             procedure_revisions: None,
             method_proposal_revisions: BTreeSet::new(),
@@ -531,6 +533,12 @@ impl ProductionSearch {
             matched_sources: BTreeSet::new(),
             matched_contexts: BTreeSet::new(),
         }
+    }
+
+    /// Resolve explicit target anchors in one canonical family, without broadened lexical discovery.
+    pub(crate) fn with_exact_object_kind(mut self, kind: &'static str) -> Self {
+        self.exact_object_kind = Some(kind);
+        self
     }
 
     pub fn with_procedure_revisions(mut self, revisions: BTreeSet<String>) -> Self {
@@ -616,7 +624,7 @@ impl ProductionSearch {
             excluded_identifiers: context.query_facets.explicit_exclusions.clone(),
             procedure_revisions: self.procedure_revisions.clone(),
             method_proposal_revisions: self.method_proposal_revisions.clone(),
-            object_kind: None,
+            object_kind: self.exact_object_kind.map(str::to_owned),
             object_access: self
                 .candidate_grants
                 .as_ref()
@@ -678,6 +686,9 @@ impl ProductionSearch {
         time_scope: Option<&TemporalReadScope<'_>>,
     ) -> Option<SearchHardFilter> {
         use evertrace_domain::query::SourceBoundary;
+        if self.exact_object_kind.is_some() {
+            return None;
+        }
         match context.query_facets.source_boundary {
             Some(SourceBoundary::ProjectPolicy | SourceBoundary::ObjectiveEvidence) => None,
             role => {
@@ -833,7 +844,7 @@ impl ProductionSearch {
                 .flatten();
             let limit = SEARCH_ACCESS_WINDOW + 1;
             let mut identifiers = context.query_facets.target_anchors.clone();
-            if !source_only && count_unit.is_none() {
+            if !source_only && count_unit.is_none() && self.exact_object_kind.is_none() {
                 identifiers.extend(exact_identifiers(&context));
             }
             identifiers.sort();
@@ -845,7 +856,7 @@ impl ProductionSearch {
                 .chain(evidence.map(|filter| (1, filter)));
             for (channel, filter) in channels {
                 let exact = snapshot.structured(&identifiers, &filter, limit).await?;
-                let fts = if atoms_only || source_only {
+                let fts = if atoms_only || source_only || self.exact_object_kind.is_some() {
                     Vec::new() // Explicit operands are not lexical queries.
                 } else {
                     snapshot
@@ -1380,7 +1391,11 @@ impl ProductionSearch {
         } else {
             limit.saturating_mul(4).min(32)
         };
-        let exact_identifiers = exact_identifiers(&context);
+        let exact_identifiers = if self.exact_object_kind.is_none() {
+            exact_identifiers(&context)
+        } else {
+            Vec::new()
+        };
         let mut structured = Vec::new();
         let mut degraded_reasons = BTreeSet::new();
         if context.raw_query != context.protected_query {
@@ -1515,7 +1530,7 @@ impl ProductionSearch {
                 }
             }
         }
-        let fts_result = if exact_atom_only {
+        let fts_result = if exact_atom_only || self.exact_object_kind.is_some() {
             Ok(Vec::new())
         } else if force_fts_failure {
             Err(StoreError::LanceDb)

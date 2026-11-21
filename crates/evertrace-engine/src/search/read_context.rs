@@ -142,8 +142,51 @@ impl SearchReadAccess<'_> {
         kind: &str,
     ) -> Result<(), ErrorCode> {
         let context = self.check_record(key, revision, kind).await?;
-        if context.selected.and_then(|row| row.object_id).as_deref() != Some(key) {
+        let row = context.selected.as_ref().ok_or(ErrorCode::StoreCorrupt)?;
+        if row.object_id.as_deref() != Some(key) {
             return Err(ErrorCode::StoreCorrupt);
+        }
+        if kind == "work_episode" {
+            let JournalPayload::WorkEpisodeRecorded(episode) =
+                serde_json::from_str(row.payload_json.as_deref().ok_or(ErrorCode::StoreCorrupt)?)
+                    .map_err(|_| ErrorCode::StoreCorrupt)?
+            else {
+                return Err(ErrorCode::StoreCorrupt);
+            };
+            if episode.lifecycle_status != evertrace_domain::work::EpisodeLifecycle::Closed {
+                return Ok(());
+            }
+            let read_payload = |kind: &str, reference: &str| {
+                context
+                    .rows
+                    .iter()
+                    .find(|row| {
+                        row.object_kind.as_deref() == Some(kind)
+                            && row.object_id.as_deref() == Some(reference)
+                    })
+                    .and_then(|row| row.payload_json.as_deref())
+                    .ok_or(ErrorCode::Untrusted)
+            };
+            if let Some(snapshot) = episode
+                .exit_worktree_snapshot_id
+                .or(episode.entry_worktree_snapshot_id)
+            {
+                let payload = read_payload("worktree_snapshot", &snapshot.to_string())?;
+                if !matches!(serde_json::from_str::<JournalPayload>(payload),
+                    Ok(JournalPayload::WorktreeSnapshotRecorded(snapshot))
+                        if Some(snapshot.worktree_instance_id) == episode.worktree_instance_id)
+                {
+                    return Err(ErrorCode::Untrusted);
+                }
+            } else if let Some(worktree) = episode.worktree_instance_id {
+                let payload = read_payload("worktree", &worktree.to_string())?;
+                if !matches!(serde_json::from_str::<JournalPayload>(payload),
+                    Ok(JournalPayload::WorktreeInstanceRecorded(tree))
+                        if tree.lifecycle == evertrace_domain::repository::WorktreeLifecycle::Active)
+                {
+                    return Err(ErrorCode::ResourceExhausted);
+                }
+            }
         }
         Ok(())
     }
