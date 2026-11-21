@@ -87,6 +87,7 @@ impl GcAuthority {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct CommittedCommand {
     pub command_id: evertrace_domain::ids::CommandId,
+    pub first_causation_id: Option<String>,
     pub event_ids: Vec<String>,
     pub payloads: Vec<JournalPayload>,
 }
@@ -323,6 +324,7 @@ fn decode_committed_command(
     rows.sort_by_key(|row| row.ordinal);
     Ok(CommittedCommand {
         command_id: rows[0].command_id,
+        first_causation_id: rows[0].causation_id.clone(),
         event_ids: rows.iter().map(|row| row.event_id.clone()).collect(),
         payloads: rows
             .iter()

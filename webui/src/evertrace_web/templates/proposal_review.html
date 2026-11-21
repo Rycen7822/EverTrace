@@ -95,6 +95,27 @@
           data-request-id="{{ acceptance_request_id }}" data-revision="{{ summary.current_revision_id }}"
           data-frontier="{{ frontier }}" data-review-digest="{{ confirmation_digest }}">确认接受这份提案</button>
       {% endif %}
+      {% if disposition_request_id %}
+        <fieldset data-disposition-fields>
+          <legend>暂不接受</legend>
+          <label>延期等候
+            <select data-proposal-waiting>
+              <option value="">选择等待条件</option>
+              <option value="new_evidence">新证据</option>
+              <option value="target_revision_change">目标修订变化</option>
+              <option value="objective_verifier">客观验证器</option>
+              <option value="conflict_resolution">冲突解决</option>
+              <option value="manual_review">人工复核</option>
+            </select>
+          </label>
+          {% for decision, label in [('defer', '确认延期'), ('reject', '确认拒绝')] %}
+          <button class="button" type="button" data-proposal-disposition="{{ decision }}" data-proposal-id="{{ summary.proposal_id }}"
+            data-request-id="{{ disposition_request_id }}" data-revision="{{ summary.current_revision_id }}"
+            data-frontier="{{ frontier }}" data-review-digest="{{ confirmation_digest }}">{{ label }}</button>
+          {% endfor %}
+          <p role="status" data-disposition-status>延期不会自动重开；拒绝不会发布这份内容。</p>
+        </fieldset>
+      {% endif %}
     {% endif %}
   {% else %}
     <p>本次没有返回可读正文或审核资格；不显示旧正文。</p>

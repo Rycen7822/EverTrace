@@ -146,6 +146,12 @@ pub enum HumanReadRequest {
         expected_frontier: u64,
         review: ProposalConfirmation,
     },
+    WebProposalDispositionOutcome {
+        request_id: RequestId,
+        expected_frontier: u64,
+        review: ProposalConfirmation,
+        decision: WebProposalDisposition,
+    },
     Related {
         relation: HumanRelationKind,
         source_stable_key: String,
@@ -215,6 +221,10 @@ pub enum RepositoryAccessAction {
 pub enum HumanActionRequest {
     WebAccept {
         review: ProposalConfirmation,
+    },
+    WebProposalDisposition {
+        review: ProposalConfirmation,
+        decision: WebProposalDisposition,
     },
     Proposal {
         proposal_id: RevisionProposalId,
@@ -824,6 +834,8 @@ pub enum HumanGovernanceResponse {
         confirmation_digest: Option<String>,
         #[serde(default, skip_serializing_if = "std::ops::Not::not")]
         web_accept_available: bool,
+        #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+        web_disposition_available: bool,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         core_anchor: Option<Box<HumanSemanticDetail>>,
     },
@@ -892,6 +904,39 @@ fn review_intent(
     )
 }
 
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
+pub enum WebProposalDisposition {
+    Defer {
+        waiting_on: evertrace_domain::semantic::ProposalWaitingOn,
+    },
+    Reject,
+}
+
+impl WebProposalDisposition {
+    pub const fn waiting_on(self) -> Option<evertrace_domain::semantic::ProposalWaitingOn> {
+        match self {
+            Self::Defer { waiting_on } => Some(waiting_on),
+            Self::Reject => None,
+        }
+    }
+}
+
+pub fn web_disposition_available(item: &HumanSnapshotItem) -> bool {
+    item.proposal_review.as_ref().is_some_and(|review| {
+        review.proposal.status.is_open()
+            && !matches!(
+                &review.proposal.payload,
+                ProposalPayload::ReservedTarget { .. }
+            )
+            && (review.proposal.base_revision_id.is_none()
+                || item
+                    .proposal_base
+                    .as_ref()
+                    .is_some_and(|base| base.state == HumanContentState::Ready))
+    })
+}
+
 pub fn web_acceptance_intent(
     item: &HumanSnapshotItem,
     frontier: u64,
@@ -916,11 +961,12 @@ pub fn web_acceptance_intent(
 }
 
 impl HumanGovernanceRequest {
-    pub fn is_web_acceptance(&self) -> bool {
+    pub fn is_web_proposal_action(&self) -> bool {
         matches!(
             self,
             Self::Act {
-                action: HumanActionRequest::WebAccept { .. },
+                action: HumanActionRequest::WebAccept { .. }
+                    | HumanActionRequest::WebProposalDisposition { .. },
                 ..
             }
         )
@@ -940,7 +986,7 @@ impl HumanGovernanceRequest {
             Self::Act {
                 action,
                 expected_frontier,
-            } => (!self.is_web_acceptance() || *expected_frontier != 0) && action.validate(),
+            } => (!self.is_web_proposal_action() || *expected_frontier != 0) && action.validate(),
         }
     }
 }
@@ -1004,6 +1050,11 @@ impl HumanReadRequest {
                 review,
                 expected_frontier,
                 ..
+            }
+            | Self::WebProposalDispositionOutcome {
+                review,
+                expected_frontier,
+                ..
             } => *expected_frontier != 0 && valid_hex(&review.expected_digest),
             Self::ProposalReview {
                 expected_digest, ..
@@ -1027,7 +1078,9 @@ impl HumanReadRequest {
 impl HumanActionRequest {
     fn validate(&self) -> bool {
         match self {
-            Self::WebAccept { review } => valid_hex(&review.expected_digest),
+            Self::WebAccept { review } | Self::WebProposalDisposition { review, .. } => {
+                valid_hex(&review.expected_digest)
+            }
             Self::Proposal {
                 expected_fingerprint,
                 decision,
@@ -1325,12 +1378,14 @@ impl HumanGovernanceResponse {
                 item,
                 confirmation_digest,
                 web_accept_available: available,
+                web_disposition_available: can_dispose,
                 core_anchor,
                 frontier,
             } => match item {
                 Some(item) => {
                     item.validate()
                         && item.proposal.is_some()
+                        && (!can_dispose || web_disposition_available(item))
                         && core_anchor.as_ref().is_none_or(|anchor| anchor.validate())
                         && (!available
                             || confirmation_digest.as_deref().is_some_and(|digest| {
@@ -1349,7 +1404,12 @@ impl HumanGovernanceResponse {
                                 .as_ref()
                                 .is_some_and(|review| review.proposal.status.is_open()))
                 }
-                None => confirmation_digest.is_none() && core_anchor.is_none() && !available,
+                None => {
+                    confirmation_digest.is_none()
+                        && core_anchor.is_none()
+                        && !available
+                        && !can_dispose
+                }
             },
             Self::Action { result } => result.validate(),
             Self::Conflict {

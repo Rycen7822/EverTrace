@@ -634,13 +634,17 @@ class Backend:
                 raise BackendError("invalid_read_response")
         return result
 
-    async def web_proposal_acceptance(self, request_id, proposal, revision, frontier, digest, *, lookup):
+    async def web_proposal_action(self, request_id, proposal, revision, frontier, digest, *, lookup, decision):
         review = {"proposal_id": proposal, "expected_revision_id": revision, "expected_digest": digest}
+        fields = {"review": review}
+        if decision is not None:
+            fields["decision"] = decision
         if lookup:
-            reply = await self._request({"kind": "web_acceptance_outcome", "request_id": request_id,
-                "expected_frontier": frontier, "review": review})
+            kind = "web_acceptance_outcome" if decision is None else "web_proposal_disposition_outcome"
+            reply = await self._request({"kind": kind, "request_id": request_id, "expected_frontier": frontier, **fields})
         else:
-            action = {"operation": "act", "expected_frontier": frontier, "action": {"kind": "web_accept", "review": review}}
+            kind = "web_accept" if decision is None else "web_proposal_disposition"
+            action = {"operation": "act", "expected_frontier": frontier, "action": {"kind": kind, **fields}}
             reply = await self._request(None, confirmation=True, action=action, request_id=request_id)
         if reply.get("kind") != "action" or reply["result"].get("status") not in (
             "applied", "no_delta", "conflict", "unavailable", "unknown",
@@ -768,7 +772,7 @@ class Backend:
                     return health
                 response = await call({"human_governance": {"operation": "read", "request": read}})
                 result = response["human_governance"]
-                if read["kind"] == "web_acceptance_outcome":
+                if read["kind"] in ("web_acceptance_outcome", "web_proposal_disposition_outcome"):
                     return result
                 if result.get("kind") not in (
                     "state",

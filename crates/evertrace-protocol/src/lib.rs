@@ -475,7 +475,7 @@ where
                 pending_mcp_return = None;
             }
             let durable_web_action = context.web_launcher
-                && matches!(&command.command, Command::HumanGovernance(request) if request.is_web_acceptance());
+                && matches!(&command.command, Command::HumanGovernance(request) if request.is_web_proposal_action());
             let result = if durable_web_action {
                 // Once the Web decision is admitted, losing the socket is not a rollback.
                 Box::pin(command_handler(

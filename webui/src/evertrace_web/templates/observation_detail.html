@@ -73,7 +73,7 @@
 {% endif %}
 {% elif surface == 'inbox' %}
 <p class="notice">
-  审核操作尚未开放。这里显示现有原生事实；能看见元数据不代表正文可读、提案可接受或支持已恢复。
+  只显示原生允许的审核操作；能见到元数据不代表正文可读、提案可接受或支持已恢复。
 </p>
 {% if item.proposal %}{% include 'proposal_review.html' %}{% endif %}
 {% for field, label in [

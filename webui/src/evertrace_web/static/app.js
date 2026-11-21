@@ -123,7 +123,7 @@ async function api(path, body, signal) {
       signal,
     });
   } catch (error) {
-    if (error.name !== "AbortError" && !path.startsWith("proposal-accept"))
+    if (error.name !== "AbortError" && !path.startsWith("proposal-"))
       closed("网页服务连接已断开，旧内容已清除；可刷新页面重新连接。");
     throw error;
   }
@@ -332,34 +332,54 @@ function showAcceptanceReceipt() {
   const receipt = state.acceptance;
   $("acceptance-receipt").hidden = !receipt;
   $("acceptance-lookup").hidden = receipt?.status !== "unknown";
+  const decision = receipt?.input.decision?.kind;
   $("acceptance-status").textContent = !receipt ? "" : ({
-    pending: "正在核对接受结果…",
-    applied: "已接受。",
+    pending: "正在核对审核结果…",
+    applied: decision === "defer" ? "已延期。" : decision === "reject" ? "已拒绝。" : "已接受。",
     no_delta: "此请求已处理；没有再次写入。",
     conflict: "提案或水位有变化；本请求未应用。",
-    unavailable: "当前提案不具备网页接受条件；本请求未应用。",
+    unavailable: "当前提案不具备此网页审核操作的条件；本请求未应用。",
     unknown: "结果未知；不会自动重试。请只查原请求。",
-  }[receipt.status] + " 请求：" + receipt.input.request_id);
+  }[receipt.status] + " 请求：" + receipt.input.request_id
+    + (receipt.result?.current_revision_ref ? " 后继修订：" + receipt.result.current_revision_ref : "")
+    + (receipt.result?.audit_event_ref ? " 审计事件：" + receipt.result.audit_event_ref : ""));
 }
 async function resolveAcceptance(receipt, lookup) {
   receipt.status = "pending";
   showAcceptanceReceipt();
   try {
-    const path = lookup ? "proposal-acceptance-result" : "proposal-accept";
-    const result = await api(path, receipt.input);
-    receipt.status = result.status;
+    const path = receipt.input.decision
+      ? (lookup ? "proposal-disposition-result" : "proposal-disposition")
+      : (lookup ? "proposal-acceptance-result" : "proposal-accept");
+    receipt.result = await api(path, receipt.input);
+    receipt.status = receipt.result.status;
   } catch {
     receipt.status = "unknown";
   } finally {
     if (state.acceptance === receipt) showAcceptanceReceipt();
   }
 }
-function acceptProposal(button) {
-  const { proposalId, revision, frontier, reviewDigest, requestId } = button.dataset;
+function actOnProposal(button) {
+  const { proposalId, revision, frontier, reviewDigest, requestId, proposalDisposition } = button.dataset;
   if (document.hidden || !state.active || proposalId !== state.selected?.object || revision !== state.selected?.revision) return;
   if (["pending", "unknown"].includes(state.acceptance?.status)) return;
-  if (!window.confirm("接受刚才显示的提案修订 " + revision + "？")) return;
   const input = { request_id: requestId, proposal_id: proposalId, revision, frontier, review_digest: reviewDigest };
+  let prompt = "接受刚才显示的提案修订 " + revision + "？";
+  if (proposalDisposition === "defer") {
+    const fields = button.closest("[data-disposition-fields]");
+    const wait = fields.querySelector("[data-proposal-waiting]");
+    if (!wait.value) {
+      fields.querySelector("[data-disposition-status]").textContent = "请先选择等待条件。";
+      wait.focus();
+      return;
+    }
+    input.decision = { kind: "defer", waiting_on: wait.value };
+    prompt = "延期提案修订 " + revision + "，等待「" + wait.selectedOptions[0].textContent + "」？";
+  } else if (proposalDisposition === "reject") {
+    input.decision = { kind: "reject" };
+    prompt = "拒绝刚才显示的提案修订 " + revision + "？相同内容与证据不会重新提交审核。";
+  }
+  if (!window.confirm(prompt)) return;
   cancel();
   state.selected = null;
   $("detail-body").replaceChildren();
@@ -850,7 +870,7 @@ async function readObservations(controller, health) {
       ? "原生读取有降级；不代表所有任务或审核已正常。"
       : system
         ? "只观察原任务和结果；离开页面不取消任务，也不自动重试。可用 CLI 返回的 Job ID 精确回查。"
-        : "仅在原生返回资格时可接受所显示的提案；编辑、拒绝和其它操作尚未开放。",
+        : "仅在原生返回资格时可接受、延期或拒绝这份修订；编辑与其它纠正操作尚未全部开放。",
   );
   const selected = state.selected;
   if (
@@ -1141,7 +1161,7 @@ $("detail-body").onclick = (event) => {
     [data-archive-next], [data-archive-first], [data-archive-up], [data-content-open],
     [data-content-nav], [data-revisions-open], [data-revisions-next], [data-detail-open],
     [data-revision-key], [data-sources-open], [data-sources-next], [data-link-key], [data-proposal-confirm], [data-proposal-accept],
-    [data-nav-back], [data-compare-base], [data-compare-key], [data-compare-side],
+    [data-proposal-disposition], [data-nav-back], [data-compare-base], [data-compare-key], [data-compare-side],
     [data-result-base], [data-result-compare],
     [data-compare-first], [data-compare-next], [data-compiled-first], [data-compiled-next], [data-compiled-refresh]`,
   );
@@ -1209,7 +1229,7 @@ $("detail-body").onclick = (event) => {
     return;
   }
   if (button.hasAttribute("data-proposal-confirm")) confirmProposal(button);
-  if (button.hasAttribute("data-proposal-accept")) acceptProposal(button);
+  if (button.matches("[data-proposal-accept], [data-proposal-disposition]")) actOnProposal(button);
   else if (button.hasAttribute("data-result-base")) compareResult(button, true);
   else if (button.hasAttribute("data-result-compare")) compareResult(button, false);
   else if (button.hasAttribute("data-compare-base")) pinComparison();

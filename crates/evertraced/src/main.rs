@@ -471,12 +471,12 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
             let maintenance_active = Arc::clone(&handler_maintenance_active);
             let dispatch_gate = Arc::clone(&handler_dispatch_gate);
             async move {
-                // Ordinary Web sockets are read-only. The inherited launcher socket adds one closed action.
-                let web_accept = matches!(&command, ProtocolCommand::HumanGovernance(request) if request.is_web_acceptance());
+                // Only the inherited launcher socket admits the closed Web proposal actions.
+                let web_action = matches!(&command, ProtocolCommand::HumanGovernance(request) if request.is_web_proposal_action());
                 let governance_read = matches!(&command, ProtocolCommand::HumanGovernance(HumanGovernanceRequest::Read { .. }));
                 let verified_web = context.client_kind == ClientKind::Web && context.web_launcher;
-                if web_accept && !verified_web || context.client_kind == ClientKind::Web
-                    && (context.peer_credentials.is_none() || !(web_accept || governance_read || matches!(&command, ProtocolCommand::Health)))
+                if web_action && !verified_web || context.client_kind == ClientKind::Web
+                    && (context.peer_credentials.is_none() || !(web_action || governance_read || matches!(&command, ProtocolCommand::Health)))
                 { return Err(ErrorCode::Untrusted); }
                 let observation_deadline = match &command {
                     ProtocolCommand::ObserveProcessSource { .. } => {
@@ -889,7 +889,7 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
                         }))
                     }
                     ProtocolCommand::HumanGovernance(command) => {
-                        if context.client_kind != ClientKind::Cli && !web_accept
+                        if context.client_kind != ClientKind::Cli && !web_action
                             && !(context.client_kind == ClientKind::Web && governance_read)
                         {
                             return Err(ErrorCode::Untrusted);
@@ -1146,6 +1146,14 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
                                     )).await.map_err(map_human_error)?;
                                     HumanGovernanceResponse::Action { result: map_human_action(outcome) }
                                 }
+                                HumanReadRequest::WebProposalDispositionOutcome { request_id, expected_frontier, review, decision } => {
+                                    if context.client_kind != ClientKind::Web { return Err(ErrorCode::Untrusted); }
+                                    let outcome = Box::pin(human_governance.acceptance().web_disposition_outcome(
+                                        &human_governance, request_id, expected_frontier,
+                                        (review.proposal_id, review.expected_revision_id, &review.expected_digest), decision.waiting_on(),
+                                    )).await.map_err(map_human_error)?;
+                                    HumanGovernanceResponse::Action { result: map_human_action(outcome) }
+                                }
                                 HumanReadRequest::Related {
                                     relation,
                                     source_stable_key,
@@ -1188,6 +1196,9 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
                                 let outcome = match action {
                                     HumanActionRequest::WebAccept { review } => Box::pin(accept_web_review(
                                         &human_governance, request_id, expected_frontier, review,
+                                    )).await,
+                                    HumanActionRequest::WebProposalDisposition { review, decision } => Box::pin(dispose_web_review(
+                                        &human_governance, request_id, expected_frontier, review, decision,
                                     )).await,
                                     HumanActionRequest::Proposal {
                                         proposal_id,
@@ -1740,6 +1751,9 @@ async fn read_proposal_review(
             });
     Ok(HumanGovernanceResponse::ProposalReview {
         frontier: page.frontier,
+        web_disposition_available: item
+            .as_ref()
+            .is_some_and(evertrace_protocol::dto::web_disposition_available),
         item: item.map(Box::new),
         confirmation_digest: digest,
         web_accept_available,
@@ -1804,6 +1818,83 @@ async fn accept_web_review(
         }
     };
     Box::pin(acceptance.accept_reviewed_web(service, request_id, id, revision, intent)).await
+}
+
+async fn dispose_web_review(
+    service: &HumanGovernanceService,
+    request_id: evertrace_protocol::dto::RequestId,
+    frontier: u64,
+    review: evertrace_protocol::dto::ProposalConfirmation,
+    decision: evertrace_protocol::dto::WebProposalDisposition,
+) -> Result<EngineHumanActionOutcome, HumanGovernanceError> {
+    let acceptance = service.acceptance();
+    let (id, revision, digest) = (
+        review.proposal_id,
+        review.expected_revision_id,
+        review.expected_digest.as_str(),
+    );
+    let lookup = || {
+        acceptance.web_disposition_outcome(
+            service,
+            request_id,
+            frontier,
+            (id, revision, digest),
+            decision.waiting_on(),
+        )
+    };
+    let retry = |outcome| match outcome {
+        EngineHumanActionOutcome::Applied {
+            current_revision_ref,
+            ..
+        } => Some(EngineHumanActionOutcome::NoDelta {
+            current_revision_ref,
+        }),
+        _ => None,
+    };
+    if let Some(outcome) = retry(Box::pin(lookup()).await?) {
+        return Ok(outcome);
+    }
+    let outcome = match Box::pin(read_proposal_review(
+        service,
+        &id.to_string(),
+        &revision.to_string(),
+        frontier,
+        Some(digest),
+    ))
+    .await?
+    {
+        HumanGovernanceResponse::ProposalReview {
+            item: Some(item),
+            web_disposition_available: true,
+            ..
+        } => {
+            let proposal = &item
+                .proposal_review
+                .as_ref()
+                .ok_or(HumanGovernanceError::Store)?
+                .proposal;
+            Box::pin(acceptance.dispose_reviewed_web(
+                request_id,
+                frontier,
+                proposal,
+                digest,
+                decision.waiting_on(),
+            ))
+            .await?
+        }
+        HumanGovernanceResponse::Conflict { .. } => EngineHumanActionOutcome::Conflict {
+            current_revision_ref: None,
+        },
+        _ => EngineHumanActionOutcome::Unavailable {
+            reason: "web_disposition_unavailable_for_proposal",
+        },
+    };
+    if matches!(outcome, EngineHumanActionOutcome::Conflict { .. })
+        && let Some(committed) = retry(Box::pin(lookup()).await?)
+    {
+        return Ok(committed);
+    }
+    Ok(outcome)
 }
 
 fn map_human_page(page: evertrace_engine::HumanPage) -> HumanGovernanceResponse {

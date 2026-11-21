@@ -211,6 +211,8 @@ class App:
             "/api/read": "POST",
             "/api/proposal-accept": "POST",
             "/api/proposal-acceptance-result": "POST",
+            "/api/proposal-disposition": "POST",
+            "/api/proposal-disposition-result": "POST",
         }.get(path)
         if expected_method is None:
             return Response(status_code=404)
@@ -271,17 +273,23 @@ class App:
             response.delete_cookie(self.cookie, httponly=True, samesite="strict", path="/")
             return response
         try:
-            if path in ("/api/proposal-accept", "/api/proposal-acceptance-result"):
-                if set(payload) != {"request_id", "proposal_id", "revision", "frontier", "review_digest"} or not _uuid7(payload["request_id"]):
+            if path in ("/api/proposal-accept", "/api/proposal-acceptance-result",
+                        "/api/proposal-disposition", "/api/proposal-disposition-result"):
+                fields = {"request_id", "proposal_id", "revision", "frontier", "review_digest"}
+                disposition = path.startswith("/api/proposal-disposition")
+                if disposition:
+                    fields.add("decision")
+                if set(payload) != fields or not _uuid7(payload["request_id"]):
                     raise BackendError("invalid_input")
                 proposal, revision = proposal_coordinates(payload["proposal_id"], payload["revision"])
                 frontier = parse_frontier(payload["frontier"])
                 digest = proposal_digest(payload["review_digest"])
+                decision = proposal_disposition(payload["decision"]) if disposition else None
                 if frontier == 0:
                     raise BackendError("invalid_input")
                 try:
-                    data = await self.backend.web_proposal_acceptance(
-                        payload["request_id"], proposal, revision, frontier, digest, lookup=path.endswith("-result"),
+                    data = await self.backend.web_proposal_action(
+                        payload["request_id"], proposal, revision, frontier, digest, lookup=path.endswith("-result"), decision=decision,
                     )
                 except BackendError:
                     # No reply is not evidence of rollback, and must not trigger another write.
@@ -706,6 +714,17 @@ def proposal_digest(digest):
     return digest
 
 
+def proposal_disposition(value):
+    if isinstance(value, dict):
+        if value == {"kind": "reject"}:
+            return value
+        if (set(value) == {"kind", "waiting_on"} and value["kind"] == "defer"
+            and value["waiting_on"] in ("new_evidence", "target_revision_change", "objective_verifier",
+                                         "conflict_resolution", "manual_review")):
+            return value
+    raise BackendError("invalid_input")
+
+
 def proposal_coordinates(proposal_id, revision):
     prefix = "proposal:"
     if (not isinstance(proposal_id, str) or not proposal_id.startswith(prefix)
@@ -759,7 +778,8 @@ def present_detail(templates, result, surface):
     return {
         "html": templates.get_template(template).render(items=result["items"], surface=surface,
             frontier=result.get("frontier"), confirmation_digest=result.get("confirmation_digest"),
-            core_anchor=result.get("core_anchor"), acceptance_request_id=_request_id() if result.get("web_accept_available") else None),
+            core_anchor=result.get("core_anchor"), acceptance_request_id=_request_id() if result.get("web_accept_available") else None,
+            disposition_request_id=_request_id() if result.get("web_disposition_available") else None),
         "source_preview": preview,
         "semantic_text": semantic_text,
         "selection": selection,

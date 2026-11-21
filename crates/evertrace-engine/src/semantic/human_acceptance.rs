@@ -21,7 +21,7 @@ use evertrace_domain::{
     semantic::{
         AcceptedProposalTarget, AtomProposalPayload, AtomScope, CoreMembershipProposalPayload,
         ProposalAcceptanceAuthority, ProposalCreatedBy, ProposalEligibility, ProposalOperation,
-        ProposalPayload, ProposalStatus, ProposalTargetId, RevisionProposal,
+        ProposalPayload, ProposalStatus, ProposalTargetId, ProposalWaitingOn, RevisionProposal,
         SupportThresholdSnapshot, TUI_ACCEPTANCE_EVENT_MANIFEST_REF,
         WEB_ACCEPTANCE_EVENT_MANIFEST_REF, WebAcceptanceIntent, tui_acceptance_capture_matches,
         tui_acceptance_event_payload,
@@ -697,6 +697,133 @@ impl HumanAcceptanceService {
             return Ok(HumanActionOutcome::Unknown);
         }
         Ok(outcome)
+    }
+
+    pub async fn dispose_reviewed_web(
+        &self,
+        request_id: RequestId,
+        frontier: u64,
+        reviewed: &RevisionProposal,
+        digest: &str,
+        waiting_on: Option<ProposalWaitingOn>,
+    ) -> Result<HumanActionOutcome, HumanGovernanceError> {
+        let snapshot = self
+            .writer
+            .project_objects()
+            .await
+            .map_err(|_| HumanGovernanceError::Store)?;
+        let view = SemanticCurrentView::from_snapshot(&snapshot)
+            .map_err(|_| HumanGovernanceError::Store)?;
+        let current = view.proposals.get(&reviewed.proposal_id);
+        let conflict = || HumanActionOutcome::Conflict {
+            current_revision_ref: current.map(|proposal| proposal.proposal_revision_id.to_string()),
+        };
+        if snapshot.frontier != frontier || current != Some(reviewed) || !reviewed.status.is_open()
+        {
+            return Ok(conflict());
+        }
+        if let Some(base) = reviewed.base_revision_id {
+            let reference = base.to_string();
+            let selected =
+                evertrace_store::projections::select_object_row_rows(&snapshot.rows, &reference)
+                    .map_err(|_| HumanGovernanceError::Store)?;
+            if !matches!(selected, Some((row, true)) if row.current_revision_id.as_deref() == Some(reference.as_str()))
+            {
+                return Ok(conflict());
+            }
+        }
+        let context = command_context(request_id, self.effective_config_hash)?;
+        let (status, reason) = web_disposition_status(waiting_on);
+        let ProposalResolution::Revision { value, command } = RevisionProposalService
+            .revise_status(
+                &view,
+                context,
+                reviewed.proposal_id,
+                status,
+                waiting_on.into_iter().collect(),
+                Some(reason.into()),
+            )
+            .map_err(|_| HumanGovernanceError::Store)?
+        else {
+            return Err(HumanGovernanceError::Store);
+        };
+        let [event] = command.events() else {
+            return Err(HumanGovernanceError::Store);
+        };
+        let mut event = event.clone();
+        // Bind the originating Web review to this existing journal event, without an acceptance source or another ledger.
+        event.causation_id = Some(web_disposition_cause(frontier, digest));
+        let command = JournalCommand::new(command.command_id(), vec![event])
+            .map_err(|_| HumanGovernanceError::Store)?;
+        match self
+            .writer
+            .commit_if_frontier(command, now_us()?, frontier)
+            .await
+        {
+            Ok(outcome) => Ok(HumanActionOutcome::Applied {
+                current_revision_ref: value.proposal_revision_id.to_string(),
+                audit_event_ref: outcome
+                    .event_ids
+                    .into_iter()
+                    .next()
+                    .ok_or(HumanGovernanceError::Store)?,
+            }),
+            Err(
+                crate::WriterActorError::StaleFrontier
+                | crate::WriterActorError::IdempotencyConflict,
+            ) => Ok(conflict()),
+            Err(_) => Err(HumanGovernanceError::Store),
+        }
+    }
+
+    pub async fn web_disposition_outcome(
+        &self,
+        service: &crate::HumanGovernanceService,
+        request_id: RequestId,
+        frontier: u64,
+        reviewed: (RevisionProposalId, RevisionId, &str),
+        waiting_on: Option<ProposalWaitingOn>,
+    ) -> Result<HumanActionOutcome, HumanGovernanceError> {
+        let (id, revision, digest) = reviewed;
+        let command_id = CommandId::from_uuid(request_id.as_uuid())
+            .map_err(|_| HumanGovernanceError::InvalidInput)?;
+        let Some(committed) = self
+            .writer
+            .committed_command(command_id)
+            .await
+            .map_err(|_| HumanGovernanceError::Store)?
+        else {
+            return Ok(HumanActionOutcome::Unknown);
+        };
+        let ([JournalPayload::RevisionProposalRecorded(next)], [audit]) = (
+            committed.payloads.as_slice(),
+            committed.event_ids.as_slice(),
+        ) else {
+            return Ok(HumanActionOutcome::Unknown);
+        };
+        let (status, reason) = web_disposition_status(waiting_on);
+        if next.proposal_id != id
+            || next.parent_proposal_revision_id != Some(revision)
+            || next.status != status
+            || next.review_reason.as_deref() != Some(reason)
+            || !next.waiting_on.iter().copied().eq(waiting_on)
+            || committed.first_causation_id.as_deref()
+                != Some(web_disposition_cause(frontier, digest).as_str())
+        {
+            return Ok(HumanActionOutcome::Unknown);
+        }
+        let snapshot = self
+            .writer
+            .project_objects()
+            .await
+            .map_err(|_| HumanGovernanceError::Store)?;
+        if !service.proposal_accessible(&snapshot, next).await? {
+            return Ok(HumanActionOutcome::Unknown);
+        }
+        Ok(HumanActionOutcome::Applied {
+            current_revision_ref: next.proposal_revision_id.to_string(),
+            audit_event_ref: audit.clone(),
+        })
     }
 
     pub async fn decide_proposal(
@@ -2651,6 +2778,18 @@ fn validate_current_edit_cohort(
         }
         _ => Err(HumanGovernanceError::Store),
     }
+}
+
+fn web_disposition_status(waiting_on: Option<ProposalWaitingOn>) -> (ProposalStatus, &'static str) {
+    if waiting_on.is_some() {
+        (ProposalStatus::Deferred, "web_deferred")
+    } else {
+        (ProposalStatus::Rejected, "web_rejected")
+    }
+}
+
+fn web_disposition_cause(frontier: u64, digest: &str) -> String {
+    format!("web-proposal-review:{frontier}:{digest}")
 }
 
 fn web_acceptance_outcome(
