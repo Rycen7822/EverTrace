@@ -12255,6 +12255,7 @@ fn other_live_source_observations(
                     user_source_observation_ref,
                     ..
                 }
+                | evertrace_domain::semantic::ProposalAcceptanceAuthority::WebAcceptance { user_source_observation_ref, .. }
                 | evertrace_domain::semantic::ProposalAcceptanceAuthority::ObjectiveEvidence {
                     user_source_observation_ref,
                 } => user_source_observation_ref,
@@ -12916,6 +12917,7 @@ impl JournalAdmissionState {
             &self.proposals,
             &self.procedure,
             &self.scenario_core,
+            self.frontier,
             command.events().iter().map(|event| {
                 (
                     &event.payload,
@@ -13177,6 +13179,7 @@ impl JournalAdmissionState {
             &self.proposals,
             &self.procedure,
             &self.scenario_core,
+            self.frontier,
             rows.iter()
                 .zip(parsed.iter())
                 .map(|(row, (payload, _, _))| {

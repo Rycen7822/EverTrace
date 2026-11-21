@@ -357,6 +357,7 @@ pub enum UserAuthorizationMode {
     UserStatement,
     CurrentTaskExactMessage,
     TuiAcceptance,
+    WebAcceptance,
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -627,7 +628,12 @@ impl Atom {
                             return Err(SemanticError::InvalidAtom);
                         }
                     }
-                    UserAuthorizationMode::TuiAcceptance => {
+                    UserAuthorizationMode::TuiAcceptance | UserAuthorizationMode::WebAcceptance => {
+                        if user.mode == UserAuthorizationMode::WebAcceptance
+                            && !matches!(self.scope, AtomScope::Task { .. })
+                        {
+                            return Err(SemanticError::InvalidAtom);
+                        }
                         if user
                             .acceptance_event_ref
                             .as_deref()
@@ -714,6 +720,7 @@ impl Atom {
                             value.mode,
                             UserAuthorizationMode::CurrentTaskExactMessage
                                 | UserAuthorizationMode::TuiAcceptance
+                                | UserAuthorizationMode::WebAcceptance
                         )
                     }),
                 AtomAuthority::ObjectiveEvidence => true,

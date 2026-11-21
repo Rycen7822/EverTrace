@@ -248,6 +248,10 @@ fn core_read_state(
                         user_source_observation_ref,
                         ..
                     }
+                    | ProposalAcceptanceAuthority::WebAcceptance {
+                        user_source_observation_ref,
+                        ..
+                    }
                     | ProposalAcceptanceAuthority::ObjectiveEvidence {
                         user_source_observation_ref,
                     } => user_source_observation_ref,

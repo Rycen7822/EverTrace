@@ -8,7 +8,7 @@ mod scenario_core;
 
 pub use emission::{
     AtomAuthorityBasis, AtomEmissionDecision, AtomEmissionGate, AtomMaterialization,
-    SparseAtomSignal, SparseNoDeltaReason, VerifiedTuiAcceptance, exact_task_constraint_draft,
+    SparseAtomSignal, SparseNoDeltaReason, VerifiedHumanAcceptance, exact_task_constraint_draft,
     materialize_atom,
 };
 pub use human_acceptance::HumanAcceptanceService;

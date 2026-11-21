@@ -823,18 +823,12 @@ pub enum HumanGovernanceResponse {
 
 /// Bind the complete permission-filtered review, not a browser-supplied statement of authority.
 pub fn proposal_confirmation_digest(item: &HumanSnapshotItem, frontier: u64) -> Option<String> {
-    use evertrace_domain::canonical::{CanonicalValue, sha256};
     let review = item
         .proposal_review
         .as_ref()
         .filter(|review| review.proposal.status.is_open())?;
-    let body = crate::frame::canonical_json(&(frontier, review, &item.proposal_base)).ok()?;
-    let digest = sha256(
-        "evertrace.proposal_review_confirmation",
-        1,
-        &CanonicalValue::Bytes(body),
-    )
-    .ok()?;
+    let digest =
+        evertrace_domain::semantic::proposal_review_digest(frontier, review, &item.proposal_base)?;
     Some(evertrace_domain::evidence::hex(&digest))
 }
 

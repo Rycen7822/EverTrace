@@ -8,9 +8,8 @@ use arrow_schema::{DataType, Field, Schema, SchemaRef};
 use evertrace_domain::ids::CommandId;
 
 use crate::command::{
-    EventScope, JOURNAL_PAYLOAD_SCHEMA, JournalCommand, JournalEventDraft, JournalPayload,
-    ObjectFamily, PreparedCommand, PreparedEvent, RecordClass, SourceKind, StoreError,
-    prepare_command,
+    EventScope, JournalCommand, JournalEventDraft, JournalPayload, ObjectFamily, PreparedCommand,
+    PreparedEvent, RecordClass, SourceKind, StoreError, prepare_command,
 };
 
 pub const JOURNAL_TABLE: &str = "evertrace_journal";
@@ -44,7 +43,12 @@ pub struct JournalRow {
 
 impl JournalRow {
     pub fn payload(&self) -> Result<JournalPayload, StoreError> {
-        serde_json::from_str(&self.payload_json).map_err(|_| StoreError::StoreCorrupt)
+        let payload: JournalPayload =
+            serde_json::from_str(&self.payload_json).map_err(|_| StoreError::StoreCorrupt)?;
+        if self.payload_schema != payload.payload_schema() {
+            return Err(StoreError::StoreCorrupt);
+        }
+        Ok(payload)
     }
 
     fn draft(&self) -> Result<JournalEventDraft, StoreError> {
@@ -155,7 +159,6 @@ fn validate_complete_command_refs(
         if row.command_id != command_id
             || row.command_event_count != expected_count
             || usize::from(row.ordinal) != index
-            || row.payload_schema != JOURNAL_PAYLOAD_SCHEMA
         {
             return Err(StoreError::StoreCorrupt);
         }
@@ -378,7 +381,7 @@ fn row_from_prepared(
         ingested_at_us,
         source_kind: event.draft.source_kind,
         source_ref_json: None,
-        payload_schema: JOURNAL_PAYLOAD_SCHEMA,
+        payload_schema: event.payload_schema,
         payload_json: event.payload_json.clone(),
         content_hash: event.content_hash,
         causation_id: event.draft.causation_id.clone(),

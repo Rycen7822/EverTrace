@@ -18,6 +18,7 @@ const MAX_SPLIT_OUTPUTS: usize = 16;
 const MAX_REVIEW_TEXT: usize = 2048;
 
 pub const TUI_ACCEPTANCE_EVENT_MANIFEST_REF: &str = "evertrace_tui_acceptance_v1";
+pub const WEB_ACCEPTANCE_EVENT_MANIFEST_REF: &str = "evertrace_web_acceptance_v1";
 const PROPOSAL_EDIT_INTENT_SCHEMA_VERSION: u32 = 1;
 
 pub fn tui_acceptance_event_payload(
@@ -31,6 +32,108 @@ pub fn tui_acceptance_event_payload(
     )
 }
 
+pub fn proposal_review_digest<Review: Serialize, Base: Serialize>(
+    frontier: u64,
+    review: Review,
+    base: Base,
+) -> Option<[u8; 32]> {
+    let body = serde_json::to_vec(&(frontier, review, base)).ok()?;
+    sha256(
+        "evertrace.proposal_review_confirmation",
+        1,
+        &CanonicalValue::Bytes(body),
+    )
+    .ok()
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct WebAcceptanceIntent {
+    pub reviewed_frontier: u64,
+    pub review_digest: [u8; 32],
+}
+
+impl WebAcceptanceIntent {
+    /// First supported Native cohort: a manually reviewed Task Atom creation.
+    pub fn for_proposal(proposal: &RevisionProposal, frontier: u64) -> Option<Self> {
+        #[derive(Serialize)]
+        struct Review<'a> {
+            proposal: &'a RevisionProposal,
+            plain_accept_eligible: bool,
+            merge_and_accept_eligible: bool,
+        }
+        let ProposalPayload::Atom(payload) = &proposal.payload else {
+            return None;
+        };
+        let AtomProposalPayload::Create { draft } = payload.as_ref() else {
+            return None;
+        };
+        if frontier == 0
+            || !proposal.status.is_open()
+            || !matches!(draft.scope, AtomScope::Task { .. })
+            || proposal.eligibility != ProposalEligibility::ManualRequired
+        {
+            return None;
+        }
+        let review = Review {
+            proposal,
+            plain_accept_eligible: true,
+            merge_and_accept_eligible: false,
+        };
+        Some(Self {
+            reviewed_frontier: frontier,
+            review_digest: proposal_review_digest(frontier, review, Option::<()>::None)?,
+        })
+    }
+
+    pub fn canonical(self, proposal: &RevisionProposal) -> Option<String> {
+        if Self::for_proposal(proposal, self.reviewed_frontier)? != self {
+            return None;
+        }
+        serde_json::to_string(&(
+            WEB_ACCEPTANCE_EVENT_MANIFEST_REF,
+            "accept",
+            proposal.proposal_id,
+            proposal.proposal_revision_id,
+            hex(&proposal.fingerprint),
+            self,
+        ))
+        .ok()
+    }
+
+    pub fn read_canonical(bytes: &[u8], proposal: &RevisionProposal) -> Option<Self> {
+        type Record = (
+            String,
+            String,
+            RevisionProposalId,
+            RevisionId,
+            String,
+            WebAcceptanceIntent,
+        );
+        let (_, _, _, _, _, intent): Record = serde_json::from_slice(bytes).ok()?;
+        (intent.canonical(proposal)?.as_bytes() == bytes).then_some(intent)
+    }
+
+    pub fn capture_matches(
+        self,
+        source: &RevisionProposal,
+        receipt: &SourceReceipt,
+        observation: &SourceObservation,
+    ) -> bool {
+        self.canonical(source).is_some_and(|canonical| {
+            acceptance_capture_matches(
+                source,
+                &canonical,
+                "web-accept",
+                "web-acceptance",
+                WEB_ACCEPTANCE_EVENT_MANIFEST_REF,
+                receipt,
+                observation,
+            )
+        })
+    }
+}
+
 /// Match the historical human-review capture envelope without re-encoding or granting authority.
 pub fn tui_acceptance_capture_matches(
     source: &RevisionProposal,
@@ -39,10 +142,31 @@ pub fn tui_acceptance_capture_matches(
     receipt: &SourceReceipt,
     observation: &SourceObservation,
 ) -> bool {
-    receipt.eligible_event_manifest_ref == TUI_ACCEPTANCE_EVENT_MANIFEST_REF
-        && receipt.identity_domain == TUI_ACCEPTANCE_EVENT_MANIFEST_REF
-        && receipt.adapter_manifest_ref == TUI_ACCEPTANCE_EVENT_MANIFEST_REF
-        && receipt.source_instance_id.as_str() == format!("tui-acceptance:{}", source.proposal_id)
+    acceptance_capture_matches(
+        source,
+        canonical,
+        record_prefix,
+        "tui-acceptance",
+        TUI_ACCEPTANCE_EVENT_MANIFEST_REF,
+        receipt,
+        observation,
+    )
+}
+
+fn acceptance_capture_matches(
+    source: &RevisionProposal,
+    canonical: &str,
+    record_prefix: &str,
+    instance_prefix: &str,
+    manifest: &str,
+    receipt: &SourceReceipt,
+    observation: &SourceObservation,
+) -> bool {
+    receipt.eligible_event_manifest_ref == manifest
+        && receipt.identity_domain == manifest
+        && receipt.adapter_manifest_ref == manifest
+        && receipt.source_instance_id.as_str()
+            == format!("{instance_prefix}:{}", source.proposal_id)
         && receipt.source_revision.as_str() == source.proposal_revision_id.to_string()
         && receipt.source_record_identity.as_str()
             == format!(
@@ -367,6 +491,11 @@ pub enum ProposalAcceptanceAuthority {
     TuiAcceptance {
         user_source_observation_ref: crate::ids::SourceObservationId,
         authorized_scope_ceiling: AtomScope,
+    },
+    WebAcceptance {
+        user_source_observation_ref: crate::ids::SourceObservationId,
+        authorized_scope_ceiling: AtomScope,
+        intent: WebAcceptanceIntent,
     },
     ObjectiveEvidence {
         user_source_observation_ref: crate::ids::SourceObservationId,

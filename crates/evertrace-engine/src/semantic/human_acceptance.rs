@@ -23,7 +23,8 @@ use evertrace_domain::{
         ProposalAcceptanceAuthority, ProposalCreatedBy, ProposalEligibility, ProposalOperation,
         ProposalPayload, ProposalStatus, ProposalTargetId, RevisionProposal,
         SupportThresholdSnapshot, TUI_ACCEPTANCE_EVENT_MANIFEST_REF,
-        tui_acceptance_capture_matches, tui_acceptance_event_payload,
+        WEB_ACCEPTANCE_EVENT_MANIFEST_REF, WebAcceptanceIntent, tui_acceptance_capture_matches,
+        tui_acceptance_event_payload,
     },
 };
 use evertrace_store::{
@@ -189,9 +190,11 @@ impl HumanAcceptanceService {
                 .ok_or(HumanGovernanceError::Store)?;
             let verified =
                 verify_capture_frame(frame, &cas).map_err(|_| HumanGovernanceError::Store)?;
-            if verified.body.eligible_event_manifest_ref != TUI_ACCEPTANCE_EVENT_MANIFEST_REF {
-                return Err(HumanGovernanceError::Store);
-            }
+            let web = match verified.body.eligible_event_manifest_ref.as_str() {
+                TUI_ACCEPTANCE_EVENT_MANIFEST_REF => false,
+                WEB_ACCEPTANCE_EVENT_MANIFEST_REF => true,
+                _ => return Err(HumanGovernanceError::Store),
+            };
             let proposal_id = RevisionProposalId::from_str(&verified.body.source_ref)
                 .map_err(|_| HumanGovernanceError::Store)?;
             let snapshot = self
@@ -208,6 +211,13 @@ impl HumanAcceptanceService {
                 .get(&reviewed_revision)
                 .filter(|value| value.proposal_id == proposal_id)
                 .ok_or(HumanGovernanceError::Store)?;
+            if web {
+                Box::pin(self.reconcile_web(&verified, &cas, &snapshot, &view, reviewed)).await?;
+                spool
+                    .acknowledge_segment(segment, 1)
+                    .map_err(|_| HumanGovernanceError::Store)?;
+                continue;
+            }
             if let Some(reserved) =
                 try_read_reauthorization_intent(&verified, &cas, &snapshot, reviewed)?
             {
@@ -295,8 +305,12 @@ impl HumanAcceptanceService {
                 .await
                 .map_err(|_| HumanGovernanceError::Store)?
             {
-                let accepted =
-                    verify_acceptance_payload_cohort(&committed.payloads, &verified, reviewed)?;
+                let accepted = verify_acceptance_payload_cohort(
+                    &committed.payloads,
+                    &verified,
+                    reviewed,
+                    None,
+                )?;
                 if view.proposals.get(&proposal_id) != Some(&accepted) {
                     return Err(HumanGovernanceError::Store);
                 }
@@ -347,6 +361,90 @@ impl HumanAcceptanceService {
                 .accept_plain(request_id, &snapshot, &view, proposal)
                 .await?;
         }
+        Ok(())
+    }
+
+    /// A durable reservation is not a reusable permission: recheck it at the writer's current frontier.
+    async fn reconcile_web(
+        &self,
+        verified: &crate::capture::VerifiedCapture,
+        cas: &CasStore,
+        snapshot: &ProjectionSnapshot,
+        view: &SemanticCurrentView,
+        reviewed: &RevisionProposal,
+    ) -> Result<(), HumanGovernanceError> {
+        let digest =
+            CasDigest::from_str(&verified.body.cas_ref).map_err(|_| HumanGovernanceError::Store)?;
+        let bytes = cas.read(&digest).map_err(|_| HumanGovernanceError::Store)?;
+        let intent = WebAcceptanceIntent::read_canonical(&bytes, reviewed)
+            .filter(|intent| {
+                intent.capture_matches(reviewed, &verified.receipt, &verified.observation)
+            })
+            .ok_or(HumanGovernanceError::Store)?;
+        if let Some(committed) = self
+            .writer
+            .committed_command(verified.body.command_id)
+            .await
+            .map_err(|_| HumanGovernanceError::Store)?
+        {
+            verify_acceptance_payload_cohort(
+                &committed.payloads,
+                verified,
+                reviewed,
+                Some(intent),
+            )?;
+            return Ok(());
+        }
+        if intent.reviewed_frontier > snapshot.frontier {
+            return Err(HumanGovernanceError::Store);
+        }
+        if view.proposals.get(&reviewed.proposal_id) != Some(reviewed)
+            || !matches!(
+                deletion_admission(snapshot, reviewed)?,
+                ObjectDeletionCandidateAdmission::Clear
+            )
+        {
+            return Ok(());
+        }
+        let occurred_at_us = now_us()?;
+        let accepted = RevisionProposalService
+            .accept(
+                view,
+                ProposalCommandContext {
+                    command_id: verified.body.command_id,
+                    occurred_at_us,
+                    effective_config_hash: self.effective_config_hash,
+                    algorithm_revision: ALGORITHM_REVISION.into(),
+                },
+                reviewed.proposal_id,
+                AtomAcceptanceContext::Web {
+                    observation: Box::new(verified.observation.clone()),
+                    receipt: Box::new(verified.receipt.clone()),
+                    intent,
+                },
+            )
+            .map_err(|_| HumanGovernanceError::Store)?;
+        let mut events = capture_event_drafts(
+            verified,
+            None,
+            self.effective_config_hash,
+            ALGORITHM_REVISION,
+        )
+        .map_err(|_| HumanGovernanceError::Store)?;
+        events.extend(accepted.command.events().iter().cloned());
+        let command = JournalCommand::new(verified.body.command_id, events)
+            .map_err(|_| HumanGovernanceError::Store)?;
+        self.writer
+            .commit_if_frontier(command, occurred_at_us, snapshot.frontier)
+            .await
+            .map_err(|_| HumanGovernanceError::Store)?;
+        let committed = self
+            .writer
+            .committed_command(verified.body.command_id)
+            .await
+            .map_err(|_| HumanGovernanceError::Store)?
+            .ok_or(HumanGovernanceError::Store)?;
+        verify_acceptance_payload_cohort(&committed.payloads, verified, reviewed, Some(intent))?;
         Ok(())
     }
 
@@ -1204,7 +1302,8 @@ impl HumanAcceptanceService {
             .await
             .map_err(|_| HumanGovernanceError::Store)?
             .ok_or(HumanGovernanceError::Store)?;
-        let accepted = verify_acceptance_payload_cohort(&committed.payloads, &verified, proposal)?;
+        let accepted =
+            verify_acceptance_payload_cohort(&committed.payloads, &verified, proposal, None)?;
         let fresh = self
             .writer
             .project()
@@ -2276,6 +2375,7 @@ fn verify_acceptance_payload_cohort(
     payloads: &[JournalPayload],
     verified: &crate::capture::VerifiedCapture,
     reviewed: &RevisionProposal,
+    expected_web_intent: Option<WebAcceptanceIntent>,
 ) -> Result<RevisionProposal, HumanGovernanceError> {
     let mut receipt_count = 0;
     let mut observation_count = 0;
@@ -2337,14 +2437,31 @@ fn verify_acceptance_payload_cohort(
                             && acceptance.reviewed_fingerprint == reviewed.fingerprint
                             && acceptance.acceptance_event_ref
                                 == verified.observation.source_observation_id.to_string()
-                            && matches!(
-                                acceptance.authority_basis,
-                                ProposalAcceptanceAuthority::TuiAcceptance {
-                                    user_source_observation_ref,
-                                    ..
-                                } if user_source_observation_ref
-                                    == verified.observation.source_observation_id
-                            )
+                            && match (expected_web_intent, &acceptance.authority_basis) {
+                                (
+                                    None,
+                                    ProposalAcceptanceAuthority::TuiAcceptance {
+                                        user_source_observation_ref,
+                                        ..
+                                    },
+                                ) => {
+                                    *user_source_observation_ref
+                                        == verified.observation.source_observation_id
+                                }
+                                (
+                                    Some(expected),
+                                    ProposalAcceptanceAuthority::WebAcceptance {
+                                        user_source_observation_ref,
+                                        intent,
+                                        ..
+                                    },
+                                ) => {
+                                    *user_source_observation_ref
+                                        == verified.observation.source_observation_id
+                                        && *intent == expected
+                                }
+                                _ => false,
+                            }
                     }) =>
             {
                 Some(value.as_ref())
@@ -2370,7 +2487,7 @@ fn verify_reauthorization_cohort(
         .canonical_toml(deletion, reviewed)
         .ok_or(HumanGovernanceError::Store)?;
     validate_reauthorization_capture(verified, reviewed, &canonical)?;
-    verify_acceptance_payload_cohort(payloads, verified, reviewed)
+    verify_acceptance_payload_cohort(payloads, verified, reviewed, None)
 }
 
 fn validate_acceptance_capture(

@@ -19,8 +19,8 @@ use evertrace_domain::{
         ProcedureProposalPayload, ProposalAcceptanceAuthority, ProposalCreatedBy,
         ProposalEligibility, ProposalOperation, ProposalPayload, ProposalStatus, ProposalTargetId,
         ProposalTargetKind, RevisionProposal, TUI_ACCEPTANCE_EVENT_MANIFEST_REF,
-        UserAuthorizationMode, VerifierStatus, tui_acceptance_capture_matches,
-        tui_acceptance_event_payload,
+        UserAuthorizationMode, VerifierStatus, WEB_ACCEPTANCE_EVENT_MANIFEST_REF,
+        tui_acceptance_capture_matches, tui_acceptance_event_payload,
     },
     work::{ArtifactPayloadStatus, Task, WorkArtifact},
 };
@@ -348,6 +348,7 @@ pub(crate) fn validate_command_boundary<'a>(
     current_proposals: &BTreeMap<RevisionProposalId, (RevisionProposal, u64)>,
     current_procedures: &super::procedure::ProcedureState,
     current_support: &super::scenario_core::ScenarioCoreState,
+    frontier: u64,
     events: impl IntoIterator<Item = (&'a JournalPayload, i64, [u8; 32])>,
     error: StoreError,
 ) -> Result<BTreeSet<RevisionProposalId>, StoreError> {
@@ -356,6 +357,7 @@ pub(crate) fn validate_command_boundary<'a>(
         .iter()
         .map(|(payload, _, _)| *payload)
         .collect::<Vec<_>>();
+    validate_web_acceptance_boundary(current_proposals, frontier, &payloads, error)?;
     validate_support_proposal_boundaries(
         current_atoms,
         current_procedures,
@@ -758,6 +760,93 @@ fn exact_edit_pairs(
     Ok(pairs)
 }
 
+/// A Web capture may enter the journal only with its own permitted accepted successor.
+fn validate_web_acceptance_boundary(
+    proposals: &BTreeMap<RevisionProposalId, (RevisionProposal, u64)>,
+    frontier: u64,
+    payloads: &[&JournalPayload],
+    error: StoreError,
+) -> Result<(), StoreError> {
+    let mut captures = payloads.iter().filter_map(|payload| match payload {
+        JournalPayload::SourceReceiptRecorded(receipt)
+            if [
+                receipt.identity_domain.as_str(),
+                receipt.adapter_manifest_ref.as_str(),
+                receipt.eligible_event_manifest_ref.as_str(),
+            ]
+            .contains(&WEB_ACCEPTANCE_EVENT_MANIFEST_REF) =>
+        {
+            Some(receipt.as_ref())
+        }
+        _ => None,
+    });
+    let mut acceptances = payloads.iter().filter_map(|payload| match payload {
+        JournalPayload::RevisionProposalRecorded(proposal) => proposal
+            .acceptance
+            .as_ref()
+            .and_then(|acceptance| match &acceptance.authority_basis {
+                ProposalAcceptanceAuthority::WebAcceptance {
+                    user_source_observation_ref,
+                    authorized_scope_ceiling,
+                    intent,
+                } => Some((
+                    proposal.as_ref(),
+                    acceptance,
+                    *user_source_observation_ref,
+                    authorized_scope_ceiling,
+                    *intent,
+                )),
+                _ => None,
+            }),
+        _ => None,
+    });
+    let (receipt, (proposal, acceptance, observation_id, scope, intent)) =
+        match (captures.next(), acceptances.next()) {
+            (None, None) => return Ok(()),
+            (Some(receipt), Some(acceptance))
+                if captures.next().is_none() && acceptances.next().is_none() =>
+            {
+                (receipt, acceptance)
+            }
+            _ => return Err(error),
+        };
+    let (reviewed, seq) = proposals.get(&proposal.proposal_id).ok_or(error)?;
+    if reviewed.proposal_revision_id != acceptance.reviewed_proposal_revision_id
+        || !(*seq..=frontier).contains(&intent.reviewed_frontier)
+        || receipt.task_id != scope.task_id()
+        || scope.task_id().is_none()
+        || receipt.repository_instance_id.is_some()
+        || receipt.worktree_instance_id.is_some()
+        || receipt.source_revision_mode != SourceRevisionMode::Append
+        || receipt.previous_source_revision.is_some()
+        || receipt.recorded_at_us < reviewed.created_at_us
+        || receipt.recorded_at_us > acceptance.accepted_at_us
+    {
+        return Err(error);
+    }
+    // Generic evidence-command validation already pairs one receipt, observation and watermark.
+    let observation = payloads
+        .iter()
+        .find_map(|event| match event {
+            JournalPayload::SourceObservationRecorded(observation) => Some(observation.as_ref()),
+            _ => None,
+        })
+        .ok_or(error)?;
+    let canonical = intent.canonical(reviewed).ok_or(error)?;
+    if observation.source_observation_id != observation_id
+        || receipt.cas_ref
+            != evertrace_capture::CasDigest::for_protected_bytes(canonical.as_bytes()).to_string()
+        || !intent.capture_matches(reviewed, receipt, observation)
+        || payloads.iter().any(|event| {
+            matches!(event, JournalPayload::SourceIngestWatermark(watermark)
+            if watermark.confirmed_prefix_digest.is_some() || watermark.earlier_prefix.is_some())
+        })
+    {
+        return Err(error);
+    }
+    Ok(())
+}
+
 fn validate_accepted_edit_boundary(
     current_proposals: &BTreeMap<RevisionProposalId, (RevisionProposal, u64)>,
     payloads: &[&JournalPayload],
@@ -1129,15 +1218,22 @@ fn validate_atom_relations(
                     return Err(StoreError::StoreCorrupt);
                 }
             }
-            UserAuthorizationMode::TuiAcceptance => match &atom.scope {
-                AtomScope::Task { task_id } if receipt.task_id == Some(*task_id) => {}
-                AtomScope::Repository {
-                    repository_instance_id,
-                } if receipt.repository_instance_id == Some(*repository_instance_id) => {}
-                AtomScope::Global if matches!(user.authorized_scope_ceiling, AtomScope::Global) => {
+            UserAuthorizationMode::WebAcceptance
+                if receipt.eligible_event_manifest_ref != WEB_ACCEPTANCE_EVENT_MANIFEST_REF =>
+            {
+                return Err(StoreError::StoreCorrupt);
+            }
+            UserAuthorizationMode::TuiAcceptance | UserAuthorizationMode::WebAcceptance => {
+                match &atom.scope {
+                    AtomScope::Task { task_id } if receipt.task_id == Some(*task_id) => {}
+                    AtomScope::Repository {
+                        repository_instance_id,
+                    } if receipt.repository_instance_id == Some(*repository_instance_id) => {}
+                    AtomScope::Global
+                        if matches!(user.authorized_scope_ceiling, AtomScope::Global) => {}
+                    _ => return Err(StoreError::StoreCorrupt),
                 }
-                _ => return Err(StoreError::StoreCorrupt),
-            },
+            }
             UserAuthorizationMode::UserStatement => {
                 let statement_hash = payload_fingerprint(
                     observation.canonicalization_revision,
@@ -1490,7 +1586,8 @@ fn validate_proposal_relations(
                         return Err(StoreError::StoreCorrupt);
                     }
                 }
-                ProposalAcceptanceAuthority::CurrentTaskExactMessage { .. } => {
+                ProposalAcceptanceAuthority::CurrentTaskExactMessage { .. }
+                | ProposalAcceptanceAuthority::WebAcceptance { .. } => {
                     return Err(StoreError::StoreCorrupt);
                 }
             }
@@ -1574,6 +1671,19 @@ fn validate_proposal_relations(
                     acceptance_receipt,
                     input,
                 )?;
+            }
+            ProposalAcceptanceAuthority::WebAcceptance {
+                user_source_observation_ref,
+                authorized_scope_ceiling,
+                intent,
+            } => {
+                if *user_source_observation_ref != acceptance_observation_id
+                    || authorized_scope_ceiling != &atom.scope
+                    || acceptance_receipt.task_id != atom.scope.task_id()
+                    || !intent.capture_matches(reviewed, acceptance_receipt, acceptance_observation)
+                {
+                    return Err(StoreError::StoreCorrupt);
+                }
             }
             ProposalAcceptanceAuthority::ObjectiveEvidence {
                 user_source_observation_ref,
@@ -1832,13 +1942,26 @@ fn validate_accepted_authority(
         ProposalAcceptanceAuthority::TuiAcceptance {
             user_source_observation_ref,
             authorized_scope_ceiling,
+        }
+        | ProposalAcceptanceAuthority::WebAcceptance {
+            user_source_observation_ref,
+            authorized_scope_ceiling,
+            ..
         } => {
+            let mode = if matches!(
+                &acceptance.authority_basis,
+                ProposalAcceptanceAuthority::WebAcceptance { .. }
+            ) {
+                UserAuthorizationMode::WebAcceptance
+            } else {
+                UserAuthorizationMode::TuiAcceptance
+            };
             let user = atom
                 .user_authorization_provenance
                 .as_ref()
                 .ok_or(StoreError::StoreCorrupt)?;
             if atom.authority != AtomAuthority::UserExplicit
-                || user.mode != UserAuthorizationMode::TuiAcceptance
+                || user.mode != mode
                 || user.user_source_observation_ref != *user_source_observation_ref
                 || user.authorized_scope_ceiling != *authorized_scope_ceiling
                 || user.acceptance_event_ref.as_deref()

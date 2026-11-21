@@ -7,7 +7,7 @@ use evertrace_domain::{
         ProposalAcceptance, ProposalAcceptanceAuthority, ProposalCreatedBy, ProposalEligibility,
         ProposalOperation, ProposalPayload, ProposalStatus, ProposalTargetId, ProposalTargetKind,
         ProposalWaitingOn, RevisionProposal, TUI_ACCEPTANCE_EVENT_MANIFEST_REF,
-        tui_acceptance_event_payload,
+        UserAuthorizationMode, WebAcceptanceIntent, tui_acceptance_event_payload,
     },
 };
 use evertrace_store::{
@@ -16,7 +16,7 @@ use evertrace_store::{
 };
 
 use super::{
-    AtomAuthorityBasis, AtomMaterialization, SemanticServiceError, VerifiedTuiAcceptance,
+    AtomAuthorityBasis, AtomMaterialization, SemanticServiceError, VerifiedHumanAcceptance,
     emission::require_user_source, materialize_atom,
 };
 
@@ -82,6 +82,11 @@ pub enum AtomAcceptanceContext {
         observation: Box<SourceObservation>,
         receipt: Box<SourceReceipt>,
     },
+    Web {
+        observation: Box<SourceObservation>,
+        receipt: Box<SourceReceipt>,
+        intent: WebAcceptanceIntent,
+    },
     ReauthorizationTui {
         observation: Box<SourceObservation>,
         receipt: Box<SourceReceipt>,
@@ -102,6 +107,7 @@ impl AtomAcceptanceContext {
             | Self::TaskTui { observation, .. }
             | Self::GlobalTui { observation, .. }
             | Self::ReauthorizationTui { observation, .. }
+            | Self::Web { observation, .. }
             | Self::ObjectiveEvidence { observation, .. } => observation,
         }
     }
@@ -146,6 +152,19 @@ impl AtomAcceptanceContext {
                 observation,
                 receipt,
             } => require_tui_acceptance_source(observation, receipt, proposal, accepted_at_us)?,
+            Self::Web {
+                observation,
+                receipt,
+                intent,
+            } => {
+                require_user_source(observation, receipt)?;
+                if !intent.capture_matches(proposal, receipt, observation)
+                    || receipt.recorded_at_us < proposal.created_at_us
+                    || receipt.recorded_at_us > accepted_at_us
+                {
+                    return Err(SemanticServiceError::InvalidInput);
+                }
+            }
             Self::ReauthorizationTui {
                 observation,
                 receipt,
@@ -196,6 +215,17 @@ impl AtomAcceptanceContext {
             Self::GlobalTui { observation, .. } => ProposalAcceptanceAuthority::TuiAcceptance {
                 user_source_observation_ref: observation.source_observation_id,
                 authorized_scope_ceiling: AtomScope::Global,
+            },
+            Self::Web {
+                observation,
+                receipt,
+                intent,
+            } => ProposalAcceptanceAuthority::WebAcceptance {
+                user_source_observation_ref: observation.source_observation_id,
+                authorized_scope_ceiling: AtomScope::Task {
+                    task_id: receipt.task_id.ok_or(SemanticServiceError::InvalidInput)?,
+                },
+                intent: *intent,
             },
             Self::ReauthorizationTui {
                 observation,
@@ -1113,8 +1143,9 @@ fn acceptance_basis(
             else {
                 return Err(SemanticServiceError::UnsupportedTarget);
             };
-            Ok(AtomAuthorityBasis::TuiAcceptance(
-                VerifiedTuiAcceptance::new(
+            Ok(AtomAuthorityBasis::HumanAcceptance(
+                VerifiedHumanAcceptance::new(
+                    UserAuthorizationMode::TuiAcceptance,
                     observation.clone(),
                     receipt.clone(),
                     AtomScope::Repository {
@@ -1130,8 +1161,9 @@ fn acceptance_basis(
             let AtomScope::Task { task_id } = draft.scope else {
                 return Err(SemanticServiceError::UnsupportedTarget);
             };
-            Ok(AtomAuthorityBasis::TuiAcceptance(
-                VerifiedTuiAcceptance::new(
+            Ok(AtomAuthorityBasis::HumanAcceptance(
+                VerifiedHumanAcceptance::new(
+                    UserAuthorizationMode::TuiAcceptance,
                     observation.clone(),
                     receipt.clone(),
                     AtomScope::Task { task_id },
@@ -1145,8 +1177,28 @@ fn acceptance_basis(
             if !matches!(draft.scope, AtomScope::Global) {
                 return Err(SemanticServiceError::UnsupportedTarget);
             }
-            Ok(AtomAuthorityBasis::TuiAcceptance(
-                VerifiedTuiAcceptance::new(observation.clone(), receipt.clone(), AtomScope::Global),
+            Ok(AtomAuthorityBasis::HumanAcceptance(
+                VerifiedHumanAcceptance::new(
+                    UserAuthorizationMode::TuiAcceptance,
+                    observation.clone(),
+                    receipt.clone(),
+                    AtomScope::Global,
+                ),
+            ))
+        }
+        AtomAcceptanceContext::Web {
+            observation,
+            receipt,
+            ..
+        } => {
+            let task_id = receipt.task_id.ok_or(SemanticServiceError::InvalidInput)?;
+            Ok(AtomAuthorityBasis::HumanAcceptance(
+                VerifiedHumanAcceptance::new(
+                    UserAuthorizationMode::WebAcceptance,
+                    observation.clone(),
+                    receipt.clone(),
+                    AtomScope::Task { task_id },
+                ),
             ))
         }
         AtomAcceptanceContext::ReauthorizationTui {
@@ -1158,8 +1210,9 @@ fn acceptance_basis(
             if !authorized_scope_ceiling.contains(&draft.scope) {
                 return Err(SemanticServiceError::UnsupportedTarget);
             }
-            Ok(AtomAuthorityBasis::TuiAcceptance(
-                VerifiedTuiAcceptance::new(
+            Ok(AtomAuthorityBasis::HumanAcceptance(
+                VerifiedHumanAcceptance::new(
+                    UserAuthorizationMode::TuiAcceptance,
                     observation.clone(),
                     receipt.clone(),
                     authorized_scope_ceiling.clone(),

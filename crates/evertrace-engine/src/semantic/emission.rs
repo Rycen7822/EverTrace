@@ -25,7 +25,7 @@ pub enum AtomAuthorityBasis {
         observation: Box<SourceObservation>,
         receipt: Box<SourceReceipt>,
     },
-    TuiAcceptance(VerifiedTuiAcceptance),
+    HumanAcceptance(VerifiedHumanAcceptance),
     ProjectPolicy {
         binding: CurrentPolicyBinding,
         observation: Box<SourceObservation>,
@@ -37,19 +37,22 @@ pub enum AtomAuthorityBasis {
 }
 
 #[derive(Clone, Debug)]
-pub struct VerifiedTuiAcceptance {
+pub struct VerifiedHumanAcceptance {
+    mode: UserAuthorizationMode,
     observation: Box<SourceObservation>,
     receipt: Box<SourceReceipt>,
     authorized_scope_ceiling: AtomScope,
 }
 
-impl VerifiedTuiAcceptance {
+impl VerifiedHumanAcceptance {
     pub(super) fn new(
+        mode: UserAuthorizationMode,
         observation: Box<SourceObservation>,
         receipt: Box<SourceReceipt>,
         authorized_scope_ceiling: AtomScope,
     ) -> Self {
         Self {
+            mode,
             observation,
             receipt,
             authorized_scope_ceiling,
@@ -82,7 +85,7 @@ pub fn materialize_atom(
         .map_err(|_| SemanticServiceError::InvalidInput)?;
     let (authority, user_authorization_provenance, policy_authority_provenance) =
         authority_fields(&draft, &authority_basis)?;
-    if let AtomAuthorityBasis::TuiAcceptance(binding) = &authority_basis {
+    if let AtomAuthorityBasis::HumanAcceptance(binding) = &authority_basis {
         draft
             .source_observation_refs
             .push(binding.observation.source_observation_id);
@@ -225,7 +228,7 @@ fn authority_fields(
                 None,
             ))
         }
-        AtomAuthorityBasis::TuiAcceptance(binding) => {
+        AtomAuthorityBasis::HumanAcceptance(binding) => {
             let observation = &binding.observation;
             let receipt = &binding.receipt;
             let authorized_scope_ceiling = &binding.authorized_scope_ceiling;
@@ -244,7 +247,7 @@ fn authority_fields(
             Ok((
                 AtomAuthority::UserExplicit,
                 Some(UserAuthorizationProvenance {
-                    mode: UserAuthorizationMode::TuiAcceptance,
+                    mode: binding.mode,
                     user_source_observation_ref: observation.source_observation_id,
                     source_message_hash: parse_digest(&observation.payload_fingerprint)?,
                     exact_value_hash: draft
@@ -394,7 +397,7 @@ impl AtomEmissionGate {
                         &value.authority_basis,
                         AtomAuthorityBasis::AgentInferred
                             | AtomAuthorityBasis::CurrentTaskExactMessage { .. }
-                            | AtomAuthorityBasis::TuiAcceptance(_)
+                            | AtomAuthorityBasis::HumanAcceptance(_)
                             | AtomAuthorityBasis::ProjectPolicy { .. }
                     )
                 {

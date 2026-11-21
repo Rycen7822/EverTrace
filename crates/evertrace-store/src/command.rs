@@ -654,6 +654,32 @@ pub enum JournalPayload {
 }
 
 impl JournalPayload {
+    /// A new logical payload generation for Web-origin authority; historical rows retain generation 1 and their hashes.
+    pub(crate) fn payload_schema(&self) -> u16 {
+        use evertrace_domain::semantic::{
+            ProposalAcceptanceAuthority, UserAuthorizationMode, WEB_ACCEPTANCE_EVENT_MANIFEST_REF,
+        };
+        let web = match self {
+            Self::SourceReceiptRecorded(receipt) => {
+                receipt.eligible_event_manifest_ref == WEB_ACCEPTANCE_EVENT_MANIFEST_REF
+            }
+            Self::RevisionProposalRecorded(proposal) => {
+                proposal.acceptance.as_ref().is_some_and(|acceptance| {
+                    matches!(
+                        acceptance.authority_basis,
+                        ProposalAcceptanceAuthority::WebAcceptance { .. }
+                    )
+                })
+            }
+            Self::AtomRecorded(atom) => atom
+                .user_authorization_provenance
+                .as_ref()
+                .is_some_and(|user| user.mode == UserAuthorizationMode::WebAcceptance),
+            _ => false,
+        };
+        if web { 2 } else { JOURNAL_PAYLOAD_SCHEMA }
+    }
+
     pub const fn event_type(&self) -> &'static str {
         match self {
             Self::MigrationApplied(_) => "migration_applied_v1",
@@ -1425,6 +1451,7 @@ pub(crate) struct PreparedEvent {
     pub ordinal: u16,
     pub event_type: &'static str,
     pub record_class: RecordClass,
+    pub payload_schema: u16,
     pub payload_json: String,
     pub content_hash: [u8; 32],
     pub draft: JournalEventDraft,
@@ -2034,9 +2061,10 @@ pub(crate) fn prepare_command(command: &JournalCommand) -> Result<PreparedComman
             ]),
         )
         .map_err(|_| StoreError::Serialization)?;
+        let payload_schema = draft.payload.payload_schema();
         let content_hash = sha256(
             "journal_payload_v1",
-            u32::from(JOURNAL_PAYLOAD_SCHEMA),
+            u32::from(payload_schema),
             &draft.payload.canonical_value(),
         )
         .map_err(|_| StoreError::Serialization)?;
@@ -2046,6 +2074,7 @@ pub(crate) fn prepare_command(command: &JournalCommand) -> Result<PreparedComman
             ordinal,
             event_type: draft.payload.event_type(),
             record_class: draft.payload.record_class(),
+            payload_schema,
             payload_json,
             content_hash,
             draft,
