@@ -12918,6 +12918,7 @@ impl JournalAdmissionState {
             &self.procedure,
             &self.scenario_core,
             self.frontier,
+            command.command_id(),
             command.events().iter().map(|event| {
                 (
                     &event.payload,
@@ -13180,6 +13181,7 @@ impl JournalAdmissionState {
             &self.procedure,
             &self.scenario_core,
             self.frontier,
+            rows.first().ok_or(StoreError::StoreCorrupt)?.command_id,
             rows.iter()
                 .zip(parsed.iter())
                 .map(|(row, (payload, _, _))| {

@@ -2583,6 +2583,7 @@ fn human_action_label(action: &evertrace_protocol::dto::HumanActionRequest) -> &
         HumanActionRequest::VerifyBackup { .. } => "verify backup",
         HumanActionRequest::Unavailable { .. }
         | HumanActionRequest::WebAccept { .. }
+        | HumanActionRequest::WebCorrectAtom { .. }
         | HumanActionRequest::WebProposalDisposition { .. } => "unavailable action",
     }
 }

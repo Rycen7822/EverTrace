@@ -205,15 +205,25 @@ impl HumanGovernanceService {
         let Some(base) = proposal.base_revision_id else {
             return Ok(false);
         };
-        let reference = base.to_string();
+        self.web_current_object_accessible(snapshot, kind, &id, &base.to_string())
+            .await
+    }
+
+    pub(crate) async fn web_current_object_accessible(
+        &self,
+        snapshot: &ProjectionSnapshot,
+        kind: &str,
+        id: &str,
+        reference: &str,
+    ) -> Result<bool, HumanGovernanceError> {
         let Some((row, true)) = super::super::actions::select_object_row(snapshot, &reference)
             .map_err(|_| HumanGovernanceError::Store)?
         else {
             return Ok(false);
         };
         if row.object_kind.as_deref() != Some(kind)
-            || row.object_id.as_deref() != Some(id.as_str())
-            || row.current_revision_id.as_deref() != Some(reference.as_str())
+            || row.object_id.as_deref() != Some(id)
+            || row.current_revision_id.as_deref() != Some(reference)
         {
             return Ok(false);
         }

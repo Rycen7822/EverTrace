@@ -213,6 +213,8 @@ class App:
             "/api/proposal-acceptance-result": "POST",
             "/api/proposal-disposition": "POST",
             "/api/proposal-disposition-result": "POST",
+            "/api/proposal-correction": "POST",
+            "/api/proposal-correction-result": "POST",
         }.get(path)
         if expected_method is None:
             return Response(status_code=404)
@@ -273,7 +275,23 @@ class App:
             response.delete_cookie(self.cookie, httponly=True, samesite="strict", path="/")
             return response
         try:
-            if path in ("/api/proposal-accept", "/api/proposal-acceptance-result",
+            if path in ("/api/proposal-correction", "/api/proposal-correction-result"):
+                submit = not path.endswith("-result")
+                fields = {"request_id", "atom_id", "base_revision_id"} | ({"frontier", "content"} if submit else set())
+                if set(payload) != fields or not _uuid7(payload["request_id"]):
+                    raise BackendError("invalid_input")
+                atom, revision = payload["atom_id"], payload["base_revision_id"]
+                if not isinstance(atom, str) or not atom.startswith("atom:") or not _uuid7(atom[5:]) or not _uuid7(revision):
+                    raise BackendError("invalid_input")
+                frontier = parse_frontier(payload["frontier"]) if submit else None
+                content = proposal_atom_edit(payload["content"]) if submit else None
+                if frontier == 0:
+                    raise BackendError("invalid_input")
+                try:
+                    data = await self.backend.web_atom_correction(payload["request_id"], atom, revision, frontier=frontier, content=content)
+                except BackendError:
+                    data = {"status": "unknown"}
+            elif path in ("/api/proposal-accept", "/api/proposal-acceptance-result",
                         "/api/proposal-disposition", "/api/proposal-disposition-result"):
                 fields = {"request_id", "proposal_id", "revision", "frontier", "review_digest"}
                 disposition = path.startswith("/api/proposal-disposition")
@@ -712,6 +730,14 @@ class App:
                         reader = read_support_detail
                     result = await reader(self.backend, payload["reference"], frontier,
                         payload["revision"], payload["object_kind"])
+                    if surface == "explorer" and payload["object_kind"] == "atom_revision" and result.get("items"):
+                        item = result["items"][0]
+                        atom = (item["semantic_detail"].get("content") or {}).get("value")
+                        if (atom and atom["lifecycle_status"] == "active" and atom["scope"]["kind"] in ("task", "repository")):
+                            alias = await self.backend.read_record_window(item["object_ref"], None)
+                            page = alias.get("page", {})
+                            if page.get("content_state") == "ready" and page["selection"]["revision_ref"] == item["revision_ref"]:
+                                result["correction_frontier"] = page["state"]["frontier"]
                 else:
                     result = await self.backend.detail(
                         payload["reference"], frontier, payload["revision"], surface
@@ -808,12 +834,14 @@ def present_detail(templates, result, surface):
         if item
         else None
     )
+    correction_frontier = result.get("correction_frontier")
     return {
         "html": templates.get_template(template).render(items=result["items"], surface=surface,
             frontier=result.get("frontier"), confirmation_digest=result.get("confirmation_digest"),
             core_anchor=result.get("core_anchor"), acceptance_request_id=_request_id() if result.get("web_accept_available") else None,
             disposition_request_id=_request_id() if result.get("web_disposition_available") else None,
-            web_edit_available=result.get("web_edit_available", False)),
+            web_edit_available=result.get("web_edit_available", False),
+            correction_frontier=correction_frontier, correction_request_id=_request_id() if correction_frontier else None),
         "source_preview": preview,
         "semantic_text": semantic_text,
         "selection": selection,

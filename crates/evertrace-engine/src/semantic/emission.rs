@@ -306,6 +306,8 @@ pub(super) fn require_user_source(
         || observation.source_revision != receipt.source_revision
         || observation.source_record_identity != receipt.source_record_identity
         || observation.source_role != SourceRole::User
+        || receipt.eligible_event_manifest_ref
+            == evertrace_domain::semantic::HUMAN_CORRECTION_MANIFEST
         || observation.content_trust != ContentTrust::UserStatement
         || observation.observation_role != ObservationRole::Message
         || receipt.observation_role != ObservationRole::Message

@@ -1138,6 +1138,13 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
                                         expected_frontier, expected_digest.as_deref(), atom_edit,
                                     )).await.map_err(map_human_error)?
                                 }
+                                HumanReadRequest::WebCorrectionOutcome { request_id, atom_id, base_revision_id } => {
+                                    if context.client_kind != ClientKind::Web { return Err(ErrorCode::Untrusted); }
+                                    let outcome = Box::pin(human_governance.acceptance().reviewed_web_correction_outcome(
+                                        &human_governance, request_id, (atom_id, base_revision_id),
+                                    )).await.map_err(map_human_error)?;
+                                    HumanGovernanceResponse::Action { result: map_human_action(outcome) }
+                                }
                                 HumanReadRequest::WebAcceptanceOutcome { request_id, expected_frontier, review } => {
                                     if context.client_kind != ClientKind::Web { return Err(ErrorCode::Untrusted); }
                                     let outcome = Box::pin(human_governance.acceptance().reviewed_web_outcome(
@@ -1194,6 +1201,9 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
                                 action,
                             } => {
                                 let outcome = match action {
+                                    HumanActionRequest::WebCorrectAtom { intent } => Box::pin(
+                                        human_governance.acceptance().submit_web_correction(&human_governance, request_id, expected_frontier, *intent)
+                                    ).await,
                                     HumanActionRequest::WebAccept { review, atom_edit } => Box::pin(accept_web_review(
                                         &human_governance, request_id, expected_frontier, review, atom_edit,
                                     )).await,

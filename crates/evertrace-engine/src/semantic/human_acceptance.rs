@@ -20,11 +20,11 @@ use evertrace_domain::{
     revision::RevisionId,
     semantic::{
         AcceptedProposalTarget, AtomProposalPayload, AtomScope, CoreMembershipProposalPayload,
-        ProposalAcceptanceAuthority, ProposalCreatedBy, ProposalEligibility, ProposalOperation,
-        ProposalPayload, ProposalStatus, ProposalTargetId, ProposalWaitingOn, RevisionProposal,
-        SupportThresholdSnapshot, TUI_ACCEPTANCE_EVENT_MANIFEST_REF,
-        WEB_ACCEPTANCE_EVENT_MANIFEST_REF, WebAcceptanceIntent, WebAtomEdit,
-        tui_acceptance_capture_matches, tui_acceptance_event_payload,
+        HUMAN_CORRECTION_MANIFEST, ProposalAcceptanceAuthority, ProposalCreatedBy,
+        ProposalEligibility, ProposalOperation, ProposalPayload, ProposalStatus, ProposalTargetId,
+        ProposalWaitingOn, RevisionProposal, SupportThresholdSnapshot,
+        TUI_ACCEPTANCE_EVENT_MANIFEST_REF, WEB_ACCEPTANCE_EVENT_MANIFEST_REF, WebAcceptanceIntent,
+        WebAtomEdit, tui_acceptance_capture_matches, tui_acceptance_event_payload,
     },
 };
 use evertrace_store::{
@@ -48,6 +48,8 @@ use crate::{
         accept_core_membership, select_support_atom_acceptance,
     },
 };
+
+mod correction;
 
 pub(crate) const ALGORITHM_REVISION: &str = "s31-human-governance-v1";
 
@@ -191,6 +193,13 @@ impl HumanAcceptanceService {
                 .ok_or(HumanGovernanceError::Store)?;
             let verified =
                 verify_capture_frame(frame, &cas).map_err(|_| HumanGovernanceError::Store)?;
+            if verified.body.eligible_event_manifest_ref == HUMAN_CORRECTION_MANIFEST {
+                Box::pin(self.reconcile_web_correction(&verified, &cas)).await?;
+                spool
+                    .acknowledge_segment(segment, 1)
+                    .map_err(|_| HumanGovernanceError::Store)?;
+                continue;
+            }
             let web = match verified.body.eligible_event_manifest_ref.as_str() {
                 TUI_ACCEPTANCE_EVENT_MANIFEST_REF => false,
                 WEB_ACCEPTANCE_EVENT_MANIFEST_REF => true,
@@ -418,7 +427,7 @@ impl HumanAcceptanceService {
                     .web_core_anchor_at(snapshot, view, reviewed)
                     .await?
                     .is_none())
-            || ((intent.procedure_coverage.is_some() || intent.atom_edit.is_some())
+            || ((reviewed.operation == ProposalOperation::Replace || intent.atom_edit.is_some())
                 && !service.web_base_accessible(snapshot, reviewed).await?)
             || !service.web_merge_accessible_at(snapshot, reviewed).await?
         {
@@ -610,7 +619,7 @@ impl HumanAcceptanceService {
         }) else {
             return Ok(conflict());
         };
-        if ((intent.procedure_coverage.is_some() || intent.atom_edit.is_some())
+        if ((proposal.operation == ProposalOperation::Replace || intent.atom_edit.is_some())
             && !service.web_base_accessible(&snapshot, proposal).await?)
             || (intent.atom_edit.is_some()
                 && !service.proposal_accessible(&snapshot, proposal).await?)
@@ -1987,17 +1996,33 @@ fn human_acceptance_capture_input(
     } else {
         ("tui-acceptance", TUI_ACCEPTANCE_EVENT_MANIFEST_REF)
     };
+    human_capture_input(
+        (proposal.proposal_id, proposal.proposal_revision_id),
+        payload,
+        record_id,
+        scope,
+        (source, manifest),
+    )
+}
+
+fn human_capture_input(
+    (proposal_id, revision): (RevisionProposalId, RevisionId),
+    payload: &str,
+    record_id: &str,
+    scope: AcceptanceCaptureScope,
+    (source, manifest): (&str, &str),
+) -> Result<CaptureRecordInput, HumanGovernanceError> {
     Ok(CaptureRecordInput {
         source_local_evidence: None,
         spool_record_id: Some(record_id.into()),
         source_observation_id_hint: None,
-        source_instance_id: format!("{source}:{}", proposal.proposal_id),
-        source_revision: proposal.proposal_revision_id.to_string(),
+        source_instance_id: format!("{source}:{proposal_id}"),
+        source_revision: revision.to_string(),
         source_record_identity: Some(record_id.into()),
         identity_strength: Some(IdentityStrength::StableNative),
         source_kind: EvidenceSourceKind::Other,
         identity_domain: manifest.into(),
-        source_ref: proposal.proposal_id.to_string(),
+        source_ref: proposal_id.to_string(),
         session_ref: "human-governance".into(),
         turn_ref: None,
         tool_ref: None,
@@ -2034,7 +2059,7 @@ fn human_acceptance_capture_input(
         source_role: SourceRole::User,
         content_trust: ContentTrust::UserStatement,
         capture_completeness: CaptureCompleteness::Complete,
-        surface_eligible: true,
+        surface_eligible: manifest != HUMAN_CORRECTION_MANIFEST,
         adapter_revision: 1,
         adapter_manifest_ref: manifest.into(),
         eligible_event_manifest_ref: manifest.into(),

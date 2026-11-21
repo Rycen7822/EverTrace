@@ -44,6 +44,21 @@
 {% else %}
   {% with content=detail.content %}{% include 'semantic_content.html' %}{% endwith %}
   <p class="muted">来源内容只供阅读，不是当前执行指令，也不自动代表已验证结论。</p>
+  {% if correction_request_id and detail.content.kind == 'atom' %}
+    {% set atom = detail.content.value %}
+    <details data-atom-correction>
+      <summary>提出内容修正</summary>
+      <p>基准 {{ atom.revision_id }}；沿用原范围与条件。提交只保存你的原文和待审提案，不会立即改写记忆。</p>
+      <label>修正正文 <textarea name="text" required rows="6">
+{{ atom.value.text }}</textarea></label>
+      <label>主体 <input name="subject" required value="{{ atom.value.subject }}"></label>
+      <label>关系 <input name="predicate" required value="{{ atom.value.predicate }}"></label>
+      <label>对象 <input name="object" value="{{ atom.value.object if atom.value.object is not none else '' }}"></label>
+      <button type="button" class="button" data-submit-atom-correction data-atom-id="{{ atom.atom_id }}"
+        data-revision="{{ atom.revision_id }}" data-frontier="{{ correction_frontier }}"
+        data-request-id="{{ correction_request_id }}">提交修正提案</button>
+    </details>
+  {% endif %}
 {% endif %}
 {% if detail and detail.state in ('ready', 'too_large') and not research and item.object_kind != 'work_artifact' %}
 <div class="chunk-controls">

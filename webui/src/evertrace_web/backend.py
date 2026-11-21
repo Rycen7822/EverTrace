@@ -637,6 +637,16 @@ class Backend:
                 raise BackendError("invalid_read_response")
         return result
 
+    async def web_atom_correction(self, request_id, atom, revision, *, frontier=None, content=None):
+        target = {"atom_id": atom, "base_revision_id": revision}
+        if content is None:
+            reply = await self._request({"kind": "web_correction_outcome", "request_id": request_id, **target})
+        else:
+            action = {"operation": "act", "expected_frontier": frontier,
+                      "action": {"kind": "web_correct_atom", "intent": {**target, "content": content}}}
+            reply = await self._request(None, confirmation=True, action=action, request_id=request_id)
+        return proposal_action_result(reply)
+
     async def web_proposal_action(self, request_id, proposal, revision, frontier, digest, *, lookup, decision, atom_edit=None):
         review = {"proposal_id": proposal, "expected_revision_id": revision, "expected_digest": digest}
         fields = {"review": review}
@@ -651,11 +661,7 @@ class Backend:
             kind = "web_accept" if decision is None else "web_proposal_disposition"
             action = {"operation": "act", "expected_frontier": frontier, "action": {"kind": kind, **fields}}
             reply = await self._request(None, confirmation=True, action=action, request_id=request_id)
-        if reply.get("kind") != "action" or reply["result"].get("status") not in (
-            "applied", "no_delta", "conflict", "unavailable", "unknown",
-        ):
-            raise BackendError("invalid_action_response")
-        return reply["result"]
+        return proposal_action_result(reply)
 
     async def job(self, job_id, frontier):
         if not isinstance(job_id, str):
@@ -777,7 +783,7 @@ class Backend:
                     return health
                 response = await call({"human_governance": {"operation": "read", "request": read}})
                 result = response["human_governance"]
-                if read["kind"] in ("web_acceptance_outcome", "web_proposal_disposition_outcome"):
+                if read["kind"] in ("web_acceptance_outcome", "web_proposal_disposition_outcome", "web_correction_outcome"):
                     return result
                 if result.get("kind") not in (
                     "state",
@@ -828,3 +834,11 @@ class Backend:
             TimeoutError,
         ) as error:
             raise BackendError() from error
+
+
+def proposal_action_result(reply):
+    if reply.get("kind") != "action" or reply["result"].get("status") not in (
+        "applied", "no_delta", "conflict", "unavailable", "unknown",
+    ):
+        raise BackendError("invalid_action_response")
+    return reply["result"]

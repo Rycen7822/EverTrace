@@ -328,16 +328,21 @@ async function confirmProposal(button) {
     }
   }
 }
+function readAtomEdit(editor) {
+  const fields = [...editor.querySelectorAll("[name]")];
+  if (fields.some((field) => !field.reportValidity())) return null;
+  const edit = Object.fromEntries(fields.map(({ name, value }) => [name, value]));
+  edit.object ||= null;
+  return edit;
+}
 async function previewAtomEdit(button) {
   const { proposalId, revision, frontier, reviewDigest } = button.dataset;
   if (document.hidden || !state.active || proposalId !== state.selected?.object || revision !== state.selected?.revision) return;
   const editor = button.closest("[data-atom-edit]");
   const panel = editor.querySelector("[data-atom-edit-content]");
   const status = editor.querySelector("[data-atom-edit-status]");
-  const fields = [...editor.querySelectorAll("[name]")];
-  if (fields.some((field) => !field.reportValidity())) return;
-  const atom_edit = Object.fromEntries(fields.map(({ name, value }) => [name, value]));
-  atom_edit.object ||= null;
+  const atom_edit = readAtomEdit(editor);
+  if (!atom_edit) return;
   cancel();
   const controller = new AbortController();
   state.controller = controller;
@@ -373,7 +378,8 @@ function showAcceptanceReceipt() {
   const decision = receipt?.input.decision?.kind;
   $("acceptance-status").textContent = !receipt ? "" : ({
     pending: "正在核对审核结果…",
-    applied: decision === "defer" ? "已延期。" : decision === "reject" ? "已拒绝。" : "已接受。",
+    applied: receipt.correction ? "已提交修正提案；请前往审核。"
+      : decision === "defer" ? "已延期。" : decision === "reject" ? "已拒绝。" : "已接受。",
     no_delta: "此请求已处理；没有再次写入。",
     conflict: "提案或水位有变化；本请求未应用。",
     unavailable: "当前提案不具备此网页审核操作的条件；本请求未应用。",
@@ -386,11 +392,15 @@ async function resolveAcceptance(receipt, lookup) {
   receipt.status = "pending";
   showAcceptanceReceipt();
   try {
-    const path = receipt.input.decision
-      ? (lookup ? "proposal-disposition-result" : "proposal-disposition")
+    const path = receipt.correction ? (lookup ? "proposal-correction-result" : "proposal-correction")
+      : receipt.input.decision ? (lookup ? "proposal-disposition-result" : "proposal-disposition")
       : (lookup ? "proposal-acceptance-result" : "proposal-accept");
     const input = { ...receipt.input };
     delete receipt.input.atom_edit;
+    if (receipt.correction) {
+      delete receipt.input.content;
+      delete receipt.input.frontier;
+    }
     receipt.result = await api(path, input);
     receipt.status = receipt.result.status;
   } catch {
@@ -423,11 +433,21 @@ function actOnProposal(button) {
     prompt = "拒绝刚才显示的提案修订 " + revision + "？相同内容与证据不会重新提交审核。";
   }
   if (!window.confirm(prompt)) return;
+  sendProposalAction({ input });
+}
+function submitAtomCorrection(button) {
+  const { atomId, revision, frontier, requestId } = button.dataset;
+  if (document.hidden || !state.active || atomId !== state.selected?.object || revision !== state.selected?.revision) return;
+  if (["pending", "unknown"].includes(state.acceptance?.status)) return;
+  const content = readAtomEdit(button.closest("[data-atom-correction]"));
+  if (!content || !window.confirm("为所选修订提交修正提案？当前记忆不会改写。")) return;
+  sendProposalAction({ correction: true, input: { request_id: requestId, atom_id: atomId, base_revision_id: revision, frontier, content } });
+}
+function sendProposalAction(receipt) {
   cancel();
   state.selected = null;
   $("detail-body").replaceChildren();
   $("detail-ref").textContent = "";
-  const receipt = { input };
   state.acceptance = receipt;
   void resolveAcceptance(receipt, false);
 }
@@ -1214,7 +1234,7 @@ $("detail-body").onclick = (event) => {
     [data-content-nav], [data-revisions-open], [data-revisions-next], [data-detail-open],
     [data-revision-key], [data-sources-open], [data-sources-next], [data-link-key], [data-proposal-confirm], [data-proposal-accept],
     [data-proposal-disposition], [data-atom-edit-preview], [data-nav-back], [data-compare-base], [data-compare-key], [data-compare-side],
-    [data-result-base], [data-result-compare],
+    [data-result-base], [data-result-compare], [data-submit-atom-correction],
     [data-compare-first], [data-compare-next], [data-compiled-first], [data-compiled-next], [data-compiled-refresh]`,
   );
   if (!button || button.disabled) return;
@@ -1282,6 +1302,7 @@ $("detail-body").onclick = (event) => {
   }
   if (button.hasAttribute("data-proposal-confirm")) confirmProposal(button);
   if (button.hasAttribute("data-atom-edit-preview")) previewAtomEdit(button);
+  if (button.hasAttribute("data-submit-atom-correction")) submitAtomCorrection(button);
   if (button.matches("[data-proposal-accept], [data-proposal-disposition]")) actOnProposal(button);
   else if (button.hasAttribute("data-result-base")) compareResult(button, true);
   else if (button.hasAttribute("data-result-compare")) compareResult(button, false);

@@ -657,11 +657,15 @@ impl JournalPayload {
     /// A new logical payload generation for Web-origin authority; historical rows retain generation 1 and their hashes.
     pub(crate) fn payload_schema(&self) -> u16 {
         use evertrace_domain::semantic::{
-            ProposalAcceptanceAuthority, UserAuthorizationMode, WEB_ACCEPTANCE_EVENT_MANIFEST_REF,
+            HUMAN_CORRECTION_MANIFEST, ProposalAcceptanceAuthority, UserAuthorizationMode,
+            WEB_ACCEPTANCE_EVENT_MANIFEST_REF,
         };
         let web = match self {
             Self::SourceReceiptRecorded(receipt) => {
-                receipt.eligible_event_manifest_ref == WEB_ACCEPTANCE_EVENT_MANIFEST_REF
+                matches!(
+                    receipt.eligible_event_manifest_ref.as_str(),
+                    WEB_ACCEPTANCE_EVENT_MANIFEST_REF | HUMAN_CORRECTION_MANIFEST
+                )
             }
             Self::RevisionProposalRecorded(proposal) => {
                 proposal.acceptance.as_ref().is_some_and(|acceptance| {

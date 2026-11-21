@@ -6,7 +6,7 @@ use evertrace_domain::{
         SourceRevisionMode, SourceRole, hex, payload_fingerprint,
     },
     ids::{
-        AtomId, RepositoryId, ResultEvidenceId, RevisionProposalId, SemanticDigestId,
+        AtomId, CommandId, RepositoryId, ResultEvidenceId, RevisionProposalId, SemanticDigestId,
         SourceObservationId, SourceReceiptId, TaskId, WorkArtifactId, WorktreeId,
     },
     procedure::{ProcedureRevision, ProcedureScope},
@@ -16,11 +16,12 @@ use evertrace_domain::{
     semantic::{
         Atom, AtomAuthority, AtomDraft, AtomLifecycleStatus, AtomProposalPayload, AtomScope,
         CoreMembershipProposalPayload, EpistemicStatus, GlobalSupportState,
-        ProcedureProposalPayload, ProposalAcceptanceAuthority, ProposalCreatedBy,
-        ProposalEligibility, ProposalOperation, ProposalPayload, ProposalStatus, ProposalTargetId,
-        ProposalTargetKind, RevisionProposal, TUI_ACCEPTANCE_EVENT_MANIFEST_REF,
-        UserAuthorizationMode, VerifierStatus, WEB_ACCEPTANCE_EVENT_MANIFEST_REF,
-        WebAcceptanceIntent, tui_acceptance_capture_matches, tui_acceptance_event_payload,
+        HUMAN_CORRECTION_MANIFEST, HumanAtomCorrection, ProcedureProposalPayload,
+        ProposalAcceptanceAuthority, ProposalCreatedBy, ProposalEligibility, ProposalOperation,
+        ProposalPayload, ProposalStatus, ProposalTargetId, ProposalTargetKind, RevisionProposal,
+        TUI_ACCEPTANCE_EVENT_MANIFEST_REF, UserAuthorizationMode, VerifierStatus,
+        WEB_ACCEPTANCE_EVENT_MANIFEST_REF, WebAcceptanceIntent, tui_acceptance_capture_matches,
+        tui_acceptance_event_payload,
     },
     work::{ArtifactPayloadStatus, Task, WorkArtifact},
 };
@@ -349,6 +350,7 @@ pub(crate) fn validate_command_boundary<'a>(
     current_procedures: &super::procedure::ProcedureState,
     current_support: &super::scenario_core::ScenarioCoreState,
     frontier: u64,
+    command_id: CommandId,
     events: impl IntoIterator<Item = (&'a JournalPayload, i64, [u8; 32])>,
     error: StoreError,
 ) -> Result<BTreeSet<RevisionProposalId>, StoreError> {
@@ -357,6 +359,7 @@ pub(crate) fn validate_command_boundary<'a>(
         .iter()
         .map(|(payload, _, _)| *payload)
         .collect::<Vec<_>>();
+    validate_human_correction_boundary(current_atoms, command_id, &payloads, error)?;
     validate_web_acceptance_boundary(
         current_atoms,
         current_proposals,
@@ -765,6 +768,85 @@ fn exact_edit_pairs(
         pairs.insert((original_id, candidate.proposal_id));
     }
     Ok(pairs)
+}
+
+/// An authored source is admitted only alongside its single, non-authoritative proposal.
+fn validate_human_correction_boundary(
+    atoms: &BTreeMap<AtomId, (Atom, u64)>,
+    command_id: CommandId,
+    payloads: &[&JournalPayload],
+    error: StoreError,
+) -> Result<(), StoreError> {
+    let mut receipts = payloads.iter().filter_map(|payload| match payload {
+        JournalPayload::SourceReceiptRecorded(receipt)
+            if [
+                receipt.identity_domain.as_str(),
+                receipt.adapter_manifest_ref.as_str(),
+                receipt.eligible_event_manifest_ref.as_str(),
+            ]
+            .contains(&HUMAN_CORRECTION_MANIFEST) =>
+        {
+            Some(receipt.as_ref())
+        }
+        _ => None,
+    });
+    let Some(receipt) = receipts.next() else {
+        return Ok(());
+    };
+    if receipts.next().is_some() {
+        return Err(error);
+    }
+    let mut observation = None;
+    let mut candidate = None;
+    for payload in payloads {
+        match payload {
+            JournalPayload::SourceObservationRecorded(value) if observation.is_none() => {
+                observation = Some(value.as_ref())
+            }
+            JournalPayload::RevisionProposalRecorded(value) if candidate.is_none() => {
+                candidate = Some(value.as_ref())
+            }
+            JournalPayload::SourceReceiptRecorded(value) if value.as_ref() == receipt => (),
+            JournalPayload::SourceIngestWatermark(value)
+                if value.confirmed_prefix_digest.is_none() && value.earlier_prefix.is_none() =>
+            {
+                ()
+            }
+            JournalPayload::DirtyTarget(_) => (),
+            _ => return Err(error),
+        }
+    }
+    let (observation, proposal) = (observation.ok_or(error)?, candidate.ok_or(error)?);
+    let intent = HumanAtomCorrection::from_pending(proposal).ok_or(error)?;
+    let base = &atoms.get(&intent.atom_id).ok_or(error)?.0;
+    let draft = intent
+        .draft(base, observation.source_observation_id)
+        .ok_or(error)?;
+    let canonical = intent
+        .canonical(proposal.proposal_id, proposal.proposal_revision_id)
+        .ok_or(error)?;
+    if proposal.proposal_id.as_uuid() != command_id.as_uuid()
+        || proposal.created_at_us != receipt.recorded_at_us
+        || proposal.review_reason.is_some()
+        || proposal.source_cohort_refs != [observation.source_observation_id.to_string()]
+        || proposal.evidence_refs != draft.evidence_refs
+        || !matches!(&proposal.payload, ProposalPayload::Atom(payload)
+            if matches!(payload.as_ref(), AtomProposalPayload::Replace { draft: actual } if actual == &draft))
+        || receipt.source_revision_mode != SourceRevisionMode::Append
+        || receipt.previous_source_revision.is_some()
+        || receipt.cas_ref
+            != evertrace_capture::CasDigest::for_protected_bytes(canonical.as_bytes()).to_string()
+        || !intent.capture_matches(
+            base,
+            proposal.proposal_id,
+            proposal.proposal_revision_id,
+            receipt,
+            observation,
+        )
+    {
+        return Err(error);
+    }
+    Ok(())
 }
 
 /// A Web capture may enter the journal only with its own permitted accepted successor.
@@ -1227,6 +1309,7 @@ fn validate_atom_relations(
             .ok_or(StoreError::StoreCorrupt)?
             .0;
         if observation.source_role != SourceRole::User
+            || receipt.eligible_event_manifest_ref == HUMAN_CORRECTION_MANIFEST
             || observation.content_trust != ContentTrust::UserStatement
             || observation.observation_role != ObservationRole::Message
             || receipt.observation_role != ObservationRole::Message

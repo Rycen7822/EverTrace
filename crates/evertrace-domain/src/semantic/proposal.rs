@@ -6,13 +6,16 @@ use crate::{
         CaptureCompleteness, ContentTrust, EvidenceSourceKind, IdentityStrength, ObservationRole,
         SourceArchiveMode, SourceObservation, SourceReceipt, SourceRole, hex, payload_fingerprint,
     },
-    ids::{AtomId, CoreMembershipId, ProcedureId, RevisionProposalId},
+    ids::{AtomId, CoreMembershipId, ProcedureId, RevisionProposalId, SourceObservationId},
     inventory::{CapabilityCoverageOmission, CapabilityCoverageSummary, CapabilityEvidenceLevel},
     procedure::{ProcedureAutoFullAudit, ProcedureDraft, ProcedureScope},
     revision::RevisionId,
 };
 
-use super::{AtomDraft, AtomScope, CoreScopeIdentity, SemanticError, valid_identifier};
+use super::{
+    Atom, AtomDraft, AtomLifecycleStatus, AtomProvenance, AtomScope, AtomValue, CoreScopeIdentity,
+    EpistemicStatus, SemanticError, valid_identifier,
+};
 
 const MAX_REFS: usize = 256;
 const MAX_SPLIT_OUTPUTS: usize = 16;
@@ -20,6 +23,7 @@ const MAX_REVIEW_TEXT: usize = 2048;
 
 pub const TUI_ACCEPTANCE_EVENT_MANIFEST_REF: &str = "evertrace_tui_acceptance_v1";
 pub const WEB_ACCEPTANCE_EVENT_MANIFEST_REF: &str = "evertrace_web_acceptance_v1";
+pub const HUMAN_CORRECTION_MANIFEST: &str = "evertrace_human_atom_correction_v1";
 const PROPOSAL_EDIT_INTENT_SCHEMA_VERSION: u32 = 1;
 
 pub fn tui_acceptance_event_payload(
@@ -70,6 +74,22 @@ pub struct WebAtomEdit {
 }
 
 impl WebAtomEdit {
+    fn apply(&self, value: &mut AtomValue) {
+        value.text.clone_from(&self.text);
+        value.subject.clone_from(&self.subject);
+        value.predicate.clone_from(&self.predicate);
+        value.object.clone_from(&self.object);
+    }
+
+    fn from_value(value: &AtomValue) -> Self {
+        Self {
+            text: value.text.clone(),
+            subject: value.subject.clone(),
+            predicate: value.predicate.clone(),
+            object: value.object.clone(),
+        }
+    }
+
     fn draft(proposal: &RevisionProposal) -> Option<&AtomDraft> {
         if !proposal.status.is_open()
             || proposal.eligibility == ProposalEligibility::AutoEligibleFull
@@ -99,10 +119,7 @@ impl WebAtomEdit {
     pub fn edited_draft(&self, proposal: &RevisionProposal) -> Option<AtomDraft> {
         let original = Self::draft(proposal)?;
         let mut draft = original.clone();
-        draft.value.text = self.text.clone();
-        draft.value.subject = self.subject.clone();
-        draft.value.predicate = self.predicate.clone();
-        draft.value.object = self.object.clone();
+        self.apply(&mut draft.value);
         draft.validate_unprivileged().ok()?;
         (draft != *original).then_some(draft)
     }
@@ -116,6 +133,151 @@ impl WebAtomEdit {
             _ => return None,
         };
         Some(ProposalPayload::Atom(Box::new(atom)))
+    }
+}
+
+/// A statement proposing a correction, never an acceptance or an authority grant.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct HumanAtomCorrection {
+    pub atom_id: AtomId,
+    pub base_revision_id: RevisionId,
+    pub content: WebAtomEdit,
+}
+
+impl HumanAtomCorrection {
+    pub fn eligible_base(base: &Atom) -> bool {
+        base.lifecycle_status == AtomLifecycleStatus::Active
+            && matches!(
+                base.scope,
+                AtomScope::Task { .. } | AtomScope::Repository { .. }
+            )
+    }
+
+    pub fn replacement_value(&self, base: &Atom) -> Option<AtomValue> {
+        if base.atom_id != self.atom_id
+            || base.revision_id != self.base_revision_id
+            || !Self::eligible_base(base)
+        {
+            return None;
+        }
+        let mut value = base.value.clone();
+        self.content.apply(&mut value);
+        value.validate().ok()?;
+        (value != base.value).then_some(value)
+    }
+
+    pub fn draft(&self, base: &Atom, source: SourceObservationId) -> Option<AtomDraft> {
+        let value = self.replacement_value(base)?;
+        let mut provenance = base.provenance.clone();
+        provenance.push(AtomProvenance::UserAsserted);
+        provenance.sort_unstable();
+        provenance.dedup();
+        let mut observations = base.source_observation_refs.clone();
+        observations.push(source);
+        observations.sort_unstable();
+        observations.dedup();
+        let mut evidence = base.evidence_refs.clone();
+        evidence.push(source.to_string());
+        evidence.sort_unstable();
+        evidence.dedup();
+        let draft = AtomDraft {
+            kind: base.kind,
+            epistemic_status: if base.kind.is_normative() {
+                EpistemicStatus::NotApplicable
+            } else {
+                EpistemicStatus::Unverified
+            },
+            value,
+            scope: base.scope.clone(),
+            applicability_expr: base.applicability_expr.clone(),
+            future_cue_lifecycle_exprs: base.future_cue_lifecycle_exprs.clone(),
+            validity_interval: base.validity_interval.clone(),
+            provenance,
+            source_observation_refs: observations,
+            evidence_refs: evidence,
+            supersedes_revision_refs: vec![base.revision_id],
+            supports_revision_refs: base.supports_revision_refs.clone(),
+            contradicts_revision_refs: base.contradicts_revision_refs.clone(),
+        };
+        draft.validate_unprivileged().ok()?;
+        Some(draft)
+    }
+
+    pub fn from_pending(proposal: &RevisionProposal) -> Option<Self> {
+        if proposal.status != ProposalStatus::Pending
+            || proposal.operation != ProposalOperation::Replace
+            || proposal.eligibility != ProposalEligibility::ManualRequired
+            || proposal.created_by != ProposalCreatedBy::User
+            || proposal.parent_proposal_revision_id.is_some()
+        {
+            return None;
+        }
+        let Some(ProposalTargetId::Atom(atom_id)) = proposal.target_id else {
+            return None;
+        };
+        let ProposalPayload::Atom(payload) = &proposal.payload else {
+            return None;
+        };
+        let AtomProposalPayload::Replace { draft } = payload.as_ref() else {
+            return None;
+        };
+        Some(Self {
+            atom_id,
+            base_revision_id: proposal.base_revision_id?,
+            content: WebAtomEdit::from_value(&draft.value),
+        })
+    }
+
+    pub fn canonical(
+        &self,
+        proposal_id: RevisionProposalId,
+        revision: RevisionId,
+    ) -> Option<String> {
+        serde_json::to_string(&(HUMAN_CORRECTION_MANIFEST, proposal_id, revision, self)).ok()
+    }
+
+    pub fn read_canonical(
+        bytes: &[u8],
+        proposal_id: RevisionProposalId,
+        revision: RevisionId,
+    ) -> Option<Self> {
+        let (_, _, _, intent): (String, RevisionProposalId, RevisionId, Self) =
+            serde_json::from_slice(bytes).ok()?;
+        (intent.canonical(proposal_id, revision)?.as_bytes() == bytes).then_some(intent)
+    }
+
+    pub fn exact_capture(receipt: &SourceReceipt) -> bool {
+        receipt.archive_mode == SourceArchiveMode::Exact
+            && receipt.protected_secret_digest.is_none()
+            && receipt.redaction_spans.is_empty()
+            && receipt.protected_length == receipt.original_length
+    }
+
+    pub fn capture_matches(
+        &self,
+        base: &Atom,
+        proposal_id: RevisionProposalId,
+        revision: RevisionId,
+        receipt: &SourceReceipt,
+        observation: &SourceObservation,
+    ) -> bool {
+        receipt.task_id == base.scope.task_id()
+            && receipt.repository_instance_id == base.scope.repository_id()
+            && receipt.worktree_instance_id.is_none()
+            && self
+                .canonical(proposal_id, revision)
+                .is_some_and(|canonical| {
+                    human_capture_matches(
+                        (proposal_id, revision),
+                        &canonical,
+                        "human-correct",
+                        "human-correction",
+                        HUMAN_CORRECTION_MANIFEST,
+                        receipt,
+                        observation,
+                    )
+                })
     }
 }
 
@@ -194,6 +356,16 @@ impl WebAcceptanceIntent {
                     if proposal.operation == ProposalOperation::Create
                         && draft.scope.task_id().is_some()
                         && proposal.eligibility == ProposalEligibility::ManualRequired =>
+                {
+                    Some(draft.scope.clone())
+                }
+                AtomProposalPayload::Replace { draft }
+                    if proposal.operation == ProposalOperation::Replace
+                        && proposal.eligibility == ProposalEligibility::ManualRequired
+                        && matches!(
+                            draft.scope,
+                            AtomScope::Task { .. } | AtomScope::Repository { .. }
+                        ) =>
                 {
                     Some(draft.scope.clone())
                 }
@@ -391,8 +563,8 @@ impl WebAcceptanceIntent {
                 && receipt.repository_instance_id == scope.repository_id()
                 && receipt.worktree_instance_id == worktree
         }) && self.canonical(source).is_some_and(|canonical| {
-            acceptance_capture_matches(
-                source,
+            human_capture_matches(
+                (source.proposal_id, source.proposal_revision_id),
                 &canonical,
                 "web-accept",
                 "web-acceptance",
@@ -412,8 +584,8 @@ pub fn tui_acceptance_capture_matches(
     receipt: &SourceReceipt,
     observation: &SourceObservation,
 ) -> bool {
-    acceptance_capture_matches(
-        source,
+    human_capture_matches(
+        (source.proposal_id, source.proposal_revision_id),
         canonical,
         record_prefix,
         "tui-acceptance",
@@ -423,8 +595,8 @@ pub fn tui_acceptance_capture_matches(
     )
 }
 
-fn acceptance_capture_matches(
-    source: &RevisionProposal,
+fn human_capture_matches(
+    (proposal_id, revision): (RevisionProposalId, RevisionId),
     canonical: &str,
     record_prefix: &str,
     instance_prefix: &str,
@@ -435,15 +607,11 @@ fn acceptance_capture_matches(
     receipt.eligible_event_manifest_ref == manifest
         && receipt.identity_domain == manifest
         && receipt.adapter_manifest_ref == manifest
-        && receipt.source_instance_id.as_str()
-            == format!("{instance_prefix}:{}", source.proposal_id)
-        && receipt.source_revision.as_str() == source.proposal_revision_id.to_string()
+        && receipt.source_instance_id.as_str() == format!("{instance_prefix}:{proposal_id}")
+        && receipt.source_revision.as_str() == revision.to_string()
         && receipt.source_record_identity.as_str()
-            == format!(
-                "{record_prefix}-{}-{}",
-                source.proposal_id, source.proposal_revision_id
-            )
-        && receipt.source_ref == source.proposal_id.to_string()
+            == format!("{record_prefix}-{proposal_id}-{revision}")
+        && receipt.source_ref == proposal_id.to_string()
         && receipt.source_session_ref == "human-governance"
         && receipt.source_sequence == 1
         && receipt.source_sequence_origin == Some(1)
