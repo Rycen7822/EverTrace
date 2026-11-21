@@ -1555,6 +1555,8 @@ impl ProductionSearch {
                 .run(snapshot.fts(
                     if self.candidate_grants.is_some() {
                         scoped_lexical_query(&context)
+                    } else if human_window {
+                        exact_slot_primary(&context)
                     } else {
                         &context.protected_query
                     },
@@ -1872,15 +1874,28 @@ fn scoped_lexical_query(context: &SearchContext) -> &str {
     {
         return topic;
     }
-    // The explicit slots stay in protected IR; only the primary clause is ranked as lexical text.
+    exact_slot_primary(context)
+}
+
+pub(super) fn exact_slot_primary(context: &SearchContext) -> &str {
+    let facets = &context.query_facets;
+    let text = &context.protected_query;
+    // The protected IR must agree with the existing anchored exact-slot syntax.
+    // An undeclared or redacted suffix stays ordinary lexical text.
     if context.budget.follow_ups_remaining != 0
-        && let Some((primary, _)) = context
-            .protected_query
-            .split_once(super::EXACT_SLOT_SEPARATOR)
+        && context.protected_facets.is_empty()
+        && let Some((primary, _)) = text.split_once(super::EXACT_SLOT_SEPARATOR)
+        && super::explicit_exact_slots(text, &facets.target_anchors).is_some_and(|slots| {
+            slots.len() == facets.exact_identifiers.len()
+                && slots
+                    .iter()
+                    .all(|slot| facets.exact_identifiers.contains(slot))
+        })
     {
-        return primary.trim();
+        primary.trim()
+    } else {
+        text
     }
-    &context.protected_query
 }
 
 pub(super) fn exact_query_reference(context: &SearchContext) -> Option<&str> {

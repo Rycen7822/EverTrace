@@ -8,7 +8,8 @@ use evertrace_store::{SearchHardFilter, SearchIndex, SearchProjectionRow, Search
 use super::{
     SearchError,
     production::{
-        RelationSources, RequestDeadline, candidate_limit, exact_query_reference, hard_compatible,
+        RelationSources, RequestDeadline, candidate_limit, exact_query_reference,
+        exact_slot_primary, hard_compatible,
     },
     read_context::SearchReadAccess,
 };
@@ -611,7 +612,7 @@ impl NativeRetrieval<'_> {
         {
             self.read_evidence(
                 &snapshot,
-                &self.context.protected_query,
+                exact_slot_primary(self.context),
                 &self.context.query_facets.exact_identifiers,
             )
             .await?;
