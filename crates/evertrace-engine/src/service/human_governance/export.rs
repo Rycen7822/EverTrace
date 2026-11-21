@@ -63,7 +63,7 @@ struct Selection {
 
 pub(super) struct SearchReadIndex<'a> {
     references: BTreeMap<&'a str, Vec<&'a ObjectRow>>,
-    live_episode: Option<LiveEpisodeRead>,
+    pub(super) live_episode: Option<LiveEpisodeRead>,
 }
 
 impl<'a> std::ops::Deref for SearchReadIndex<'a> {
@@ -77,10 +77,12 @@ impl<'a> SearchReadIndex<'a> {
     pub(super) fn new(
         snapshot: &'a ProjectionSnapshot,
         facets: &evertrace_domain::query::QueryFacetSet,
+        selection: evertrace_domain::query::MemoryScopeSelection,
         deadline: Instant,
     ) -> ExportResult<Self> {
         let references = presentation_index(snapshot, deadline)?;
-        let live_episode = LiveEpisodeRead::for_relation(snapshot, &references, facets, deadline);
+        let live_episode =
+            LiveEpisodeRead::for_relation(snapshot, &references, facets, selection, deadline);
         Ok(Self {
             references,
             live_episode,

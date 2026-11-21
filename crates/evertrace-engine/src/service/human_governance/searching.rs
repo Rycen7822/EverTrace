@@ -5,7 +5,9 @@ use evertrace_domain::{
     semantic::{NormativeResolutionState, SemanticResolution},
 };
 
-const SEARCH_HIT_ORDER_REVISION: u32 = 9;
+use crate::search::read_context::RelationArchiveBudget;
+
+const SEARCH_HIT_ORDER_REVISION: u32 = 10;
 
 type SearchPolicy = Option<(String, Option<evertrace_codex::policy::PolicyEvidence>)>;
 
@@ -27,6 +29,7 @@ struct SearchHitCursor {
     policy: SearchPolicy,
     inherited_repository: Option<RepositoryId>,
     blocked_task_shards: Option<BTreeSet<RepositoryId>>,
+    relation_archive_budget: RelationArchiveBudget,
     wiki_inputs: std::collections::BTreeMap<String, BTreeSet<String>>,
     after: Option<HumanSearchHit>,
     remaining: Vec<HumanSearchHit>,
@@ -1054,8 +1057,10 @@ impl HumanGovernanceService {
         snapshot: &ProjectionSnapshot,
         index: &export::SearchReadIndex<'_>,
         checks: &BTreeSet<String>,
+        archive_budget: &mut RelationArchiveBudget,
         deadline: std::time::Instant,
     ) -> bool {
+        let mut verify_relation_archive = false;
         for reference in checks {
             let rows = index
                 .get(reference.as_str())
@@ -1072,10 +1077,28 @@ impl HumanGovernanceService {
                 {
                     return false;
                 }
+                verify_relation_archive |= index
+                    .live_episode
+                    .as_ref()
+                    .is_some_and(|proof| proof.contains(row));
             }
             if !found {
                 return false;
             }
+        }
+        if verify_relation_archive {
+            let (Some(proof), Some(runtime)) = (&index.live_episode, &self.runtime_snapshot) else {
+                return false;
+            };
+            return proof
+                .check_archive(
+                    &self.writer,
+                    &runtime.cas_dir,
+                    index,
+                    archive_budget,
+                    deadline,
+                )
+                .await;
         }
         true
     }
@@ -1141,8 +1164,9 @@ impl HumanGovernanceService {
             {
                 return conflict();
             }
-            let index = export::SearchReadIndex::new(&snapshot, &query.facets, deadline)
-                .map_err(|_| HumanGovernanceError::Store)?;
+            let index =
+                export::SearchReadIndex::new(&snapshot, &query.facets, query.selection, deadline)
+                    .map_err(|_| HumanGovernanceError::Store)?;
             let mut checks = BTreeSet::new();
             for hit in cursor.after.iter().chain(&cursor.remaining) {
                 if let Some(deps) = cursor.wiki_inputs.get(&hit.candidate_id) {
@@ -1152,7 +1176,13 @@ impl HumanGovernanceService {
                 }
             }
             if !self
-                .search_checks_readable(&snapshot, &index, &checks, deadline)
+                .search_checks_readable(
+                    &snapshot,
+                    &index,
+                    &checks,
+                    &mut cursor.relation_archive_budget,
+                    deadline,
+                )
                 .await
             {
                 return conflict();
@@ -1389,8 +1419,13 @@ impl HumanGovernanceService {
                 }
                 return Ok(page);
             }
-            let index = export::SearchReadIndex::new(&snapshot, &protected.facets, deadline)
-                .map_err(|_| HumanGovernanceError::Store)?;
+            let index = export::SearchReadIndex::new(
+                &snapshot,
+                &protected.facets,
+                query.selection,
+                deadline,
+            )
+            .map_err(|_| HumanGovernanceError::Store)?;
             let mut refs = BTreeSet::new();
             let mut proposals = BTreeSet::new();
             let mut unavailable = false;
@@ -1427,6 +1462,23 @@ impl HumanGovernanceService {
                     Err(export::Failure::Denied) => {}
                     Err(_) => unavailable = true,
                 }
+            }
+            let mut relation_archive_budget = RelationArchiveBudget::default();
+            let mut relation_archive_gap = false;
+            if let Some(proof) = &index.live_episode
+                && proof.admitted(&refs)
+                && !proof
+                    .check_archive(
+                        &self.writer,
+                        &runtime.cas_dir,
+                        &index,
+                        &mut relation_archive_budget,
+                        deadline,
+                    )
+                    .await
+            {
+                proof.withhold(&mut refs);
+                relation_archive_gap = true;
             }
             let suppression = ObjectDeletionCurrentView::from_snapshot(&snapshot)
                 .map_err(|_| HumanGovernanceError::Store)?;
@@ -1729,7 +1781,13 @@ impl HumanGovernanceService {
                 }
             }
             let mut access_changed = !self
-                .search_checks_readable(&snapshot, &index, &checks, deadline)
+                .search_checks_readable(
+                    &snapshot,
+                    &index,
+                    &checks,
+                    &mut relation_archive_budget,
+                    deadline,
+                )
                 .await;
             let current_report = self.search_report().await;
             if let Ok(Some(repository)) = selected_repository
@@ -1810,7 +1868,12 @@ impl HumanGovernanceService {
                     .degraded_reasons
                     .insert("source_read_restricted".into());
             }
-            if projection_gap || text_gap || task_restricted {
+            if relation_archive_gap {
+                page.result
+                    .degraded_reasons
+                    .insert("search_relation_source_unavailable".into());
+            }
+            if projection_gap || text_gap || task_restricted || relation_archive_gap {
                 if page.result.completeness == RetrievalCompleteness::Complete {
                     page.result.completeness = RetrievalCompleteness::Partial;
                 }
@@ -1859,6 +1922,7 @@ impl HumanGovernanceService {
                     policy,
                     inherited_repository,
                     blocked_task_shards,
+                    relation_archive_budget,
                     wiki_inputs,
                     after: None,
                     remaining,
