@@ -6,9 +6,10 @@ use evertrace_domain::{
 };
 
 use crate::search::read_context::{
-    ATTEMPT_RUN_RELATION, LINEAGE_RELATIONS, LineageQuery, LineageRead, RUN_RESULT_RELATION,
-    RelationArchiveBudget, check_relation_archive, check_research_archive,
-    current_operation_binding, operation_binding_read, search_observation_access,
+    ATTEMPT_RUN_RELATION, LINEAGE_RELATIONS, LineageQuery, LineageRead, OperationRead,
+    RUN_RESULT_RELATION, RelationArchiveBudget, check_relation_archive, check_research_archive,
+    current_operation_binding, operation_binding_read, repository_operation_read,
+    search_observation_access,
 };
 
 const SEARCH_HIT_ORDER_REVISION: u32 = 12;
@@ -1265,6 +1266,7 @@ impl HumanGovernanceService {
         checks: &BTreeSet<String>,
         archive_budget: &mut RelationArchiveBudget,
         research: bool,
+        physical: Option<&OperationRead<'_>>,
         deadline: std::time::Instant,
     ) -> bool {
         let mut verify_relation_archive = false;
@@ -1307,20 +1309,12 @@ impl HumanGovernanceService {
                     }
                 }
                 if row.object_kind.as_deref() == Some("work_binding") {
-                    let (Some(proof), Some(runtime)) =
-                        (operation_binding_read(row, index), &self.runtime_snapshot)
-                    else {
+                    let Some(proof) = operation_binding_read(row, index) else {
                         return false;
                     };
-                    if !check_relation_archive(
-                        &proof.sources,
-                        &self.writer,
-                        &runtime.cas_dir,
-                        index,
-                        archive_budget,
-                        deadline,
-                    )
-                    .await
+                    if !self
+                        .retained_relation_archive(&proof.sources, index, archive_budget, deadline)
+                        .await
                     {
                         return false;
                     }
@@ -1333,6 +1327,16 @@ impl HumanGovernanceService {
             if !found {
                 return false;
             }
+        }
+        // An Operation reaches every effect through the stored dependency closure;
+        // each effect reciprocally reaches the Operation, including on a last cursor page.
+        if let Some(proof) = physical
+            && checks.iter().any(|id| proof.contains(id))
+            && !self
+                .retained_relation_archive(&proof.physical_sources, index, archive_budget, deadline)
+                .await
+        {
+            return false;
         }
         if verify_relation_archive {
             let (Some(proof), Some(runtime)) = (&index.live_episode, &self.runtime_snapshot) else {
@@ -1349,6 +1353,27 @@ impl HumanGovernanceService {
                 .await;
         }
         true
+    }
+
+    async fn retained_relation_archive(
+        &self,
+        sources: &BTreeSet<String>,
+        index: &export::SearchReadIndex<'_>,
+        budget: &mut RelationArchiveBudget,
+        deadline: std::time::Instant,
+    ) -> bool {
+        let Some(runtime) = &self.runtime_snapshot else {
+            return false;
+        };
+        check_relation_archive(
+            sources,
+            &self.writer,
+            &runtime.cas_dir,
+            index,
+            budget,
+            deadline,
+        )
+        .await
     }
 
     async fn search_report(&self) -> Option<evertrace_codex::HostProbeReport> {
@@ -1461,6 +1486,7 @@ impl HumanGovernanceService {
                     checks.insert(hit.access_reference().to_owned());
                 }
             }
+            let physical = repository_operation_read(query.selection, &query.facets, &index);
             if !self
                 .search_checks_readable(
                     &snapshot,
@@ -1468,6 +1494,7 @@ impl HumanGovernanceService {
                     &checks,
                     &mut cursor.relation_archive_budget,
                     research_anchor(query.selection, &query.text, &query.facets).is_some(),
+                    physical.as_ref(),
                     deadline,
                 )
                 .await
@@ -1878,8 +1905,36 @@ impl HumanGovernanceService {
                 proof.withhold(&mut refs);
                 relation_archive_gap = true;
             }
+            let physical = repository_operation_read(query.selection, &protected.facets, &index);
             let mut binding_source = None;
             let mut physical_operands = Vec::new();
+            if let Some(proof) = &physical {
+                if let Some(operands) = proof.repository_operands()
+                    && operands.iter().all(|operand| {
+                        operand
+                            .candidate_id
+                            .as_ref()
+                            .is_some_and(|id| refs.contains(id))
+                    })
+                {
+                    if self
+                        .retained_relation_archive(
+                            &proof.physical_sources,
+                            &index,
+                            &mut relation_archive_budget,
+                            deadline,
+                        )
+                        .await
+                    {
+                        physical_operands = operands;
+                    } else {
+                        relation_archive_gap = true;
+                    }
+                }
+                if physical_operands.is_empty() {
+                    refs.retain(|id| !proof.contains(id));
+                }
+            }
             if !matches!(
                 query.selection,
                 MemoryScopeSelection::Global | MemoryScopeSelection::Unassigned
@@ -1907,19 +1962,32 @@ impl HumanGovernanceService {
                             .is_some_and(|id| refs.contains(id))
                     })
                 {
-                    if check_relation_archive(
-                        &proof.sources,
-                        &self.writer,
-                        &runtime.cas_dir,
-                        &index,
-                        &mut relation_archive_budget,
-                        deadline,
-                    )
-                    .await
+                    let assignment: BTreeSet<_>;
+                    let sources = if physical.is_some() && !physical_operands.is_empty() {
+                        assignment = proof
+                            .sources
+                            .difference(&proof.physical_sources)
+                            .cloned()
+                            .collect();
+                        &assignment
+                    } else {
+                        &proof.sources
+                    };
+                    if sources.is_empty()
+                        || self
+                            .retained_relation_archive(
+                                sources,
+                                &index,
+                                &mut relation_archive_budget,
+                                deadline,
+                            )
+                            .await
                     {
                         refs.extend(source.candidate_id.iter().cloned());
                         binding_source = Some(source);
-                        physical_operands = operands;
+                        if physical_operands.is_empty() {
+                            physical_operands = operands;
+                        }
                     } else {
                         relation_archive_gap = true;
                     }
@@ -2300,6 +2368,7 @@ impl HumanGovernanceService {
                     &checks,
                     &mut relation_archive_budget,
                     research.is_some(),
+                    physical.as_ref(),
                     deadline,
                 )
                 .await;

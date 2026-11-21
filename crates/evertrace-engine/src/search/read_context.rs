@@ -614,7 +614,7 @@ pub(crate) fn physical_read_index(rows: &[ObjectRow]) -> BTreeMap<&str, Vec<&Obj
     index
 }
 
-pub(crate) struct OperationBindingRead<'a> {
+pub(crate) struct OperationRead<'a> {
     operation: &'a ObjectRow,
     effects: Vec<(&'a ObjectRow, evertrace_domain::evidence::ScopeEffect)>,
     covers_operation: bool,
@@ -622,7 +622,57 @@ pub(crate) struct OperationBindingRead<'a> {
     pub physical_sources: BTreeSet<String>,
 }
 
-impl OperationBindingRead<'_> {
+impl OperationRead<'_> {
+    fn shard(
+        &self,
+    ) -> Option<(
+        Option<evertrace_domain::ids::RepositoryId>,
+        Option<evertrace_domain::ids::WorktreeId>,
+    )> {
+        let (_, first) = self.effects.first()?;
+        let key = (first.repository_instance_id, first.worktree_instance_id);
+        (self.covers_operation
+            && self.effects.iter().all(|(_, effect)| {
+                (effect.repository_instance_id, effect.worktree_instance_id) == key
+            }))
+        .then_some(key)
+    }
+
+    fn rows(&self) -> impl Iterator<Item = &ObjectRow> {
+        std::iter::once(self.operation).chain(self.effects.iter().map(|(row, _)| *row))
+    }
+
+    pub(crate) fn contains(&self, reference: &str) -> bool {
+        self.rows()
+            .any(|row| row.current_revision_id.as_deref() == Some(reference))
+    }
+
+    pub(crate) fn repository_operands(&self) -> Option<Vec<evertrace_store::SearchProjectionRow>> {
+        let (repository, worktree) = self.shard()?;
+        self.operands(
+            &None,
+            &Some(repository?.to_string()),
+            &worktree.map(|id| id.to_string()),
+        )
+    }
+
+    fn operands(
+        &self,
+        task: &Option<String>,
+        repository: &Option<String>,
+        worktree: &Option<String>,
+    ) -> Option<Vec<evertrace_store::SearchProjectionRow>> {
+        self.rows()
+            .map(|row| {
+                let mut source = evertrace_store::query::canonical_physical_source(row).ok()?;
+                source.task_id.clone_from(task);
+                source.repository_id.clone_from(repository);
+                source.worktree_id.clone_from(worktree);
+                Some(source)
+            })
+            .collect()
+    }
+
     /// Exact-only operands for a single physical shard. Indexed rows and durable coordinates stay unchanged.
     pub(crate) fn scoped_operands(
         &self,
@@ -633,16 +683,7 @@ impl OperationBindingRead<'_> {
         if selection == Scope::All {
             return Some(Vec::new());
         }
-        if !self.covers_operation {
-            return None;
-        }
-        let (_, first) = self.effects.first()?;
-        let (repo, tree) = (first.repository_instance_id, first.worktree_instance_id);
-        if self.effects.iter().any(|(_, effect)| {
-            effect.repository_instance_id != repo || effect.worktree_instance_id != tree
-        }) {
-            return None;
-        }
+        let (repo, tree) = self.shard()?;
         match selection {
             Scope::Repository { repository_id } if repo == Some(repository_id) => {}
             Scope::Worktree { worktree_id } if repo.is_some() && tree == Some(worktree_id) => {}
@@ -652,25 +693,19 @@ impl OperationBindingRead<'_> {
         }
         binding.repository_id = repo.map(|id| id.to_string());
         binding.worktree_id = tree.map(|id| id.to_string());
-        let mut rows = Vec::new();
-        for row in std::iter::once(self.operation).chain(self.effects.iter().map(|(row, _)| *row)) {
-            let mut source = evertrace_store::query::canonical_physical_source(row).ok()?;
-            source.task_id.clone_from(&binding.task_id);
-            source.repository_id.clone_from(&binding.repository_id);
-            source.worktree_id.clone_from(&binding.worktree_id);
-            rows.push(source);
-        }
-        Some(rows)
+        self.operands(
+            &binding.task_id,
+            &binding.repository_id,
+            &binding.worktree_id,
+        )
     }
 }
 
 pub(crate) fn operation_binding_read<'a>(
     row: &ObjectRow,
     index: &BTreeMap<&str, Vec<&'a ObjectRow>>,
-) -> Option<OperationBindingRead<'a>> {
-    use evertrace_domain::{
-        evidence::PairingState, ids::SourceObservationId, work::AssignmentStatus,
-    };
+) -> Option<OperationRead<'a>> {
+    use evertrace_domain::{ids::SourceObservationId, work::AssignmentStatus};
     let JournalPayload::WorkBindingRecorded(binding) =
         serde_json::from_str(row.payload_json.as_deref()?).ok()?
     else {
@@ -681,9 +716,65 @@ pub(crate) fn operation_binding_read<'a>(
     {
         return None;
     }
-    let operation_ref = binding.operation_id.to_string();
+    let mut read = operation_read(
+        binding.operation_id,
+        Some(&binding.scope_effect_refs),
+        index,
+    )?;
+    read.sources.extend(binding.evidence_refs.iter().cloned());
+    (row.task_id.as_deref()
+        == binding
+            .primary_binding
+            .task_id
+            .map(|id| id.to_string())
+            .as_deref()
+        && read
+            .sources
+            .iter()
+            .all(|reference| reference.parse::<SourceObservationId>().is_ok()))
+    .then_some(read)
+}
+
+/// A current physical proof can be read without any WorkBinding assignment.
+pub(crate) fn repository_operation_read<'a>(
+    selection: evertrace_domain::query::MemoryScopeSelection,
+    facets: &evertrace_domain::query::QueryFacetSet,
+    index: &BTreeMap<&str, Vec<&'a ObjectRow>>,
+) -> Option<OperationRead<'a>> {
+    use evertrace_domain::query::{MemoryScopeSelection as Scope, TemporalMode};
+    if !matches!(selection, Scope::Repository { .. } | Scope::Worktree { .. })
+        || facets.temporal_mode != TemporalMode::Current
+        || !facets.temporal_qualifiers.is_empty()
+        || !facets
+            .relation_requirements
+            .iter()
+            .any(|kind| kind == "operation_to_scope_effect")
+    {
+        return None;
+    }
+    let [anchor] = facets.target_anchors.as_slice() else {
+        return None;
+    };
+    let read = operation_read(anchor.parse().ok()?, None, index)?;
+    let (Some(repo), tree) = read.shard()? else {
+        return None;
+    };
+    match selection {
+        Scope::Repository { repository_id } if repository_id == repo => Some(read),
+        Scope::Worktree { worktree_id } if Some(worktree_id) == tree => Some(read),
+        _ => None,
+    }
+}
+
+fn operation_read<'a>(
+    operation_id: evertrace_domain::ids::OperationId,
+    selected: Option<&[evertrace_domain::ids::ScopeEffectId]>,
+    index: &BTreeMap<&str, Vec<&'a ObjectRow>>,
+) -> Option<OperationRead<'a>> {
+    use evertrace_domain::evidence::PairingState;
+    let key = operation_id.to_string();
     let operation_row = *index
-        .get(operation_ref.as_str())?
+        .get(key.as_str())?
         .iter()
         .filter(|row| row.object_kind.as_deref() == Some("operation"))
         .max_by_key(|row| row.source_event_seq)?;
@@ -692,8 +783,15 @@ pub(crate) fn operation_binding_read<'a>(
     else {
         return None;
     };
-    if operation.operation_id != binding.operation_id
+    if operation.operation_id != operation_id
         || operation.pairing_state != PairingState::Paired
+        || operation.validate().is_err()
+    {
+        return None;
+    }
+    let selected = selected.unwrap_or(&operation.scope_effect_ids);
+    if selected.is_empty()
+        || selected.len() > usize::from(evertrace_domain::query::METADATA_READ_LIMIT)
     {
         return None;
     }
@@ -704,7 +802,7 @@ pub(crate) fn operation_binding_read<'a>(
         .map(ToString::to_string)
         .collect();
     let mut effects = Vec::new();
-    for id in &binding.scope_effect_refs {
+    for id in selected {
         let reference = id.to_string();
         let [row] = index.get(reference.as_str())?.as_slice() else {
             return None;
@@ -715,6 +813,7 @@ pub(crate) fn operation_binding_read<'a>(
             return None;
         };
         if effect.scope_effect_id != *id
+            || effect.validate().is_err()
             || effect.operation_id != operation.operation_id
             || !operation.scope_effect_ids.contains(id)
         {
@@ -723,25 +822,11 @@ pub(crate) fn operation_binding_read<'a>(
         physical_sources.extend(effect.evidence_refs.iter().map(ToString::to_string));
         effects.push((*row, *effect));
     }
-    let sources: BTreeSet<_> = physical_sources
-        .iter()
-        .cloned()
-        .chain(binding.evidence_refs.iter().cloned())
-        .collect();
-    (row.task_id.as_deref()
-        == binding
-            .primary_binding
-            .task_id
-            .map(|id| id.to_string())
-            .as_deref()
-        && sources
-            .iter()
-            .all(|reference| reference.parse::<SourceObservationId>().is_ok()))
-    .then_some(OperationBindingRead {
+    Some(OperationRead {
         operation: operation_row,
         effects,
-        covers_operation: operation.scope_effect_ids.len() == binding.scope_effect_refs.len(),
-        sources,
+        covers_operation: operation.scope_effect_ids.len() == selected.len(),
+        sources: physical_sources.clone(),
         physical_sources,
     })
 }
