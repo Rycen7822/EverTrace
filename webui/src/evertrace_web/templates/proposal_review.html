@@ -59,6 +59,12 @@
         <dt>删除审计</dt><dd>{{ review.reauthorization.purge_job_audit_ref }}</dd>
       </dl>
     {% endif %}
+    {% if summary.status in ('pending', 'validating') and frontier is not none %}
+      <button class="button" type="button" data-proposal-confirm data-proposal-id="{{ summary.proposal_id }}"
+        data-revision="{{ summary.current_revision_id }}" data-frontier="{{ frontier }}"
+        data-fingerprint="{{ summary.fingerprint }}">复核当前提案</button>
+      <p data-proposal-confirmation-result role="status">只核对这份提案；不会提交审核决定。</p>
+    {% endif %}
   {% else %}
     <p>本次没有返回可读正文或审核资格；不显示旧正文。</p>
   {% endif %}

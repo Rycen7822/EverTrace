@@ -6,6 +6,7 @@ from pathlib import Path
 import secrets
 import socket
 import time
+import uuid
 
 from jinja2 import Environment, FileSystemLoader, StrictUndefined, select_autoescape
 from starlette.requests import ClientDisconnect, Request
@@ -617,6 +618,10 @@ class App:
                         "matching_count": str(result["matching_count"]) if result["matching_count"] is not None else None,
                         "state": result["status"],
                     }
+            elif payload.get("kind") == "proposal_confirmation" and set(payload) == {
+                "kind", "proposal_id", "revision", "frontier", "fingerprint",
+            }:
+                data = {"confirmation": await confirm_proposal_revision(self.backend, payload)}
             elif payload.get("kind") == "detail" and set(payload) == {
                 "kind",
                 "reference",
@@ -663,6 +668,42 @@ class App:
         if self.session is not current or not self.authenticated(request):
             return JSONResponse({"error": "session_expired"}, status_code=401)
         return JSONResponse(data)
+
+
+async def confirm_proposal_revision(backend, expected):
+    """Re-read the view the human selected; this is not an acceptance or an authorization receipt."""
+    proposal_id, revision, fingerprint = (expected[key] for key in ("proposal_id", "revision", "fingerprint"))
+    frontier = parse_frontier(expected["frontier"])
+    prefix = "proposal:"
+    if (not isinstance(proposal_id, str) or not proposal_id.startswith(prefix)
+        or not _uuid7(proposal_id[len(prefix):]) or not _uuid7(revision)
+        or not isinstance(fingerprint, str) or len(fingerprint) != 64
+        or any(char not in "0123456789abcdef" for char in fingerprint)):
+        raise BackendError("invalid_input")
+    result = await backend.detail(proposal_id, frontier, revision, "inbox")
+    if result["kind"] == "conflict":
+        return "conflict"
+    if result["kind"] != "snapshot" or len(result["items"]) != 1:
+        return "unavailable"
+    item, = result["items"]
+    summary = item.get("proposal")
+    if item["object_kind"] != "revision_proposal_revision" or not summary or not item.get("proposal_review"):
+        return "unavailable"
+    if (result["frontier"] != frontier or item["object_ref"] != proposal_id or item["revision_ref"] != revision
+        or summary["proposal_id"] != proposal_id or summary["current_revision_id"] != revision
+        or summary["fingerprint"] != fingerprint or summary["status"] not in ("pending", "validating")):
+        return "conflict"
+    return "matches"
+
+
+def _uuid7(value):
+    if not isinstance(value, str) or len(value) != 36:
+        return False
+    try:
+        parsed = uuid.UUID(value)
+    except ValueError:
+        return False
+    return str(parsed) == value and parsed.version == 7 and parsed.variant == uuid.RFC_4122
 
 
 def present_detail(templates, result, surface):

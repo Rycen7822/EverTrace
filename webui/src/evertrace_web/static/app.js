@@ -289,6 +289,42 @@ async function detail(item, frontier, controller, scroll = 0) {
   $("detail-body").scrollTop = scroll;
   if (item.surface && !result.selection) state.selected = null;
 }
+async function confirmProposal(button) {
+  const item = state.selected;
+  if (!state.active || document.hidden || item?.surface !== "inbox" || item.kind !== "revision_proposal_revision") return;
+  const { proposalId, revision, frontier, fingerprint } = button.dataset;
+  if (proposalId !== item.object || revision !== item.revision) return;
+  cancel();
+  const controller = new AbortController();
+  state.controller = controller;
+  button.disabled = true;
+  const feedback = button.parentElement.querySelector("[data-proposal-confirmation-result]");
+  feedback.textContent = "正在复核…";
+  let message = "暂时无法复核，已清除旧正文。";
+  try {
+    const { confirmation } = await api(
+      "read", { kind: "proposal_confirmation", proposal_id: proposalId, revision, frontier, fingerprint }, controller.signal,
+    );
+    if (state.controller !== controller || document.hidden) return;
+    if (confirmation === "matches") {
+      feedback.textContent = "当前提案与所读修订一致；未提交任何操作。";
+      button.disabled = false;
+      return;
+    }
+    if (confirmation === "conflict") message = "提案或水位已变化，请重新选择；没有改用当前版本。";
+  } catch {
+    // Do not keep the old review body when current access could not be re-established.
+  } finally {
+    if (state.controller === controller) {
+      state.controller = null;
+      if (button.disabled && !document.hidden) {
+        state.selected = null;
+        $("detail-body").textContent = message;
+        $("detail-ref").textContent = "";
+      }
+    }
+  }
+}
 async function readSources(item, after, frontier, controller, scroll = 0) {
   const result = await api(
     "read",
@@ -1057,7 +1093,7 @@ $("detail-body").onclick = (event) => {
     `[data-archive-revisions], [data-archive-revision], [data-archive-record],
     [data-archive-next], [data-archive-first], [data-archive-up], [data-content-open],
     [data-content-nav], [data-revisions-open], [data-revisions-next], [data-detail-open],
-    [data-revision-key], [data-sources-open], [data-sources-next], [data-link-key],
+    [data-revision-key], [data-sources-open], [data-sources-next], [data-link-key], [data-proposal-confirm],
     [data-nav-back], [data-compare-base], [data-compare-key], [data-compare-side],
     [data-result-base], [data-result-compare],
     [data-compare-first], [data-compare-next], [data-compiled-first], [data-compiled-next], [data-compiled-refresh]`,
@@ -1125,7 +1161,8 @@ $("detail-body").onclick = (event) => {
     });
     return;
   }
-  if (button.hasAttribute("data-result-base")) compareResult(button, true);
+  if (button.hasAttribute("data-proposal-confirm")) confirmProposal(button);
+  else if (button.hasAttribute("data-result-base")) compareResult(button, true);
   else if (button.hasAttribute("data-result-compare")) compareResult(button, false);
   else if (button.hasAttribute("data-compare-base")) pinComparison();
   else if (button.dataset.compareKey) compareRevision(button);
