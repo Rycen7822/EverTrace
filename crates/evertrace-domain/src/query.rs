@@ -771,7 +771,7 @@ pub struct GroundedStatement {
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct GroundedEvidenceView {
-    /// Exact only within candidate_set, never a catalog or physical-event total.
+    /// Only a proven operand domain can yield an exact count; open retrieval is not a catalog total.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub candidate_count: Option<GroundedCount>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -1034,33 +1034,65 @@ impl GroundedEvidenceView {
         let unit = self.evidence_need.count_unit?;
         let mut identities = BTreeSet::new();
         let mut statement_indices = BTreeSet::new();
+        let targets = &self.evidence_need.target;
         for (index, candidate) in self.quoted_operands(candidates, matching_constraints)? {
-            let identity = match unit {
-                CountUnit::ObjectRevision
-                    if candidate.row_variant == SearchCandidateVariant::Object =>
-                {
-                    if candidate.object_kind.as_deref()? == "wiki_projection" {
-                        continue;
-                    }
-                    candidate.candidate_id.as_str()
-                }
-                CountUnit::SourceObservation
-                    if candidate.row_variant == SearchCandidateVariant::EvidenceSurface =>
-                {
-                    candidate.source_ref.parse::<SourceObservationId>().ok()?;
-                    candidate.source_ref.as_str()
-                }
-                _ => continue,
+            if !targets.is_empty()
+                && !targets
+                    .iter()
+                    .any(|target| candidate.matches_reference(target))
+            {
+                continue;
+            }
+            let Some(identity) = unit.identity(candidate) else {
+                continue;
             };
             identities.insert(identity);
             statement_indices.insert(index);
         }
         Some(GroundedCount {
             operator_revision: 1,
-            value: (self.completeness == RetrievalCompleteness::Complete)
-                .then(|| u32::try_from(identities.len()).ok())
-                .flatten(),
+            value: (self.completeness == RetrievalCompleteness::Complete
+                && self.count_domain_proven(unit, candidates, &statement_indices))
+            .then(|| u32::try_from(identities.len()).ok())
+            .flatten(),
             statement_indices,
+        })
+    }
+
+    fn count_domain_proven(
+        &self,
+        unit: CountUnit,
+        candidates: &[SearchCandidate],
+        operands: &BTreeSet<u32>,
+    ) -> bool {
+        let targets = &self.evidence_need.target;
+        if targets.is_empty() {
+            return false;
+        }
+        let counted: BTreeSet<_> = operands
+            .iter()
+            .filter_map(|index| self.active_evidence.get(*index as usize))
+            .flat_map(|statement| &statement.support_refs)
+            .collect();
+        targets.iter().all(|target| {
+            let mut matches = candidates
+                .iter()
+                .filter(|candidate| candidate.matches_reference(target))
+                .filter_map(|candidate| Some((unit.identity(candidate)?, candidate)))
+                .peekable();
+            let Some(&(identity, _)) = matches.peek() else {
+                return false;
+            };
+            let mut witnessed = false;
+            for (other, candidate) in matches {
+                if identity != other || candidate.conflicted {
+                    return false;
+                }
+                witnessed |= counted.contains(&candidate.candidate_id)
+                    || candidate.temporal_match(&self.evidence_need.temporal_scope.qualifiers)
+                        == Some(false);
+            }
+            witnessed
         })
     }
 
@@ -1492,6 +1524,8 @@ impl GroundedEvidenceView {
             if self.evidence_need.answer_shape != Some(AnswerShape::Count)
                 || self.evidence_need.count_unit.is_none()
                 || count.operator_revision != 1
+                || (self.evidence_need.target.is_empty()
+                    && self.completeness == RetrievalCompleteness::Complete)
                 || count.value.is_some() != (self.completeness == RetrievalCompleteness::Complete)
                 || count.statement_indices.iter().any(|index| {
                     self.active_evidence
@@ -2351,6 +2385,23 @@ pub fn validity_match(
                 && interval.valid_until_us.is_none_or(|end| end > *start_us),
         ),
         _ => None,
+    }
+}
+
+impl CountUnit {
+    fn identity(self, candidate: &SearchCandidate) -> Option<&str> {
+        match (self, &candidate.row_variant) {
+            (Self::ObjectRevision, SearchCandidateVariant::Object)
+                if candidate.object_kind.as_deref()? != "wiki_projection" =>
+            {
+                Some(candidate.candidate_id.as_str())
+            }
+            (Self::SourceObservation, SearchCandidateVariant::EvidenceSurface) => {
+                candidate.source_ref.parse::<SourceObservationId>().ok()?;
+                Some(candidate.source_ref.as_str())
+            }
+            _ => None,
+        }
     }
 }
 

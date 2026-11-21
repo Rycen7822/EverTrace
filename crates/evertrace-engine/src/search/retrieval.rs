@@ -1211,8 +1211,17 @@ impl NativeRetrieval<'_> {
         view.candidate_count =
             view.derive_candidate_count(&self.result.candidates, &matching_constraints);
         let count_gaps = view.count_temporal_gaps(&self.result.candidates);
-        if !count_gaps.is_empty() {
-            self.degraded("count_temporal_evidence_unverified");
+        let count_domain_unverified = view.candidate_count.as_ref().is_some_and(|count| {
+            view.evidence_need.target.is_empty()
+                || (view.completeness == RetrievalCompleteness::Complete && count.value.is_none())
+        });
+        if count_domain_unverified {
+            self.degraded("count_domain_unverified");
+        }
+        if !count_gaps.is_empty() || count_domain_unverified {
+            if !count_gaps.is_empty() {
+                self.degraded("count_temporal_evidence_unverified");
+            }
             for identifier in count_gaps {
                 let gap = NamedGap {
                     kind: NamedGapKind::TemporalEvidence,
@@ -1227,8 +1236,9 @@ impl NativeRetrieval<'_> {
                 self.result.completeness = RetrievalCompleteness::Partial;
             }
             view.completeness = self.result.completeness;
-            view.candidate_count =
-                view.derive_candidate_count(&self.result.candidates, &matching_constraints);
+            if let Some(count) = &mut view.candidate_count {
+                count.value = None;
+            }
         }
         view.candidate_latest =
             view.derive_candidate_latest(&self.result.candidates, &matching_constraints);

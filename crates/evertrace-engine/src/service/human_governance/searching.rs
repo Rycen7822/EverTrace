@@ -1191,6 +1191,9 @@ impl HumanGovernanceService {
                 }
                 if let Some(view) = &mut page.grounded_view {
                     view.completeness = page.result.completeness;
+                    if let Some(count) = &mut view.candidate_count {
+                        count.value = None;
+                    }
                 }
             }
             page.result.budget.latency_us_remaining = page.result.budget.latency_us_remaining.min(
