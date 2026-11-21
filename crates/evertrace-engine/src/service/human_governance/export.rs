@@ -220,20 +220,71 @@ impl HumanGovernanceService {
         index: &BTreeMap<&str, Vec<&ObjectRow>>,
         deadline: Instant,
     ) -> Result<(), Failure> {
+        self.readable_with_dependencies(snapshot, row, index, false, deadline)
+            .await
+    }
+
+    pub(super) async fn readable_search_row(
+        &self,
+        snapshot: &ProjectionSnapshot,
+        row: &ObjectRow,
+        index: &BTreeMap<&str, Vec<&ObjectRow>>,
+        deadline: Instant,
+    ) -> Result<(), Failure> {
+        self.readable_with_dependencies(snapshot, row, index, true, deadline)
+            .await
+    }
+
+    async fn readable_with_dependencies(
+        &self,
+        snapshot: &ProjectionSnapshot,
+        row: &ObjectRow,
+        index: &BTreeMap<&str, Vec<&ObjectRow>>,
+        allow_independent_workstream: bool,
+        deadline: Instant,
+    ) -> Result<(), Failure> {
         let mut charged = BTreeSet::new();
         let mut remaining = MAX_METADATA_BYTES;
         charge_metadata(row, &mut charged, &mut remaining, deadline)?;
-        let dependencies = collect_dependencies(
+        let payload = decode(row)?;
+        let mut dependencies = collect_dependencies(
             index,
-            dependencies_for(row, &decode(row)?),
+            dependencies_for(row, &payload),
             &mut charged,
             &mut remaining,
             deadline,
         )?;
+        let mut root = row.clone();
+        if allow_independent_workstream
+            && let JournalPayload::WorkstreamRecorded(work) = payload
+            && row.repository_id.as_deref()
+                == work
+                    .repository_instance_id
+                    .map(|id| id.to_string())
+                    .as_deref()
+            && row.repository_id.is_some()
+            && row.task_id.as_deref() == Some(work.task_id.to_string().as_str())
+            && work.parent_workstream_id.is_none()
+            && work.dependency_workstream_ids.is_empty()
+            && work.worktree_lineage_refs.is_empty()
+            && work.active_episode_id.is_none()
+            && work.execution_lane_ids.is_empty()
+            && let Some(task) = &row.task_id
+        {
+            // A standalone member already has a canonical shard. Keep the Task and all its
+            // source dependencies, but don't treat other memberships as this member's scopes.
+            root.task_id = None;
+            for dependency in dependencies.values_mut().flatten().filter(|dependency| {
+                dependency.object_kind.as_deref() == Some("task")
+                    && dependency.object_id.as_ref() == Some(task)
+            }) {
+                dependency.task_id = None;
+            }
+        }
         self.export_access(
             snapshot,
             &Selection {
-                rows: vec![row.clone()],
+                rows: vec![root],
                 dependencies,
             },
             deadline,

@@ -5,7 +5,7 @@ use evertrace_domain::{
     semantic::{NormativeResolutionState, SemanticResolution},
 };
 
-const SEARCH_HIT_ORDER_REVISION: u32 = 2;
+const SEARCH_HIT_ORDER_REVISION: u32 = 3;
 
 type SearchPolicy = Option<(String, Option<evertrace_codex::policy::PolicyEvidence>)>;
 
@@ -710,22 +710,53 @@ struct MatchedSources {
     unknown: bool,
 }
 
+fn task_search_shards(
+    index: &std::collections::BTreeMap<&str, Vec<&ObjectRow>>,
+    id: evertrace_domain::ids::TaskId,
+) -> Option<Vec<evertrace_domain::ids::RepositoryId>> {
+    let [row] = index.get(id.to_string().as_str())?.as_slice() else {
+        return None;
+    };
+    let JournalPayload::TaskRecorded(task) =
+        serde_json::from_str(row.payload_json.as_deref()?).ok()?
+    else {
+        return None;
+    };
+    if task.task_id != id || task.validate().is_err() {
+        return None;
+    }
+    Some(
+        task.scope_memberships
+            .iter()
+            .filter_map(|membership| membership.repository_instance_id)
+            .collect(),
+    )
+}
+
 impl HumanGovernanceService {
-    async fn search_repository_readable(
+    async fn search_shards_readable(
         &self,
-        repository: evertrace_domain::ids::RepositoryId,
+        repositories: &[evertrace_domain::ids::RepositoryId],
         authority: RepositoryReadAuthority<'_>,
         deadline: std::time::Instant,
     ) -> Result<bool, HumanGovernanceError> {
-        let (blocked, _) = crate::repository::repository_read_assessment(
-            &self.writer,
-            BTreeSet::from([repository]),
-            &authority,
-            deadline,
-        )
-        .await
-        .map_err(|_| HumanGovernanceError::Store)?;
-        Ok(blocked.is_empty() && std::time::Instant::now() < deadline)
+        for batch in repositories.chunks(usize::from(METADATA_READ_LIMIT)) {
+            if std::time::Instant::now() >= deadline {
+                return Ok(false);
+            }
+            let (blocked, _) = crate::repository::repository_read_assessment(
+                &self.writer,
+                batch.iter().copied().collect(),
+                &authority,
+                deadline,
+            )
+            .await
+            .map_err(|_| HumanGovernanceError::Store)?;
+            if !blocked.is_empty() {
+                return Ok(false);
+            }
+        }
+        Ok(std::time::Instant::now() < deadline)
     }
 
     async fn source_dependency_access(
@@ -742,7 +773,7 @@ impl HumanGovernanceService {
                 .iter()
                 .filter(|row| row.row_class == Some(ObjectRowClass::Object))
                 .max_by_key(|row| row.source_event_seq)?;
-            self.readable_indexed_row(snapshot, current, index, deadline)
+            self.readable_search_row(snapshot, current, index, deadline)
                 .await
                 .ok()?;
             checks.insert(current.row_id.clone());
@@ -976,7 +1007,7 @@ impl HumanGovernanceService {
             for row in rows {
                 found = true;
                 if self
-                    .readable_indexed_row(snapshot, row, index, deadline)
+                    .readable_search_row(snapshot, row, index, deadline)
                     .await
                     .is_err()
                 {
@@ -1065,8 +1096,8 @@ impl HumanGovernanceService {
             }
             if let Some(repository) = cursor.inherited_repository
                 && !self
-                    .search_repository_readable(
-                        repository,
+                    .search_shards_readable(
+                        &[repository],
                         RepositoryReadAuthority::observed(report.as_ref()),
                         deadline,
                     )
@@ -1255,8 +1286,8 @@ impl HumanGovernanceService {
             };
             if let Some(repository) = selected_repository
                 && !self
-                    .search_repository_readable(
-                        repository,
+                    .search_shards_readable(
+                        &[repository],
                         RepositoryReadAuthority::retained(report.as_ref()),
                         deadline,
                     )
@@ -1294,7 +1325,7 @@ impl HumanGovernanceService {
                     return Err(HumanGovernanceError::Store);
                 }
                 match self
-                    .readable_indexed_row(&snapshot, row, &index, deadline)
+                    .readable_search_row(&snapshot, row, &index, deadline)
                     .await
                 {
                     Ok(()) => {
@@ -1326,6 +1357,21 @@ impl HumanGovernanceService {
                 }
                 Some(ScopeBoundary::Worktree { worktree_id }) => (None, None, Some(worktree_id)),
                 None => (None, None, None),
+            };
+            let task_shards = task_id.map(|id| task_search_shards(&index, id));
+            // A Task may have readable local work even with an unavailable repository shard.
+            let task_restricted = match &task_shards {
+                None => false,
+                Some(None) => true,
+                Some(Some(shards)) => {
+                    !self
+                        .search_shards_readable(
+                            shards,
+                            RepositoryReadAuthority::retained(report.as_ref()),
+                            deadline,
+                        )
+                        .await?
+                }
             };
             let budget = budget();
             if budget.latency_us_remaining == 0 {
@@ -1614,14 +1660,24 @@ impl HumanGovernanceService {
             let current_report = self.search_report().await;
             if let Some(repository) = selected_repository
                 && !self
-                    .search_repository_readable(
-                        repository,
+                    .search_shards_readable(
+                        &[repository],
                         RepositoryReadAuthority::retained(current_report.as_ref()),
                         deadline,
                     )
                     .await?
             {
                 access_changed = true;
+            }
+            if let Some(Some(shards)) = &task_shards {
+                let readable = self
+                    .search_shards_readable(
+                        shards,
+                        RepositoryReadAuthority::retained(current_report.as_ref()),
+                        deadline,
+                    )
+                    .await?;
+                access_changed |= readable == task_restricted;
             }
             if let Some(before) = start_state {
                 let state = self
@@ -1680,7 +1736,13 @@ impl HumanGovernanceService {
                     .degraded_reasons
                     .insert("search_source_text_unavailable".into());
             }
-            if projection_gap || text_gap {
+            let task_restricted = task_restricted && !boundary_changed;
+            if task_restricted {
+                page.result
+                    .degraded_reasons
+                    .insert("source_read_restricted".into());
+            }
+            if projection_gap || text_gap || task_restricted {
                 if page.result.completeness == RetrievalCompleteness::Complete {
                     page.result.completeness = RetrievalCompleteness::Partial;
                 }
