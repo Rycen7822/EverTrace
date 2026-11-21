@@ -1717,17 +1717,32 @@ async fn read_proposal_review(
     {
         return Ok(conflict(page.frontier));
     }
+    let core_anchor =
+        if let Some(review) = item.as_ref().and_then(|item| item.proposal_review.as_ref()) {
+            Box::pin(service.web_core_anchor(&review.proposal, page.frontier))
+                .await?
+                .map(map_semantic_detail)
+                .map(Box::new)
+        } else {
+            None
+        };
     let web_accept_available =
         item.as_ref()
             .zip(digest.as_deref())
             .is_some_and(|(item, digest)| {
-                evertrace_protocol::dto::web_accept_available(item, page.frontier, digest)
+                evertrace_protocol::dto::web_accept_available(
+                    item,
+                    page.frontier,
+                    digest,
+                    core_anchor.as_deref(),
+                )
             });
     Ok(HumanGovernanceResponse::ProposalReview {
         frontier: page.frontier,
         item: item.map(Box::new),
         confirmation_digest: digest,
         web_accept_available,
+        core_anchor,
     })
 }
 

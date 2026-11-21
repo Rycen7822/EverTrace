@@ -410,9 +410,14 @@ impl HumanAcceptanceService {
         {
             return Ok(());
         }
-        if !crate::HumanGovernanceService::new(self.writer.clone(), self.effective_config_hash)
-            .proposal_accessible(snapshot, reviewed)
-            .await?
+        let service =
+            crate::HumanGovernanceService::new(self.writer.clone(), self.effective_config_hash);
+        if !service.proposal_accessible(snapshot, reviewed).await?
+            || (reviewed.core_creation().is_some()
+                && service
+                    .web_core_anchor_at(snapshot, view, reviewed)
+                    .await?
+                    .is_none())
         {
             return Ok(());
         }
@@ -440,23 +445,44 @@ impl HumanAcceptanceService {
         intent: WebAcceptanceIntent,
         occurred_at_us: i64,
     ) -> Result<JournalCommand, HumanGovernanceError> {
-        let accepted = RevisionProposalService
-            .accept(
+        let context = ProposalCommandContext {
+            command_id: verified.body.command_id,
+            occurred_at_us,
+            effective_config_hash: self.effective_config_hash,
+            algorithm_revision: ALGORITHM_REVISION.into(),
+        };
+        let authority = AtomAcceptanceContext::Web {
+            observation: Box::new(verified.observation.clone()),
+            receipt: Box::new(verified.receipt.clone()),
+            authorized_scope_ceiling: WebAcceptanceIntent::scope(reviewed)
+                .ok_or(HumanGovernanceError::Store)?,
+            intent,
+        };
+        let accepted = if let Some((revision, scope)) = reviewed.core_creation() {
+            let atom = scope
+                .reviewable_atom(revision, view.atoms.values())
+                .ok_or(HumanGovernanceError::Store)?;
+            let membership = CoreMembershipId::from_uuid(reviewed.proposal_id.as_uuid())
+                .map_err(|_| HumanGovernanceError::Store)?;
+            accept_core_membership(
                 view,
-                ProposalCommandContext {
-                    command_id: verified.body.command_id,
-                    occurred_at_us,
-                    effective_config_hash: self.effective_config_hash,
-                    algorithm_revision: ALGORITHM_REVISION.into(),
-                },
+                context,
                 reviewed.proposal_id,
-                AtomAcceptanceContext::Web {
-                    observation: Box::new(verified.observation.clone()),
-                    receipt: Box::new(verified.receipt.clone()),
-                    intent,
+                CoreMembershipAcceptanceContext::Web(authority),
+                atom,
+                membership,
+                SupportThresholdSnapshot {
+                    minimum_surviving_support: 1,
+                    require_authorization: true,
                 },
             )
-            .map_err(|_| HumanGovernanceError::Store)?;
+            .map(|accepted| accepted.command)
+        } else {
+            RevisionProposalService
+                .accept(view, context, reviewed.proposal_id, authority)
+                .map(|accepted| accepted.command)
+        }
+        .map_err(|_| HumanGovernanceError::Store)?;
         let mut events = capture_event_drafts(
             verified,
             None,
@@ -464,7 +490,7 @@ impl HumanAcceptanceService {
             ALGORITHM_REVISION,
         )
         .map_err(|_| HumanGovernanceError::Store)?;
-        events.extend(accepted.command.events().iter().cloned());
+        events.extend(accepted.events().iter().cloned());
         JournalCommand::new(verified.body.command_id, events)
             .map_err(|_| HumanGovernanceError::Store)
     }
@@ -521,6 +547,13 @@ impl HumanAcceptanceService {
                 reason: "web_acceptance_requires_reauthorization",
             });
         }
+        if proposal.core_creation().is_some_and(|(revision, scope)| {
+            scope
+                .reviewable_atom(revision, view.atoms.values())
+                .is_none()
+        }) {
+            return Ok(conflict());
+        }
         let canonical = intent
             .canonical(proposal)
             .ok_or(HumanGovernanceError::Store)?;
@@ -535,8 +568,8 @@ impl HumanAcceptanceService {
         .map_err(|_| HumanGovernanceError::Store)?;
         let cas =
             CasStore::open(runtime.cas_dir.clone()).map_err(|_| HumanGovernanceError::Store)?;
-        let mut capture =
-            CaptureRuntime::open(runtime.clone()).map_err(|_| HumanGovernanceError::Store)?;
+        let mut capture = CaptureRuntime::open_for_admission(runtime.clone())
+            .map_err(|_| HumanGovernanceError::Store)?;
         let capture_record =
             human_acceptance_capture_input(proposal, &canonical, &record_id, scope, true)?;
         // A repeated request ID cannot reserve a different confirmation. Different requests
@@ -562,9 +595,7 @@ impl HumanAcceptanceService {
                 crate::WriterActorError::StaleFrontier
                 | crate::WriterActorError::IdempotencyConflict,
             ) => {
-                spool
-                    .acknowledge_segment(segment, 1)
-                    .map_err(|_| HumanGovernanceError::Store)?;
+                acknowledge_web_reservation(&spool, &segment).await?;
                 return Ok(conflict());
             }
             Err(_) => return Err(HumanGovernanceError::Store),
@@ -578,9 +609,7 @@ impl HumanAcceptanceService {
         verify_acceptance_payload_cohort(&committed.payloads, &verified, proposal, Some(intent))?;
         let outcome = web_acceptance_outcome(&committed, proposal, intent)
             .ok_or(HumanGovernanceError::Store)?;
-        spool
-            .acknowledge_segment(segment, 1)
-            .map_err(|_| HumanGovernanceError::Store)?;
+        acknowledge_web_reservation(&spool, &segment).await?;
         Ok(outcome)
     }
 
@@ -1511,6 +1540,22 @@ impl HumanAcceptanceService {
             current_revision_ref: accepted_revision.to_string(),
             audit_event_ref,
         })
+    }
+}
+
+async fn acknowledge_web_reservation(
+    spool: &DurableSpool,
+    segment: &evertrace_capture::SealedSegment,
+) -> Result<(), HumanGovernanceError> {
+    let deadline = std::time::Instant::now() + std::time::Duration::from_millis(100);
+    loop {
+        match spool.acknowledge_claimed_segment(segment, 1) {
+            Ok(()) => return Ok(()),
+            Err(evertrace_capture::SpoolError::Busy) if std::time::Instant::now() < deadline => {
+                tokio::time::sleep(std::time::Duration::from_millis(2)).await;
+            }
+            Err(_) => return Err(HumanGovernanceError::Store),
+        }
     }
 }
 

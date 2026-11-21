@@ -38,6 +38,14 @@
       <h4>拟议 Core 范围</h4><p>{{ change.scope_identity.kind }} {{ change.scope_identity.id|default('') }}</p>
       {% if change.action == 'create' %}
         <p>拟纳入的修订：{{ exact_work_link('atom_revision', change.atom_revision_id) }}</p>
+        {% if core_anchor %}
+          <section aria-label="拟纳入的当前 Atom">
+            <p>确认会创建 Core membership，不会修改这份 Atom。</p>
+            {% with content=core_anchor.content %}{% include 'semantic_content.html' %}{% endwith %}
+          </section>
+        {% else %}
+          <p>未返回完整、当前且符合资格的 Atom，不能接受。</p>
+        {% endif %}
       {% else %}
         <p>冲突双方：{{ exact_work_link('atom_revision', change.left_atom_revision_id) }}
           {{ exact_work_link('atom_revision', change.right_atom_revision_id) }}</p>

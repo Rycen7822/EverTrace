@@ -11,7 +11,10 @@ use crate::{
     work::PhaseKind,
 };
 
-use super::{SemanticError, valid_identifier};
+use super::{
+    Atom, AtomAuthority, AtomKind, AtomLifecycleStatus, AtomScope, EpistemicStatus, SemanticError,
+    valid_identifier,
+};
 
 const MAX_REFS: usize = 256;
 const MAX_TEXT: usize = 1024;
@@ -162,6 +165,45 @@ pub enum CoreScopeIdentity {
 }
 
 impl CoreScopeIdentity {
+    pub fn atom_scope(&self) -> AtomScope {
+        match self {
+            Self::Global => AtomScope::Global,
+            Self::Repository(repository_instance_id) => AtomScope::Repository {
+                repository_instance_id: *repository_instance_id,
+            },
+        }
+    }
+
+    pub fn permits_atom(&self, atom: &Atom) -> bool {
+        atom.kind == AtomKind::Constraint
+            && atom.epistemic_status == EpistemicStatus::NotApplicable
+            && atom.lifecycle_status == AtomLifecycleStatus::Active
+            && atom.scope == self.atom_scope()
+            && match self {
+                Self::Global => atom.authority == AtomAuthority::UserExplicit,
+                Self::Repository(_) => matches!(
+                    atom.authority,
+                    AtomAuthority::UserExplicit | AtomAuthority::ProjectPolicy
+                ),
+            }
+    }
+
+    pub fn reviewable_atom<'a>(
+        &self,
+        revision: RevisionId,
+        mut current: impl Iterator<Item = &'a Atom> + Clone,
+    ) -> Option<&'a Atom> {
+        let atom = current
+            .clone()
+            .find(|atom| atom.revision_id == revision && self.permits_atom(atom))?;
+        (!current.any(|other| {
+            other.lifecycle_status == AtomLifecycleStatus::Active
+                && (atom.contradicts_revision_refs.contains(&other.revision_id)
+                    || other.contradicts_revision_refs.contains(&revision))
+        }))
+        .then_some(atom)
+    }
+
     pub fn projection_id(&self) -> Result<CoreProjectionId, SemanticError> {
         let value = match self {
             Self::Global => CanonicalValue::String("global".into()),

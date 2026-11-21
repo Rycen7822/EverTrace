@@ -759,7 +759,7 @@ def present_detail(templates, result, surface):
     return {
         "html": templates.get_template(template).render(items=result["items"], surface=surface,
             frontier=result.get("frontier"), confirmation_digest=result.get("confirmation_digest"),
-            acceptance_request_id=_request_id() if result.get("web_accept_available") else None),
+            core_anchor=result.get("core_anchor"), acceptance_request_id=_request_id() if result.get("web_accept_available") else None),
         "source_preview": preview,
         "semantic_text": semantic_text,
         "selection": selection,

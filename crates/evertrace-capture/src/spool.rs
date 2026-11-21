@@ -1010,6 +1010,14 @@ impl DurableSpool {
         segment: SealedSegment,
         committed_frames: usize,
     ) -> Result<(), SpoolError> {
+        self.acknowledge_claimed_segment(&segment, committed_frames)
+    }
+
+    pub fn acknowledge_claimed_segment(
+        &self,
+        segment: &SealedSegment,
+        committed_frames: usize,
+    ) -> Result<(), SpoolError> {
         if !segment.complete() || committed_frames != segment.frames.len() || committed_frames == 0
         {
             return Err(SpoolError::InvalidAcknowledgement);

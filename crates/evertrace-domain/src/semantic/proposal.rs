@@ -54,7 +54,29 @@ pub struct WebAcceptanceIntent {
 }
 
 impl WebAcceptanceIntent {
-    /// First supported Native cohort: a manually reviewed Task Atom creation.
+    pub fn scope(proposal: &RevisionProposal) -> Option<AtomScope> {
+        if !proposal.status.is_open() || proposal.operation != ProposalOperation::Create {
+            return None;
+        }
+        match &proposal.payload {
+            ProposalPayload::Atom(payload) => match payload.as_ref() {
+                AtomProposalPayload::Create { draft }
+                    if draft.scope.task_id().is_some()
+                        && proposal.eligibility == ProposalEligibility::ManualRequired =>
+                {
+                    Some(draft.scope.clone())
+                }
+                _ => None,
+            },
+            ProposalPayload::CoreMembership(payload)
+                if proposal.eligibility != ProposalEligibility::AutoEligibleFull =>
+            {
+                payload.creation().map(|(_, scope)| scope.atom_scope())
+            }
+            _ => None,
+        }
+    }
+
     pub fn for_proposal(proposal: &RevisionProposal, frontier: u64) -> Option<Self> {
         #[derive(Serialize)]
         struct Review<'a> {
@@ -62,19 +84,11 @@ impl WebAcceptanceIntent {
             plain_accept_eligible: bool,
             merge_and_accept_eligible: bool,
         }
-        let ProposalPayload::Atom(payload) = &proposal.payload else {
-            return None;
-        };
-        let AtomProposalPayload::Create { draft } = payload.as_ref() else {
-            return None;
-        };
-        if frontier == 0
-            || !proposal.status.is_open()
-            || !matches!(draft.scope, AtomScope::Task { .. })
-            || proposal.eligibility != ProposalEligibility::ManualRequired
-        {
+        if frontier == 0 {
             return None;
         }
+        Self::scope(proposal)?;
+        // A Core creation binds the displayed immutable Atom by its exact revision in the proposal.
         let review = Review {
             proposal,
             plain_accept_eligible: true,
@@ -120,7 +134,11 @@ impl WebAcceptanceIntent {
         receipt: &SourceReceipt,
         observation: &SourceObservation,
     ) -> bool {
-        self.canonical(source).is_some_and(|canonical| {
+        Self::scope(source).is_some_and(|scope| {
+            receipt.task_id == scope.task_id()
+                && receipt.repository_instance_id == scope.repository_id()
+                && receipt.worktree_instance_id.is_none()
+        }) && self.canonical(source).is_some_and(|canonical| {
             acceptance_capture_matches(
                 source,
                 &canonical,
@@ -386,6 +404,18 @@ pub enum CoreMembershipProposalPayload {
         right_atom_revision_id: RevisionId,
         scope_identity: CoreScopeIdentity,
     },
+}
+
+impl CoreMembershipProposalPayload {
+    pub fn creation(&self) -> Option<(RevisionId, &CoreScopeIdentity)> {
+        match self {
+            Self::Create {
+                atom_revision_id,
+                scope_identity,
+            } => Some((*atom_revision_id, scope_identity)),
+            Self::ResolveConflict { .. } => None,
+        }
+    }
 }
 
 impl ProposalPayload {
@@ -656,6 +686,13 @@ impl ClosedProposalEditIntent {
 }
 
 impl RevisionProposal {
+    pub fn core_creation(&self) -> Option<(RevisionId, &CoreScopeIdentity)> {
+        let ProposalPayload::CoreMembership(payload) = &self.payload else {
+            return None;
+        };
+        payload.creation()
+    }
+
     pub fn validate_edit_candidate(&self, new_proposal: &Self) -> Result<(), SemanticError> {
         ClosedProposalEditIntent::new(self, new_proposal.clone()).validate(self)
     }

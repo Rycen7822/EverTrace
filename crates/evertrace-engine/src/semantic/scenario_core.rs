@@ -909,6 +909,7 @@ pub struct AcceptedCoreMembershipCommand {
 #[derive(Clone, Debug)]
 pub enum CoreMembershipAcceptanceContext {
     Tui(AtomAcceptanceContext),
+    Web(AtomAcceptanceContext),
     AutoFull,
 }
 
@@ -971,15 +972,25 @@ pub fn accept_core_membership(
     };
     let accepted_revision_id = RevisionId::new_v7();
     let (accepted, mut payloads) = match acceptance_context {
-        CoreMembershipAcceptanceContext::Tui(value) => {
-            let evertrace_domain::semantic::ProposalAcceptanceAuthority::TuiAcceptance {
-                authorized_scope_ceiling,
-                ..
-            } = value.authority_basis()?
-            else {
-                return Err(SemanticServiceError::InvalidInput);
+        CoreMembershipAcceptanceContext::Tui(value)
+        | CoreMembershipAcceptanceContext::Web(value) => {
+            use evertrace_domain::semantic::ProposalAcceptanceAuthority;
+            let allowed = match value.authority_basis()? {
+                ProposalAcceptanceAuthority::TuiAcceptance {
+                    authorized_scope_ceiling,
+                    ..
+                } => authorized_scope_ceiling.contains(&atom.scope),
+                ProposalAcceptanceAuthority::WebAcceptance {
+                    authorized_scope_ceiling,
+                    ..
+                } => {
+                    authorized_scope_ceiling == atom.scope
+                        && scope_identity.reviewable_atom(*atom_revision_id, view.atoms.values())
+                            == Some(atom)
+                }
+                _ => false,
             };
-            if !authorized_scope_ceiling.contains(&atom.scope) {
+            if !allowed {
                 return Err(SemanticServiceError::InvalidInput);
             }
             accepted_proposal_successor(proposal, &context, &value, accepted_revision_id, target)?

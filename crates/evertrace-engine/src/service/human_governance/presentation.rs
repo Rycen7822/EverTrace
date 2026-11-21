@@ -56,6 +56,69 @@ pub(super) fn capture_page(context: evertrace_store::CaptureCurrentContext) -> H
 }
 
 impl HumanGovernanceService {
+    pub async fn web_core_anchor(
+        &self,
+        proposal: &RevisionProposal,
+        frontier: u64,
+    ) -> Result<Option<HumanSemanticDetail>, HumanGovernanceError> {
+        if proposal.core_creation().is_none() {
+            return Ok(None);
+        }
+        let snapshot = self
+            .writer
+            .project_objects()
+            .await
+            .map_err(|_| HumanGovernanceError::Store)?;
+        if snapshot.frontier != frontier {
+            return Ok(None);
+        }
+        let view = SemanticCurrentView::from_snapshot(&snapshot)
+            .map_err(|_| HumanGovernanceError::Store)?;
+        self.web_core_anchor_at(&snapshot, &view, proposal).await
+    }
+
+    pub(crate) async fn web_core_anchor_at(
+        &self,
+        snapshot: &ProjectionSnapshot,
+        view: &SemanticCurrentView,
+        proposal: &RevisionProposal,
+    ) -> Result<Option<HumanSemanticDetail>, HumanGovernanceError> {
+        let Some((revision, scope)) = proposal.core_creation() else {
+            return Ok(None);
+        };
+        let Some(atom) = scope.reviewable_atom(revision, view.atoms.values()) else {
+            return Ok(None);
+        };
+        let reference = revision.to_string();
+        let Some((row, _)) = super::super::actions::select_object_row(snapshot, &reference)
+            .map_err(|_| HumanGovernanceError::Store)?
+        else {
+            return Ok(None);
+        };
+        if row.object_kind.as_deref() != Some("atom_revision")
+            || row.current_revision_id.as_deref() != Some(reference.as_str())
+        {
+            return Err(HumanGovernanceError::Store);
+        }
+        match self
+            .readable_row(snapshot, row, std::time::Instant::now() + READ_DEADLINE)
+            .await
+        {
+            Ok(()) => {
+                let detail = present(row)?;
+                match detail.content.as_ref() {
+                    Some(HumanSemanticContent::Atom(value)) if value.as_ref() == atom => {
+                        Ok(Some(detail))
+                    }
+                    None => Ok(None),
+                    _ => Err(HumanGovernanceError::Store),
+                }
+            }
+            Err(export::Failure::Denied) => Ok(None),
+            Err(_) => Err(HumanGovernanceError::Store),
+        }
+    }
+
     pub(super) async fn semantic_details(
         &self,
         snapshot: &ProjectionSnapshot,

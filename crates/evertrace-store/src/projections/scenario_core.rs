@@ -5,11 +5,11 @@ use evertrace_domain::{
     ids::{CoreMembershipId, ScenarioId},
     revision::RevisionId,
     semantic::{
-        Atom, AtomAuthority, AtomKind, AtomLifecycleStatus, AtomScope, CoreMembership,
-        CoreMembershipProposalPayload, CoreScopeIdentity, EpistemicStatus,
-        GlobalSuccessorSupportContract, GlobalSupportState, GlobalSupportValidationEvent,
-        L3CoreProjection, ProposalAcceptanceAuthority, ProposalEligibility, ProposalPayload,
-        ProposalStatus, RevisionProposal, Scenario, UserAuthorizationMode,
+        Atom, AtomAuthority, AtomScope, CoreMembership, CoreMembershipProposalPayload,
+        CoreScopeIdentity, GlobalSuccessorSupportContract, GlobalSupportState,
+        GlobalSupportValidationEvent, L3CoreProjection, ProposalAcceptanceAuthority,
+        ProposalEligibility, ProposalPayload, ProposalStatus, RevisionProposal, Scenario,
+        UserAuthorizationMode,
     },
 };
 
@@ -774,7 +774,7 @@ impl ScenarioCoreState {
             let atom = atom_revisions
                 .get(&membership.atom_revision_id)
                 .ok_or(StoreError::StoreCorrupt)?;
-            if !core_atom_eligible(&atom.0, &membership.scope_identity)
+            if !membership.scope_identity.permits_atom(&atom.0)
                 || !self
                     .contracts
                     .contains_key(&membership.support_contract_ref)
@@ -1241,23 +1241,6 @@ fn validate_validation_successor(
         return Err(StoreError::StoreCorrupt);
     }
     Ok(())
-}
-
-fn core_atom_eligible(atom: &Atom, scope: &CoreScopeIdentity) -> bool {
-    atom.kind == AtomKind::Constraint
-        && atom.epistemic_status == EpistemicStatus::NotApplicable
-        && atom.lifecycle_status == AtomLifecycleStatus::Active
-        && match (&atom.authority, &atom.scope, scope) {
-            (AtomAuthority::UserExplicit, AtomScope::Global, CoreScopeIdentity::Global) => true,
-            (
-                AtomAuthority::UserExplicit | AtomAuthority::ProjectPolicy,
-                AtomScope::Repository {
-                    repository_instance_id,
-                },
-                CoreScopeIdentity::Repository(scope_repository),
-            ) => repository_instance_id == scope_repository,
-            _ => false,
-        }
 }
 
 fn conflicted_revisions(atoms: &BTreeMap<RevisionId, (Atom, u64)>) -> BTreeSet<RevisionId> {

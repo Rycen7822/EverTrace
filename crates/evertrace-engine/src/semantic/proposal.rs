@@ -85,6 +85,7 @@ pub enum AtomAcceptanceContext {
     Web {
         observation: Box<SourceObservation>,
         receipt: Box<SourceReceipt>,
+        authorized_scope_ceiling: AtomScope,
         intent: WebAcceptanceIntent,
     },
     ReauthorizationTui {
@@ -155,10 +156,12 @@ impl AtomAcceptanceContext {
             Self::Web {
                 observation,
                 receipt,
+                authorized_scope_ceiling,
                 intent,
             } => {
                 require_user_source(observation, receipt)?;
-                if !intent.capture_matches(proposal, receipt, observation)
+                if WebAcceptanceIntent::scope(proposal).as_ref() != Some(authorized_scope_ceiling)
+                    || !intent.capture_matches(proposal, receipt, observation)
                     || receipt.recorded_at_us < proposal.created_at_us
                     || receipt.recorded_at_us > accepted_at_us
                 {
@@ -218,13 +221,12 @@ impl AtomAcceptanceContext {
             },
             Self::Web {
                 observation,
-                receipt,
+                authorized_scope_ceiling,
                 intent,
+                ..
             } => ProposalAcceptanceAuthority::WebAcceptance {
                 user_source_observation_ref: observation.source_observation_id,
-                authorized_scope_ceiling: AtomScope::Task {
-                    task_id: receipt.task_id.ok_or(SemanticServiceError::InvalidInput)?,
-                },
+                authorized_scope_ceiling: authorized_scope_ceiling.clone(),
                 intent: *intent,
             },
             Self::ReauthorizationTui {

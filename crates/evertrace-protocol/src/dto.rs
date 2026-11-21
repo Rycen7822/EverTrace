@@ -824,6 +824,8 @@ pub enum HumanGovernanceResponse {
         confirmation_digest: Option<String>,
         #[serde(default, skip_serializing_if = "std::ops::Not::not")]
         web_accept_available: bool,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        core_anchor: Option<Box<HumanSemanticDetail>>,
     },
     Action {
         result: HumanActionResult,
@@ -853,10 +855,26 @@ pub struct ProposalConfirmation {
     pub expected_digest: String,
 }
 
-pub fn web_accept_available(item: &HumanSnapshotItem, frontier: u64, digest: &str) -> bool {
+pub fn web_accept_available(
+    item: &HumanSnapshotItem,
+    frontier: u64,
+    digest: &str,
+    core_anchor: Option<&HumanSemanticDetail>,
+) -> bool {
     item.proposal_review
         .as_ref()
         .filter(|review| review.plain_accept_eligible && review.reauthorization.is_none())
+        .filter(|review| {
+            review
+                .proposal
+                .core_creation()
+                .is_none_or(|(revision, scope)| {
+                    core_anchor.is_some_and(|detail| {
+                        matches!(&detail.content, Some(HumanSemanticContent::Atom(atom))
+                if atom.revision_id == revision && scope.permits_atom(atom))
+                    })
+                })
+        })
         .and_then(|review| {
             evertrace_domain::semantic::WebAcceptanceIntent::for_proposal(
                 &review.proposal,
@@ -1275,13 +1293,23 @@ impl HumanGovernanceResponse {
             Self::ProposalReview {
                 item,
                 confirmation_digest,
-                web_accept_available,
-                ..
+                web_accept_available: available,
+                core_anchor,
+                frontier,
             } => match item {
                 Some(item) => {
                     item.validate()
                         && item.proposal.is_some()
-                        && (!web_accept_available || confirmation_digest.is_some())
+                        && core_anchor.as_ref().is_none_or(|anchor| anchor.validate())
+                        && (!available
+                            || confirmation_digest.as_deref().is_some_and(|digest| {
+                                web_accept_available(
+                                    item,
+                                    *frontier,
+                                    digest,
+                                    core_anchor.as_deref(),
+                                )
+                            }))
                         && confirmation_digest.as_deref().is_none_or(valid_hex)
                         && (confirmation_digest.is_some()
                             == item
@@ -1289,7 +1317,7 @@ impl HumanGovernanceResponse {
                                 .as_ref()
                                 .is_some_and(|review| review.proposal.status.is_open()))
                 }
-                None => confirmation_digest.is_none() && !web_accept_available,
+                None => confirmation_digest.is_none() && core_anchor.is_none() && !available,
             },
             Self::Action { result } => result.validate(),
             Self::Conflict {
