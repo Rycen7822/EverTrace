@@ -4161,7 +4161,8 @@ impl HumanSearchPage {
                 statement.derivation_kind != DerivationKind::Quoted
                     || (statement.support_refs.len() == 1
                         && self.result.candidates.iter().any(|candidate| {
-                            statement.support_refs.contains(&candidate.candidate_id)
+                            candidate.object_kind.as_deref() != Some("wiki_projection")
+                                && statement.support_refs.contains(&candidate.candidate_id)
                                 && statement.statement == candidate.text
                         }))
             })

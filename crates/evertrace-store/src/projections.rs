@@ -129,7 +129,8 @@ pub(crate) fn l3_core_projection(row: &ObjectRow) -> Result<bool, StoreError> {
     scenario_core::ScenarioCoreState::restore_projection(row)
 }
 
-pub(crate) fn wiki_projection(
+/// Decode a compiled Wiki row and verify its canonical projection coordinates.
+pub fn wiki_projection(
     row: &ObjectRow,
 ) -> Result<Option<evertrace_domain::semantic::WikiProjection>, StoreError> {
     synthesis::restore_wiki_projection(row)

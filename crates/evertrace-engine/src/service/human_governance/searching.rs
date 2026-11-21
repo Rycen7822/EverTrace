@@ -386,6 +386,99 @@ fn canonical_episode_sources(
     Ok(sources.into_values().collect())
 }
 
+fn wiki_navigation_sources(
+    snapshot: &ProjectionSnapshot,
+    index: &std::collections::BTreeMap<&str, Vec<&ObjectRow>>,
+    readable: &BTreeSet<String>,
+    now: i64,
+    deadline: std::time::Instant,
+) -> Result<std::collections::BTreeMap<String, BTreeSet<String>>, HumanGovernanceError> {
+    use evertrace_domain::semantic::{AtomAuthority, AtomScope};
+    let current = |reference: &str, kind: &str| {
+        index
+            .get(reference)?
+            .iter()
+            .copied()
+            .filter(|row| {
+                row.row_class == Some(ObjectRowClass::Object)
+                    && row.object_kind.as_deref() == Some(kind)
+            })
+            .max_by_key(|row| row.source_event_seq)
+    };
+    let mut output = std::collections::BTreeMap::new();
+    'pages: for row in snapshot
+        .data_rows()
+        .filter(|row| row.object_kind.as_deref() == Some("wiki_projection"))
+    {
+        export::check_deadline(deadline).map_err(|_| HumanGovernanceError::Store)?;
+        let wiki = evertrace_store::projections::wiki_projection(row)
+            .map_err(|_| HumanGovernanceError::Store)?
+            .ok_or(HumanGovernanceError::Store)?;
+        if wiki.compiler_version != 1 || wiki.source_watermark > snapshot.frontier {
+            continue;
+        }
+        let mut sources = BTreeSet::new();
+        for reference in &wiki.source_atom_ids {
+            export::check_deadline(deadline).map_err(|_| HumanGovernanceError::Store)?;
+            let Some(row) = current(&reference.to_string(), "atom_revision") else {
+                continue 'pages;
+            };
+            let Some(revision) = row
+                .current_revision_id
+                .as_ref()
+                .filter(|id| readable.contains(*id))
+            else {
+                continue 'pages;
+            };
+            let JournalPayload::AtomRecorded(atom) = serde_json::from_str(
+                row.payload_json
+                    .as_deref()
+                    .ok_or(HumanGovernanceError::Store)?,
+            )
+            .map_err(|_| HumanGovernanceError::Store)?
+            else {
+                return Err(HumanGovernanceError::Store);
+            };
+            // The search row has no shard coordinates. This is explicit all-repository navigation,
+            // not the global support/policy channel and not a contextual instruction.
+            if !matches!(atom.scope, AtomScope::Repository { .. })
+                || atom.authority == AtomAuthority::ProjectPolicy
+                || row.lifecycle.as_deref() != Some("active")
+                || row.source_event_seq > wiki.source_watermark
+                || !atom.validity_interval.contains(now)
+                || !atom
+                    .applicability_expr
+                    .evaluate(&Default::default(), None)
+                    .allows_enforcement()
+            {
+                continue 'pages;
+            }
+            sources.insert(revision.clone());
+        }
+        for reference in &wiki.source_episode_ids {
+            export::check_deadline(deadline).map_err(|_| HumanGovernanceError::Store)?;
+            let Some(row) = current(&reference.to_string(), "work_episode") else {
+                continue 'pages;
+            };
+            let Some(revision) = row
+                .current_revision_id
+                .as_ref()
+                .filter(|id| readable.contains(*id))
+            else {
+                continue 'pages;
+            };
+            if row.lifecycle.as_deref() != Some("closed")
+                || row.source_event_seq > wiki.source_watermark
+            {
+                continue 'pages;
+            }
+            sources.insert(revision.clone());
+        }
+        output.insert(wiki.page_id.to_string(), sources);
+    }
+    Ok(output)
+}
+
 #[derive(Default)]
 struct MatchedSources {
     references: BTreeSet<String>,
@@ -702,8 +795,9 @@ impl HumanGovernanceService {
             let mut unavailable = false;
             for row in snapshot.data_rows() {
                 let kind = row.object_kind.as_deref().unwrap_or_default();
-                if !matches!(kind, "source_observation" | "work_episode")
-                    && !evertrace_store::search::is_searchable_object_kind(kind)
+                if kind == "wiki_projection"
+                    || !matches!(kind, "source_observation" | "work_episode")
+                        && !evertrace_store::search::is_searchable_object_kind(kind)
                 {
                     continue;
                 }
@@ -779,6 +873,19 @@ impl HumanGovernanceService {
             )
             .map_err(|_| HumanGovernanceError::Store)?;
             let semantics = std::sync::Arc::new(semantics);
+            let facets = &context.query_facets;
+            let wiki = if query.selection == MemoryScopeSelection::All
+                && facets.answer_shape.is_none()
+                && facets.relation_requirements.is_empty()
+                && facets.temporal_qualifiers.is_empty()
+                && !facets.temporal_mode.has_temporal_predicate()
+                && facets.statement_role == StatementRole::Unknown
+            {
+                wiki_navigation_sources(&snapshot, &index, &refs, now_us()?, deadline)?
+            } else {
+                Default::default()
+            };
+            refs.extend(wiki.keys().cloned());
             let sequence_scope =
                 source_sequence_scope(&index, &refs, &context.query_facets, deadline);
             if let Some(scope) = &sequence_scope {
@@ -954,13 +1061,23 @@ impl HumanGovernanceService {
             // Trust/report state can change without a new journal event. Recheck
             // returned and interpretation dependencies before exposing fields.
             let mut access_changed = false;
-            checks.extend(page.result.candidates.iter().map(|candidate| {
-                if candidate.row_variant == SearchCandidateVariant::EvidenceSurface {
-                    candidate.source_ref.clone()
+            for candidate in &page.result.candidates {
+                let id = if candidate.row_variant == SearchCandidateVariant::EvidenceSurface {
+                    &candidate.source_ref
                 } else {
-                    candidate.candidate_id.clone()
+                    &candidate.candidate_id
+                };
+                if let Some(inputs) = wiki.get(id) {
+                    checks.extend(inputs.iter().cloned());
+                } else {
+                    checks.insert(id.clone());
                 }
-            }));
+            }
+            for id in &page.result.omitted_refs {
+                if let Some(inputs) = wiki.get(id) {
+                    checks.extend(inputs.iter().cloned());
+                }
+            }
             for reference in &checks {
                 let Some(rows) = index.get(reference.as_str()).filter(|rows| {
                     rows.iter()

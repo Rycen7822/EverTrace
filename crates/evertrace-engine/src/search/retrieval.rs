@@ -1105,6 +1105,9 @@ impl NativeRetrieval<'_> {
             quoted_candidates = ordered;
         }
         for candidate in quoted_candidates {
+            if candidate.object_kind.as_deref() == Some("wiki_projection") {
+                continue; // A compiled navigation page is not a direct evidence statement.
+            }
             let rule = super::resolution::active_rule(candidate);
             let compatible = !self.context.unverified_hard_constraint()
                 && self
