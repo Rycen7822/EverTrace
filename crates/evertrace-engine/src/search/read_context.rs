@@ -119,6 +119,7 @@ pub(crate) const SCOPED_OBJECT_KINDS: &[&str] = &[
     "workstream",
     "work_episode",
     "attempt",
+    "procedure_revision",
 ];
 
 impl SearchReadAccess<'_> {
@@ -145,6 +146,30 @@ impl SearchReadAccess<'_> {
         let row = context.selected.as_ref().ok_or(ErrorCode::StoreCorrupt)?;
         if row.object_id.as_deref() != Some(key) {
             return Err(ErrorCode::StoreCorrupt);
+        }
+        if kind == "procedure_revision" {
+            let JournalPayload::ProcedureRevisionRecorded(procedure) =
+                serde_json::from_str(row.payload_json.as_deref().ok_or(ErrorCode::StoreCorrupt)?)
+                    .map_err(|_| ErrorCode::StoreCorrupt)?
+            else {
+                return Err(ErrorCode::StoreCorrupt);
+            };
+            // A missing or suppressed hard dependency is not permission to use the indexed route text.
+            let present = |reference: &str| {
+                context.rows.iter().any(|fact| {
+                    fact.object_id.as_deref() == Some(reference)
+                        || fact.current_revision_id.as_deref() == Some(reference)
+                })
+            };
+            if procedure.draft.evidence_refs.iter().any(|id| !present(id))
+                || procedure
+                    .draft
+                    .support_revision_refs
+                    .iter()
+                    .any(|id| !present(&id.to_string()))
+            {
+                return Err(ErrorCode::Untrusted);
+            }
         }
         if kind == "work_episode" {
             let JournalPayload::WorkEpisodeRecorded(episode) =
