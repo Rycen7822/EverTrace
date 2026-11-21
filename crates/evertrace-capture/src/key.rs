@@ -36,6 +36,59 @@ impl DeviceKey {
         self.generation
     }
 
+    fn search_continuation_key(&self) -> Result<ring::aead::LessSafeKey, DeviceKeyError> {
+        let key = ring::hmac::Key::new(ring::hmac::HMAC_SHA256, &self.bytes);
+        let material = ring::hmac::sign(&key, b"evertrace.native_search_continuation.v1");
+        ring::aead::UnboundKey::new(&ring::aead::AES_256_GCM, material.as_ref())
+            .map(ring::aead::LessSafeKey::new)
+            .map_err(|_| DeviceKeyError::Corrupt)
+    }
+
+    /// Seal transient Native search coordinates; this key cannot sign MCP or recovery claims.
+    pub fn seal_search_continuation(
+        &self,
+        binding: &[u8],
+        payload: &[u8],
+    ) -> Result<Vec<u8>, DeviceKeyError> {
+        use ring::aead::{Aad, NONCE_LEN, Nonce};
+        let mut nonce = [0; NONCE_LEN];
+        secure_random(&mut nonce)?;
+        let mut sealed =
+            Vec::with_capacity(NONCE_LEN + payload.len() + ring::aead::AES_256_GCM.tag_len());
+        sealed.extend_from_slice(&nonce);
+        sealed.extend_from_slice(payload);
+        let tag = self
+            .search_continuation_key()?
+            .seal_in_place_separate_tag(
+                Nonce::assume_unique_for_key(nonce),
+                Aad::from(binding),
+                &mut sealed[NONCE_LEN..],
+            )
+            .map_err(|_| DeviceKeyError::Corrupt)?;
+        sealed.extend_from_slice(tag.as_ref());
+        Ok(sealed)
+    }
+
+    pub fn open_search_continuation<'a>(
+        &self,
+        binding: &[u8],
+        sealed: &'a mut [u8],
+    ) -> Result<&'a [u8], DeviceKeyError> {
+        use ring::aead::{Aad, NONCE_LEN, Nonce};
+        let (nonce, body) = sealed
+            .split_at_mut_checked(NONCE_LEN)
+            .ok_or(DeviceKeyError::Corrupt)?;
+        let plain = self
+            .search_continuation_key()?
+            .open_in_place(
+                Nonce::try_assume_unique_for_key(nonce).map_err(|_| DeviceKeyError::Corrupt)?,
+                Aad::from(binding),
+                body,
+            )
+            .map_err(|_| DeviceKeyError::Corrupt)?;
+        Ok(plain)
+    }
+
     pub(crate) const fn bytes(&self) -> &[u8; KEY_LENGTH] {
         &self.bytes
     }

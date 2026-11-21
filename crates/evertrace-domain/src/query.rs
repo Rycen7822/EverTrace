@@ -4027,6 +4027,23 @@ fn valid_metadata_records(records: &[serde_json::Value]) -> bool {
         .all(|record| record.is_object() && record.get("payload_json").is_none())
 }
 
+const MAX_SEARCH_CURSOR_BYTES: usize = 80 * 1024;
+
+pub fn valid_search_cursor(token: &str) -> bool {
+    (56..=MAX_SEARCH_CURSOR_BYTES).contains(&token.len())
+        && token.len().is_multiple_of(2)
+        && token
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+}
+
+#[derive(Clone, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct HumanSearchPaging {
+    pub limit: u16,
+    pub after: Option<String>,
+}
+
 /// Literal search plus explicitly supplied typed intent. No access grants,
 /// budgets, candidate boundary or completeness proof comes from the client.
 #[derive(Clone, Deserialize, Eq, PartialEq, Serialize)]
@@ -4036,6 +4053,8 @@ pub struct HumanSearchQuery {
     pub selection: MemoryScopeSelection,
     pub facets: QueryFacetSet,
     pub limit: u16,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub paging: Option<HumanSearchPaging>,
 }
 impl std::fmt::Debug for HumanSearchQuery {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -4054,6 +4073,13 @@ impl HumanSearchQuery {
         if self.text.trim().is_empty()
             || self.text.len() > MAX_QUERY_BYTES
             || !(1..=32).contains(&self.limit)
+            || self.paging.as_ref().is_some_and(|paging| {
+                !(1..=32).contains(&paging.limit)
+                    || paging
+                        .after
+                        .as_deref()
+                        .is_some_and(|token| !valid_search_cursor(token))
+            })
             || self.selection == MemoryScopeSelection::Unassigned
             || self.facets.scope_boundary != self.selection.boundary()
             || self
@@ -4127,8 +4153,29 @@ pub struct HumanSearchPage {
     /// The bounded Native hit stream in admission order, independent of quote packing. Never a corpus total.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub hit_window: Option<Vec<HumanSearchHit>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub hit_page: Option<HumanSearchHitPage>,
 }
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct HumanSearchHitPage {
+    pub selection: MemoryScopeSelection,
+    pub data_identity: ReadDataIdentity,
+    pub projection_version: u64,
+    pub next_cursor: Option<String>,
+}
+
 impl HumanSearchPage {
+    pub fn cursor_conflict_frontier(&self) -> Option<u64> {
+        (self.result.completeness == RetrievalCompleteness::Unknown
+            && self
+                .result
+                .degraded_reasons
+                .contains("search_cursor_conflict"))
+        .then_some(self.result.authoritative_frontier)
+    }
+
     pub fn validate(&self) -> bool {
         let refs = self
             .result
@@ -4176,9 +4223,16 @@ impl HumanSearchPage {
 
     fn hit_window_valid(&self) -> bool {
         let Some(window) = &self.hit_window else {
-            return true;
+            return self.hit_page.is_none();
         };
-        if self.result.completeness == RetrievalCompleteness::Unknown
+        if self.hit_page.as_ref().is_some_and(|page| {
+            page.projection_version == 0
+                || page.selection == MemoryScopeSelection::Unassigned
+                || page
+                    .next_cursor
+                    .as_deref()
+                    .is_some_and(|token| window.is_empty() || !valid_search_cursor(token))
+        }) || self.result.completeness == RetrievalCompleteness::Unknown
             || self.result.projection_frontier != self.result.authoritative_frontier
             || window.len() > 32
             || self.result.budget.candidates_remaining as usize > 32 - window.len()
@@ -4211,6 +4265,7 @@ impl HumanSearchPage {
             .candidates
             .iter()
             .filter(|candidate| Some(&candidate.candidate_id) != delta)
+            .filter(|candidate| self.hit_page.is_none() || seen.contains(&candidate.candidate_id))
             .all(|candidate| ordered.any(|hit| hit.matches(candidate)))
     }
 

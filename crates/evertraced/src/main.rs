@@ -1013,7 +1013,12 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
                                         => return Err(ErrorCode::Internal),
                                 HumanReadRequest::Search {query} => {
                                     let page = human_governance.search(query).await.map_err(map_human_error)?;
-                                    HumanGovernanceResponse::Search {page: Box::new(page)}
+                                    match page.cursor_conflict_frontier() {
+                                        Some(current_frontier) => HumanGovernanceResponse::Conflict {
+                                            current_frontier, current_revision_ref: None,
+                                        },
+                                        None => HumanGovernanceResponse::Search { page: Box::new(page) },
+                                    }
                                 }
                                 HumanReadRequest::BrowseMemories {
                                     query,

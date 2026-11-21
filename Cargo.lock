@@ -1817,6 +1817,7 @@ dependencies = [
  "evertrace-domain",
  "fs2",
  "hmac",
+ "ring",
  "rustix 1.1.4",
  "serde",
  "serde_json",

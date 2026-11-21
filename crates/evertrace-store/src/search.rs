@@ -37,6 +37,7 @@ pub struct SearchIndex {
 
 pub struct SearchSnapshot {
     table: Table,
+    version: u64,
     frontier: u64,
     authoritative_frontier: u64,
     readers: StoreReadHandle,
@@ -133,6 +134,23 @@ impl SearchIndex {
         })
     }
 
+    /// Read the pinned search stamp without scanning or decoding search documents.
+    pub async fn current_stamp(
+        data_dir: &Path,
+        readers: StoreReadHandle,
+    ) -> Result<(u64, u64, u64), StoreError> {
+        let index = Self {
+            data_dir: data_dir.to_owned(),
+            readers,
+        };
+        let snapshot = index.snapshot().await?;
+        Ok((
+            snapshot.version(),
+            snapshot.frontier(),
+            snapshot.authoritative_frontier(),
+        ))
+    }
+
     pub fn read_handle(&self) -> StoreReadHandle {
         self.readers.clone()
     }
@@ -174,7 +192,7 @@ impl SearchIndex {
             // reads take a permit only for their actual blocking lifetime.
             let lease = self.readers.search_lease().await?;
             let before = self.authoritative_frontier(&lease).await?;
-            let (table, frontier) = self.pinned_snapshot(&lease).await?;
+            let (table, version, frontier) = self.pinned_snapshot(&lease).await?;
             let after = self.authoritative_frontier(&lease).await?;
             if before == after || after == validated_frontier.unwrap_or(u64::MAX) || attempt == 1 {
                 if frontier > after {
@@ -182,6 +200,7 @@ impl SearchIndex {
                 }
                 return Ok(SearchSnapshot {
                     table,
+                    version,
                     frontier,
                     authoritative_frontier: after,
                     readers: self.readers.clone(),
@@ -196,7 +215,7 @@ impl SearchIndex {
     async fn pinned_snapshot(
         &self,
         lease: &crate::connection::StoreReadLease,
-    ) -> Result<(Table, u64), StoreError> {
+    ) -> Result<(Table, u64, u64), StoreError> {
         evertrace_capture::ConfinedRoot::open_owned_private(&crate::connection::native_root(
             &self.data_dir,
         ))
@@ -233,7 +252,7 @@ impl SearchIndex {
         )
         .await?;
         let frontier = exact_checkpoint_frontier(&checkpoints)?;
-        Ok((table, frontier))
+        Ok((table, version, frontier))
     }
 
     async fn authoritative_frontier(
@@ -263,6 +282,10 @@ fn exact_checkpoint_frontier(rows: &[SearchProjectionRow]) -> Result<u64, StoreE
 }
 
 impl SearchSnapshot {
+    pub const fn version(&self) -> u64 {
+        self.version
+    }
+
     pub async fn is_current(&self) -> Result<bool, StoreError> {
         let frontier = self.frontier;
         self.readers

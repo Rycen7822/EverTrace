@@ -721,7 +721,7 @@ impl ProductionSearch {
         global_only: bool,
         time_scope: Option<&TemporalReadScope<'_>>,
         relation_sources: RelationSources<'_>,
-    ) -> Result<evertrace_domain::query::HumanSearchPage, SearchError> {
+    ) -> Result<(HumanSearchPage, Option<u64>), SearchError> {
         context.validate()?;
         if self.readable_refs.is_none() {
             return Err(SearchError::Unsupported);
@@ -730,11 +730,7 @@ impl ProductionSearch {
             || (context.query_facets.polarity != Polarity::Positive
                 && context.query_facets.explicit_exclusions.is_empty())
         {
-            return Ok(HumanSearchPage {
-                result: self.search(context).await?,
-                grounded_view: None,
-                hit_window: None,
-            });
+            return Ok((ungrounded(self.search(context).await?), None));
         }
         let deadline = RequestDeadline::new(Instant::now(), context.budget.latency_us_remaining);
         let snapshot = match deadline
@@ -746,11 +742,15 @@ impl ProductionSearch {
         {
             Ok(snapshot) => snapshot?,
             Err(()) => {
-                return Ok(HumanSearchPage {
-                    result: deadline_result(context, "snapshot_deadline_exhausted", 0, 0),
-                    grounded_view: None,
-                    hit_window: None,
-                });
+                return Ok((
+                    ungrounded(deadline_result(
+                        context,
+                        "snapshot_deadline_exhausted",
+                        0,
+                        0,
+                    )),
+                    None,
+                ));
             }
         };
         let snapshot = if let Some((frontier, rows)) = &self.canonical_sources
@@ -775,7 +775,8 @@ impl ProductionSearch {
                 time_scope,
             )
             .await?;
-        super::retrieval::NativeRetrieval {
+        let version = snapshot.version();
+        let page = super::retrieval::NativeRetrieval {
             context: &context,
             result,
             objects,
@@ -788,7 +789,8 @@ impl ProductionSearch {
             include_hit_window: true,
         }
         .run(snapshot)
-        .await
+        .await?;
+        Ok((page, Some(version)))
     }
 
     pub async fn search(&self, context: SearchContext) -> Result<SearchResult, SearchError> {
@@ -1939,6 +1941,7 @@ fn ungrounded(result: SearchResult) -> HumanSearchPage {
         result,
         grounded_view: None,
         hit_window: None,
+        hit_page: None,
     }
 }
 

@@ -4,6 +4,133 @@ use evertrace_domain::{
     semantic::{NormativeResolutionState, SemanticResolution},
 };
 
+const SEARCH_HIT_ORDER_REVISION: u32 = 1;
+
+type SearchPolicy = Option<(String, Option<evertrace_codex::policy::PolicyEvidence>)>;
+
+fn search_policy(report: Option<&evertrace_codex::HostProbeReport>) -> SearchPolicy {
+    report.map(|value| {
+        (
+            value.manifest().adapter_manifest_id.clone(),
+            value.current_project_policy_evidence(),
+        )
+    })
+}
+
+#[derive(serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+struct SearchHitCursor {
+    frontier: u64,
+    data_identity: ReadDataIdentity,
+    projection_version: u64,
+    policy: SearchPolicy,
+    inherited_repository: Option<RepositoryId>,
+    wiki_inputs: std::collections::BTreeMap<String, BTreeSet<String>>,
+    after: Option<HumanSearchHit>,
+    remaining: Vec<HumanSearchHit>,
+    layer: RetrievalLayer,
+    completeness: RetrievalCompleteness,
+    reasons: BTreeSet<String>,
+    budget: RetrievalBudget,
+}
+
+impl SearchHitCursor {
+    fn open(
+        key: &evertrace_capture::DeviceKey,
+        binding: &[u8],
+        token: &str,
+    ) -> Result<Self, HumanGovernanceError> {
+        // Query validation has already bounded and checked the lowercase hex envelope.
+        let mut bytes = token
+            .as_bytes()
+            .chunks_exact(2)
+            .map(|pair| {
+                let digit = |byte| {
+                    if byte <= b'9' {
+                        byte - b'0'
+                    } else {
+                        byte - b'a' + 10
+                    }
+                };
+                digit(pair[0]) << 4 | digit(pair[1])
+            })
+            .collect::<Vec<_>>();
+        let plaintext = key
+            .open_search_continuation(binding, &mut bytes)
+            .map_err(|_| HumanGovernanceError::InvalidInput)?;
+        serde_json::from_slice(plaintext).map_err(|_| HumanGovernanceError::InvalidInput)
+    }
+
+    fn take_page(
+        &mut self,
+        selection: MemoryScopeSelection,
+        limit: u16,
+        key: &evertrace_capture::DeviceKey,
+        binding: &[u8],
+    ) -> Result<Option<(Vec<HumanSearchHit>, HumanSearchHitPage)>, HumanGovernanceError> {
+        let split = self.remaining.len().min(usize::from(limit));
+        let rest = self.remaining.split_off(split);
+        let hits = std::mem::replace(&mut self.remaining, rest);
+        self.after = hits.last().cloned();
+        self.wiki_inputs.retain(|id, _| {
+            self.after
+                .iter()
+                .chain(&self.remaining)
+                .any(|hit| hit.candidate_id == *id)
+        });
+        let next_cursor = if self.remaining.is_empty() {
+            None
+        } else {
+            let bytes = serde_json::to_vec(&self).map_err(|_| HumanGovernanceError::Store)?;
+            let sealed = key
+                .seal_search_continuation(binding, &bytes)
+                .map_err(|_| HumanGovernanceError::Store)?;
+            use std::fmt::Write;
+            let mut token = String::with_capacity(sealed.len() * 2);
+            for byte in sealed {
+                write!(token, "{byte:02x}").map_err(|_| HumanGovernanceError::Store)?;
+            }
+            if !valid_search_cursor(&token) {
+                return Ok(None);
+            }
+            Some(token)
+        };
+        Ok(Some((
+            hits,
+            HumanSearchHitPage {
+                selection,
+                data_identity: self.data_identity,
+                projection_version: self.projection_version,
+                next_cursor,
+            },
+        )))
+    }
+}
+
+fn cursor_unavailable(frontier: u64, reason: &str) -> HumanSearchPage {
+    HumanSearchPage {
+        result: SearchResult {
+            layer: RetrievalLayer::A,
+            projection_frontier: 0,
+            authoritative_frontier: frontier,
+            candidates: Vec::new(),
+            completeness: RetrievalCompleteness::Unknown,
+            degraded_reasons: BTreeSet::from([reason.into()]),
+            omitted_refs: BTreeSet::new(),
+            budget: RetrievalBudget {
+                candidates_remaining: 0,
+                tokens_remaining: 0,
+                latency_us_remaining: 0,
+                hops_remaining: 0,
+                follow_ups_remaining: 0,
+            },
+        },
+        grounded_view: None,
+        hit_window: None,
+        hit_page: None,
+    }
+}
+
 fn source_sequence_scope(
     index: &std::collections::BTreeMap<&str, Vec<&ObjectRow>>,
     readable: &BTreeSet<String>,
@@ -788,6 +915,184 @@ impl HumanGovernanceService {
         Ok((sources, checks, incomplete))
     }
 
+    async fn search_checks_readable(
+        &self,
+        snapshot: &ProjectionSnapshot,
+        index: &std::collections::BTreeMap<&str, Vec<&ObjectRow>>,
+        checks: &BTreeSet<String>,
+        deadline: std::time::Instant,
+    ) -> bool {
+        for reference in checks {
+            let rows = index
+                .get(reference.as_str())
+                .into_iter()
+                .flatten()
+                .filter(|row| row.row_class == Some(ObjectRowClass::Object));
+            let mut found = false;
+            for row in rows {
+                found = true;
+                if self
+                    .readable_indexed_row(snapshot, row, index, deadline)
+                    .await
+                    .is_err()
+                {
+                    return false;
+                }
+            }
+            if !found {
+                return false;
+            }
+        }
+        true
+    }
+
+    async fn search_report(&self) -> Option<evertrace_codex::HostProbeReport> {
+        match &self.session_report {
+            Some(value) => value.read().await.clone(),
+            None => None,
+        }
+    }
+
+    async fn resume_hits(
+        &self,
+        query: &HumanSearchQuery,
+        paging: &HumanSearchPaging,
+        key: &evertrace_capture::DeviceKey,
+        binding: &[u8],
+        mut cursor: SearchHitCursor,
+        started: std::time::Instant,
+    ) -> Result<HumanSearchPage, HumanGovernanceError> {
+        let reader = self.writer.read_handle();
+        let state = (cursor.frontier, cursor.data_identity);
+        let exhausted = "search_cursor_budget_exhausted";
+        let deadline =
+            started + std::time::Duration::from_micros(cursor.budget.latency_us_remaining);
+        let run = async {
+            const CONFLICT: &str = "search_cursor_conflict";
+            let observed = reader
+                .state()
+                .await
+                .map_err(|_| HumanGovernanceError::Store)?;
+            if observed != state {
+                return Ok(cursor_unavailable(observed.0, CONFLICT));
+            }
+            let conflict = || Ok(cursor_unavailable(observed.0, CONFLICT));
+            let Some(snapshot) = self
+                .writer
+                .current_objects_for_read()
+                .await
+                .map_err(|_| HumanGovernanceError::Store)?
+            else {
+                return conflict();
+            };
+            if snapshot.frontier != cursor.frontier {
+                return conflict();
+            }
+            let index = export::presentation_index(&snapshot, deadline)
+                .map_err(|_| HumanGovernanceError::Store)?;
+            let report = self.search_report().await;
+            if search_policy(report.as_ref()) != cursor.policy {
+                return conflict();
+            }
+            let mut checks = BTreeSet::new();
+            for hit in cursor.after.iter().chain(&cursor.remaining) {
+                if let Some(deps) = cursor.wiki_inputs.get(&hit.candidate_id) {
+                    checks.extend(deps.iter().cloned());
+                } else {
+                    checks.insert(hit.access_reference().to_owned());
+                }
+            }
+            if !self
+                .search_checks_readable(&snapshot, &index, &checks, deadline)
+                .await
+            {
+                return conflict();
+            }
+            if !cursor.wiki_inputs.is_empty() {
+                let readable =
+                    wiki_navigation_sources(&snapshot, &index, &checks, now_us()?, deadline)?;
+                if cursor
+                    .wiki_inputs
+                    .iter()
+                    .any(|(id, inputs)| readable.get(id) != Some(inputs))
+                {
+                    return conflict();
+                }
+            }
+            if let Some(repository) = cursor.inherited_repository
+                && !self
+                    .inherited_repository_readable(repository, report.as_ref(), deadline)
+                    .await?
+            {
+                return conflict();
+            }
+            if search_policy(self.search_report().await.as_ref()) != cursor.policy {
+                return conflict();
+            }
+            if reader
+                .state()
+                .await
+                .map_err(|_| HumanGovernanceError::Store)?
+                != state
+            {
+                return conflict();
+            }
+            let runtime = self
+                .runtime_snapshot
+                .as_ref()
+                .ok_or(HumanGovernanceError::Store)?;
+            let stamp = evertrace_store::SearchIndex::current_stamp(
+                runtime
+                    .data_dir()
+                    .map_err(|_| HumanGovernanceError::Store)?,
+                reader,
+            )
+            .await
+            .map_err(|_| HumanGovernanceError::Store)?;
+            if stamp != (cursor.projection_version, cursor.frontier, cursor.frontier) {
+                return Ok(cursor_unavailable(stamp.2, CONFLICT));
+            }
+            let remaining = deadline
+                .saturating_duration_since(std::time::Instant::now())
+                .as_micros();
+            cursor.budget.latency_us_remaining = u64::try_from(remaining).unwrap_or_default();
+            if cursor.budget.latency_us_remaining == 0 {
+                return Ok(cursor_unavailable(cursor.frontier, exhausted));
+            }
+            let Some((hits, hit_page)) =
+                cursor.take_page(query.selection, paging.limit, key, binding)?
+            else {
+                return Ok(cursor_unavailable(
+                    cursor.frontier,
+                    "search_cursor_size_exhausted",
+                ));
+            };
+            let page = HumanSearchPage {
+                result: SearchResult {
+                    layer: cursor.layer,
+                    projection_frontier: cursor.frontier,
+                    authoritative_frontier: cursor.frontier,
+                    candidates: Vec::new(),
+                    completeness: cursor.completeness,
+                    degraded_reasons: cursor.reasons,
+                    omitted_refs: BTreeSet::new(),
+                    budget: cursor.budget,
+                },
+                grounded_view: None,
+                hit_window: Some(hits),
+                hit_page: Some(hit_page),
+            };
+            if !page.validate() {
+                return Err(HumanGovernanceError::Store);
+            }
+            Ok(page)
+        };
+        match tokio::time::timeout_at(tokio::time::Instant::from_std(deadline), run).await {
+            Ok(result) => result,
+            Err(_) => Ok(cursor_unavailable(state.0, exhausted)),
+        }
+    }
+
     /// Native read-only entry: no MCP binding, usage, cue, Returned or journal.
     pub async fn search(
         &self,
@@ -800,14 +1105,51 @@ impl HumanGovernanceService {
             .runtime_snapshot
             .as_ref()
             .ok_or(HumanGovernanceError::Store)?;
-        let deadline = std::time::Instant::now() + presentation::READ_DEADLINE;
+        let started = std::time::Instant::now();
+        let deadline = started + presentation::READ_DEADLINE;
         // Load an existing key only. Reading never installs a key or imports data.
         let key = evertrace_capture::DeviceKeyStore::new(runtime.device_key_dir.clone())
             .load()
             .map_err(|_| HumanGovernanceError::Store)?;
+        let binding = query
+            .paging
+            .as_ref()
+            .map(|paging| {
+                // Query bytes are authenticated in memory; the cursor carries neither query nor digest.
+                serde_json::to_vec(&(
+                    SEARCH_HIT_ORDER_REVISION,
+                    &query.text,
+                    &query.facets,
+                    query.selection,
+                    query.limit,
+                    paging.limit,
+                    self.effective_config_hash,
+                ))
+            })
+            .transpose()
+            .map_err(|_| HumanGovernanceError::InvalidInput)?;
+        if let (Some(paging), Some(binding)) = (&query.paging, binding.as_ref())
+            && let Some(after) = &paging.after
+        {
+            let cursor = SearchHitCursor::open(&key, binding, after)?;
+            return self
+                .resume_hits(&query, paging, &key, binding, cursor, started)
+                .await;
+        }
         let protected = crate::search::protection::prepare(&query.text, &query.facets, &key)
             .map_err(|_| HumanGovernanceError::InvalidInput)?;
         let future = async {
+            let start_state = if binding.is_some() {
+                Some(
+                    self.writer
+                        .read_handle()
+                        .state()
+                        .await
+                        .map_err(|_| HumanGovernanceError::Store)?,
+                )
+            } else {
+                None
+            };
             let snapshot = self
                 .writer
                 .current_objects_for_read()
@@ -855,6 +1197,7 @@ impl HumanGovernanceService {
                     },
                     grounded_view: None,
                     hit_window: None,
+                    hit_page: None,
                 });
             };
             let index = export::presentation_index(&snapshot, deadline)
@@ -928,10 +1271,7 @@ impl HumanGovernanceService {
                 },
                 budget,
             };
-            let report = match &self.session_report {
-                Some(value) => value.read().await.clone(),
-                None => None,
-            };
+            let report = self.search_report().await;
             let (mut semantics, mut checks) =
                 crate::search::SemanticSearchResolution::for_human_read(
                     &snapshot,
@@ -1124,23 +1464,24 @@ impl HumanGovernanceService {
                 readable_refs: time_refs.as_ref(),
                 source_domain: !validity_query && !sequence_query,
             });
-            let mut page = crate::search::ProductionSearch::new(search.clone())
-                .with_canonical_sources(snapshot.frontier, canonical_sources)
-                .with_recall_sources(recall_sources)
-                .with_matched_sources(matched.references, matched.contexts)
-                .with_sequence_scope(sequence_scope)
-                .with_semantic_resolution(std::sync::Arc::clone(&semantics))
-                .with_validated_frontier(snapshot.frontier)
-                .with_method_proposals(proposals)
-                .with_readable_refs(snapshot.frontier, refs)
-                .retrieve(
-                    context,
-                    query.selection == MemoryScopeSelection::Global,
-                    time_scope.as_ref(),
-                    &relation_sources,
-                )
-                .await
-                .map_err(|_| HumanGovernanceError::Store)?;
+            let (mut page, projection_version) =
+                crate::search::ProductionSearch::new(search.clone())
+                    .with_canonical_sources(snapshot.frontier, canonical_sources)
+                    .with_recall_sources(recall_sources)
+                    .with_matched_sources(matched.references, matched.contexts)
+                    .with_sequence_scope(sequence_scope)
+                    .with_semantic_resolution(std::sync::Arc::clone(&semantics))
+                    .with_validated_frontier(snapshot.frontier)
+                    .with_method_proposals(proposals)
+                    .with_readable_refs(snapshot.frontier, refs)
+                    .retrieve(
+                        context,
+                        query.selection == MemoryScopeSelection::Global,
+                        time_scope.as_ref(),
+                        &relation_sources,
+                    )
+                    .await
+                    .map_err(|_| HumanGovernanceError::Store)?;
             if matched.unknown {
                 page.result
                     .degraded_reasons
@@ -1156,7 +1497,6 @@ impl HumanGovernanceService {
             }
             // Trust/report state can change without a new journal event. Recheck
             // returned and interpretation dependencies before exposing fields.
-            let mut access_changed = false;
             let mut recheck = |id: &str| {
                 if let Some(inputs) = wiki.get(id) {
                     checks.extend(inputs.iter().cloned());
@@ -1188,35 +1528,10 @@ impl HumanGovernanceService {
                     recheck(id);
                 }
             }
-            for reference in &checks {
-                let Some(rows) = index.get(reference.as_str()).filter(|rows| {
-                    rows.iter()
-                        .any(|row| row.row_class == Some(ObjectRowClass::Object))
-                }) else {
-                    access_changed = true;
-                    break;
-                };
-                for row in rows
-                    .iter()
-                    .filter(|row| row.row_class == Some(ObjectRowClass::Object))
-                {
-                    if self
-                        .readable_indexed_row(&snapshot, row, &index, deadline)
-                        .await
-                        .is_err()
-                    {
-                        access_changed = true;
-                        break;
-                    }
-                }
-                if access_changed {
-                    break;
-                }
-            }
-            let current_report = match &self.session_report {
-                Some(value) => value.read().await.clone(),
-                None => None,
-            };
+            let mut access_changed = !self
+                .search_checks_readable(&snapshot, &index, &checks, deadline)
+                .await;
+            let current_report = self.search_report().await;
             if let Some(repository) = inherited_repository
                 && !self
                     .inherited_repository_readable(repository, current_report.as_ref(), deadline)
@@ -1224,21 +1539,33 @@ impl HumanGovernanceService {
             {
                 access_changed = true;
             }
+            if let Some(before) = start_state {
+                let state = self
+                    .writer
+                    .read_handle()
+                    .state()
+                    .await
+                    .map_err(|_| HumanGovernanceError::Store)?;
+                if before != state || before.0 != snapshot.frontier {
+                    return Ok(cursor_unavailable(state.0, "search_cursor_conflict"));
+                }
+            }
             // The writer's authority read above must not wait while a search snapshot lease is held.
             let current = search
                 .snapshot_after_validated_frontier(snapshot.frontier)
                 .await
                 .map_err(|_| HumanGovernanceError::Store)?;
-            let policy = |value: Option<&evertrace_codex::HostProbeReport>| {
-                value.map(|value| {
-                    (
-                        value.manifest().adapter_manifest_id.clone(),
-                        value.current_project_policy_evidence(),
-                    )
-                })
-            };
+            let policy = search_policy(current_report.as_ref());
+            if binding.is_some()
+                && projection_version.is_some_and(|version| current.version() != version)
+            {
+                return Ok(cursor_unavailable(
+                    current.authoritative_frontier(),
+                    "search_cursor_conflict",
+                ));
+            }
             if access_changed
-                || policy(current_report.as_ref()) != policy(report.as_ref())
+                || policy != search_policy(report.as_ref())
                 || current.frontier() != snapshot.frontier
                 || current.authoritative_frontier() != snapshot.frontier
             {
@@ -1282,6 +1609,47 @@ impl HumanGovernanceService {
                 )
                 .unwrap_or(u64::MAX),
             );
+            if let (
+                Some(paging),
+                Some(binding),
+                Some((frontier, data_identity)),
+                Some(projection_version),
+            ) = (
+                query.paging.as_ref(),
+                binding.as_ref(),
+                start_state,
+                projection_version,
+            ) && let Some(remaining) = page.hit_window.take()
+            {
+                let wiki_inputs = remaining
+                    .iter()
+                    .filter_map(|hit| {
+                        wiki.get(&hit.candidate_id)
+                            .map(|inputs| (hit.candidate_id.clone(), inputs.clone()))
+                    })
+                    .collect();
+                let mut cursor = SearchHitCursor {
+                    frontier,
+                    data_identity,
+                    projection_version,
+                    policy,
+                    inherited_repository,
+                    wiki_inputs,
+                    after: None,
+                    remaining,
+                    layer: page.result.layer,
+                    completeness: page.result.completeness,
+                    reasons: page.result.degraded_reasons.clone(),
+                    budget: page.result.budget.clone(),
+                };
+                let Some((hits, hit_page)) =
+                    cursor.take_page(query.selection, paging.limit, &key, binding)?
+                else {
+                    return Ok(cursor_unavailable(frontier, "search_cursor_size_exhausted"));
+                };
+                page.hit_window = Some(hits);
+                page.hit_page = Some(hit_page);
+            }
             if !page.validate() {
                 return Err(HumanGovernanceError::Store);
             }

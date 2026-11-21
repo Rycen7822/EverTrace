@@ -602,6 +602,7 @@ impl NativeRetrieval<'_> {
                 result: self.result,
                 grounded_view: None,
                 hit_window: None,
+                hit_page: None,
             });
         }
         if self
@@ -1333,6 +1334,7 @@ impl NativeRetrieval<'_> {
             result: self.result,
             grounded_view: Some(view),
             hit_window,
+            hit_page: None,
         })
     }
     fn output_limit(&self) -> usize {
@@ -1517,6 +1519,7 @@ impl NativeRetrieval<'_> {
             result: self.result,
             grounded_view: None,
             hit_window: None,
+            hit_page: None,
         }
     }
 }
