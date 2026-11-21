@@ -1,4 +1,5 @@
 {% from 'semantic_content.html' import text_list, exact_work_link %}
+{% from 'proposal_coverage.html' import procedure_coverage %}
 {% set summary = item.proposal %}
 {% set review = item.get('proposal_review') %}
 <section data-proposal-review>
@@ -35,24 +36,7 @@
       {% endif %}
     {% elif payload.kind == 'procedure' %}
       {% with content={'kind': 'procedure_draft', 'value': change} %}{% include 'semantic_content.html' %}{% endwith %}
-      {% set coverage = review.get('capability_coverage') %}
-      <h4>原生能力覆盖</h4>
-      {% if coverage %}
-        <dl class="observation-facts">
-          <dt>资产 / 未观察来源 / 未知合同</dt>
-          <dd>{{ coverage.present_assets }} / {{ coverage.unobserved_sources }} / {{ coverage.unknown_contracts }}</dd>
-          <dt>参与比较的库存记录</dt><dd>{{ coverage.inventory_refs|length }}</dd>
-          <dt>可能冗余</dt><dd>{{ '是' if coverage.likely_redundant else '本次未判定为可能冗余' }}</dd>
-          <dt>增量比较的基准</dt>
-          <dd>{% if coverage.incremental_base_revision %}{{ exact_work_link('procedure_revision', coverage.incremental_base_revision) }}
-            {% else %}未确定{% endif %}</dd>
-        </dl>
-        {{ text_list('未覆盖的证据', coverage.omissions) }}
-        {{ text_list('等价资产的证据等级', coverage.equivalent_assets|map(attribute='level')|list) }}
-        <p>覆盖缺口不代表未使用；人工接受不授予自动发布资格。</p>
-      {% else %}
-        <p>没有可核对的能力覆盖结果。</p>
-      {% endif %}
+      {{ procedure_coverage(review.get('capability_coverage')) }}
     {% elif payload.kind == 'core_membership' %}
       <h4>拟议 Core 范围</h4><p>{{ change.scope_identity.kind }} {{ change.scope_identity.id|default('') }}</p>
       {% if change.action == 'create' %}
@@ -97,7 +81,7 @@
           data-frontier="{{ frontier }}" data-review-digest="{{ confirmation_digest }}">
           {{ '确认合并并接受' if summary.operation == 'merge' else '确认接受这份提案' }}</button>
       {% endif %}
-      {% if web_edit_available %}
+      {% if web_edit_available and payload.kind == 'atom' %}
         {% set value = change.draft.value %}
         <fieldset data-atom-edit>
           <legend>编辑 Atom 正文</legend>
@@ -111,6 +95,25 @@
             data-review-digest="{{ confirmation_digest }}">查看编辑确认稿</button>
           <p data-atom-edit-status role="status"></p>
           <div data-atom-edit-content></div>
+        </fieldset>
+      {% elif web_edit_available and payload.kind == 'procedure' %}
+        {% set draft = change.draft %}
+        <fieldset data-procedure-edit>
+          <legend>编辑 Procedure 正文</legend>
+          <p>先核对编辑稿与重新计算的覆盖。范围、分支、编译条件和来源保持不变。列表每行一项，不留空行。</p>
+          <label>标题 <input name="title" required value="{{ draft.title }}"></label>
+          <label>摘要 <input name="summary" required value="{{ draft.summary }}"></label>
+          {% set aligned = draft.get('stage_alignment') is not none %}
+          {% if aligned %}<p>已有编译对齐条件的步骤在此只读。</p>{% endif %}
+          <label>步骤 <textarea name="stages" rows="4" required{{ ' readonly' if aligned }}>{{ draft.actions.stages|join('\n') }}</textarea></label>
+          {% for name, label in [('success', '完成标准'), ('abort', '中止条件'), ('verify', '验证方式')] %}
+          <label>{{ label }} <textarea name="{{ name }}" rows="3" required>{{ draft.done[name]|join('\n') }}</textarea></label>
+          {% endfor %}
+          <button class="button" type="button" data-procedure-edit-preview data-proposal-id="{{ summary.proposal_id }}"
+            data-revision="{{ summary.current_revision_id }}" data-frontier="{{ frontier }}"
+            data-review-digest="{{ confirmation_digest }}">查看编辑确认稿</button>
+          <p data-procedure-edit-status role="status"></p>
+          <div data-procedure-edit-content></div>
         </fieldset>
       {% endif %}
       {% if disposition_request_id %}

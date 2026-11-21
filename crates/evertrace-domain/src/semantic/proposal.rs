@@ -11,7 +11,7 @@ use crate::{
         SourceObservationId, TaskId,
     },
     inventory::{CapabilityCoverageOmission, CapabilityCoverageSummary, CapabilityEvidenceLevel},
-    procedure::{ProcedureAutoFullAudit, ProcedureDraft, ProcedureScope},
+    procedure::{ProcedureAutoFullAudit, ProcedureDone, ProcedureDraft, ProcedureScope},
     revision::RevisionId,
 };
 
@@ -73,6 +73,8 @@ pub struct WebAcceptanceIntent {
     pub procedure_coverage: Option<Box<WebProcedureCoverage>>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub atom_edit: Option<Box<WebAtomEdit>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub procedure_edit: Option<Box<WebProcedureEdit>>,
 }
 
 /// Content-only edit; identity, authority, conditions and provenance stay with the reviewed proposal.
@@ -145,6 +147,75 @@ impl WebAtomEdit {
             _ => return None,
         };
         Some(ProposalPayload::Atom(Box::new(atom)))
+    }
+}
+
+/// Editable Procedure content. Typed conditions, scope and source references are not browser input.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct WebProcedureEdit {
+    pub title: String,
+    pub summary: String,
+    pub stages: Vec<String>,
+    pub done: ProcedureDone,
+}
+
+impl WebProcedureEdit {
+    pub fn draft(proposal: &RevisionProposal) -> Option<&ProcedureDraft> {
+        WebAcceptanceIntent::scope(proposal)?;
+        let ProposalPayload::Procedure(payload) = &proposal.payload else {
+            return None;
+        };
+        Some(payload.draft())
+    }
+
+    pub fn from_draft(draft: &ProcedureDraft) -> Self {
+        Self {
+            title: draft.title.clone(),
+            summary: draft.summary.clone(),
+            stages: draft.actions.stages.clone(),
+            done: draft.done.clone(),
+        }
+    }
+
+    pub fn edited_draft(&self, proposal: &RevisionProposal) -> Option<ProcedureDraft> {
+        let original = Self::draft(proposal)?;
+        // Changing the sequence independently would invalidate the meaning of typed step predicates.
+        if original.stage_alignment.is_some() && self.stages != original.actions.stages {
+            return None;
+        }
+        let mut draft = original.clone();
+        draft.title.clone_from(&self.title);
+        draft.summary.clone_from(&self.summary);
+        draft.actions.stages.clone_from(&self.stages);
+        draft.done.clone_from(&self.done);
+        draft.validate().ok()?;
+        (draft != *original).then_some(draft)
+    }
+
+    fn payload(&self, proposal: &RevisionProposal) -> Option<ProposalPayload> {
+        let draft = self.edited_draft(proposal)?;
+        let payload = match proposal.operation {
+            ProposalOperation::Create => ProcedureProposalPayload::Create { draft },
+            ProposalOperation::Replace => ProcedureProposalPayload::Replace { draft },
+            _ => return None,
+        };
+        Some(ProposalPayload::Procedure(Box::new(payload)))
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum WebProposalEdit<'a> {
+    Atom(&'a WebAtomEdit),
+    Procedure(&'a WebProcedureEdit),
+}
+
+impl WebProposalEdit<'_> {
+    pub fn payload(&self, proposal: &RevisionProposal) -> Option<ProposalPayload> {
+        match self {
+            Self::Atom(edit) => edit.payload(proposal),
+            Self::Procedure(edit) => edit.payload(proposal),
+        }
     }
 }
 
@@ -639,6 +710,7 @@ impl WebAcceptanceIntent {
             review_digest: Self::digest(proposal, frontier, procedure_coverage.as_deref())?,
             procedure_coverage,
             atom_edit: None,
+            procedure_edit: None,
         })
     }
 
@@ -657,7 +729,56 @@ impl WebAcceptanceIntent {
             review_digest,
             procedure_coverage: None,
             atom_edit: Some(edit),
+            procedure_edit: None,
         })
+    }
+
+    pub fn for_procedure_edit(
+        proposal: &RevisionProposal,
+        frontier: u64,
+        edit: Box<WebProcedureEdit>,
+        coverage: &CapabilityCoverageSummary,
+    ) -> Option<Self> {
+        let coverage = Box::new(WebProcedureCoverage::from_summary(coverage)?);
+        Some(Self {
+            reviewed_frontier: frontier,
+            review_digest: Self::procedure_edit_digest(proposal, frontier, &edit, &coverage)?,
+            procedure_coverage: Some(coverage),
+            atom_edit: None,
+            procedure_edit: Some(edit),
+        })
+    }
+
+    pub fn procedure_edit_digest(
+        proposal: &RevisionProposal,
+        frontier: u64,
+        edit: &WebProcedureEdit,
+        coverage: &WebProcedureCoverage,
+    ) -> Option<[u8; 32]> {
+        if frontier == 0 || !coverage.permits_manual(proposal.operation) {
+            return None;
+        }
+        proposal_review_digest(
+            frontier,
+            (
+                "edit_and_accept",
+                proposal,
+                edit.edited_draft(proposal)?,
+                coverage,
+            ),
+            proposal.base_revision_id,
+        )
+    }
+
+    pub fn edit(&self) -> Option<WebProposalEdit<'_>> {
+        self.atom_edit
+            .as_deref()
+            .map(WebProposalEdit::Atom)
+            .or_else(|| {
+                self.procedure_edit
+                    .as_deref()
+                    .map(WebProposalEdit::Procedure)
+            })
     }
 
     fn edit_digest(
@@ -689,7 +810,7 @@ impl WebAcceptanceIntent {
         original: &RevisionProposal,
         reviewed: &RevisionProposal,
     ) -> bool {
-        match &self.atom_edit {
+        match self.edit() {
             Some(edit) => {
                 original.validate_edit_candidate(reviewed).is_ok()
                     && edit.payload(original).as_ref() == Some(&reviewed.payload)
@@ -736,12 +857,24 @@ impl WebAcceptanceIntent {
     }
 
     pub fn canonical(&self, proposal: &RevisionProposal) -> Option<String> {
-        let (action, digest) = match &self.atom_edit {
-            Some(edit) if self.procedure_coverage.is_none() => (
+        if self.atom_edit.is_some() && self.procedure_edit.is_some() {
+            return None;
+        }
+        let (action, digest) = match self.edit() {
+            Some(WebProposalEdit::Atom(edit)) if self.procedure_coverage.is_none() => (
                 "edit_and_accept",
                 Self::edit_digest(proposal, self.reviewed_frontier, edit)?,
             ),
-            Some(_) => return None,
+            Some(WebProposalEdit::Atom(_)) => return None,
+            Some(WebProposalEdit::Procedure(edit)) => (
+                "edit_and_accept",
+                Self::procedure_edit_digest(
+                    proposal,
+                    self.reviewed_frontier,
+                    edit,
+                    self.procedure_coverage.as_deref()?,
+                )?,
+            ),
             None => (
                 "accept",
                 Self::digest(

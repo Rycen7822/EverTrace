@@ -3,7 +3,7 @@ use evertrace_domain::{
         AtomId, AttemptId, JobId, ProcedureNegativeEvidenceId, RepositoryId, RevisionProposalId,
         WorktreeId,
     },
-    procedure::ProcedureNegativeReviewStatus,
+    procedure::{ProcedureDraft, ProcedureNegativeReviewStatus},
     purge::{ObjectDeletionTarget, ObjectReauthorizationRef},
     revision::RevisionId,
     semantic::{
@@ -17,7 +17,7 @@ pub use evertrace_domain::{
     query::ExactReadQuery,
     semantic::{
         HumanAtomCorrection, HumanAtomCreation, HumanCreationScope, WebAcceptanceIntent,
-        WebAtomEdit,
+        WebAtomEdit, WebProcedureCoverage, WebProcedureEdit, WebProposalEdit,
     },
 };
 use serde::{Deserialize, Serialize};
@@ -149,6 +149,8 @@ pub enum HumanReadRequest {
         expected_digest: Option<String>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         atom_edit: Option<Box<WebAtomEdit>>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        procedure_edit: Option<Box<WebProcedureEdit>>,
     },
     WebCreationScope {
         scope: HumanCreationScope,
@@ -251,6 +253,8 @@ pub enum HumanActionRequest {
         review: ProposalConfirmation,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         atom_edit: Option<Box<WebAtomEdit>>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        procedure_edit: Option<Box<WebProcedureEdit>>,
     },
     WebProposalDisposition {
         review: ProposalConfirmation,
@@ -875,6 +879,8 @@ pub enum HumanGovernanceResponse {
         atom_edit_preview: Option<Box<AtomDraft>>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         core_anchor: Option<Box<HumanSemanticDetail>>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        procedure_edit_preview: Option<Box<WebProcedureEditPreview>>,
     },
     Action {
         result: HumanActionResult,
@@ -883,6 +889,13 @@ pub enum HumanGovernanceResponse {
         current_frontier: u64,
         current_revision_ref: Option<String>,
     },
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct WebProcedureEditPreview {
+    pub draft: ProcedureDraft,
+    pub coverage: WebProcedureCoverage,
 }
 
 /// Bind the complete permission-filtered review, not a browser-supplied statement of authority.
@@ -1110,9 +1123,12 @@ impl HumanReadRequest {
             Self::ProposalReview {
                 expected_digest,
                 atom_edit,
+                procedure_edit,
                 ..
             } => {
-                (atom_edit.is_none() || expected_digest.is_some())
+                (atom_edit.is_none() || procedure_edit.is_none())
+                    && ((atom_edit.is_none() && procedure_edit.is_none())
+                        || expected_digest.is_some())
                     && expected_digest.as_deref().is_none_or(valid_hex)
             }
             Self::Related {
@@ -1135,9 +1151,15 @@ impl HumanActionRequest {
     fn validate(&self) -> bool {
         match self {
             Self::WebCreateAtom { .. } | Self::WebCorrectAtom { .. } => true,
-            Self::WebAccept { review, .. } | Self::WebProposalDisposition { review, .. } => {
-                valid_hex(&review.expected_digest)
+            Self::WebAccept {
+                review,
+                atom_edit,
+                procedure_edit,
+            } => {
+                (atom_edit.is_none() || procedure_edit.is_none())
+                    && valid_hex(&review.expected_digest)
             }
+            Self::WebProposalDisposition { review, .. } => valid_hex(&review.expected_digest),
             Self::Proposal {
                 expected_fingerprint,
                 decision,
@@ -1438,6 +1460,7 @@ impl HumanGovernanceResponse {
                 web_disposition_available: can_dispose,
                 web_edit_available: can_edit,
                 atom_edit_preview,
+                procedure_edit_preview,
                 core_anchor,
                 frontier,
             } => match item {
@@ -1446,7 +1469,8 @@ impl HumanGovernanceResponse {
                         && item.proposal.is_some()
                         && (!can_dispose || web_disposition_available(item))
                         && (!can_edit || item.proposal_review.as_ref().is_some_and(|review| {
-                            review.plain_accept_eligible && review.reauthorization.is_none() && WebAtomEdit::available(&review.proposal)
+                            review.plain_accept_eligible && review.reauthorization.is_none()
+                                && (WebAtomEdit::available(&review.proposal) || WebProcedureEdit::draft(&review.proposal).is_some())
                         }))
                         && atom_edit_preview.as_deref().is_none_or(|draft| {
                             *can_edit && !available && !can_dispose && item.proposal_review.as_ref().is_some_and(|review| {
@@ -1460,6 +1484,16 @@ impl HumanGovernanceResponse {
                                         .is_some_and(|intent| confirmation_digest.as_deref()
                                             == Some(evertrace_domain::evidence::hex(&intent.review_digest).as_str()))
                             })
+                        })
+                        && procedure_edit_preview.as_deref().is_none_or(|preview| {
+                            *can_edit && !available && !can_dispose && atom_edit_preview.is_none()
+                                && item.proposal_review.as_ref().is_some_and(|review| {
+                                    let edit = WebProcedureEdit::from_draft(&preview.draft);
+                                    edit.edited_draft(&review.proposal).as_ref() == Some(&preview.draft)
+                                        && WebAcceptanceIntent::procedure_edit_digest(&review.proposal, *frontier, &edit, &preview.coverage)
+                                            .is_some_and(|digest| confirmation_digest.as_deref()
+                                                == Some(evertrace_domain::evidence::hex(&digest).as_str()))
+                                })
                         })
                         && core_anchor.as_ref().is_none_or(|anchor| anchor.validate())
                         && (!available
@@ -1483,6 +1517,7 @@ impl HumanGovernanceResponse {
                     confirmation_digest.is_none()
                         && core_anchor.is_none()
                         && atom_edit_preview.is_none()
+                        && procedure_edit_preview.is_none()
                         && !available
                         && !can_dispose
                         && !can_edit

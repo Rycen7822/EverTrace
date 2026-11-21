@@ -621,13 +621,13 @@ class Backend:
             }
         )
 
-    async def proposal_review(self, proposal_id, revision, frontier, expected_digest=None, *, atom_edit=None):
+    async def proposal_review(self, proposal_id, revision, frontier, expected_digest=None, *, edit=None):
         request = {
             "kind": "proposal_review", "proposal_id": proposal_id, "expected_revision_id": revision,
             "expected_frontier": frontier, "expected_digest": expected_digest,
         }
-        if atom_edit is not None:
-            request["atom_edit"] = atom_edit
+        if edit is not None:
+            request.update(edit)
         result = await self._request(request, confirmation=expected_digest is not None)
         if result["kind"] not in ("conflict", "proposal_review"):
             raise BackendError("invalid_read_response")
@@ -655,13 +655,13 @@ class Backend:
             reply = await self._request(None, confirmation=True, action=action, request_id=request_id)
         return proposal_action_result(reply)
 
-    async def web_proposal_action(self, request_id, proposal, revision, frontier, digest, *, lookup, decision, atom_edit=None):
+    async def web_proposal_action(self, request_id, proposal, revision, frontier, digest, *, lookup, decision, edit=None):
         review = {"proposal_id": proposal, "expected_revision_id": revision, "expected_digest": digest}
         fields = {"review": review}
         if decision is not None:
             fields["decision"] = decision
-        if atom_edit is not None and not lookup:
-            fields["atom_edit"] = atom_edit
+        if edit is not None and not lookup:
+            fields.update(edit)
         if lookup:
             kind = "web_acceptance_outcome" if decision is None else "web_proposal_disposition_outcome"
             reply = await self._request({"kind": kind, "request_id": request_id, "expected_frontier": frontier, **fields})

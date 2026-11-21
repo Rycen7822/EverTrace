@@ -23,7 +23,7 @@ use evertrace_domain::{
         HumanAtomAuthoring, ProposalAcceptanceAuthority, ProposalCreatedBy, ProposalEligibility,
         ProposalOperation, ProposalPayload, ProposalStatus, ProposalTargetId, ProposalWaitingOn,
         RevisionProposal, SupportThresholdSnapshot, TUI_ACCEPTANCE_EVENT_MANIFEST_REF,
-        WEB_ACCEPTANCE_EVENT_MANIFEST_REF, WebAcceptanceIntent, WebAtomEdit,
+        WEB_ACCEPTANCE_EVENT_MANIFEST_REF, WebAcceptanceIntent, WebProposalEdit,
         is_human_authoring_manifest, tui_acceptance_capture_matches, tui_acceptance_event_payload,
     },
 };
@@ -431,7 +431,7 @@ impl HumanAcceptanceService {
                     .web_core_anchor_at(snapshot, view, reviewed)
                     .await?
                     .is_none())
-            || ((reviewed.operation == ProposalOperation::Replace || intent.atom_edit.is_some())
+            || ((reviewed.operation == ProposalOperation::Replace || intent.edit().is_some())
                 && !service.web_base_accessible(snapshot, reviewed).await?)
             || !service.web_merge_accessible_at(snapshot, reviewed).await?
         {
@@ -480,7 +480,7 @@ impl HumanAcceptanceService {
                 .ok_or(HumanGovernanceError::Store)?,
             intent: intent.clone(),
         };
-        let accepted_events = if let Some(edit) = &intent.atom_edit {
+        let accepted_events = if let Some(edit) = intent.edit() {
             let payload = edit
                 .payload(reviewed)
                 .ok_or(HumanGovernanceError::InvalidInput)?;
@@ -623,13 +623,13 @@ impl HumanAcceptanceService {
         }) else {
             return Ok(conflict());
         };
-        if ((proposal.operation == ProposalOperation::Replace || intent.atom_edit.is_some())
+        if ((proposal.operation == ProposalOperation::Replace || intent.edit().is_some())
             && !service.web_base_accessible(&snapshot, proposal).await?)
             || !Box::pin(authored_creation_scope_current(
                 service, &snapshot, proposal,
             ))
             .await?
-            || (intent.atom_edit.is_some()
+            || (intent.edit().is_some()
                 && !service.proposal_accessible(&snapshot, proposal).await?)
         {
             return Ok(conflict());
@@ -729,7 +729,7 @@ impl HumanAcceptanceService {
         request_id: RequestId,
         frontier: u64,
         (id, revision, digest): (RevisionProposalId, RevisionId, &str),
-        submitted_edit: Option<Option<&WebAtomEdit>>,
+        submitted_edit: Option<Option<WebProposalEdit<'_>>>,
     ) -> Result<HumanActionOutcome, HumanGovernanceError> {
         let command = CommandId::from_uuid(request_id.as_uuid())
             .map_err(|_| HumanGovernanceError::InvalidInput)?;
@@ -758,7 +758,7 @@ impl HumanAcceptanceService {
         let Some(outcome) = web_acceptance_outcome(&committed, proposal, |saved| {
             saved.reviewed_frontier == frontier
                 && hex(&saved.review_digest) == digest
-                && submitted_edit.is_none_or(|edit| saved.atom_edit.as_deref() == edit)
+                && submitted_edit.is_none_or(|edit| saved.edit() == edit)
                 && saved.canonical(proposal).is_some()
         }) else {
             return Ok(HumanActionOutcome::Unknown);
@@ -2929,7 +2929,7 @@ fn valid_web_accepted_candidate(
     if accepted.status != ProposalStatus::Accepted || !matches_intent(intent) {
         return false;
     }
-    if intent.atom_edit.is_none() {
+    if intent.edit().is_none() {
         return accepted.proposal_id == original.proposal_id
             && audit.reviewed_proposal_revision_id == original.proposal_revision_id
             && audit.reviewed_fingerprint == original.fingerprint;

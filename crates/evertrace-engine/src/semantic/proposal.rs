@@ -259,7 +259,7 @@ impl AtomAcceptanceContext {
         } = self
         {
             require_user_source(observation, receipt)?;
-            if intent.atom_edit.is_none()
+            if intent.edit().is_none()
                 || intent.reviewed_scope(original).as_ref() != Some(authorized_scope_ceiling)
                 || !intent.matches_reviewed(original, proposal)
                 || !intent.capture_matches(original, receipt, observation)

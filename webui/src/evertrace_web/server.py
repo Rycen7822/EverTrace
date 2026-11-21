@@ -313,21 +313,20 @@ class App:
                 disposition = path.startswith("/api/proposal-disposition")
                 if disposition:
                     fields.add("decision")
-                if path == "/api/proposal-accept" and "atom_edit" in payload:
-                    fields.add("atom_edit")
-                if set(payload) != fields or not _uuid7(payload["request_id"]):
+                edit_fields = payload.keys() & PROPOSAL_EDIT_FIELDS.keys() if path == "/api/proposal-accept" else set()
+                if len(edit_fields) > 1 or set(payload) != fields | edit_fields or not _uuid7(payload["request_id"]):
                     raise BackendError("invalid_input")
                 proposal, revision = proposal_coordinates(payload["proposal_id"], payload["revision"])
                 frontier = parse_frontier(payload["frontier"])
                 digest = proposal_digest(payload["review_digest"])
                 decision = proposal_disposition(payload["decision"]) if disposition else None
-                atom_edit = proposal_atom_edit(payload["atom_edit"]) if "atom_edit" in fields else None
+                edit = {key: PROPOSAL_EDIT_FIELDS[key](payload[key]) for key in edit_fields}
                 if frontier == 0:
                     raise BackendError("invalid_input")
                 try:
                     data = await self.backend.web_proposal_action(
                         payload["request_id"], proposal, revision, frontier, digest,
-                        lookup=path.endswith("-result"), decision=decision, atom_edit=atom_edit,
+                        lookup=path.endswith("-result"), decision=decision, edit=edit,
                     )
                 except BackendError:
                     # No reply is not evidence of rollback, and must not trigger another write.
@@ -700,20 +699,22 @@ class App:
                 else:
                     data = {"html": self.templates.get_template("proposal_creation.html").render(
                         reference=reference, scope=scope, frontier=frontier, request_id=_request_id())}
-            elif payload.get("kind") == "proposal_atom_edit" and set(payload) == {
-                "kind", "proposal_id", "revision", "frontier", "review_digest", "atom_edit",
-            }:
+            elif payload.get("kind") in ("proposal_atom_edit", "proposal_procedure_edit"):
+                edit_key = payload["kind"].removeprefix("proposal_")
+                if set(payload) != {"kind", "proposal_id", "revision", "frontier", "review_digest", edit_key}:
+                    raise BackendError("invalid_input")
                 proposal, revision = proposal_coordinates(payload["proposal_id"], payload["revision"])
                 frontier = parse_frontier(payload["frontier"])
                 digest = proposal_digest(payload["review_digest"])
-                edit = proposal_atom_edit(payload["atom_edit"])
-                result = await self.backend.proposal_review(proposal, revision, frontier, digest, atom_edit=edit)
+                edit = PROPOSAL_EDIT_FIELDS[edit_key](payload[edit_key])
+                result = await self.backend.proposal_review(proposal, revision, frontier, digest, edit={edit_key: edit})
                 if result["kind"] == "conflict":
                     data = {"conflict": True}
-                elif (candidate := result.get("atom_edit_preview")) is not None and result["confirmation_digest"]:
-                    data = {"html": self.templates.get_template("proposal_atom_edit.html").render(
-                        proposal=proposal, revision=revision, frontier=frontier, digest=result["confirmation_digest"],
+                elif (candidate := result.get(edit_key + "_preview")) is not None and result["confirmation_digest"]:
+                    data = {"html": self.templates.get_template("proposal_edit.html").render(
+                        proposal=proposal, revision=revision, frontier=result["frontier"], digest=result["confirmation_digest"],
                         edit=edit, candidate=candidate, request_id=_request_id(), base=result["item"]["proposal"].get("base_revision_id"),
+                        target=edit_key.removesuffix("_edit"),
                     )}
                 else:
                     data = {"unavailable": True}
@@ -807,6 +808,27 @@ def proposal_atom_edit(value):
         raise BackendError("invalid_input")
     # Native wire frames require the DTO field order, not the browser's JSON key order.
     return {key: value[key] for key in fields}
+
+
+def proposal_procedure_edit(value):
+    fields = ("title", "summary", "stages", "done")
+    done_fields = ("success", "abort", "verify")
+    if not isinstance(value, dict) or set(value) != set(fields):
+        raise BackendError("invalid_input")
+    if any(not isinstance(value[key], str) for key in fields[:2]):
+        raise BackendError("invalid_input")
+    if not isinstance(value["done"], dict) or set(value["done"]) != set(done_fields):
+        raise BackendError("invalid_input")
+    for lines in (value["stages"], *value["done"].values()):
+        if not isinstance(lines, list) or not all(isinstance(line, str) for line in lines):
+            raise BackendError("invalid_input")
+    return {
+        "title": value["title"], "summary": value["summary"], "stages": value["stages"],
+        "done": {key: value["done"][key] for key in done_fields},
+    }
+
+
+PROPOSAL_EDIT_FIELDS = {"atom_edit": proposal_atom_edit, "procedure_edit": proposal_procedure_edit}
 
 
 def proposal_disposition(value):

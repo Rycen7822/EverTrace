@@ -176,7 +176,7 @@ impl HumanGovernanceService {
         Ok(false)
     }
 
-    pub async fn web_atom_edit_base_current(
+    pub async fn web_edit_base_current(
         &self,
         proposal: &RevisionProposal,
         frontier: u64,
@@ -190,6 +190,38 @@ impl HumanGovernanceService {
             .await
             .map_err(|_| HumanGovernanceError::Store)?;
         Ok(snapshot.frontier == frontier && self.web_base_accessible(&snapshot, proposal).await?)
+    }
+
+    pub async fn web_procedure_edit_coverage(
+        &self,
+        proposal: &RevisionProposal,
+        draft: &evertrace_domain::procedure::ProcedureDraft,
+        frontier: u64,
+    ) -> Result<Option<evertrace_domain::inventory::CapabilityCoverageSummary>, HumanGovernanceError>
+    {
+        let (Some(runtime), Some(bindings)) = (&self.runtime_snapshot, &self.inventory_bindings)
+        else {
+            return Ok(None);
+        };
+        let snapshot = self
+            .writer
+            .project_objects()
+            .await
+            .map_err(|_| HumanGovernanceError::Store)?;
+        if snapshot.frontier != frontier {
+            return Ok(None);
+        }
+        let coverage = crate::procedure::resolve_procedure_coverage(
+            &self.writer,
+            bindings,
+            runtime,
+            &snapshot,
+            draft,
+            &proposal.source_cohort_refs,
+        )
+        .await
+        .map_err(|_| HumanGovernanceError::Store)?;
+        Ok(Some(coverage.summary().clone()))
     }
 
     pub(crate) async fn web_base_accessible(

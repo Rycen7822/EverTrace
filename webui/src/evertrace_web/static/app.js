@@ -338,14 +338,22 @@ function readAtomEdit(editor) {
   edit.object ||= null;
   return edit;
 }
-async function previewAtomEdit(button) {
+function readProcedureEdit(editor) {
+  const fields = [...editor.querySelectorAll("[name]")];
+  if (fields.some((field) => !field.reportValidity())) return null;
+  const { title, summary, stages, success, abort, verify } = Object.fromEntries(fields.map(({ name, value }) => [name, value]));
+  const lines = (text) => text.split("\n");
+  return { title, summary, stages: lines(stages), done: { success: lines(success), abort: lines(abort), verify: lines(verify) } };
+}
+async function previewProposalEdit(button) {
   const { proposalId, revision, frontier, reviewDigest } = button.dataset;
   if (document.hidden || !state.active || proposalId !== state.selected?.object || revision !== state.selected?.revision) return;
-  const editor = button.closest("[data-atom-edit]");
-  const panel = editor.querySelector("[data-atom-edit-content]");
-  const status = editor.querySelector("[data-atom-edit-status]");
-  const atom_edit = readAtomEdit(editor);
-  if (!atom_edit) return;
+  const kind = button.hasAttribute("data-atom-edit-preview") ? "atom" : "procedure";
+  const editor = button.closest(`[data-${kind}-edit]`);
+  const panel = editor.querySelector(`[data-${kind}-edit-content]`);
+  const status = editor.querySelector(`[data-${kind}-edit-status]`);
+  const edit = (kind === "atom" ? readAtomEdit : readProcedureEdit)(editor);
+  if (!edit) return;
   cancel();
   const controller = new AbortController();
   state.controller = controller;
@@ -354,7 +362,7 @@ async function previewAtomEdit(button) {
   status.textContent = "正在复核编辑稿…";
   try {
     const result = await api("read", {
-      kind: "proposal_atom_edit", proposal_id: proposalId, revision, frontier, review_digest: reviewDigest, atom_edit,
+      kind: `proposal_${kind}_edit`, proposal_id: proposalId, revision, frontier, review_digest: reviewDigest, [`${kind}_edit`]: edit,
     }, controller.signal);
     if (state.controller !== controller || document.hidden) return;
     if (result.conflict) {
@@ -401,6 +409,7 @@ async function resolveAcceptance(receipt, lookup) {
       : (lookup ? "proposal-acceptance-result" : "proposal-accept");
     const input = { ...receipt.input };
     delete receipt.input.atom_edit;
+    delete receipt.input.procedure_edit;
     if (receipt.authoring) {
       delete receipt.input.content;
       delete receipt.input.frontier;
@@ -422,7 +431,10 @@ function actOnProposal(button) {
   const action = button.dataset.proposalAccept;
   let prompt = ({ merge: "合并并接受", edit: "编辑并接受" }[action] || "接受")
     + "刚才显示的提案修订 " + revision + "？";
-  if (action === "edit") input.atom_edit = JSON.parse(button.dataset.atomEditValue);
+  if (action === "edit") {
+    if (button.dataset.atomEditValue) input.atom_edit = JSON.parse(button.dataset.atomEditValue);
+    else input.procedure_edit = JSON.parse(button.dataset.procedureEditValue);
+  }
   if (proposalDisposition === "defer") {
     const fields = button.closest("[data-disposition-fields]");
     const wait = fields.querySelector("[data-proposal-waiting]");
@@ -1271,13 +1283,14 @@ function route(name) {
   refresh();
 }
 $("detail-body").oninput = (event) => {
-  const editor = event.target.matches("[name]") && event.target.closest("[data-atom-edit]");
+  const editor = event.target.matches("[name]") && event.target.closest("[data-atom-edit], [data-procedure-edit]");
   if (!editor) return;
-  const button = editor.querySelector("[data-atom-edit-preview]");
+  const kind = editor.hasAttribute("data-atom-edit") ? "atom" : "procedure";
+  const button = editor.querySelector(`[data-${kind}-edit-preview]`);
   if (button.disabled) cancel();
   button.disabled = false;
-  editor.querySelector("[data-atom-edit-content]").replaceChildren();
-  editor.querySelector("[data-atom-edit-status]").textContent = "";
+  editor.querySelector(`[data-${kind}-edit-content]`).replaceChildren();
+  editor.querySelector(`[data-${kind}-edit-status]`).textContent = "";
 };
 $("detail-body").onclick = (event) => {
   const button = event.target.closest(
@@ -1285,7 +1298,8 @@ $("detail-body").onclick = (event) => {
     [data-archive-next], [data-archive-first], [data-archive-up], [data-content-open],
     [data-content-nav], [data-revisions-open], [data-revisions-next], [data-detail-open],
     [data-revision-key], [data-sources-open], [data-sources-next], [data-link-key], [data-proposal-confirm], [data-proposal-accept],
-    [data-proposal-disposition], [data-atom-edit-preview], [data-nav-back], [data-compare-base], [data-compare-key], [data-compare-side],
+    [data-proposal-disposition], [data-atom-edit-preview], [data-procedure-edit-preview],
+    [data-nav-back], [data-compare-base], [data-compare-key], [data-compare-side],
     [data-result-base], [data-result-compare], [data-submit-atom-correction],
     [data-compare-first], [data-compare-next], [data-compiled-first], [data-compiled-next], [data-compiled-refresh]`,
   );
@@ -1353,7 +1367,7 @@ $("detail-body").onclick = (event) => {
     return;
   }
   if (button.hasAttribute("data-proposal-confirm")) confirmProposal(button);
-  if (button.hasAttribute("data-atom-edit-preview")) previewAtomEdit(button);
+  if (button.matches("[data-atom-edit-preview], [data-procedure-edit-preview]")) previewProposalEdit(button);
   if (button.hasAttribute("data-submit-atom-correction")) submitAtomCorrection(button);
   if (button.matches("[data-proposal-accept], [data-proposal-disposition]")) actOnProposal(button);
   else if (button.hasAttribute("data-result-base")) compareResult(button, true);

@@ -954,10 +954,10 @@ fn validate_web_acceptance_boundary(
         .parse::<RevisionProposalId>()
         .map_err(|_| error)?;
     let (reviewed, seq) = proposals.get(&original_id).ok_or(error)?;
-    if (intent.atom_edit.is_none()
+    if (intent.edit().is_none()
         && (original_id != proposal.proposal_id
             || reviewed.proposal_revision_id != acceptance.reviewed_proposal_revision_id))
-        || (intent.atom_edit.is_some() && original_id == proposal.proposal_id)
+        || (intent.edit().is_some() && original_id == proposal.proposal_id)
         || !(*seq..=frontier).contains(&intent.reviewed_frontier)
         || intent.reviewed_scope(reviewed).as_ref() != Some(scope)
         || receipt.source_revision_mode != SourceRevisionMode::Append
@@ -1027,7 +1027,7 @@ fn validate_accepted_edit_boundary(
     };
     let web_edit = match &acceptance.authority_basis {
         ProposalAcceptanceAuthority::TuiAcceptance { .. } => None,
-        ProposalAcceptanceAuthority::WebAcceptance { intent, .. } if intent.atom_edit.is_some() => {
+        ProposalAcceptanceAuthority::WebAcceptance { intent, .. } if intent.edit().is_some() => {
             if expected_original_id.is_none() {
                 return Err(error);
             }
@@ -1745,13 +1745,7 @@ fn validate_proposal_relations(
                     let sources = validate_acceptance_sources(proposal, input)?;
                     if auto_full_audit.is_some()
                         || *user_source_observation_ref != sources.observation_id
-                        || WebAcceptanceIntent::scope(sources.reviewed).as_ref()
-                            != Some(authorized_scope_ceiling)
-                        || !intent.capture_matches(
-                            sources.reviewed,
-                            sources.receipt,
-                            sources.observation,
-                        )
+                        || !validate_web_capture(intent, authorized_scope_ceiling, &sources, input)?
                     {
                         return Err(StoreError::StoreCorrupt);
                     }
@@ -1886,7 +1880,7 @@ fn validate_proposal_relations(
                 if *user_source_observation_ref != acceptance_observation_id
                     || authorized_scope_ceiling != &atom.scope
                     || acceptance_receipt.task_id != atom.scope.task_id()
-                    || !validate_web_atom_capture(intent, &sources, input)?
+                    || !validate_web_capture(intent, authorized_scope_ceiling, &sources, input)?
                 {
                     return Err(StoreError::StoreCorrupt);
                 }
@@ -2099,12 +2093,13 @@ fn validate_acceptance_sources<'a>(
     })
 }
 
-fn validate_web_atom_capture(
+fn validate_web_capture(
     intent: &WebAcceptanceIntent,
+    authorized_scope_ceiling: &AtomScope,
     sources: &AcceptanceSources<'_>,
     input: &SemanticRelationInputs<'_>,
 ) -> Result<bool, StoreError> {
-    let original = if intent.atom_edit.is_some() {
+    let original = if intent.edit().is_some() {
         let revision = sources
             .receipt
             .source_revision
@@ -2140,8 +2135,11 @@ fn validate_web_atom_capture(
             return Err(StoreError::StoreCorrupt);
         }
     }
-    Ok(intent.matches_reviewed(original, sources.reviewed)
-        && intent.capture_matches(original, sources.receipt, sources.observation))
+    Ok(
+        intent.reviewed_scope(original).as_ref() == Some(authorized_scope_ceiling)
+            && intent.matches_reviewed(original, sources.reviewed)
+            && intent.capture_matches(original, sources.receipt, sources.observation),
+    )
 }
 
 fn validate_accepted_authority(
