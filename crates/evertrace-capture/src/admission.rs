@@ -466,7 +466,10 @@ impl CaptureRuntime {
             let segment = self
                 .spool
                 .append_isolated_sealed(&record, routing_hint)
-                .map_err(|_| CaptureError::Spool)?;
+                .map_err(|error| match error {
+                    SpoolError::DuplicateRecord => CaptureError::ReservationExists,
+                    _ => CaptureError::Spool,
+                })?;
             let end_watermark = segment.length();
             *isolated_segment = Some(segment);
             if self.state != CaptureAdmissionState::Recovering {
@@ -571,6 +574,8 @@ pub enum CaptureError {
     Cas,
     #[error("capture spool is unavailable")]
     Spool,
+    #[error("protected reservation already exists")]
+    ReservationExists,
     #[error("capture serialization failed")]
     Serialization,
     #[error("capture clock is unavailable")]

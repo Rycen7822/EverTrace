@@ -484,7 +484,7 @@ pub struct HumanGovernanceService {
 }
 
 impl HumanGovernanceService {
-    fn acceptance(&self) -> crate::semantic::HumanAcceptanceService {
+    pub fn acceptance(&self) -> crate::semantic::HumanAcceptanceService {
         crate::semantic::HumanAcceptanceService::new(
             self.writer.clone(),
             self.effective_config_hash,
@@ -768,6 +768,34 @@ impl HumanGovernanceService {
             global_promotion,
             session_report: None,
             inventory_bindings: None,
+        }
+    }
+
+    pub(crate) async fn proposal_accessible(
+        &self,
+        snapshot: &ProjectionSnapshot,
+        proposal: &RevisionProposal,
+    ) -> Result<bool, HumanGovernanceError> {
+        let id = proposal.proposal_id.to_string();
+        let revision = proposal.proposal_revision_id.to_string();
+        let Some(row) = snapshot.data_rows().find(|row| {
+            row.object_kind.as_deref() == Some("revision_proposal_revision")
+                && row.object_id.as_deref() == Some(id.as_str())
+                && row.current_revision_id.as_deref() == Some(revision.as_str())
+        }) else {
+            return Ok(false);
+        };
+        match self
+            .readable_row(
+                snapshot,
+                row,
+                std::time::Instant::now() + presentation::READ_DEADLINE,
+            )
+            .await
+        {
+            Ok(()) => Ok(true),
+            Err(export::Failure::Denied) => Ok(false),
+            Err(_) => Err(HumanGovernanceError::Store),
         }
     }
 

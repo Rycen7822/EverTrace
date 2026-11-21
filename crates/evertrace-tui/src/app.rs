@@ -2581,7 +2581,9 @@ fn human_action_label(action: &evertrace_protocol::dto::HumanActionRequest) -> &
             "collect orphan CAS (24 h grace) and prune versions older than 30 d"
         }
         HumanActionRequest::VerifyBackup { .. } => "verify backup",
-        HumanActionRequest::Unavailable { .. } => "unavailable action",
+        HumanActionRequest::Unavailable { .. } | HumanActionRequest::WebAccept { .. } => {
+            "unavailable action"
+        }
     }
 }
 

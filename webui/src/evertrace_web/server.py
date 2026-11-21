@@ -15,7 +15,7 @@ import uvicorn
 import orjson
 from uvicorn.protocols.http.h11_impl import H11Protocol
 
-from .backend import Backend, BackendError, _decode, verify_peer
+from .backend import Backend, BackendError, _decode, _request_id, verify_peer
 from .jobs import read_jobs
 from .comparison import read_comparison
 from .research import read_research_comparison
@@ -209,6 +209,8 @@ class App:
             "/api/bootstrap": "POST",
             "/api/logout": "POST",
             "/api/read": "POST",
+            "/api/proposal-accept": "POST",
+            "/api/proposal-acceptance-result": "POST",
         }.get(path)
         if expected_method is None:
             return Response(status_code=404)
@@ -269,7 +271,22 @@ class App:
             response.delete_cookie(self.cookie, httponly=True, samesite="strict", path="/")
             return response
         try:
-            if path == "/api/status":
+            if path in ("/api/proposal-accept", "/api/proposal-acceptance-result"):
+                if set(payload) != {"request_id", "proposal_id", "revision", "frontier", "review_digest"} or not _uuid7(payload["request_id"]):
+                    raise BackendError("invalid_input")
+                proposal, revision = proposal_coordinates(payload["proposal_id"], payload["revision"])
+                frontier = parse_frontier(payload["frontier"])
+                digest = proposal_digest(payload["review_digest"])
+                if frontier == 0:
+                    raise BackendError("invalid_input")
+                try:
+                    data = await self.backend.web_proposal_acceptance(
+                        payload["request_id"], proposal, revision, frontier, digest, lookup=path.endswith("-result"),
+                    )
+                except BackendError:
+                    # No reply is not evidence of rollback, and must not trigger another write.
+                    data = {"status": "unknown"}
+            elif path == "/api/status":
                 result = await self.backend.health()
                 data = {"mode": result["mode"], "config_hash": result["effective_config_hash"]}
             elif payload.get("kind") == "list" and not (
@@ -622,9 +639,7 @@ class App:
                 "kind", "proposal_id", "revision", "frontier", "review_digest",
             }:
                 proposal_id, revision = proposal_coordinates(payload["proposal_id"], payload["revision"])
-                digest = payload["review_digest"]
-                if not isinstance(digest, str) or len(digest) != 64 or any(c not in "0123456789abcdef" for c in digest):
-                    raise BackendError("invalid_input")
+                digest = proposal_digest(payload["review_digest"])
                 result = await self.backend.proposal_review(proposal_id, revision, parse_frontier(payload["frontier"]), digest)
                 if result["kind"] == "conflict":
                     confirmation = "conflict"
@@ -685,6 +700,12 @@ class App:
         return JSONResponse(data)
 
 
+def proposal_digest(digest):
+    if not isinstance(digest, str) or len(digest) != 64 or any(c not in "0123456789abcdef" for c in digest):
+        raise BackendError("invalid_input")
+    return digest
+
+
 def proposal_coordinates(proposal_id, revision):
     prefix = "proposal:"
     if (not isinstance(proposal_id, str) or not proposal_id.startswith(prefix)
@@ -737,7 +758,8 @@ def present_detail(templates, result, surface):
     )
     return {
         "html": templates.get_template(template).render(items=result["items"], surface=surface,
-            frontier=result.get("frontier"), confirmation_digest=result.get("confirmation_digest")),
+            frontier=result.get("frontier"), confirmation_digest=result.get("confirmation_digest"),
+            acceptance_request_id=_request_id() if result.get("web_accept_available") else None),
         "source_preview": preview,
         "semantic_text": semantic_text,
         "selection": selection,

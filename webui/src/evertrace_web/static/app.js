@@ -26,6 +26,7 @@ const state = {
   links: null,
   comparison: null,
   compareBase: null,
+  acceptance: null,
   controller: null,
 };
 let restoreSourceControls = false;
@@ -72,6 +73,8 @@ function closed(text, broadcast = false) {
   state.comparison = null;
   state.compareBase = null;
   state.links = null;
+  state.acceptance = null;
+  showAcceptanceReceipt();
   clearInterval(poller);
   poller = null;
   state.csrf = null;
@@ -120,7 +123,7 @@ async function api(path, body, signal) {
       signal,
     });
   } catch (error) {
-    if (error.name !== "AbortError")
+    if (error.name !== "AbortError" && !path.startsWith("proposal-accept"))
       closed("网页服务连接已断开，旧内容已清除；可刷新页面重新连接。");
     throw error;
   }
@@ -325,6 +328,50 @@ async function confirmProposal(button) {
     }
   }
 }
+function showAcceptanceReceipt() {
+  const receipt = state.acceptance;
+  $("acceptance-receipt").hidden = !receipt;
+  $("acceptance-lookup").hidden = receipt?.status !== "unknown";
+  $("acceptance-status").textContent = !receipt ? "" : ({
+    pending: "正在核对接受结果…",
+    applied: "已接受。",
+    no_delta: "此请求已处理；没有再次写入。",
+    conflict: "提案或水位有变化；本请求未应用。",
+    unavailable: "当前提案不具备网页接受条件；本请求未应用。",
+    unknown: "结果未知；不会自动重试。请只查原请求。",
+  }[receipt.status] + " 请求：" + receipt.input.request_id);
+}
+async function resolveAcceptance(receipt, lookup) {
+  receipt.status = "pending";
+  showAcceptanceReceipt();
+  try {
+    const path = lookup ? "proposal-acceptance-result" : "proposal-accept";
+    const result = await api(path, receipt.input);
+    receipt.status = result.status;
+  } catch {
+    receipt.status = "unknown";
+  } finally {
+    if (state.acceptance === receipt) showAcceptanceReceipt();
+  }
+}
+function acceptProposal(button) {
+  const { proposalId, revision, frontier, reviewDigest, requestId } = button.dataset;
+  if (document.hidden || !state.active || proposalId !== state.selected?.object || revision !== state.selected?.revision) return;
+  if (["pending", "unknown"].includes(state.acceptance?.status)) return;
+  if (!window.confirm("接受刚才显示的提案修订 " + revision + "？")) return;
+  const input = { request_id: requestId, proposal_id: proposalId, revision, frontier, review_digest: reviewDigest };
+  cancel();
+  state.selected = null;
+  $("detail-body").replaceChildren();
+  $("detail-ref").textContent = "";
+  const receipt = { input };
+  state.acceptance = receipt;
+  void resolveAcceptance(receipt, false);
+}
+$("acceptance-lookup").onclick = () => {
+  const receipt = state.acceptance;
+  if (state.active && receipt?.status === "unknown") void resolveAcceptance(receipt, true);
+};
 async function readSources(item, after, frontier, controller, scroll = 0) {
   const result = await api(
     "read",
@@ -803,7 +850,7 @@ async function readObservations(controller, health) {
       ? "原生读取有降级；不代表所有任务或审核已正常。"
       : system
         ? "只观察原任务和结果；离开页面不取消任务，也不自动重试。可用 CLI 返回的 Job ID 精确回查。"
-        : "只读原生待处理队列。网页接受、编辑、拒绝及其它治理操作仍未开放。",
+        : "仅在原生返回资格时可接受所显示的提案；编辑、拒绝和其它操作尚未开放。",
   );
   const selected = state.selected;
   if (
@@ -1093,7 +1140,7 @@ $("detail-body").onclick = (event) => {
     `[data-archive-revisions], [data-archive-revision], [data-archive-record],
     [data-archive-next], [data-archive-first], [data-archive-up], [data-content-open],
     [data-content-nav], [data-revisions-open], [data-revisions-next], [data-detail-open],
-    [data-revision-key], [data-sources-open], [data-sources-next], [data-link-key], [data-proposal-confirm],
+    [data-revision-key], [data-sources-open], [data-sources-next], [data-link-key], [data-proposal-confirm], [data-proposal-accept],
     [data-nav-back], [data-compare-base], [data-compare-key], [data-compare-side],
     [data-result-base], [data-result-compare],
     [data-compare-first], [data-compare-next], [data-compiled-first], [data-compiled-next], [data-compiled-refresh]`,
@@ -1162,6 +1209,7 @@ $("detail-body").onclick = (event) => {
     return;
   }
   if (button.hasAttribute("data-proposal-confirm")) confirmProposal(button);
+  if (button.hasAttribute("data-proposal-accept")) acceptProposal(button);
   else if (button.hasAttribute("data-result-base")) compareResult(button, true);
   else if (button.hasAttribute("data-result-compare")) compareResult(button, false);
   else if (button.hasAttribute("data-compare-base")) pinComparison();

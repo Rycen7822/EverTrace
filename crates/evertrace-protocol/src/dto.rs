@@ -15,7 +15,7 @@ use evertrace_domain::{
 };
 use serde::{Deserialize, Serialize};
 
-pub use evertrace_domain::query::MetadataReadOutcome;
+pub use evertrace_domain::{ids::RequestId, query::MetadataReadOutcome};
 
 pub const PROTOCOL_VERSION: u32 = 1;
 pub const MAX_FRAME_SIZE: usize = 1_048_576;
@@ -141,6 +141,11 @@ pub enum HumanReadRequest {
         expected_frontier: u64,
         expected_digest: Option<String>,
     },
+    WebAcceptanceOutcome {
+        request_id: RequestId,
+        expected_frontier: u64,
+        review: ProposalConfirmation,
+    },
     Related {
         relation: HumanRelationKind,
         source_stable_key: String,
@@ -208,6 +213,9 @@ pub enum RepositoryAccessAction {
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
 pub enum HumanActionRequest {
+    WebAccept {
+        review: ProposalConfirmation,
+    },
     Proposal {
         proposal_id: RevisionProposalId,
         expected_revision_id: RevisionId,
@@ -741,6 +749,7 @@ pub enum HumanActionStatus {
     NoDelta,
     Conflict,
     Unavailable,
+    Unknown,
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -813,6 +822,8 @@ pub enum HumanGovernanceResponse {
         frontier: u64,
         item: Option<Box<HumanSnapshotItem>>,
         confirmation_digest: Option<String>,
+        #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+        web_accept_available: bool,
     },
     Action {
         result: HumanActionResult,
@@ -834,7 +845,38 @@ pub fn proposal_confirmation_digest(item: &HumanSnapshotItem, frontier: u64) -> 
     Some(evertrace_domain::evidence::hex(&digest))
 }
 
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct ProposalConfirmation {
+    pub proposal_id: RevisionProposalId,
+    pub expected_revision_id: RevisionId,
+    pub expected_digest: String,
+}
+
+pub fn web_accept_available(item: &HumanSnapshotItem, frontier: u64, digest: &str) -> bool {
+    item.proposal_review
+        .as_ref()
+        .filter(|review| review.plain_accept_eligible && review.reauthorization.is_none())
+        .and_then(|review| {
+            evertrace_domain::semantic::WebAcceptanceIntent::for_proposal(
+                &review.proposal,
+                frontier,
+            )
+        })
+        .is_some_and(|intent| evertrace_domain::evidence::hex(&intent.review_digest) == digest)
+}
+
 impl HumanGovernanceRequest {
+    pub fn is_web_acceptance(&self) -> bool {
+        matches!(
+            self,
+            Self::Act {
+                action: HumanActionRequest::WebAccept { .. },
+                ..
+            }
+        )
+    }
+
     pub fn validate(&self) -> bool {
         match self {
             Self::Export { selections } => {
@@ -846,7 +888,10 @@ impl HumanGovernanceRequest {
                     })
             }
             Self::Read { request } => request.validate(),
-            Self::Act { action, .. } => action.validate(),
+            Self::Act {
+                action,
+                expected_frontier,
+            } => (!self.is_web_acceptance() || *expected_frontier != 0) && action.validate(),
         }
     }
 }
@@ -906,6 +951,11 @@ impl HumanReadRequest {
                 expected_revision_ref,
                 ..
             } => valid_ref(object_ref) && expected_revision_ref.as_deref().is_none_or(valid_ref),
+            Self::WebAcceptanceOutcome {
+                review,
+                expected_frontier,
+                ..
+            } => *expected_frontier != 0 && valid_hex(&review.expected_digest),
             Self::ProposalReview {
                 expected_digest, ..
             } => expected_digest.as_deref().is_none_or(valid_hex),
@@ -928,6 +978,7 @@ impl HumanReadRequest {
 impl HumanActionRequest {
     fn validate(&self) -> bool {
         match self {
+            Self::WebAccept { review } => valid_hex(&review.expected_digest),
             Self::Proposal {
                 expected_fingerprint,
                 decision,
@@ -1224,11 +1275,13 @@ impl HumanGovernanceResponse {
             Self::ProposalReview {
                 item,
                 confirmation_digest,
+                web_accept_available,
                 ..
             } => match item {
                 Some(item) => {
                     item.validate()
                         && item.proposal.is_some()
+                        && (!web_accept_available || confirmation_digest.is_some())
                         && confirmation_digest.as_deref().is_none_or(valid_hex)
                         && (confirmation_digest.is_some()
                             == item
@@ -1236,7 +1289,7 @@ impl HumanGovernanceResponse {
                                 .as_ref()
                                 .is_some_and(|review| review.proposal.status.is_open()))
                 }
-                None => confirmation_digest.is_none(),
+                None => confirmation_digest.is_none() && !web_accept_available,
             },
             Self::Action { result } => result.validate(),
             Self::Conflict {
@@ -2055,6 +2108,11 @@ impl HumanActionResult {
                 }
                 HumanActionStatus::Unavailable => {
                     self.audit_event_ref.is_none() && self.reason.is_some()
+                }
+                HumanActionStatus::Unknown => {
+                    self.current_revision_ref.is_none()
+                        && self.audit_event_ref.is_none()
+                        && self.reason.is_none()
                 }
             }
     }

@@ -474,7 +474,17 @@ where
             } else {
                 pending_mcp_return = None;
             }
-            let result = if context.client_kind == dto::ClientKind::Web {
+            let durable_web_action = context.web_launcher
+                && matches!(&command.command, Command::HumanGovernance(request) if request.is_web_acceptance());
+            let result = if durable_web_action {
+                // Once the Web decision is admitted, losing the socket is not a rollback.
+                Box::pin(command_handler(
+                    context,
+                    command.request_id,
+                    command.command,
+                ))
+                .await
+            } else if context.client_kind == dto::ClientKind::Web {
                 let mut operation = Box::pin(command_handler(
                     context,
                     command.request_id,

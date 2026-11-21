@@ -92,7 +92,7 @@
             <path d="m16 16 4.5 4.5" /></svg
           ><span>搜索暂未开放</span>
         </button>
-        <div class="top-actions"><span class="mode-label">本机连接 · 只读</span></div>
+        <div class="top-actions"><span class="mode-label">本机连接 · 人工确认</span></div>
       </header>
       <main id="main-content" class="main-content" tabindex="-1">
         <div class="page-heading">
@@ -107,6 +107,10 @@
           </div>
         </div>
         <div id="notice" class="notice" role="status">正在验证本机网页会话…</div>
+        <div id="acceptance-receipt" class="notice" hidden>
+          <span id="acceptance-status" role="status"></span>
+          <button id="acceptance-lookup" type="button" class="button" hidden>查原请求结果</button>
+        </div>
         <section id="system-panel" class="system-connection" aria-label="连接状态" hidden>
           <strong>连接状态</strong><span id="system-status"></span>
         </section>

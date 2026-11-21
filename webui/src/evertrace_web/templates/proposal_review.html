@@ -64,6 +64,11 @@
         data-revision="{{ summary.current_revision_id }}" data-frontier="{{ frontier }}"
         data-review-digest="{{ confirmation_digest }}">复核当前提案</button>
       <p data-proposal-confirmation-result role="status">只核对这份提案；不会提交审核决定。</p>
+      {% if acceptance_request_id %}
+        <button class="button" type="button" data-proposal-accept data-proposal-id="{{ summary.proposal_id }}"
+          data-request-id="{{ acceptance_request_id }}" data-revision="{{ summary.current_revision_id }}"
+          data-frontier="{{ frontier }}" data-review-digest="{{ confirmation_digest }}">确认接受这份提案</button>
+      {% endif %}
     {% endif %}
   {% else %}
     <p>本次没有返回可读正文或审核资格；不显示旧正文。</p>

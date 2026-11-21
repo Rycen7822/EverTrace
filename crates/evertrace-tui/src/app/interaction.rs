@@ -1479,6 +1479,7 @@ impl App {
                 HumanActionStatus::Unavailable => {
                     s.language.text("Action unavailable", "操作不可用")
                 }
+                HumanActionStatus::Unknown => s.language.text("Result unknown", "结果未知"),
             };
             frame.render_widget(
                 Paragraph::new(format!(

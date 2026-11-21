@@ -4,8 +4,8 @@ use std::{
 };
 
 use evertrace_capture::{
-    CaptureOutcome, CaptureRecordInput, CaptureRuntime, CasDigest, CasStore, DurableSpool,
-    RuntimeSnapshot,
+    CaptureError, CaptureOutcome, CaptureRecordInput, CaptureRuntime, CasDigest, CasStore,
+    DurableSpool, RuntimeSnapshot,
 };
 use evertrace_domain::{
     config::GlobalPromotionConfig,
@@ -76,6 +76,7 @@ pub enum HumanActionOutcome {
     Unavailable {
         reason: &'static str,
     },
+    Unknown,
 }
 
 #[derive(Debug, Error)]
@@ -387,12 +388,15 @@ impl HumanAcceptanceService {
             .await
             .map_err(|_| HumanGovernanceError::Store)?
         {
-            verify_acceptance_payload_cohort(
-                &committed.payloads,
-                verified,
-                reviewed,
-                Some(intent),
-            )?;
+            // A different already-committed use of this request ID cannot be overwritten.
+            if web_acceptance_outcome(&committed, reviewed, intent).is_some() {
+                verify_acceptance_payload_cohort(
+                    &committed.payloads,
+                    verified,
+                    reviewed,
+                    Some(intent),
+                )?;
+            }
             return Ok(());
         }
         if intent.reviewed_frontier > snapshot.frontier {
@@ -406,7 +410,36 @@ impl HumanAcceptanceService {
         {
             return Ok(());
         }
-        let occurred_at_us = now_us()?;
+        if !crate::HumanGovernanceService::new(self.writer.clone(), self.effective_config_hash)
+            .proposal_accessible(snapshot, reviewed)
+            .await?
+        {
+            return Ok(());
+        }
+        let at = now_us()?;
+        let command = self.web_acceptance_command(verified, view, reviewed, intent, at)?;
+        self.writer
+            .commit_if_frontier(command, at, snapshot.frontier)
+            .await
+            .map_err(|_| HumanGovernanceError::Store)?;
+        let committed = self
+            .writer
+            .committed_command(verified.body.command_id)
+            .await
+            .map_err(|_| HumanGovernanceError::Store)?
+            .ok_or(HumanGovernanceError::Store)?;
+        verify_acceptance_payload_cohort(&committed.payloads, verified, reviewed, Some(intent))?;
+        Ok(())
+    }
+
+    fn web_acceptance_command(
+        &self,
+        verified: &crate::capture::VerifiedCapture,
+        view: &SemanticCurrentView,
+        reviewed: &RevisionProposal,
+        intent: WebAcceptanceIntent,
+        occurred_at_us: i64,
+    ) -> Result<JournalCommand, HumanGovernanceError> {
         let accepted = RevisionProposalService
             .accept(
                 view,
@@ -432,20 +465,170 @@ impl HumanAcceptanceService {
         )
         .map_err(|_| HumanGovernanceError::Store)?;
         events.extend(accepted.command.events().iter().cloned());
-        let command = JournalCommand::new(verified.body.command_id, events)
-            .map_err(|_| HumanGovernanceError::Store)?;
-        self.writer
-            .commit_if_frontier(command, occurred_at_us, snapshot.frontier)
+        JournalCommand::new(verified.body.command_id, events)
+            .map_err(|_| HumanGovernanceError::Store)
+    }
+
+    pub async fn accept_reviewed_web(
+        &self,
+        request_id: RequestId,
+        frontier: u64,
+        id: RevisionProposalId,
+        revision: RevisionId,
+        digest: &str,
+    ) -> Result<HumanActionOutcome, HumanGovernanceError> {
+        let conflict = || HumanActionOutcome::Conflict {
+            current_revision_ref: None,
+        };
+        let Some(runtime) = self.runtime_snapshot.as_ref() else {
+            return Ok(HumanActionOutcome::Unavailable {
+                reason: "web_acceptance_source_unavailable",
+            });
+        };
+        let command = CommandId::from_uuid(request_id.as_uuid())
+            .map_err(|_| HumanGovernanceError::InvalidInput)?;
+        if self
+            .writer
+            .committed_command(command)
+            .await
+            .map_err(|_| HumanGovernanceError::Store)?
+            .is_some()
+        {
+            return Ok(conflict());
+        }
+        let snapshot = self
+            .writer
+            .project_objects()
             .await
             .map_err(|_| HumanGovernanceError::Store)?;
+        let view = SemanticCurrentView::from_snapshot(&snapshot)
+            .map_err(|_| HumanGovernanceError::Store)?;
+        let Some(proposal) = view.proposals.get(&id).filter(|proposal| {
+            snapshot.frontier == frontier && proposal.proposal_revision_id == revision
+        }) else {
+            return Ok(conflict());
+        };
+        let Some(intent) = WebAcceptanceIntent::for_proposal(proposal, frontier)
+            .filter(|intent| hex(&intent.review_digest) == digest)
+        else {
+            return Ok(conflict());
+        };
+        if !matches!(
+            deletion_admission(&snapshot, proposal)?,
+            ObjectDeletionCandidateAdmission::Clear
+        ) {
+            return Ok(HumanActionOutcome::Unavailable {
+                reason: "web_acceptance_requires_reauthorization",
+            });
+        }
+        let canonical = intent
+            .canonical(proposal)
+            .ok_or(HumanGovernanceError::Store)?;
+        let record_id = format!("web-accept-{id}-{revision}");
+        let scope = acceptance_capture_scope(proposal, &view)?;
+        let spool = DurableSpool::open_read_only(
+            runtime.spool_dir.clone(),
+            runtime
+                .spool_limits()
+                .map_err(|_| HumanGovernanceError::Store)?,
+        )
+        .map_err(|_| HumanGovernanceError::Store)?;
+        let cas =
+            CasStore::open(runtime.cas_dir.clone()).map_err(|_| HumanGovernanceError::Store)?;
+        let mut capture =
+            CaptureRuntime::open(runtime.clone()).map_err(|_| HumanGovernanceError::Store)?;
+        let capture_record =
+            human_acceptance_capture_input(proposal, &canonical, &record_id, scope, true)?;
+        // A repeated request ID cannot reserve a different confirmation. Different requests
+        // for one proposal compete at the existing journal frontier check.
+        let routing_hint = format!("web-{}", command.as_uuid().hyphenated());
+        let segment = match capture.capture_isolated(capture_record, command, &routing_hint) {
+            Ok(result) if matches!(result.outcome, CaptureOutcome::Durable { .. }) => {
+                result.segment
+            }
+            Err(CaptureError::ReservationExists) => return Ok(HumanActionOutcome::Unknown),
+            _ => return Err(HumanGovernanceError::Store),
+        };
+        let [frame] = segment.frames() else {
+            return Err(HumanGovernanceError::Store);
+        };
+        let verified =
+            verify_capture_frame(frame, &cas).map_err(|_| HumanGovernanceError::Store)?;
+        let at = now_us()?;
+        let batch = self.web_acceptance_command(&verified, &view, proposal, intent, at)?;
+        match self.writer.commit_if_frontier(batch, at, frontier).await {
+            Ok(_) => (),
+            Err(
+                crate::WriterActorError::StaleFrontier
+                | crate::WriterActorError::IdempotencyConflict,
+            ) => {
+                spool
+                    .acknowledge_segment(segment, 1)
+                    .map_err(|_| HumanGovernanceError::Store)?;
+                return Ok(conflict());
+            }
+            Err(_) => return Err(HumanGovernanceError::Store),
+        }
         let committed = self
             .writer
-            .committed_command(verified.body.command_id)
+            .committed_command(command)
             .await
             .map_err(|_| HumanGovernanceError::Store)?
             .ok_or(HumanGovernanceError::Store)?;
-        verify_acceptance_payload_cohort(&committed.payloads, verified, reviewed, Some(intent))?;
-        Ok(())
+        verify_acceptance_payload_cohort(&committed.payloads, &verified, proposal, Some(intent))?;
+        let outcome = web_acceptance_outcome(&committed, proposal, intent)
+            .ok_or(HumanGovernanceError::Store)?;
+        spool
+            .acknowledge_segment(segment, 1)
+            .map_err(|_| HumanGovernanceError::Store)?;
+        Ok(outcome)
+    }
+
+    pub async fn reviewed_web_outcome(
+        &self,
+        service: &crate::HumanGovernanceService,
+        request_id: RequestId,
+        frontier: u64,
+        id: RevisionProposalId,
+        revision: RevisionId,
+        digest: &str,
+    ) -> Result<HumanActionOutcome, HumanGovernanceError> {
+        let command = CommandId::from_uuid(request_id.as_uuid())
+            .map_err(|_| HumanGovernanceError::InvalidInput)?;
+        let Some(committed) = self
+            .writer
+            .committed_command(command)
+            .await
+            .map_err(|_| HumanGovernanceError::Store)?
+        else {
+            return Ok(HumanActionOutcome::Unknown);
+        };
+        let snapshot = self
+            .writer
+            .project_objects()
+            .await
+            .map_err(|_| HumanGovernanceError::Store)?;
+        let view = SemanticCurrentView::from_snapshot(&snapshot)
+            .map_err(|_| HumanGovernanceError::Store)?;
+        let Some(proposal) = view
+            .proposal_revisions
+            .get(&revision)
+            .filter(|proposal| proposal.proposal_id == id)
+        else {
+            return Ok(HumanActionOutcome::Unknown);
+        };
+        let Some(intent) = WebAcceptanceIntent::for_proposal(proposal, frontier)
+            .filter(|intent| hex(&intent.review_digest) == digest)
+        else {
+            return Ok(HumanActionOutcome::Unknown);
+        };
+        let Some(outcome) = web_acceptance_outcome(&committed, proposal, intent) else {
+            return Ok(HumanActionOutcome::Unknown);
+        };
+        if !service.proposal_accessible(&snapshot, proposal).await? {
+            return Ok(HumanActionOutcome::Unknown);
+        }
+        Ok(outcome)
     }
 
     pub async fn decide_proposal(
@@ -1523,16 +1706,31 @@ fn acceptance_capture_input(
     record_id: &str,
     scope: AcceptanceCaptureScope,
 ) -> Result<CaptureRecordInput, HumanGovernanceError> {
+    human_acceptance_capture_input(proposal, payload, record_id, scope, false)
+}
+
+fn human_acceptance_capture_input(
+    proposal: &RevisionProposal,
+    payload: &str,
+    record_id: &str,
+    scope: AcceptanceCaptureScope,
+    web: bool,
+) -> Result<CaptureRecordInput, HumanGovernanceError> {
+    let (source, manifest) = if web {
+        ("web-acceptance", WEB_ACCEPTANCE_EVENT_MANIFEST_REF)
+    } else {
+        ("tui-acceptance", TUI_ACCEPTANCE_EVENT_MANIFEST_REF)
+    };
     Ok(CaptureRecordInput {
         source_local_evidence: None,
         spool_record_id: Some(record_id.into()),
         source_observation_id_hint: None,
-        source_instance_id: format!("tui-acceptance:{}", proposal.proposal_id),
+        source_instance_id: format!("{source}:{}", proposal.proposal_id),
         source_revision: proposal.proposal_revision_id.to_string(),
         source_record_identity: Some(record_id.into()),
         identity_strength: Some(IdentityStrength::StableNative),
         source_kind: EvidenceSourceKind::Other,
-        identity_domain: TUI_ACCEPTANCE_EVENT_MANIFEST_REF.into(),
+        identity_domain: manifest.into(),
         source_ref: proposal.proposal_id.to_string(),
         session_ref: "human-governance".into(),
         turn_ref: None,
@@ -1557,7 +1755,7 @@ fn acceptance_capture_input(
             physical_execution_ordinal: None,
             pairing_role: ObservationRole::Message,
             field_provenance: Vec::new(),
-            adapter_manifest_ref: TUI_ACCEPTANCE_EVENT_MANIFEST_REF.into(),
+            adapter_manifest_ref: manifest.into(),
             adapter_revision: 1,
             strong_gate_receipt_ref: None,
             admission: CorrelationAdmission::Unavailable,
@@ -1572,8 +1770,8 @@ fn acceptance_capture_input(
         capture_completeness: CaptureCompleteness::Complete,
         surface_eligible: true,
         adapter_revision: 1,
-        adapter_manifest_ref: TUI_ACCEPTANCE_EVENT_MANIFEST_REF.into(),
-        eligible_event_manifest_ref: TUI_ACCEPTANCE_EVENT_MANIFEST_REF.into(),
+        adapter_manifest_ref: manifest.into(),
+        eligible_event_manifest_ref: manifest.into(),
         parser_revision: 1,
         canonicalization_revision: 1,
         event_time_us: Some(now_us()?),
@@ -2369,6 +2567,29 @@ fn validate_current_edit_cohort(
         }
         _ => Err(HumanGovernanceError::Store),
     }
+}
+
+fn web_acceptance_outcome(
+    committed: &evertrace_store::CommittedCommand,
+    proposal: &RevisionProposal,
+    intent: WebAcceptanceIntent,
+) -> Option<HumanActionOutcome> {
+    committed.payloads.iter().zip(&committed.event_ids).find_map(|(payload, event)| {
+        let JournalPayload::RevisionProposalRecorded(value) = payload else { return None; };
+        let audit = value.acceptance.as_ref()?;
+        if value.status == ProposalStatus::Accepted
+            && value.proposal_id == proposal.proposal_id
+            && audit.reviewed_proposal_revision_id == proposal.proposal_revision_id
+            && audit.reviewed_fingerprint == proposal.fingerprint
+            && matches!(audit.authority_basis, ProposalAcceptanceAuthority::WebAcceptance { intent: saved, .. } if saved == intent)
+        {
+            return Some(HumanActionOutcome::Applied {
+                current_revision_ref: value.proposal_revision_id.to_string(),
+                audit_event_ref: event.clone(),
+            });
+        }
+        None
+    })
 }
 
 fn verify_acceptance_payload_cohort(

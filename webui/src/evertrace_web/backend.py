@@ -634,6 +634,20 @@ class Backend:
                 raise BackendError("invalid_read_response")
         return result
 
+    async def web_proposal_acceptance(self, request_id, proposal, revision, frontier, digest, *, lookup):
+        review = {"proposal_id": proposal, "expected_revision_id": revision, "expected_digest": digest}
+        if lookup:
+            reply = await self._request({"kind": "web_acceptance_outcome", "request_id": request_id,
+                "expected_frontier": frontier, "review": review})
+        else:
+            action = {"operation": "act", "expected_frontier": frontier, "action": {"kind": "web_accept", "review": review}}
+            reply = await self._request(None, confirmation=True, action=action, request_id=request_id)
+        if reply.get("kind") != "action" or reply["result"].get("status") not in (
+            "applied", "no_delta", "conflict", "unavailable", "unknown",
+        ):
+            raise BackendError("invalid_action_response")
+        return reply["result"]
+
     async def job(self, job_id, frontier):
         if not isinstance(job_id, str):
             raise BackendError("invalid_input")
@@ -678,7 +692,7 @@ class Backend:
             raise BackendError("invalid_read_response")
         return page
 
-    async def _request(self, read, *, confirmation=False):
+    async def _request(self, read, *, confirmation=False, action=None, request_id=None):
         async def execute():
             writer = None
             try:
@@ -723,8 +737,8 @@ class Backend:
                         raise BackendError("version_mismatch")
                     maximum = body["max_frame"]
 
-                async def call(command):
-                    identity = _request_id()
+                async def call(command, identity=None):
+                    identity = _request_id() if identity is None else identity
                     await send(
                         {"kind": "command", "body": {"request_id": identity, "command": command}}
                     )
@@ -748,10 +762,14 @@ class Backend:
                     or health.get("effective_config_hash") != self.config_hash
                 ):
                     raise BackendError("inactive_configuration")
+                if action is not None:
+                    return (await call({"human_governance": action}, request_id))["human_governance"]
                 if read is None:
                     return health
                 response = await call({"human_governance": {"operation": "read", "request": read}})
                 result = response["human_governance"]
+                if read["kind"] == "web_acceptance_outcome":
+                    return result
                 if result.get("kind") not in (
                     "state",
                     "jobs",
