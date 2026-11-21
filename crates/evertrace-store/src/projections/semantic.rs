@@ -357,7 +357,14 @@ pub(crate) fn validate_command_boundary<'a>(
         .iter()
         .map(|(payload, _, _)| *payload)
         .collect::<Vec<_>>();
-    validate_web_acceptance_boundary(current_atoms, current_proposals, frontier, &payloads, error)?;
+    validate_web_acceptance_boundary(
+        current_atoms,
+        current_proposals,
+        current_procedures,
+        frontier,
+        &payloads,
+        error,
+    )?;
     validate_support_proposal_boundaries(
         current_atoms,
         current_procedures,
@@ -764,6 +771,7 @@ fn exact_edit_pairs(
 fn validate_web_acceptance_boundary(
     atoms: &BTreeMap<AtomId, (Atom, u64)>,
     proposals: &BTreeMap<RevisionProposalId, (RevisionProposal, u64)>,
+    procedures: &super::procedure::ProcedureState,
     frontier: u64,
     payloads: &[&JournalPayload],
     error: StoreError,
@@ -795,7 +803,7 @@ fn validate_web_acceptance_boundary(
                     acceptance,
                     *user_source_observation_ref,
                     authorized_scope_ceiling,
-                    *intent,
+                    intent,
                 )),
                 _ => None,
             }),
@@ -838,6 +846,14 @@ fn validate_web_acceptance_boundary(
         {
             return Err(error);
         }
+    }
+    if let (Some(ProposalTargetId::Procedure(id)), Some(base)) =
+        (reviewed.target_id, reviewed.base_revision_id)
+        && procedures
+            .current_revision(id)
+            .is_none_or(|current| current.revision_id != base)
+    {
+        return Err(error);
     }
     // Generic evidence-command validation already pairs one receipt, observation and watermark.
     let observation = payloads
@@ -1569,8 +1585,7 @@ fn validate_proposal_relations(
                     }
                     let sources = validate_acceptance_sources(proposal, input)?;
                     if *user_source_observation_ref != sources.observation_id
-                        || !authorized_scope_ceiling
-                            .contains(&procedure_atom_scope(payload.draft().scope))
+                        || !authorized_scope_ceiling.contains(&payload.draft().scope.into())
                     {
                         return Err(StoreError::StoreCorrupt);
                     }
@@ -1582,6 +1597,25 @@ fn validate_proposal_relations(
                         sources.receipt,
                         input,
                     )?;
+                }
+                ProposalAcceptanceAuthority::WebAcceptance {
+                    user_source_observation_ref,
+                    authorized_scope_ceiling,
+                    intent,
+                } => {
+                    let sources = validate_acceptance_sources(proposal, input)?;
+                    if auto_full_audit.is_some()
+                        || *user_source_observation_ref != sources.observation_id
+                        || WebAcceptanceIntent::scope(sources.reviewed).as_ref()
+                            != Some(authorized_scope_ceiling)
+                        || !intent.capture_matches(
+                            sources.reviewed,
+                            sources.receipt,
+                            sources.observation,
+                        )
+                    {
+                        return Err(StoreError::StoreCorrupt);
+                    }
                 }
                 ProposalAcceptanceAuthority::ObjectiveEvidence {
                     user_source_observation_ref,
@@ -1620,8 +1654,7 @@ fn validate_proposal_relations(
                         return Err(StoreError::StoreCorrupt);
                     }
                 }
-                ProposalAcceptanceAuthority::CurrentTaskExactMessage { .. }
-                | ProposalAcceptanceAuthority::WebAcceptance { .. } => {
+                ProposalAcceptanceAuthority::CurrentTaskExactMessage { .. } => {
                     return Err(StoreError::StoreCorrupt);
                 }
             }
@@ -1841,22 +1874,6 @@ fn validate_proposal_relations(
         }
     }
     Ok(())
-}
-
-fn procedure_atom_scope(scope: ProcedureScope) -> AtomScope {
-    match scope {
-        ProcedureScope::Worktree {
-            repository_id,
-            worktree_id,
-        } => AtomScope::Worktree {
-            repository_instance_id: repository_id,
-            worktree_instance_id: worktree_id,
-        },
-        ProcedureScope::Repository { repository_id } => AtomScope::Repository {
-            repository_instance_id: repository_id,
-        },
-        ProcedureScope::Global => AtomScope::Global,
-    }
 }
 
 struct AcceptanceSources<'a> {

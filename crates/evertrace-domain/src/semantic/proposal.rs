@@ -7,7 +7,8 @@ use crate::{
         SourceArchiveMode, SourceObservation, SourceReceipt, SourceRole, hex, payload_fingerprint,
     },
     ids::{AtomId, CoreMembershipId, ProcedureId, RevisionProposalId},
-    procedure::{ProcedureAutoFullAudit, ProcedureDraft},
+    inventory::{CapabilityCoverageOmission, CapabilityCoverageSummary, CapabilityEvidenceLevel},
+    procedure::{ProcedureAutoFullAudit, ProcedureDraft, ProcedureScope},
     revision::RevisionId,
 };
 
@@ -46,62 +47,168 @@ pub fn proposal_review_digest<Review: Serialize, Base: Serialize>(
     .ok()
 }
 
-#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct WebAcceptanceIntent {
     pub reviewed_frontier: u64,
     pub review_digest: [u8; 32],
+    /// The Native-reviewed observation is not an automatic eligibility certificate.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub procedure_coverage: Option<Box<WebProcedureCoverage>>,
+}
+
+/// Only the displayed coverage, with no inventory identifiers or protected CAS locators.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct WebProcedureCoverage {
+    inventory_count: usize,
+    present_assets: u32,
+    unobserved_sources: u32,
+    unknown_contracts: u32,
+    equivalent_levels: Vec<CapabilityEvidenceLevel>,
+    incremental_base_revision: Option<RevisionId>,
+    omissions: Vec<CapabilityCoverageOmission>,
+    likely_redundant: bool,
+}
+
+impl WebProcedureCoverage {
+    fn from_summary(value: &CapabilityCoverageSummary) -> Option<Self> {
+        value.validate().then(|| Self {
+            inventory_count: value.inventory_refs.len(),
+            present_assets: value.present_assets,
+            unobserved_sources: value.unobserved_sources,
+            unknown_contracts: value.unknown_contracts,
+            equivalent_levels: value
+                .equivalent_assets
+                .iter()
+                .map(|asset| asset.level)
+                .collect(),
+            incremental_base_revision: value.incremental_base_revision,
+            omissions: value.omissions.clone(),
+            likely_redundant: value.likely_redundant,
+        })
+    }
+
+    fn permits_manual(&self, operation: ProposalOperation) -> bool {
+        self.inventory_count <= 8
+            && self.equivalent_levels.len() <= 64
+            && self.unknown_contracts <= self.present_assets
+            && self.omissions.windows(2).all(|pair| pair[0] < pair[1])
+            && (operation != ProposalOperation::Create
+                || !self
+                    .equivalent_levels
+                    .contains(&CapabilityEvidenceLevel::OutcomeSupported))
+    }
+}
+
+impl From<ProcedureScope> for AtomScope {
+    fn from(scope: ProcedureScope) -> Self {
+        match scope {
+            ProcedureScope::Worktree {
+                repository_id,
+                worktree_id,
+            } => AtomScope::Worktree {
+                repository_instance_id: repository_id,
+                worktree_instance_id: worktree_id,
+            },
+            ProcedureScope::Repository { repository_id } => AtomScope::Repository {
+                repository_instance_id: repository_id,
+            },
+            ProcedureScope::Global => AtomScope::Global,
+        }
+    }
 }
 
 impl WebAcceptanceIntent {
     pub fn scope(proposal: &RevisionProposal) -> Option<AtomScope> {
-        if !proposal.status.is_open() || proposal.operation != ProposalOperation::Create {
+        if !proposal.status.is_open()
+            || proposal.eligibility == ProposalEligibility::AutoEligibleFull
+        {
             return None;
         }
         match &proposal.payload {
-            ProposalPayload::Atom(payload) => match payload.as_ref() {
-                AtomProposalPayload::Create { draft }
-                    if draft.scope.task_id().is_some()
-                        && proposal.eligibility == ProposalEligibility::ManualRequired =>
-                {
-                    Some(draft.scope.clone())
+            ProposalPayload::Atom(payload) if proposal.operation == ProposalOperation::Create => {
+                match payload.as_ref() {
+                    AtomProposalPayload::Create { draft }
+                        if draft.scope.task_id().is_some()
+                            && proposal.eligibility == ProposalEligibility::ManualRequired =>
+                    {
+                        Some(draft.scope.clone())
+                    }
+                    _ => None,
                 }
-                _ => None,
-            },
+            }
             ProposalPayload::CoreMembership(payload)
-                if proposal.eligibility != ProposalEligibility::AutoEligibleFull =>
+                if proposal.operation == ProposalOperation::Create =>
             {
                 payload.creation().map(|(_, scope)| scope.atom_scope())
+            }
+            ProposalPayload::Procedure(payload) if proposal.operation == payload.operation() => {
+                Some(payload.draft().scope.into())
             }
             _ => None,
         }
     }
 
-    pub fn for_proposal(proposal: &RevisionProposal, frontier: u64) -> Option<Self> {
+    pub fn for_review(
+        proposal: &RevisionProposal,
+        frontier: u64,
+        coverage: Option<&CapabilityCoverageSummary>,
+    ) -> Option<Self> {
+        let procedure_coverage = match coverage {
+            Some(value) => Some(Box::new(WebProcedureCoverage::from_summary(value)?)),
+            None => None,
+        };
+        Some(Self {
+            reviewed_frontier: frontier,
+            review_digest: Self::digest(proposal, frontier, procedure_coverage.as_deref())?,
+            procedure_coverage,
+        })
+    }
+
+    fn digest(
+        proposal: &RevisionProposal,
+        frontier: u64,
+        coverage: Option<&WebProcedureCoverage>,
+    ) -> Option<[u8; 32]> {
         #[derive(Serialize)]
         struct Review<'a> {
             proposal: &'a RevisionProposal,
             plain_accept_eligible: bool,
             merge_and_accept_eligible: bool,
+            #[serde(skip_serializing_if = "Option::is_none")]
+            capability_coverage: Option<&'a WebProcedureCoverage>,
         }
         if frontier == 0 {
             return None;
         }
         Self::scope(proposal)?;
-        // A Core creation binds the displayed immutable Atom by its exact revision in the proposal.
+        match (&proposal.payload, coverage) {
+            (ProposalPayload::Procedure(_), Some(value))
+                if value.permits_manual(proposal.operation) =>
+            {
+                ()
+            }
+            (ProposalPayload::Procedure(_), _) | (_, Some(_)) => return None,
+            _ => (),
+        }
         let review = Review {
             proposal,
             plain_accept_eligible: true,
             merge_and_accept_eligible: false,
+            capability_coverage: coverage,
         };
-        Some(Self {
-            reviewed_frontier: frontier,
-            review_digest: proposal_review_digest(frontier, review, Option::<()>::None)?,
-        })
+        // The original base and Core anchor are immutable revisions bound by the proposal, not re-encoded presentation.
+        proposal_review_digest(frontier, review, proposal.base_revision_id)
     }
 
-    pub fn canonical(self, proposal: &RevisionProposal) -> Option<String> {
-        if Self::for_proposal(proposal, self.reviewed_frontier)? != self {
+    pub fn canonical(&self, proposal: &RevisionProposal) -> Option<String> {
+        if Self::digest(
+            proposal,
+            self.reviewed_frontier,
+            self.procedure_coverage.as_deref(),
+        )? != self.review_digest
+        {
             return None;
         }
         serde_json::to_string(&(
@@ -129,15 +236,22 @@ impl WebAcceptanceIntent {
     }
 
     pub fn capture_matches(
-        self,
+        &self,
         source: &RevisionProposal,
         receipt: &SourceReceipt,
         observation: &SourceObservation,
     ) -> bool {
         Self::scope(source).is_some_and(|scope| {
+            let worktree = match scope {
+                AtomScope::Worktree {
+                    worktree_instance_id,
+                    ..
+                } => Some(worktree_instance_id),
+                _ => None,
+            };
             receipt.task_id == scope.task_id()
                 && receipt.repository_instance_id == scope.repository_id()
-                && receipt.worktree_instance_id.is_none()
+                && receipt.worktree_instance_id == worktree
         }) && self.canonical(source).is_some_and(|canonical| {
             acceptance_capture_matches(
                 source,

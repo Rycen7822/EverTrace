@@ -9,7 +9,7 @@ use evertrace_domain::{
     query::{SearchContext, SearchIntent},
     revision::RevisionId,
     semantic::{
-        AcceptedProposalTarget, AtomScope, ConstraintState, ConstraintTruth, GlobalSupportState,
+        AcceptedProposalTarget, ConstraintState, ConstraintTruth, GlobalSupportState,
         ProcedureProposalPayload, ProposalAcceptanceAuthority, ProposalEligibility,
         ProposalPayload, ProposalTargetId, ProposalTargetKind, RevisionProposal,
     },
@@ -839,16 +839,7 @@ fn accept_procedure_inner(
                 let ProcedureAcceptanceContext::Manual(manual) = acceptance_context else {
                     return Ok(ProcedureAcceptanceResolution::NoDelta);
                 };
-                let ProposalAcceptanceAuthority::TuiAcceptance {
-                    authorized_scope_ceiling,
-                    ..
-                } = manual.authority_basis()?
-                else {
-                    return Err(SemanticServiceError::InvalidInput);
-                };
-                if !authorized_scope_ceiling.contains(&scope_as_atom(draft.scope)) {
-                    return Err(SemanticServiceError::InvalidInput);
-                }
+                require_manual_scope(&manual, draft.scope)?;
                 let accepted_target = AcceptedProposalTarget::Procedure {
                     procedure_id: current.procedure_id,
                     procedure_revision_id: current.revision_id,
@@ -914,16 +905,7 @@ fn accept_procedure_inner(
         .map_err(|_| SemanticServiceError::InvalidInput)?;
     let (accepted, mut payloads) = match acceptance_context {
         ProcedureAcceptanceContext::Manual(manual) => {
-            let evertrace_domain::semantic::ProposalAcceptanceAuthority::TuiAcceptance {
-                authorized_scope_ceiling,
-                ..
-            } = manual.authority_basis()?
-            else {
-                return Err(SemanticServiceError::InvalidInput);
-            };
-            if !authorized_scope_ceiling.contains(&scope_as_atom(draft.scope)) {
-                return Err(SemanticServiceError::InvalidInput);
-            }
+            require_manual_scope(&manual, draft.scope)?;
             let accepted_target = AcceptedProposalTarget::Procedure {
                 procedure_id,
                 procedure_revision_id: revision_id,
@@ -1059,6 +1041,24 @@ fn accept_procedure_inner(
         state: Box::new(state),
         command,
     })
+}
+
+fn require_manual_scope(
+    manual: &AtomAcceptanceContext,
+    scope: ProcedureScope,
+) -> Result<(), SemanticServiceError> {
+    let authority = manual.authority_basis()?;
+    match authority {
+        ProposalAcceptanceAuthority::TuiAcceptance {
+            authorized_scope_ceiling,
+            ..
+        }
+        | ProposalAcceptanceAuthority::WebAcceptance {
+            authorized_scope_ceiling,
+            ..
+        } if authorized_scope_ceiling.contains(&scope.into()) => Ok(()),
+        _ => Err(SemanticServiceError::InvalidInput),
+    }
 }
 
 pub fn publication_event(
@@ -1362,22 +1362,6 @@ fn scope_matches(scope: ProcedureScope, context: &SearchContext) -> bool {
         } => {
             context.repository_id == Some(repository_id) && context.worktree_id == Some(worktree_id)
         }
-    }
-}
-
-fn scope_as_atom(scope: ProcedureScope) -> AtomScope {
-    match scope {
-        ProcedureScope::Worktree {
-            repository_id,
-            worktree_id,
-        } => AtomScope::Worktree {
-            repository_instance_id: repository_id,
-            worktree_instance_id: worktree_id,
-        },
-        ProcedureScope::Repository { repository_id } => AtomScope::Repository {
-            repository_instance_id: repository_id,
-        },
-        ProcedureScope::Global => AtomScope::Global,
     }
 }
 

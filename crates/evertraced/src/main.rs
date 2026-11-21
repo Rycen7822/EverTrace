@@ -1730,12 +1730,13 @@ async fn read_proposal_review(
         item.as_ref()
             .zip(digest.as_deref())
             .is_some_and(|(item, digest)| {
-                evertrace_protocol::dto::web_accept_available(
+                evertrace_protocol::dto::web_acceptance_intent(
                     item,
                     page.frontier,
                     digest,
                     core_anchor.as_deref(),
                 )
+                .is_some()
             });
     Ok(HumanGovernanceResponse::ProposalReview {
         frontier: page.frontier,
@@ -1770,7 +1771,7 @@ async fn accept_web_review(
             current_revision_ref,
         });
     }
-    match Box::pin(read_proposal_review(
+    let intent = match Box::pin(read_proposal_review(
         service,
         &id.to_string(),
         &revision.to_string(),
@@ -1780,9 +1781,17 @@ async fn accept_web_review(
     .await?
     {
         HumanGovernanceResponse::ProposalReview {
+            item: Some(item),
             web_accept_available: true,
+            core_anchor,
             ..
-        } => (),
+        } => evertrace_protocol::dto::web_acceptance_intent(
+            &item,
+            frontier,
+            &digest,
+            core_anchor.as_deref(),
+        )
+        .ok_or(HumanGovernanceError::Store)?,
         HumanGovernanceResponse::Conflict { .. } => {
             return Ok(EngineHumanActionOutcome::Conflict {
                 current_revision_ref: None,
@@ -1793,8 +1802,8 @@ async fn accept_web_review(
                 reason: "web_acceptance_unavailable_for_proposal",
             });
         }
-    }
-    Box::pin(acceptance.accept_reviewed_web(request_id, frontier, id, revision, &digest)).await
+    };
+    Box::pin(acceptance.accept_reviewed_web(service, request_id, id, revision, intent)).await
 }
 
 fn map_human_page(page: evertrace_engine::HumanPage) -> HumanGovernanceResponse {

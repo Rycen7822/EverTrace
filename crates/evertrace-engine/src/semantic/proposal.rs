@@ -227,7 +227,7 @@ impl AtomAcceptanceContext {
             } => ProposalAcceptanceAuthority::WebAcceptance {
                 user_source_observation_ref: observation.source_observation_id,
                 authorized_scope_ceiling: authorized_scope_ceiling.clone(),
-                intent: *intent,
+                intent: intent.clone(),
             },
             Self::ReauthorizationTui {
                 observation,

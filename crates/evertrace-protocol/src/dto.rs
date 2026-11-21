@@ -842,8 +842,15 @@ pub fn proposal_confirmation_digest(item: &HumanSnapshotItem, frontier: u64) -> 
         .proposal_review
         .as_ref()
         .filter(|review| review.proposal.status.is_open())?;
-    let digest =
-        evertrace_domain::semantic::proposal_review_digest(frontier, review, &item.proposal_base)?;
+    let digest = review_intent(item, frontier)
+        .map(|intent| intent.review_digest)
+        .or_else(|| {
+            evertrace_domain::semantic::proposal_review_digest(
+                frontier,
+                review,
+                &item.proposal_base,
+            )
+        })?;
     Some(evertrace_domain::evidence::hex(&digest))
 }
 
@@ -855,15 +862,44 @@ pub struct ProposalConfirmation {
     pub expected_digest: String,
 }
 
-pub fn web_accept_available(
+fn review_intent(
+    item: &HumanSnapshotItem,
+    frontier: u64,
+) -> Option<evertrace_domain::semantic::WebAcceptanceIntent> {
+    let review = item.proposal_review.as_ref().filter(|review| {
+        review.plain_accept_eligible
+            && !review.merge_and_accept_eligible
+            && review.reauthorization.is_none()
+    })?;
+    if let Some(revision) = review.proposal.base_revision_id {
+        let base = item
+            .proposal_base
+            .as_ref()
+            .filter(|base| base.state == HumanContentState::Ready)?;
+        let Some(HumanSemanticContent::Procedure(base)) = base.content.as_ref() else {
+            return None;
+        };
+        if base.revision_id != revision
+            || review.proposal.target_id != Some(ProposalTargetId::Procedure(base.procedure_id))
+        {
+            return None;
+        }
+    }
+    evertrace_domain::semantic::WebAcceptanceIntent::for_review(
+        &review.proposal,
+        frontier,
+        review.capability_coverage.as_ref(),
+    )
+}
+
+pub fn web_acceptance_intent(
     item: &HumanSnapshotItem,
     frontier: u64,
     digest: &str,
     core_anchor: Option<&HumanSemanticDetail>,
-) -> bool {
+) -> Option<evertrace_domain::semantic::WebAcceptanceIntent> {
     item.proposal_review
         .as_ref()
-        .filter(|review| review.plain_accept_eligible && review.reauthorization.is_none())
         .filter(|review| {
             review
                 .proposal
@@ -875,13 +911,8 @@ pub fn web_accept_available(
                     })
                 })
         })
-        .and_then(|review| {
-            evertrace_domain::semantic::WebAcceptanceIntent::for_proposal(
-                &review.proposal,
-                frontier,
-            )
-        })
-        .is_some_and(|intent| evertrace_domain::evidence::hex(&intent.review_digest) == digest)
+        .and_then(|_| review_intent(item, frontier))
+        .filter(|intent| evertrace_domain::evidence::hex(&intent.review_digest) == digest)
 }
 
 impl HumanGovernanceRequest {
@@ -1303,12 +1334,13 @@ impl HumanGovernanceResponse {
                         && core_anchor.as_ref().is_none_or(|anchor| anchor.validate())
                         && (!available
                             || confirmation_digest.as_deref().is_some_and(|digest| {
-                                web_accept_available(
+                                web_acceptance_intent(
                                     item,
                                     *frontier,
                                     digest,
                                     core_anchor.as_deref(),
                                 )
+                                .is_some()
                             }))
                         && confirmation_digest.as_deref().is_none_or(valid_hex)
                         && (confirmation_digest.is_some()

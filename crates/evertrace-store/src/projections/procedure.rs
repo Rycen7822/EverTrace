@@ -513,8 +513,38 @@ impl ProcedureState {
                     _ => None,
                 })
                 .collect::<Vec<_>>();
-            let edit_command = accepted_edits.contains(&proposal.proposal_id);
-            if edit_command {
+            let web = proposal.acceptance.as_ref().is_some_and(|acceptance| {
+                matches!(
+                    acceptance.authority_basis,
+                    evertrace_domain::semantic::ProposalAcceptanceAuthority::WebAcceptance { .. }
+                )
+            });
+            if web {
+                use ProcedurePublicationState as S;
+                use evertrace_domain::procedure::ProcedureStateReason as R;
+                let mut states = payloads
+                    .iter()
+                    .filter_map(|payload| match payload {
+                        JournalPayload::ProcedureStateRecorded(state) => {
+                            Some((state.procedure_revision_id, state.to_state, state.reason))
+                        }
+                        _ => None,
+                    })
+                    .collect::<Vec<_>>();
+                states.sort_by_key(|state| state.0);
+                let mut expected = Vec::new();
+                if !materialized.is_empty() {
+                    expected.push((*procedure_revision_id, S::ActiveProbationary, R::Accepted));
+                    if let Some(base) = proposal.base_revision_id {
+                        expected.push((base, S::Superseded, R::Replaced));
+                    }
+                    expected.sort_by_key(|state| state.0);
+                }
+                if states != expected {
+                    return Err(StoreError::StoreCorrupt);
+                }
+            }
+            if web || accepted_edits.contains(&proposal.proposal_id) {
                 if payloads
                     .iter()
                     .filter(|payload| {

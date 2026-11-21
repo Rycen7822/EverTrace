@@ -119,6 +119,39 @@ impl HumanGovernanceService {
         }
     }
 
+    pub(crate) async fn web_procedure_base_accessible(
+        &self,
+        snapshot: &ProjectionSnapshot,
+        proposal: &RevisionProposal,
+    ) -> Result<bool, HumanGovernanceError> {
+        let Some(ProposalTargetId::Procedure(id)) = proposal.target_id else {
+            return Ok(proposal.base_revision_id.is_none());
+        };
+        let Some(base) = proposal.base_revision_id else {
+            return Ok(false);
+        };
+        let reference = base.to_string();
+        let Some((row, true)) = super::super::actions::select_object_row(snapshot, &reference)
+            .map_err(|_| HumanGovernanceError::Store)?
+        else {
+            return Ok(false);
+        };
+        if row.object_kind.as_deref() != Some("procedure_revision")
+            || row.object_id.as_deref() != Some(id.to_string().as_str())
+            || row.current_revision_id.as_deref() != Some(reference.as_str())
+        {
+            return Ok(false);
+        }
+        match self
+            .readable_row(snapshot, row, std::time::Instant::now() + READ_DEADLINE)
+            .await
+        {
+            Ok(()) => Ok(true),
+            Err(export::Failure::Denied) => Ok(false),
+            Err(_) => Err(HumanGovernanceError::Store),
+        }
+    }
+
     pub(super) async fn semantic_details(
         &self,
         snapshot: &ProjectionSnapshot,

@@ -389,12 +389,12 @@ impl HumanAcceptanceService {
             .map_err(|_| HumanGovernanceError::Store)?
         {
             // A different already-committed use of this request ID cannot be overwritten.
-            if web_acceptance_outcome(&committed, reviewed, intent).is_some() {
+            if web_acceptance_outcome(&committed, reviewed, |saved| saved == &intent).is_some() {
                 verify_acceptance_payload_cohort(
                     &committed.payloads,
                     verified,
                     reviewed,
-                    Some(intent),
+                    Some(&intent),
                 )?;
             }
             return Ok(());
@@ -418,11 +418,19 @@ impl HumanAcceptanceService {
                     .web_core_anchor_at(snapshot, view, reviewed)
                     .await?
                     .is_none())
+            || (intent.procedure_coverage.is_some()
+                && !service
+                    .web_procedure_base_accessible(snapshot, reviewed)
+                    .await?)
         {
             return Ok(());
         }
         let at = now_us()?;
-        let command = self.web_acceptance_command(verified, view, reviewed, intent, at)?;
+        let command =
+            match self.web_acceptance_command(verified, snapshot, view, reviewed, &intent, at) {
+                Err(HumanGovernanceError::InvalidInput) => return Ok(()),
+                result => result?,
+            };
         self.writer
             .commit_if_frontier(command, at, snapshot.frontier)
             .await
@@ -433,16 +441,17 @@ impl HumanAcceptanceService {
             .await
             .map_err(|_| HumanGovernanceError::Store)?
             .ok_or(HumanGovernanceError::Store)?;
-        verify_acceptance_payload_cohort(&committed.payloads, verified, reviewed, Some(intent))?;
+        verify_acceptance_payload_cohort(&committed.payloads, verified, reviewed, Some(&intent))?;
         Ok(())
     }
 
     fn web_acceptance_command(
         &self,
         verified: &crate::capture::VerifiedCapture,
+        snapshot: &ProjectionSnapshot,
         view: &SemanticCurrentView,
         reviewed: &RevisionProposal,
-        intent: WebAcceptanceIntent,
+        intent: &WebAcceptanceIntent,
         occurred_at_us: i64,
     ) -> Result<JournalCommand, HumanGovernanceError> {
         let context = ProposalCommandContext {
@@ -456,7 +465,7 @@ impl HumanAcceptanceService {
             receipt: Box::new(verified.receipt.clone()),
             authorized_scope_ceiling: WebAcceptanceIntent::scope(reviewed)
                 .ok_or(HumanGovernanceError::Store)?,
-            intent,
+            intent: intent.clone(),
         };
         let accepted = if let Some((revision, scope)) = reviewed.core_creation() {
             let atom = scope
@@ -477,12 +486,33 @@ impl HumanAcceptanceService {
                 },
             )
             .map(|accepted| accepted.command)
+        } else if matches!(reviewed.payload, ProposalPayload::Procedure(_)) {
+            let (current, publication) = current_procedure(snapshot, reviewed)?;
+            accept_procedure(
+                view,
+                context,
+                reviewed.proposal_id,
+                ProcedureAcceptanceContext::Manual(authority),
+                current.as_ref(),
+                publication,
+                &self.global_promotion,
+            )
+            .and_then(|result| match result {
+                ProcedureAcceptanceResolution::Command { command, .. }
+                | ProcedureAcceptanceResolution::AcceptedExisting { command, .. } => Ok(command),
+                ProcedureAcceptanceResolution::NoDelta => {
+                    Err(crate::semantic::SemanticServiceError::BaseConflict)
+                }
+            })
         } else {
             RevisionProposalService
                 .accept(view, context, reviewed.proposal_id, authority)
                 .map(|accepted| accepted.command)
         }
-        .map_err(|_| HumanGovernanceError::Store)?;
+        .map_err(|err| match err {
+            crate::semantic::SemanticServiceError::Store(_) => HumanGovernanceError::Store,
+            _ => HumanGovernanceError::InvalidInput,
+        })?;
         let mut events = capture_event_drafts(
             verified,
             None,
@@ -497,11 +527,11 @@ impl HumanAcceptanceService {
 
     pub async fn accept_reviewed_web(
         &self,
+        service: &crate::HumanGovernanceService,
         request_id: RequestId,
-        frontier: u64,
         id: RevisionProposalId,
         revision: RevisionId,
-        digest: &str,
+        intent: WebAcceptanceIntent,
     ) -> Result<HumanActionOutcome, HumanGovernanceError> {
         let conflict = || HumanActionOutcome::Conflict {
             current_revision_ref: None,
@@ -529,16 +559,19 @@ impl HumanAcceptanceService {
             .map_err(|_| HumanGovernanceError::Store)?;
         let view = SemanticCurrentView::from_snapshot(&snapshot)
             .map_err(|_| HumanGovernanceError::Store)?;
+        let frontier = intent.reviewed_frontier;
         let Some(proposal) = view.proposals.get(&id).filter(|proposal| {
             snapshot.frontier == frontier && proposal.proposal_revision_id == revision
         }) else {
             return Ok(conflict());
         };
-        let Some(intent) = WebAcceptanceIntent::for_proposal(proposal, frontier)
-            .filter(|intent| hex(&intent.review_digest) == digest)
-        else {
+        if intent.procedure_coverage.is_some()
+            && !service
+                .web_procedure_base_accessible(&snapshot, proposal)
+                .await?
+        {
             return Ok(conflict());
-        };
+        }
         if !matches!(
             deletion_admission(&snapshot, proposal)?,
             ObjectDeletionCandidateAdmission::Clear
@@ -588,7 +621,14 @@ impl HumanAcceptanceService {
         let verified =
             verify_capture_frame(frame, &cas).map_err(|_| HumanGovernanceError::Store)?;
         let at = now_us()?;
-        let batch = self.web_acceptance_command(&verified, &view, proposal, intent, at)?;
+        let batch =
+            match self.web_acceptance_command(&verified, &snapshot, &view, proposal, &intent, at) {
+                Err(HumanGovernanceError::InvalidInput) => {
+                    acknowledge_web_reservation(&spool, &segment).await?;
+                    return Ok(conflict());
+                }
+                result => result?,
+            };
         match self.writer.commit_if_frontier(batch, at, frontier).await {
             Ok(_) => (),
             Err(
@@ -606,8 +646,8 @@ impl HumanAcceptanceService {
             .await
             .map_err(|_| HumanGovernanceError::Store)?
             .ok_or(HumanGovernanceError::Store)?;
-        verify_acceptance_payload_cohort(&committed.payloads, &verified, proposal, Some(intent))?;
-        let outcome = web_acceptance_outcome(&committed, proposal, intent)
+        verify_acceptance_payload_cohort(&committed.payloads, &verified, proposal, Some(&intent))?;
+        let outcome = web_acceptance_outcome(&committed, proposal, |saved| saved == &intent)
             .ok_or(HumanGovernanceError::Store)?;
         acknowledge_web_reservation(&spool, &segment).await?;
         Ok(outcome)
@@ -646,12 +686,11 @@ impl HumanAcceptanceService {
         else {
             return Ok(HumanActionOutcome::Unknown);
         };
-        let Some(intent) = WebAcceptanceIntent::for_proposal(proposal, frontier)
-            .filter(|intent| hex(&intent.review_digest) == digest)
-        else {
-            return Ok(HumanActionOutcome::Unknown);
-        };
-        let Some(outcome) = web_acceptance_outcome(&committed, proposal, intent) else {
+        let Some(outcome) = web_acceptance_outcome(&committed, proposal, |saved| {
+            saved.reviewed_frontier == frontier
+                && hex(&saved.review_digest) == digest
+                && saved.canonical(proposal).is_some()
+        }) else {
             return Ok(HumanActionOutcome::Unknown);
         };
         if !service.proposal_accessible(&snapshot, proposal).await? {
@@ -2617,7 +2656,7 @@ fn validate_current_edit_cohort(
 fn web_acceptance_outcome(
     committed: &evertrace_store::CommittedCommand,
     proposal: &RevisionProposal,
-    intent: WebAcceptanceIntent,
+    matches_intent: impl Fn(&WebAcceptanceIntent) -> bool,
 ) -> Option<HumanActionOutcome> {
     committed.payloads.iter().zip(&committed.event_ids).find_map(|(payload, event)| {
         let JournalPayload::RevisionProposalRecorded(value) = payload else { return None; };
@@ -2626,7 +2665,7 @@ fn web_acceptance_outcome(
             && value.proposal_id == proposal.proposal_id
             && audit.reviewed_proposal_revision_id == proposal.proposal_revision_id
             && audit.reviewed_fingerprint == proposal.fingerprint
-            && matches!(audit.authority_basis, ProposalAcceptanceAuthority::WebAcceptance { intent: saved, .. } if saved == intent)
+            && matches!(&audit.authority_basis, ProposalAcceptanceAuthority::WebAcceptance { intent, .. } if matches_intent(intent))
         {
             return Some(HumanActionOutcome::Applied {
                 current_revision_ref: value.proposal_revision_id.to_string(),
@@ -2641,7 +2680,7 @@ fn verify_acceptance_payload_cohort(
     payloads: &[JournalPayload],
     verified: &crate::capture::VerifiedCapture,
     reviewed: &RevisionProposal,
-    expected_web_intent: Option<WebAcceptanceIntent>,
+    expected_web_intent: Option<&WebAcceptanceIntent>,
 ) -> Result<RevisionProposal, HumanGovernanceError> {
     let mut receipt_count = 0;
     let mut observation_count = 0;
@@ -2724,7 +2763,7 @@ fn verify_acceptance_payload_cohort(
                                 ) => {
                                     *user_source_observation_ref
                                         == verified.observation.source_observation_id
-                                        && *intent == expected
+                                        && intent == expected
                                 }
                                 _ => false,
                             }

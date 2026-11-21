@@ -34,6 +34,24 @@
       {% endif %}
     {% elif payload.kind == 'procedure' %}
       {% with content={'kind': 'procedure_draft', 'value': change} %}{% include 'semantic_content.html' %}{% endwith %}
+      {% set coverage = review.get('capability_coverage') %}
+      <h4>原生能力覆盖</h4>
+      {% if coverage %}
+        <dl class="observation-facts">
+          <dt>资产 / 未观察来源 / 未知合同</dt>
+          <dd>{{ coverage.present_assets }} / {{ coverage.unobserved_sources }} / {{ coverage.unknown_contracts }}</dd>
+          <dt>参与比较的库存记录</dt><dd>{{ coverage.inventory_refs|length }}</dd>
+          <dt>可能冗余</dt><dd>{{ '是' if coverage.likely_redundant else '本次未判定为可能冗余' }}</dd>
+          <dt>增量比较的基准</dt>
+          <dd>{% if coverage.incremental_base_revision %}{{ exact_work_link('procedure_revision', coverage.incremental_base_revision) }}
+            {% else %}未确定{% endif %}</dd>
+        </dl>
+        {{ text_list('未覆盖的证据', coverage.omissions) }}
+        {{ text_list('等价资产的证据等级', coverage.equivalent_assets|map(attribute='level')|list) }}
+        <p>覆盖缺口不代表未使用；人工接受不授予自动发布资格。</p>
+      {% else %}
+        <p>没有可核对的能力覆盖结果。</p>
+      {% endif %}
     {% elif payload.kind == 'core_membership' %}
       <h4>拟议 Core 范围</h4><p>{{ change.scope_identity.kind }} {{ change.scope_identity.id|default('') }}</p>
       {% if change.action == 'create' %}
