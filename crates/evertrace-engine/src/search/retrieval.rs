@@ -70,6 +70,7 @@ pub(super) struct NativeRetrieval<'a> {
     pub sequence_scope: Option<&'a super::SourceSequenceScope>,
     pub time_scope: Option<&'a super::TemporalReadScope<'a>>,
     pub relation_sources: Option<RelationSources<'a>>,
+    pub include_hit_window: bool,
 }
 
 fn snippet_end(text: &str) -> usize {
@@ -600,6 +601,7 @@ impl NativeRetrieval<'_> {
             return Ok(HumanSearchPage {
                 result: self.result,
                 grounded_view: None,
+                hit_window: None,
             });
         }
         if self
@@ -785,9 +787,10 @@ impl NativeRetrieval<'_> {
         let revision_bridge = self.time_scope.and_then(|scope| {
             scope.missing_revision_bridge(&self.result.candidates, &self.deadline)
         });
-        // Freeze the base candidates and their relation traces before deciding whether E can run.
+        // The hit stream is independent of display and quote packing; GEV keeps its own compact base.
+        let mut hit_window = self.include_hit_window.then(Vec::new);
         let mut clipped_exact = BTreeMap::new();
-        self.pack(&mut clipped_exact)?;
+        self.pack(&mut clipped_exact, hit_window.as_mut())?;
         // A slot is supported only if every admitted edge of that kind fits in the reply.
         let mut witnessed = BTreeSet::new();
         let mut projected = Vec::new();
@@ -860,6 +863,8 @@ impl NativeRetrieval<'_> {
                     && revision_bridge.is_some_and(|(endpoint, _)| endpoint == gap.identifier)
                     && self.result.budget.hops_remaining >= 2))
             && gap.validate_follow_up().is_ok()
+            // Packing must not manufacture a missing operand or a unique delta.
+            && (hit_window.is_none() || self.result.omitted_refs.is_empty())
             && self.result.budget.follow_ups_remaining > 0
             && access.as_ref().is_none_or(|access| {
                 access.checks_remaining >= 2
@@ -1073,7 +1078,7 @@ impl NativeRetrieval<'_> {
                 self.degraded("named_gap_ambiguous");
             }
         }
-        self.pack(&mut clipped_exact)?;
+        self.pack(&mut clipped_exact, None)?;
         if let Some(scope) = self.time_scope {
             scope.align_revision_domain(
                 &mut self.result.candidates,
@@ -1327,6 +1332,7 @@ impl NativeRetrieval<'_> {
         Ok(HumanSearchPage {
             result: self.result,
             grounded_view: Some(view),
+            hit_window,
         })
     }
     fn output_limit(&self) -> usize {
@@ -1350,6 +1356,7 @@ impl NativeRetrieval<'_> {
     fn pack(
         &mut self,
         clipped_exact: &mut BTreeMap<String, BTreeSet<String>>,
+        hit_window: Option<&mut Vec<HumanSearchHit>>,
     ) -> Result<(), SearchError> {
         if self.context.unverified_hard_constraint() {
             self.result
@@ -1363,6 +1370,14 @@ impl NativeRetrieval<'_> {
                         ))
                 })
             });
+        }
+        if let Some(window) = hit_window {
+            window.extend(
+                self.result
+                    .candidates
+                    .iter()
+                    .map(HumanSearchHit::from_candidate),
+            );
         }
         let limit = self.output_limit();
         let text_limit = self.answer_text_limit();
@@ -1501,6 +1516,7 @@ impl NativeRetrieval<'_> {
         HumanSearchPage {
             result: self.result,
             grounded_view: None,
+            hit_window: None,
         }
     }
 }

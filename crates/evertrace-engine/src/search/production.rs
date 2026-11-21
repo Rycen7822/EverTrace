@@ -733,6 +733,7 @@ impl ProductionSearch {
             return Ok(HumanSearchPage {
                 result: self.search(context).await?,
                 grounded_view: None,
+                hit_window: None,
             });
         }
         let deadline = RequestDeadline::new(Instant::now(), context.budget.latency_us_remaining);
@@ -748,6 +749,7 @@ impl ProductionSearch {
                 return Ok(HumanSearchPage {
                     result: deadline_result(context, "snapshot_deadline_exhausted", 0, 0),
                     grounded_view: None,
+                    hit_window: None,
                 });
             }
         };
@@ -783,6 +785,7 @@ impl ProductionSearch {
             sequence_scope: self.sequence_scope.as_ref(),
             time_scope,
             relation_sources: Some(relation_sources),
+            include_hit_window: true,
         }
         .run(snapshot)
         .await
@@ -1132,6 +1135,7 @@ impl ProductionSearch {
             sequence_scope: None,
             time_scope,
             relation_sources: None,
+            include_hit_window: false,
         };
         if source_count || time_scope.is_some() {
             let mode = if source_count {
@@ -1253,6 +1257,7 @@ impl ProductionSearch {
             sequence_scope: self.sequence_scope.as_ref(),
             time_scope: None,
             relation_sources: None,
+            include_hit_window: false,
         };
         let has_unread_source = self.candidate_grants.as_ref().is_some_and(|grants| {
             grants.evidence_sources.iter().any(|id| {
@@ -1381,8 +1386,13 @@ impl ProductionSearch {
         if exact_atom_only {
             filter.object_kind = Some("atom_revision".into());
         }
-        let requested_limit =
-            candidate_limit(&context.query_facets, context.budget.candidates_remaining);
+        let human_window = self.readable_refs.is_some();
+        let maximum = context.budget.candidates_remaining;
+        let requested_limit = if human_window {
+            maximum
+        } else {
+            candidate_limit(&context.query_facets, maximum)
+        };
         let limit = usize::try_from(requested_limit).map_err(|_| SearchError::Unsupported)?;
         let fetch_limit = if limit >= 32 {
             limit
@@ -1547,7 +1557,7 @@ impl ProductionSearch {
                         &context.protected_query
                     },
                     &filter,
-                    fetch_limit,
+                    fetch_limit + usize::from(human_window),
                 ))
                 .await
             {
@@ -1928,6 +1938,7 @@ fn ungrounded(result: SearchResult) -> HumanSearchPage {
     HumanSearchPage {
         result,
         grounded_view: None,
+        hit_window: None,
     }
 }
 

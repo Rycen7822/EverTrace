@@ -854,6 +854,7 @@ impl HumanGovernanceService {
                         budget: budget(),
                     },
                     grounded_view: None,
+                    hit_window: None,
                 });
             };
             let index = export::presentation_index(&snapshot, deadline)
@@ -1156,21 +1157,35 @@ impl HumanGovernanceService {
             // Trust/report state can change without a new journal event. Recheck
             // returned and interpretation dependencies before exposing fields.
             let mut access_changed = false;
-            for candidate in &page.result.candidates {
-                let id = if candidate.row_variant == SearchCandidateVariant::EvidenceSurface {
-                    &candidate.source_ref
-                } else {
-                    &candidate.candidate_id
-                };
+            let mut recheck = |id: &str| {
                 if let Some(inputs) = wiki.get(id) {
                     checks.extend(inputs.iter().cloned());
                 } else {
-                    checks.insert(id.clone());
+                    checks.insert(id.to_owned());
                 }
+            };
+            let quoted = page.result.candidates.iter().map(|candidate| {
+                if candidate.row_variant == SearchCandidateVariant::EvidenceSurface {
+                    candidate.source_ref.as_str()
+                } else {
+                    candidate.candidate_id.as_str()
+                }
+            });
+            for reference in quoted.chain(
+                page.hit_window
+                    .iter()
+                    .flatten()
+                    .map(HumanSearchHit::access_reference),
+            ) {
+                recheck(reference);
             }
             for id in &page.result.omitted_refs {
-                if let Some(inputs) = wiki.get(id) {
-                    checks.extend(inputs.iter().cloned());
+                if let Some((source, _, _)) =
+                    evertrace_domain::evidence::EvidenceSurface::parse_candidate_ref(id)
+                {
+                    recheck(&source.to_string());
+                } else {
+                    recheck(id);
                 }
             }
             for reference in &checks {
@@ -1234,6 +1249,7 @@ impl HumanGovernanceService {
                     .degraded_reasons
                     .insert("read_access_changed".into());
                 page.grounded_view = None;
+                page.hit_window = None;
             }
             if recall_incomplete {
                 page.result

@@ -4081,11 +4081,52 @@ impl HumanSearchQuery {
     }
 }
 
+/// One admitted hit's identity. The ordered window carries no display text or access grant.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct HumanSearchHit {
+    pub candidate_id: String,
+    pub source_ref: String,
+    pub row_variant: SearchCandidateVariant,
+    pub object_kind: Option<String>,
+    pub currentness: Option<SearchCurrentness>,
+}
+
+impl HumanSearchHit {
+    pub fn from_candidate(candidate: &SearchCandidate) -> Self {
+        Self {
+            candidate_id: candidate.candidate_id.clone(),
+            source_ref: candidate.source_ref.clone(),
+            row_variant: candidate.row_variant.clone(),
+            object_kind: candidate.object_kind.clone(),
+            currentness: candidate.currentness,
+        }
+    }
+
+    pub fn access_reference(&self) -> &str {
+        match self.row_variant {
+            SearchCandidateVariant::Object => &self.candidate_id,
+            SearchCandidateVariant::EvidenceSurface => &self.source_ref,
+        }
+    }
+
+    fn matches(&self, candidate: &SearchCandidate) -> bool {
+        self.candidate_id == candidate.candidate_id
+            && self.source_ref == candidate.source_ref
+            && self.row_variant == candidate.row_variant
+            && self.object_kind == candidate.object_kind
+            && self.currentness == candidate.currentness
+    }
+}
+
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct HumanSearchPage {
     pub result: SearchResult,
     pub grounded_view: Option<GroundedEvidenceView>,
+    /// The bounded Native hit stream in admission order, independent of quote packing. Never a corpus total.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub hit_window: Option<Vec<HumanSearchHit>>,
 }
 impl HumanSearchPage {
     pub fn validate(&self) -> bool {
@@ -4126,10 +4167,51 @@ impl HumanSearchPage {
                     && self.latest_derivation_valid(view)
                     && self.comparison_derivation_valid(view)
             })
+            && self.hit_window_valid()
             && self.quoted_statements_valid()
             && self.timeline_order_valid()
             && self.sequence_positions_valid()
             && self.time_positions_valid()
+    }
+
+    fn hit_window_valid(&self) -> bool {
+        let Some(window) = &self.hit_window else {
+            return true;
+        };
+        if self.result.completeness == RetrievalCompleteness::Unknown
+            || self.result.projection_frontier != self.result.authoritative_frontier
+            || window.len() > 32
+            || self.result.budget.candidates_remaining as usize > 32 - window.len()
+        {
+            return false;
+        }
+        let delta = self
+            .grounded_view
+            .as_ref()
+            .and_then(|view| view.candidate_set.added_candidate_refs.first());
+        let mut seen = BTreeSet::new();
+        let mut ordered = window.iter();
+        window.iter().all(|hit| {
+            Some(&hit.candidate_id) != delta
+                && !hit.candidate_id.is_empty()
+                && !hit.source_ref.is_empty()
+                && hit.candidate_id.len() <= 512
+                && hit.source_ref.len() <= 512
+                && seen.insert(&hit.candidate_id)
+                && match hit.row_variant {
+                    SearchCandidateVariant::Object => {
+                        hit.currentness.is_some() && hit.object_kind.is_some()
+                    }
+                    SearchCandidateVariant::EvidenceSurface => {
+                        hit.currentness.is_none() && hit.object_kind.is_none()
+                    }
+                }
+        }) && self
+            .result
+            .candidates
+            .iter()
+            .filter(|candidate| Some(&candidate.candidate_id) != delta)
+            .all(|candidate| ordered.any(|hit| hit.matches(candidate)))
     }
 
     fn follow_up_boundary_valid(&self, view: &GroundedEvidenceView) -> bool {
