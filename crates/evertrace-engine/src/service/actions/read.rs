@@ -567,18 +567,26 @@ impl McpActionService {
                     blocked_candidates.insert(candidate.candidate_id.clone());
                 }
             }
-            if let Some(operation) = physical
-                && (fresh_access.frontier != read_access.frontier
-                    || Box::pin(self.physical_binding_operands(
+            if let Some(operation) = physical {
+                let rechecked = if fresh_access.frontier == read_access.frontier {
+                    Box::pin(self.physical_binding_operands(
                         &scope,
                         &fresh_access,
                         operation,
                         &mut archive_budget,
                     ))
                     .await
-                    .is_none())
-            {
-                blocked_candidates.extend(candidate_ids.iter().cloned());
+                } else {
+                    None
+                };
+                if rechecked.as_ref().is_none_or(|(_, binding)| {
+                    binding.is_none()
+                        && selected_candidates.iter().any(|candidate| {
+                            candidate.object_kind.as_deref() == Some("work_binding")
+                        })
+                }) {
+                    blocked_candidates.extend(candidate_ids.iter().cloned());
+                }
             }
             let method_hits = found
                 .candidates
@@ -712,7 +720,10 @@ impl McpActionService {
                             .degraded_reasons
                             .insert("search_bounded_operator_partial".into());
                     }
-                    if explicit_exact || (atom_relation && !grounded.unresolved_gaps.is_empty()) {
+                    if explicit_exact
+                        || ((atom_relation || physical.is_some())
+                            && !grounded.unresolved_gaps.is_empty())
+                    {
                         let reason = if explicit_exact {
                             "search_exact_request_partial"
                         } else {
@@ -790,24 +801,31 @@ impl McpActionService {
             };
             let refs = operands
                 .iter()
-                .chain(std::iter::once(&binding))
+                .chain(binding.iter())
                 .filter_map(|row| row.candidate_id.clone())
                 .collect();
             let sources = |targets: &[String], readable: &BTreeSet<String>| {
                 Ok(binding
-                    .candidate_id
-                    .as_ref()
-                    .filter(|id| targets.contains(id) && readable.contains(*id))
-                    .map(|_| binding.clone())
-                    .into_iter()
+                    .iter()
+                    .filter(|row| {
+                        row.candidate_id
+                            .as_ref()
+                            .is_some_and(|id| targets.contains(id) && readable.contains(id))
+                    })
+                    .cloned()
                     .collect())
             };
-            let (page, _) = search
+            let (mut page, _) = search
                 .with_readable_refs(access.frontier, refs)
                 .with_canonical_sources(access.frontier, operands)
                 .retrieve(context, false, None, &sources)
                 .await
                 .map_err(|_| McpServiceError::Store)?;
+            if binding.is_none() {
+                page.result
+                    .degraded_reasons
+                    .insert("search_relation_source_unavailable".into());
+            }
             Ok(Some(page))
         })
     }
@@ -820,7 +838,7 @@ impl McpActionService {
         archive_budget: &mut RelationArchiveBudget,
     ) -> Option<(
         Vec<evertrace_store::SearchProjectionRow>,
-        evertrace_store::SearchProjectionRow,
+        Option<evertrace_store::SearchProjectionRow>,
     )> {
         use crate::search::read_context::{
             check_relation_archive, operation_binding_read, operation_binding_references,
@@ -882,7 +900,7 @@ impl McpActionService {
             let row = closure.selected.as_ref()?;
             let index = physical_read_index(&closure.rows);
             let proof = operation_binding_read(row, &index)?;
-            let operands = proof.scoped_operands(selected_scope, &mut binding)?;
+            let mut operands = proof.scoped_operands(selected_scope, &mut binding)?;
             if operands.len() != 2 {
                 return None;
             }
@@ -906,7 +924,7 @@ impl McpActionService {
                     .ok()?;
             }
             if !check_relation_archive(
-                &proof.sources,
+                &proof.physical_sources,
                 &self.writer,
                 &self.runtime_snapshot.cas_dir,
                 &index,
@@ -917,7 +935,33 @@ impl McpActionService {
             {
                 return None;
             }
-            Some((operands, binding))
+            let assignment_sources = proof
+                .sources
+                .difference(&proof.physical_sources)
+                .cloned()
+                .collect::<BTreeSet<_>>();
+            if assignment_sources.is_empty()
+                || check_relation_archive(
+                    &assignment_sources,
+                    &self.writer,
+                    &self.runtime_snapshot.cas_dir,
+                    &index,
+                    archive_budget,
+                    access.deadline,
+                )
+                .await
+            {
+                return Some((operands, Some(binding)));
+            }
+            // Only the physical effect establishes the repository/worktree. Do not use missing assignment
+            // evidence to ascribe the independently verifiable prefix to a Task, even when a repository is selected.
+            if anchor.task_id.is_some() || anchor.repository_id.is_none() {
+                return None;
+            }
+            for operand in &mut operands {
+                operand.task_id = None;
+            }
+            Some((operands, None))
         };
         tokio::time::timeout_at(tokio::time::Instant::from_std(access.deadline), read)
             .await

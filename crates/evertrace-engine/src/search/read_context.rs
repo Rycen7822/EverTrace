@@ -120,7 +120,7 @@ pub(crate) async fn check_relation_archive(
                 }
                 Ok(())
             };
-            let verify = || -> Result<RelationArchiveBudget, CasError> {
+            let verify = || -> Result<(), CasError> {
                 let cas = CasStore::open_existing(cas_dir)?;
                 for (receipt, observation) in archives {
                     check()?;
@@ -138,22 +138,30 @@ pub(crate) async fn check_relation_archive(
                     remaining.encoded -= window.encoded_bytes;
                     remaining.decoded -= window.total_bytes;
                 }
-                check()?;
-                Ok(remaining)
+                check()
             };
-            Ok(verify().ok())
+            let result = verify();
+            Ok((result, remaining))
         })
         .await;
-    if let Ok(Some(remaining)) = read {
-        *budget = remaining;
-        true
-    } else {
-        // A failed verification may have consumed the read budget. Do not retry it within this stream.
-        *budget = RelationArchiveBudget {
-            encoded: 0,
-            decoded: 0,
-        };
-        false
+    match read {
+        Ok((Ok(()), remaining)) => {
+            *budget = remaining;
+            true
+        }
+        Ok((Err(CasError::NotFound), remaining)) => {
+            // The missing file was detected before any bytes of it were read.
+            *budget = remaining;
+            false
+        }
+        _ => {
+            // A failed verification may have consumed unreported bytes.
+            *budget = RelationArchiveBudget {
+                encoded: 0,
+                decoded: 0,
+            };
+            false
+        }
     }
 }
 
@@ -570,6 +578,7 @@ pub(crate) struct OperationBindingRead<'a> {
     effects: Vec<(&'a ObjectRow, evertrace_domain::evidence::ScopeEffect)>,
     covers_operation: bool,
     pub sources: BTreeSet<String>,
+    pub physical_sources: BTreeSet<String>,
 }
 
 impl OperationBindingRead<'_> {
@@ -647,14 +656,12 @@ pub(crate) fn operation_binding_read<'a>(
     {
         return None;
     }
-    let mut sources: BTreeSet<_> = binding.evidence_refs.iter().cloned().collect();
-    sources.extend(
-        operation
-            .input_source_observation_refs
-            .iter()
-            .chain(&operation.result_source_observation_refs)
-            .map(ToString::to_string),
-    );
+    let mut physical_sources: BTreeSet<_> = operation
+        .input_source_observation_refs
+        .iter()
+        .chain(&operation.result_source_observation_refs)
+        .map(ToString::to_string)
+        .collect();
     let mut effects = Vec::new();
     for id in &binding.scope_effect_refs {
         let reference = id.to_string();
@@ -672,9 +679,14 @@ pub(crate) fn operation_binding_read<'a>(
         {
             return None;
         }
-        sources.extend(effect.evidence_refs.iter().map(ToString::to_string));
+        physical_sources.extend(effect.evidence_refs.iter().map(ToString::to_string));
         effects.push((*row, *effect));
     }
+    let sources: BTreeSet<_> = physical_sources
+        .iter()
+        .cloned()
+        .chain(binding.evidence_refs.iter().cloned())
+        .collect();
     (row.task_id.as_deref()
         == binding
             .primary_binding
@@ -689,6 +701,7 @@ pub(crate) fn operation_binding_read<'a>(
         effects,
         covers_operation: operation.scope_effect_ids.len() == binding.scope_effect_refs.len(),
         sources,
+        physical_sources,
     })
 }
 
