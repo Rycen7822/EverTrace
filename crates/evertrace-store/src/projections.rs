@@ -3911,6 +3911,16 @@ pub fn read_dependencies_for(row: &ObjectRow, payload: &JournalPayload) -> BTree
         JournalPayload::RevisionProposalRecorded(value) => {
             refs.extend(value.evidence_refs.iter().cloned());
             refs.extend(value.source_cohort_refs.iter().cloned());
+            if let ProposalPayload::Procedure(method) = &value.payload {
+                refs.extend(method.draft().evidence_refs.iter().cloned());
+                refs.extend(
+                    method
+                        .draft()
+                        .support_revision_refs
+                        .iter()
+                        .map(ToString::to_string),
+                );
+            }
         }
         JournalPayload::CoreMembershipRecorded(value) => {
             refs.insert(value.atom_revision_id.to_string());

@@ -1441,7 +1441,7 @@ impl McpActionService {
                 self.runtime_snapshot.effective_config_hash,
                 (scope.anchor.repository_id, scope.anchor.worktree_id),
                 Some(&selected),
-                std::time::Instant::now() + std::time::Duration::from_micros(750_000),
+                deadline,
             )
             .await
             .map_err(|_| McpServiceError::Store)?;
@@ -1469,24 +1469,35 @@ impl McpActionService {
             )
             .await?
             .is_empty();
-        let atom_access = SearchReadAccess {
+        let read_access = SearchReadAccess {
             writer: &self.writer,
             authority: crate::repository::RepositoryReadAuthority::observed(repository_report),
             frontier: scope.snapshot.frontier,
             config_hash: self.runtime_snapshot.effective_config_hash,
             deadline,
         };
-        if restricted
-            || row.object_kind.as_deref() == Some("atom_revision")
-                && atom_access
-                    .check_revision(
-                        row.current_revision_id
-                            .as_deref()
-                            .ok_or(McpServiceError::Store)?,
-                    )
+        let field_restricted = if restricted {
+            true
+        } else if let Some(kind @ ("atom_revision" | "revision_proposal_revision")) =
+            row.object_kind.as_deref()
+        {
+            let revision = row
+                .current_revision_id
+                .as_deref()
+                .ok_or(McpServiceError::Store)?;
+            if kind == "atom_revision" {
+                read_access.check_revision(revision).await.is_err()
+            } else {
+                let key = row.object_id.as_deref().ok_or(McpServiceError::Store)?;
+                read_access
+                    .check_current(key, revision, kind)
                     .await
                     .is_err()
-        {
+            }
+        } else {
+            false
+        };
+        if field_restricted {
             return Ok(empty_result(
                 request_id,
                 McpServiceStatus::NotFound,

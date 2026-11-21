@@ -120,6 +120,7 @@ pub(crate) const SCOPED_OBJECT_KINDS: &[&str] = &[
     "work_episode",
     "attempt",
     "procedure_revision",
+    "revision_proposal_revision",
 ];
 
 impl SearchReadAccess<'_> {
@@ -147,23 +148,39 @@ impl SearchReadAccess<'_> {
         if row.object_id.as_deref() != Some(key) {
             return Err(ErrorCode::StoreCorrupt);
         }
-        if kind == "procedure_revision" {
-            let JournalPayload::ProcedureRevisionRecorded(procedure) =
-                serde_json::from_str(row.payload_json.as_deref().ok_or(ErrorCode::StoreCorrupt)?)
-                    .map_err(|_| ErrorCode::StoreCorrupt)?
-            else {
-                return Err(ErrorCode::StoreCorrupt);
-            };
-            // A missing or suppressed hard dependency is not permission to use the indexed route text.
+        if matches!(kind, "procedure_revision" | "revision_proposal_revision") {
+            // A missing or suppressed dependency is not permission to use indexed method text.
             let present = |reference: &str| {
                 context.rows.iter().any(|fact| {
                     fact.object_id.as_deref() == Some(reference)
                         || fact.current_revision_id.as_deref() == Some(reference)
                 })
             };
-            if procedure.draft.evidence_refs.iter().any(|id| !present(id))
-                || procedure
-                    .draft
+            let payload =
+                serde_json::from_str(row.payload_json.as_deref().ok_or(ErrorCode::StoreCorrupt)?)
+                    .map_err(|_| ErrorCode::StoreCorrupt)?;
+            let draft = match &payload {
+                JournalPayload::ProcedureRevisionRecorded(procedure) => &procedure.draft,
+                JournalPayload::RevisionProposalRecorded(proposal) => {
+                    let evertrace_domain::semantic::ProposalPayload::Procedure(method) =
+                        &proposal.payload
+                    else {
+                        return Err(ErrorCode::Untrusted);
+                    };
+                    if !proposal
+                        .source_cohort_refs
+                        .iter()
+                        .chain(&proposal.evidence_refs)
+                        .all(|id| present(id))
+                    {
+                        return Err(ErrorCode::Untrusted);
+                    }
+                    method.draft()
+                }
+                _ => return Err(ErrorCode::StoreCorrupt),
+            };
+            if draft.evidence_refs.iter().any(|id| !present(id))
+                || draft
                     .support_revision_refs
                     .iter()
                     .any(|id| !present(&id.to_string()))
