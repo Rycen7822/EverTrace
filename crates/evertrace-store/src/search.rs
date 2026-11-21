@@ -919,7 +919,12 @@ impl SearchProjectionRow {
     }
 
     fn validate_canonical_source(&self) -> Result<(), StoreError> {
-        if self.row_variant != "object" || self.object_kind.as_deref() != Some("work_episode") {
+        if self.row_variant != "object"
+            || !matches!(
+                self.object_kind.as_deref(),
+                Some("work_episode" | "work_binding")
+            )
+        {
             return Err(StoreError::StoreCorrupt);
         }
         self.validate_kind(true, SEARCH_PROJECTION_GENERATION)
@@ -975,10 +980,11 @@ impl SearchProjectionRow {
         } else if self.row_variant == "object" {
             if self.source_kind.as_deref() != Some("object_projection")
                 || self.object_kind.as_deref().is_none_or(str::is_empty)
-                || !self
+                || !(self
                     .object_kind
                     .as_deref()
                     .is_some_and(is_searchable_object_kind)
+                    || canonical && self.object_kind.as_deref() == Some("work_binding"))
                 || (self.object_kind.as_deref() == Some("work_episode")
                     && !canonical
                     && (generation < 2 || self.lifecycle.as_deref() != Some("terminal")))
@@ -1102,6 +1108,14 @@ fn valid_physical_reference(row: &SearchProjectionRow) -> bool {
                 && source
                     .parse::<evertrace_domain::ids::ScopeEffectId>()
                     .is_ok()
+        }
+        Some("work_binding") => {
+            id == source
+                && source
+                    .parse::<evertrace_domain::ids::WorkBindingRevisionId>()
+                    .is_ok()
+                && row.currentness.as_deref() == Some("current")
+                && row.lifecycle.as_deref() == Some("active")
         }
         _ => true,
     }

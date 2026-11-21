@@ -5,9 +5,12 @@ use evertrace_domain::{
     semantic::{NormativeResolutionState, SemanticResolution},
 };
 
-use crate::search::read_context::RelationArchiveBudget;
+use crate::search::read_context::{
+    RelationArchiveBudget, check_relation_archive, current_operation_binding,
+    operation_binding_sources,
+};
 
-const SEARCH_HIT_ORDER_REVISION: u32 = 10;
+const SEARCH_HIT_ORDER_REVISION: u32 = 11;
 
 type SearchPolicy = Option<(String, Option<evertrace_codex::policy::PolicyEvidence>)>;
 
@@ -1077,6 +1080,26 @@ impl HumanGovernanceService {
                 {
                     return false;
                 }
+                if row.object_kind.as_deref() == Some("work_binding") {
+                    let (Some(sources), Some(runtime)) = (
+                        operation_binding_sources(row, index),
+                        &self.runtime_snapshot,
+                    ) else {
+                        return false;
+                    };
+                    if !check_relation_archive(
+                        &sources,
+                        &self.writer,
+                        &runtime.cas_dir,
+                        index,
+                        archive_budget,
+                        deadline,
+                    )
+                    .await
+                    {
+                        return false;
+                    }
+                }
                 verify_relation_archive |= index
                     .live_episode
                     .as_ref()
@@ -1480,6 +1503,40 @@ impl HumanGovernanceService {
                 proof.withhold(&mut refs);
                 relation_archive_gap = true;
             }
+            let mut binding_source = None;
+            if query.selection == MemoryScopeSelection::All
+                && let Some(row) = current_operation_binding(
+                    &search,
+                    &index,
+                    &protected.facets,
+                    snapshot.frontier,
+                    deadline,
+                )
+                .await
+                && self
+                    .readable_search_row(&snapshot, row, &index, deadline)
+                    .await
+                    .is_ok()
+                && let Some(sources) = operation_binding_sources(row, &index)
+            {
+                if check_relation_archive(
+                    &sources,
+                    &self.writer,
+                    &runtime.cas_dir,
+                    &index,
+                    &mut relation_archive_budget,
+                    deadline,
+                )
+                .await
+                {
+                    let source = evertrace_store::query::canonical_work_binding_source(row)
+                        .map_err(|_| HumanGovernanceError::Store)?;
+                    refs.extend(source.candidate_id.iter().cloned());
+                    binding_source = Some(source);
+                } else {
+                    relation_archive_gap = true;
+                }
+            }
             let suppression = ObjectDeletionCurrentView::from_snapshot(&snapshot)
                 .map_err(|_| HumanGovernanceError::Store)?;
             let boundary = query.selection.boundary();
@@ -1597,7 +1654,7 @@ impl HumanGovernanceService {
                 false,
             )?;
             let relation_sources = |targets: &[String], readable: &BTreeSet<String>| {
-                canonical_episode_sources(
+                let mut sources = canonical_episode_sources(
                     snapshot.frontier,
                     &index,
                     readable,
@@ -1605,7 +1662,16 @@ impl HumanGovernanceService {
                     deadline,
                     true,
                 )
-                .map_err(|_| crate::search::SearchError::Corrupt)
+                .map_err(|_| crate::search::SearchError::Corrupt)?;
+                if let Some(binding) = &binding_source
+                    && binding
+                        .candidate_id
+                        .as_ref()
+                        .is_some_and(|id| targets.contains(id) && readable.contains(id))
+                {
+                    sources.push(binding.clone());
+                }
+                Ok(sources)
             };
             let validity_query = matches!(context.query_facets.temporal_qualifiers.as_slice(), [qualifier] if qualifier.is_validity());
             let validity_timeline = context.query_facets.answer_shape

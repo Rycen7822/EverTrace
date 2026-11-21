@@ -61,7 +61,6 @@ impl LiveEpisodeRead {
         revisions.remove(&self.attempt_revision);
     }
 
-    /// Run only after source, repository and deletion authorization. Do not return or retain source bytes.
     pub(crate) async fn check_archive(
         &self,
         writer: &WriterHandle,
@@ -70,74 +69,95 @@ impl LiveEpisodeRead {
         budget: &mut RelationArchiveBudget,
         deadline: Instant,
     ) -> bool {
-        use evertrace_capture::{CasError, CasStore, cas::SourceArchiveVerifier};
-        use evertrace_domain::ids::SourceObservationId;
-        let Some(archives) = self.sources.as_ref().and_then(|references| {
-            references
-                .iter()
-                .filter(|reference| reference.parse::<SourceObservationId>().is_ok())
-                .map(|reference| {
-                    source_archive(reference, |key| match index.get(key)?.as_slice() {
-                        [row] => Some(*row),
-                        _ => None,
-                    })
-                })
-                .collect::<Option<Vec<_>>>()
-        }) else {
+        let Some(sources) = &self.sources else {
             return false;
         };
-        if archives.is_empty() {
-            return false;
-        }
-        let cas_dir = cas_dir.to_path_buf();
-        let mut remaining = *budget;
-        let read = writer
-            .read_handle()
-            .read_blocking(move |cancel| {
-                let mut check = || {
-                    cancel.check().map_err(|_| CasError::ReadCancelled)?;
-                    if Instant::now() >= deadline {
-                        return Err(CasError::ReadCancelled);
-                    }
-                    Ok(())
-                };
-                let verify = || -> Result<RelationArchiveBudget, CasError> {
-                    let cas = CasStore::open_existing(cas_dir)?;
-                    for (receipt, observation) in archives {
-                        check()?;
-                        let digest = receipt.cas_ref.parse()?;
-                        let mut source = SourceArchiveVerifier::new(&receipt, &observation)?;
-                        let window = cas.read_bounded_window_checked(
-                            &digest,
-                            remaining.encoded,
-                            remaining.decoded,
-                            0..0,
-                            &mut check,
-                            &mut |chunk| source.update(chunk),
-                        )?;
-                        source.finish()?;
-                        remaining.encoded -= window.encoded_bytes;
-                        remaining.decoded -= window.total_bytes;
-                    }
-                    check()?;
-                    Ok(remaining)
-                };
-                Ok(verify().ok())
-            })
-            .await;
-        if let Ok(Some(remaining)) = read {
-            *budget = remaining;
-            true
-        } else {
-            // A failed verification may have consumed the read budget. Do not retry it within this stream.
-            *budget = RelationArchiveBudget {
-                encoded: 0,
-                decoded: 0,
-            };
-            false
-        }
+        check_relation_archive(sources, writer, cas_dir, index, budget, deadline).await
     }
+}
 
+/// Run only after source, repository and deletion authorization. Do not return or retain source bytes.
+pub(crate) async fn check_relation_archive(
+    sources: &BTreeSet<String>,
+    writer: &WriterHandle,
+    cas_dir: &std::path::Path,
+    index: &BTreeMap<&str, Vec<&ObjectRow>>,
+    budget: &mut RelationArchiveBudget,
+    deadline: Instant,
+) -> bool {
+    use evertrace_capture::{CasError, CasStore, cas::SourceArchiveVerifier};
+    use evertrace_domain::ids::SourceObservationId;
+    let archives = || {
+        sources
+            .iter()
+            .filter(|reference| reference.parse::<SourceObservationId>().is_ok())
+            .map(|reference| {
+                source_archive(reference, |key| match index.get(key)?.as_slice() {
+                    [row] => Some(*row),
+                    _ => None,
+                })
+            })
+            .take(usize::from(evertrace_domain::query::METADATA_READ_LIMIT) + 1)
+            .collect::<Option<Vec<_>>>()
+    };
+    let Some(archives) = archives() else {
+        return false;
+    };
+    if archives.is_empty()
+        || archives.len() > usize::from(evertrace_domain::query::METADATA_READ_LIMIT)
+    {
+        return false;
+    }
+    let cas_dir = cas_dir.to_path_buf();
+    let mut remaining = *budget;
+    let read = writer
+        .read_handle()
+        .read_blocking(move |cancel| {
+            let mut check = || {
+                cancel.check().map_err(|_| CasError::ReadCancelled)?;
+                if Instant::now() >= deadline {
+                    return Err(CasError::ReadCancelled);
+                }
+                Ok(())
+            };
+            let verify = || -> Result<RelationArchiveBudget, CasError> {
+                let cas = CasStore::open_existing(cas_dir)?;
+                for (receipt, observation) in archives {
+                    check()?;
+                    let digest = receipt.cas_ref.parse()?;
+                    let mut source = SourceArchiveVerifier::new(&receipt, &observation)?;
+                    let window = cas.read_bounded_window_checked(
+                        &digest,
+                        remaining.encoded,
+                        remaining.decoded,
+                        0..0,
+                        &mut check,
+                        &mut |chunk| source.update(chunk),
+                    )?;
+                    source.finish()?;
+                    remaining.encoded -= window.encoded_bytes;
+                    remaining.decoded -= window.total_bytes;
+                }
+                check()?;
+                Ok(remaining)
+            };
+            Ok(verify().ok())
+        })
+        .await;
+    if let Ok(Some(remaining)) = read {
+        *budget = remaining;
+        true
+    } else {
+        // A failed verification may have consumed the read budget. Do not retry it within this stream.
+        *budget = RelationArchiveBudget {
+            encoded: 0,
+            decoded: 0,
+        };
+        false
+    }
+}
+
+impl LiveEpisodeRead {
     pub(crate) fn for_relation(
         snapshot: &evertrace_store::ProjectionSnapshot,
         index: &BTreeMap<&str, Vec<&ObjectRow>>,
@@ -420,6 +440,148 @@ impl LiveEpisodeRead {
             sources,
         })
     }
+}
+
+/// Only admit the current assignment of the named Operation, not the newest one mentioning a given effect.
+pub(crate) async fn current_operation_binding<'a>(
+    search: &evertrace_store::SearchIndex,
+    index: &BTreeMap<&str, Vec<&'a ObjectRow>>,
+    facets: &evertrace_domain::query::QueryFacetSet,
+    frontier: u64,
+    deadline: Instant,
+) -> Option<&'a ObjectRow> {
+    use evertrace_domain::{ids::OperationId, query::TemporalMode, work::AssignmentStatus};
+    if facets.temporal_mode != TemporalMode::Current
+        || !facets.temporal_qualifiers.is_empty()
+        || !facets
+            .relation_requirements
+            .iter()
+            .any(|kind| kind == "binding_to_scope_effect")
+    {
+        return None;
+    }
+    let [operation] = facets.target_anchors.as_slice() else {
+        return None;
+    };
+    let operation_id = operation.parse::<OperationId>().ok()?;
+    let neighbours = {
+        let snapshot = search
+            .snapshot_after_validated_frontier(frontier)
+            .await
+            .ok()?;
+        if snapshot.frontier() != frontier || snapshot.authoritative_frontier() != frontier {
+            return None;
+        }
+        snapshot
+            .adjacent_relations(
+                std::slice::from_ref(operation),
+                &["operation_to_binding_revision".into()],
+                65,
+            )
+            .await
+            .ok()??
+    };
+    if neighbours.len() > 64 {
+        return None;
+    }
+    let mut rows = Vec::new();
+    let mut bytes = evertrace_store::projections::READ_DEPENDENCY_BYTES;
+    for edge in neighbours {
+        if Instant::now() >= deadline || edge.source_id.as_ref() != Some(operation) {
+            return None;
+        }
+        let reference = edge.target_id?;
+        let [row] = index.get(reference.as_str())?.as_slice() else {
+            return None;
+        };
+        if row.object_kind.as_deref() != Some("work_binding")
+            || row.object_id.as_ref() != Some(&reference)
+        {
+            return None;
+        }
+        bytes = bytes.checked_sub(row.payload_json.as_ref()?.len() as u64)?;
+        rows.push((*row).clone());
+    }
+    let view = evertrace_store::WorkBindingCurrentView::from_rows(frontier, &rows).ok()?;
+    if view.bindings.len() != 1 {
+        return None;
+    }
+    let binding = view.bindings.get(&operation_id)?;
+    if binding.assignment_status != AssignmentStatus::Resolved {
+        return None;
+    }
+    let [row] = index
+        .get(binding.work_binding_revision_id.to_string().as_str())?
+        .as_slice()
+    else {
+        return None;
+    };
+    Some(*row)
+}
+
+pub(crate) fn operation_binding_sources(
+    row: &ObjectRow,
+    index: &BTreeMap<&str, Vec<&ObjectRow>>,
+) -> Option<BTreeSet<String>> {
+    use evertrace_domain::{
+        evidence::PairingState, ids::SourceObservationId, work::AssignmentStatus,
+    };
+    let JournalPayload::WorkBindingRecorded(binding) =
+        serde_json::from_str(row.payload_json.as_deref()?).ok()?
+    else {
+        return None;
+    };
+    if binding.assignment_status != AssignmentStatus::Resolved
+        || binding.scope_effect_refs.is_empty()
+    {
+        return None;
+    }
+    let operation_ref = binding.operation_id.to_string();
+    let operation = index
+        .get(operation_ref.as_str())?
+        .iter()
+        .filter(|row| row.object_kind.as_deref() == Some("operation"))
+        .max_by_key(|row| row.source_event_seq)?;
+    let JournalPayload::OperationDerived(operation) =
+        serde_json::from_str(operation.payload_json.as_deref()?).ok()?
+    else {
+        return None;
+    };
+    if operation.operation_id != binding.operation_id
+        || operation.pairing_state != PairingState::Paired
+    {
+        return None;
+    }
+    let mut sources: BTreeSet<_> = binding.evidence_refs.iter().cloned().collect();
+    sources.extend(
+        operation
+            .input_source_observation_refs
+            .iter()
+            .chain(&operation.result_source_observation_refs)
+            .map(ToString::to_string),
+    );
+    for id in &binding.scope_effect_refs {
+        let reference = id.to_string();
+        let [row] = index.get(reference.as_str())?.as_slice() else {
+            return None;
+        };
+        let JournalPayload::ScopeEffectDerived(effect) =
+            serde_json::from_str(row.payload_json.as_deref()?).ok()?
+        else {
+            return None;
+        };
+        if effect.scope_effect_id != *id
+            || effect.operation_id != operation.operation_id
+            || !operation.scope_effect_ids.contains(id)
+        {
+            return None;
+        }
+        sources.extend(effect.evidence_refs.into_iter().map(|id| id.to_string()));
+    }
+    sources
+        .iter()
+        .all(|reference| reference.parse::<SourceObservationId>().is_ok())
+        .then_some(sources)
 }
 
 /// Assess only the canonical source and repository closure; observation recording belongs to callers.

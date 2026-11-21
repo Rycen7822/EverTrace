@@ -133,6 +133,42 @@ pub(super) fn exact_identifier_row(
     .map(Some)
 }
 
+/// An assignment endpoint is visible only through a proven current typed relation, not FTS.
+pub fn canonical_work_binding_source(
+    row: &crate::ObjectRow,
+) -> Result<SearchProjectionRow, StoreError> {
+    row.validate()?;
+    let payload: JournalPayload = serde_json::from_str(
+        row.payload_json
+            .as_deref()
+            .ok_or(StoreError::StoreCorrupt)?,
+    )
+    .map_err(|_| StoreError::StoreCorrupt)?;
+    let JournalPayload::WorkBindingRecorded(binding) = &payload else {
+        return Err(StoreError::InvalidInput);
+    };
+    binding.validate().map_err(|_| StoreError::StoreCorrupt)?;
+    let id = binding.work_binding_revision_id.to_string();
+    if row.object_kind.as_deref() != Some("work_binding")
+        || row.object_id.as_ref() != Some(&id)
+        || row.current_revision_id.as_ref() != Some(&id)
+        || row.row_id != format!("object:work:work_binding:{id}")
+        || binding.assignment_status != evertrace_domain::work::AssignmentStatus::Resolved
+    {
+        return Err(StoreError::StoreCorrupt);
+    }
+    let mut source = object_identifier_row(
+        row,
+        &payload,
+        true,
+        vec!["assignment:resolved".into()],
+        0,
+        row.source_event_seq,
+    )?;
+    source.lifecycle = Some("active".into());
+    Ok(source)
+}
+
 /// Structured canonical Work sources are request-local, never an open-Episode FTS row.
 pub fn canonical_work_episode_source(
     row: &crate::ObjectRow,

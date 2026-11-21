@@ -256,16 +256,18 @@ impl NativeRetrieval<'_> {
         &mut self,
         snapshot: &SearchSnapshot,
         identifiers: &[String],
-        episodes: &[String],
+        canonical_targets: &[String],
     ) -> Result<(), SearchError> {
         let sources = match (self.objects.readable_refs.as_ref(), self.relation_sources) {
-            (Some(refs), Some(read)) if !episodes.is_empty() => match read(episodes, refs) {
-                Ok(sources) => sources,
-                Err(_) => {
-                    self.degraded("relation_source_unavailable");
-                    Vec::new()
+            (Some(refs), Some(read)) if !canonical_targets.is_empty() => {
+                match read(canonical_targets, refs) {
+                    Ok(sources) => sources,
+                    Err(_) => {
+                        self.degraded("relation_source_unavailable");
+                        Vec::new()
+                    }
                 }
-            },
+            }
             _ => Vec::new(),
         };
         for (filter, sources) in [
@@ -725,17 +727,18 @@ impl NativeRetrieval<'_> {
                 .collect::<BTreeSet<_>>()
                 .into_iter()
                 .collect::<Vec<_>>();
-            // A current Workstream can lead to its open Episode even though the Episode
-            // has no FTS row. Do not materialize today's alias for historical queries.
-            let episodes = if self.objects.current_only {
+            // These current inverse endpoints have no FTS row; historical reads never resolve today's alias.
+            let canonical_targets = if self.objects.current_only {
                 edges
                     .iter()
                     .filter_map(|edge| {
-                        (edge.relation_kind.as_deref() == Some("episode_to_workstream")
-                            && edge
-                                .target_id
-                                .as_ref()
-                                .is_some_and(|id| sources.contains(id)))
+                        (matches!(
+                            edge.relation_kind.as_deref(),
+                            Some("episode_to_workstream" | "binding_to_scope_effect")
+                        ) && edge
+                            .target_id
+                            .as_ref()
+                            .is_some_and(|id| sources.contains(id)))
                         .then(|| edge.source_id.clone())
                         .flatten()
                     })
@@ -750,7 +753,7 @@ impl NativeRetrieval<'_> {
                 };
                 snapshot = reopened;
             } else {
-                self.lookup_relation_targets(&snapshot, &targets, &episodes)
+                self.lookup_relation_targets(&snapshot, &targets, &canonical_targets)
                     .await?;
             }
             let refs = self.references();

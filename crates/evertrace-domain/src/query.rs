@@ -717,6 +717,7 @@ impl EvidenceRole {
             | "artifact_produced_by_run"
             | "artifact_produced_by_operation"
             | "operation_to_scope_effect"
+            | "binding_to_scope_effect"
             | "binding_to_primary_task"
             | "binding_to_primary_workstream"
             | "atom_from_source_observation"
