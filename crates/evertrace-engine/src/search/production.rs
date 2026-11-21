@@ -10,7 +10,7 @@ use evertrace_domain::query::{
     QuantityConstraint, QueryError, QueryFacetSet, RetrievalCompleteness, RetrievalLayer,
     ScopeBoundary, SearchCandidate, SearchContext, SearchResult, SourceBoundary,
     SuppressionSnapshot, TemporalMode, TemporalOrdering, TemporalQualifier,
-    production_retrieval_layer, requested_ordering,
+    production_retrieval_layer, requested_ordering, valid_target_reference,
 };
 use evertrace_domain::{error::ErrorCode, evidence::SourceRevision};
 use evertrace_store::{
@@ -651,17 +651,7 @@ impl ProductionSearch {
             },
             object_only,
             global_only: false,
-            current_only: match context.query_facets.temporal_mode {
-                TemporalMode::Current => true,
-                TemporalMode::Any | TemporalMode::Unknown => {
-                    context.intent != evertrace_domain::query::SearchIntent::HistoryLookup
-                }
-                TemporalMode::AsOf
-                | TemporalMode::Interval
-                | TemporalMode::Sequence
-                | TemporalMode::Before
-                | TemporalMode::After => false,
-            },
+            current_only: requires_current_objects(context),
             suppressed_refs: suppressed_hashes.clone(),
             suppressed_hashes,
             event_time_as_of: match context.query_facets.temporal_qualifiers.as_slice() {
@@ -858,7 +848,11 @@ impl ProductionSearch {
                 .chain(evidence.map(|filter| (1, filter)));
             for (channel, filter) in channels {
                 let exact = snapshot.structured(&identifiers, &filter, limit).await?;
-                let fts = if atoms_only || source_only || self.exact_object_kind.is_some() {
+                let fts = if atoms_only
+                    || source_only
+                    || self.exact_object_kind.is_some()
+                    || exact_query_reference(&context).is_some()
+                {
                     Vec::new() // Explicit operands are not lexical queries.
                 } else {
                     snapshot
@@ -1537,7 +1531,10 @@ impl ProductionSearch {
                 }
             }
         }
-        let fts_result = if exact_atom_only || self.exact_object_kind.is_some() {
+        let fts_result = if exact_atom_only
+            || self.exact_object_kind.is_some()
+            || exact_query_reference(&context).is_some()
+        {
             Ok(Vec::new())
         } else if force_fts_failure {
             Err(StoreError::LanceDb)
@@ -1578,6 +1575,13 @@ impl ProductionSearch {
         rows.extend(fts);
         rows.sort();
         rows.dedup_by(|left, right| left.row_id == right.row_id);
+        let exact_slots = context
+            .query_facets
+            .exact_identifiers
+            .iter()
+            .map(|id| (id.as_str(), !valid_target_reference(id)))
+            .collect::<Vec<_>>();
+        let query = context.protected_query.trim();
         let mut ranked = Vec::with_capacity(rows.len());
         for row in &rows {
             let inherited = row.object_kind.as_deref() == Some("atom_revision")
@@ -1595,22 +1599,10 @@ impl ProductionSearch {
             {
                 continue;
             }
-            let exact = row.candidate_id.as_deref() == Some(context.protected_query.as_str())
-                || row.source_ref.as_deref() == Some(context.protected_query.as_str())
-                || context
-                    .query_facets
-                    .exact_identifiers
-                    .iter()
-                    .any(|identifier| {
-                        row.candidate_id.as_deref() == Some(identifier)
-                            || row.source_ref.as_deref() == Some(identifier)
-                            || row.text.contains(identifier)
-                    });
-            let stable = row
-                .candidate_id
-                .as_deref()
-                .is_some_and(|id| id == context.protected_query)
-                || row.source_ref.as_deref() == Some(context.protected_query.as_str());
+            let exact = row.matches_reference(query)
+                || exact_slots.iter().any(|(id, literal)| {
+                    row.matches_reference(id) || (*literal && row.text.contains(*id))
+                });
             let anchor_position = target_anchor_position(&context, row);
             let active = row
                 .candidate_id
@@ -1634,14 +1626,14 @@ impl ProductionSearch {
                 (0, 2)
             } else if let Some(position) = anchor_position {
                 (1, position)
-            } else if exact || stable {
+            } else if exact {
                 (2, 0)
             } else if let Some(position) = fts_ranks.get(&row.row_id) {
                 (3, *position)
             } else {
                 continue;
             };
-            ranked.push((rank, row, exact || stable));
+            ranked.push((rank, row, exact));
         }
         ranked.sort_by(|(left_rank, left, _), (right_rank, right, _)| {
             left_rank
@@ -1672,11 +1664,7 @@ impl ProductionSearch {
             if rank.0 <= 1 && *explicit_exact {
                 origins.insert("exact".into());
             }
-            if rank.0 == 0
-                && context.query_facets.target_anchors.iter().any(|id| {
-                    row.candidate_id.as_deref() == Some(id) || row.source_ref.as_deref() == Some(id)
-                })
-            {
+            if rank.0 == 0 && target_anchor_position(&context, row).is_some() {
                 origins.insert("target_anchor".into());
             }
             if fts_ranks.contains_key(&row.row_id) {
@@ -1863,7 +1851,7 @@ fn target_anchor_position(context: &SearchContext, row: &SearchProjectionRow) ->
         .query_facets
         .target_anchors
         .iter()
-        .position(|id| row.candidate_id.as_ref() == Some(id) || row.source_ref.as_ref() == Some(id))
+        .position(|id| row.matches_reference(id))
 }
 
 fn scoped_lexical_query(context: &SearchContext) -> &str {
@@ -1883,9 +1871,26 @@ fn scoped_lexical_query(context: &SearchContext) -> &str {
     &context.protected_query
 }
 
+pub(super) fn exact_query_reference(context: &SearchContext) -> Option<&str> {
+    let reference = context.protected_query.trim();
+    // A matching sequence anchor binds the source domain, not an implicit answer operand.
+    (valid_target_reference(reference)
+        && !context
+            .query_facets
+            .temporal_qualifiers
+            .iter()
+            .filter_map(TemporalQualifier::source_sequence_ref)
+            .any(|anchor| anchor.to_string() == reference))
+    .then_some(reference)
+}
+
 fn exact_identifiers(context: &SearchContext) -> Vec<String> {
     let mut refs = context.query_facets.exact_identifiers.clone();
-    refs.push(context.protected_query.clone());
+    refs.push(
+        exact_query_reference(context)
+            .unwrap_or(&context.protected_query)
+            .to_owned(),
+    );
     refs.sort();
     refs.dedup();
     refs
@@ -1972,6 +1977,16 @@ fn source_filter(boundary: Option<SourceBoundary>) -> (Option<String>, Option<St
     }
 }
 
+fn requires_current_objects(context: &SearchContext) -> bool {
+    match context.query_facets.temporal_mode {
+        TemporalMode::Current => true,
+        TemporalMode::Any | TemporalMode::Unknown => {
+            context.intent != evertrace_domain::query::SearchIntent::HistoryLookup
+        }
+        _ => false,
+    }
+}
+
 pub(super) fn hard_compatible(
     row: &SearchProjectionRow,
     context: &SearchContext,
@@ -2006,11 +2021,7 @@ fn hard_compatible_with_inheritance(
     if !inherited_global_constraint && has_route && !route_matches
         || !source_compatible(row, context.query_facets.source_boundary)
         || row.row_variant == "object"
-            && context.intent != evertrace_domain::query::SearchIntent::HistoryLookup
-            && matches!(
-                context.query_facets.temporal_mode,
-                TemporalMode::Current | TemporalMode::Any | TemporalMode::Unknown
-            )
+            && requires_current_objects(context)
             && row.currentness.as_deref() != Some("current")
         || row.row_variant == "object"
             && match context.query_facets.lifecycle_boundary {
@@ -2154,10 +2165,7 @@ fn temporal_compatible(
             .is_none_or(|position| {
                 position.matches(&context.query_facets.temporal_qualifiers) != Some(false)
                     || position.contextual()
-                    || context.query_facets.target_anchors.iter().any(|reference| {
-                        row.candidate_id.as_ref() == Some(reference)
-                            || row.source_ref.as_ref() == Some(reference)
-                    })
+                    || target_anchor_position(context, row).is_some()
             }));
     }
     Ok(match context.query_facets.temporal_qualifiers.as_slice() {

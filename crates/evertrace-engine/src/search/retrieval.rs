@@ -7,7 +7,9 @@ use evertrace_store::{SearchHardFilter, SearchIndex, SearchProjectionRow, Search
 
 use super::{
     SearchError,
-    production::{RelationSources, RequestDeadline, candidate_limit, hard_compatible},
+    production::{
+        RelationSources, RequestDeadline, candidate_limit, exact_query_reference, hard_compatible,
+    },
     read_context::SearchReadAccess,
 };
 
@@ -405,29 +407,41 @@ impl NativeRetrieval<'_> {
                 changes_result: true,
             })
             .collect::<Vec<_>>();
-        for anchor in &self.context.query_facets.target_anchors {
-            if !self.result.candidates.iter().any(|candidate| {
-                candidate.candidate_id == *anchor || candidate.source_ref == *anchor
-            }) {
+        let facets = &self.context.query_facets;
+        let references = facets
+            .target_anchors
+            .iter()
+            .map(String::as_str)
+            .chain(exact_query_reference(self.context))
+            .chain(
+                facets
+                    .exact_identifiers
+                    .iter()
+                    .map(String::as_str)
+                    .filter(|id| valid_target_reference(id)),
+            )
+            .collect::<BTreeSet<_>>();
+        for reference in references {
+            if !self
+                .result
+                .candidates
+                .iter()
+                .any(|candidate| candidate.matches_reference(reference))
+            {
                 gaps.push(NamedGap {
                     kind: NamedGapKind::StableObjectId,
-                    identifier: anchor.clone(),
+                    identifier: reference.to_owned(),
                     changes_result: true,
                 });
             }
         }
-        for identifier in &self.context.query_facets.exact_identifiers {
-            if self
-                .context
-                .query_facets
-                .target_anchors
-                .contains(identifier)
-            {
-                continue;
-            }
+        for identifier in facets
+            .exact_identifiers
+            .iter()
+            .filter(|id| !valid_target_reference(id))
+        {
             if !self.result.candidates.iter().any(|candidate| {
-                candidate.candidate_id == *identifier
-                    || candidate.source_ref == *identifier
+                candidate.matches_reference(identifier)
                     || candidate.text.contains(identifier)
                     || clipped_exact
                         .get(identifier)
@@ -556,6 +570,13 @@ impl NativeRetrieval<'_> {
         identifiers: &[String],
     ) -> Result<(), SearchError> {
         // B: original EvidenceSurface, not object metadata relabelled as evidence.
+        if let Some(reference) = exact_query_reference(self.context) {
+            let mut identifiers = identifiers.to_vec();
+            identifiers.push(reference.to_owned());
+            return self
+                .read_exact_evidence(snapshot, &identifiers, ExactEvidence::Lexical)
+                .await;
+        }
         let had_room = self.remaining() != 0;
         self.read_exact_evidence(snapshot, identifiers, ExactEvidence::Lexical)
             .await?;

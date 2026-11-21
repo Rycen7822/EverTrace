@@ -358,25 +358,28 @@ impl SearchSnapshot {
                 return Err(StoreError::StoreCorrupt);
             }
         }
+        // Historical objects retain their owner ID for provenance, not for exact binding.
+        // Flat alternatives keep parser stack use bounded; AND binds before OR.
         let exact = identifiers
             .iter()
             .flat_map(|value| {
                 let value = sql_literal(value);
                 [
                     format!("candidate_id = {value}"),
-                    format!("source_ref = {value}"),
+                    format!("source_ref = {value} AND row_variant = 'evidence_surface'"),
+                    format!("source_ref = {value} AND currentness = 'current'"),
                 ]
             })
             .collect::<Vec<_>>()
             .join(" OR ");
-        let predicate = combine_filter(filter_sql(filter), Some(format!("({exact})")));
+        let predicate = combine_filter(filter_sql(filter), Some(exact.clone()));
         let indexed = query_rows(&self.table, predicate, limit, None).await?;
         if self.canonical_sources.is_empty() && supplemental.is_empty() {
             return Ok(indexed);
         }
         let predicate = combine_filter(
             filter_sql_dialect(filter, FilterDialect::Sqlite),
-            Some(format!("({exact})")),
+            Some(exact),
         )
         .ok_or(StoreError::InvalidInput)?;
         let sources = self
@@ -850,6 +853,13 @@ pub struct SearchProjectionRow {
 }
 
 impl SearchProjectionRow {
+    pub fn matches_reference(&self, reference: &str) -> bool {
+        self.candidate_id.as_deref() == Some(reference)
+            || (self.source_ref.as_deref() == Some(reference)
+                && (self.row_variant == "evidence_surface"
+                    || self.currentness.as_deref() == Some("current")))
+    }
+
     pub fn checkpoint(frontier: u64) -> Self {
         Self {
             row_id: SEARCH_CHECKPOINT_ID.into(),
