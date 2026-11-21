@@ -264,7 +264,7 @@ async function detail(item, frontier, controller, scroll = 0) {
     "read",
     {
       kind: "detail",
-      reference: item.key,
+      reference: item.surface === "inbox" && item.kind === "revision_proposal_revision" ? item.object : item.key,
       frontier,
       revision: item.revision || null,
       surface: item.surface || "explorer",
@@ -292,7 +292,7 @@ async function detail(item, frontier, controller, scroll = 0) {
 async function confirmProposal(button) {
   const item = state.selected;
   if (!state.active || document.hidden || item?.surface !== "inbox" || item.kind !== "revision_proposal_revision") return;
-  const { proposalId, revision, frontier, fingerprint } = button.dataset;
+  const { proposalId, revision, frontier, reviewDigest } = button.dataset;
   if (proposalId !== item.object || revision !== item.revision) return;
   cancel();
   const controller = new AbortController();
@@ -303,7 +303,7 @@ async function confirmProposal(button) {
   let message = "暂时无法复核，已清除旧正文。";
   try {
     const { confirmation } = await api(
-      "read", { kind: "proposal_confirmation", proposal_id: proposalId, revision, frontier, fingerprint }, controller.signal,
+      "read", { kind: "proposal_confirmation", proposal_id: proposalId, revision, frontier, review_digest: reviewDigest }, controller.signal,
     );
     if (state.controller !== controller || document.hidden) return;
     if (confirmation === "matches") {

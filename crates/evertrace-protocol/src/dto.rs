@@ -133,6 +133,12 @@ pub enum HumanReadRequest {
         expected_frontier: u64,
         expected_revision_ref: Option<String>,
     },
+    ProposalReview {
+        proposal_id: RevisionProposalId,
+        expected_revision_id: RevisionId,
+        expected_frontier: u64,
+        expected_digest: Option<String>,
+    },
     Related {
         relation: HumanRelationKind,
         source_stable_key: String,
@@ -801,6 +807,11 @@ pub enum HumanGovernanceResponse {
         items: Vec<HumanSnapshotItem>,
         next_cursor: Option<String>,
     },
+    ProposalReview {
+        frontier: u64,
+        item: Option<Box<HumanSnapshotItem>>,
+        confirmation_digest: Option<String>,
+    },
     Action {
         result: HumanActionResult,
     },
@@ -808,6 +819,23 @@ pub enum HumanGovernanceResponse {
         current_frontier: u64,
         current_revision_ref: Option<String>,
     },
+}
+
+/// Bind the complete permission-filtered review, not a browser-supplied statement of authority.
+pub fn proposal_confirmation_digest(item: &HumanSnapshotItem, frontier: u64) -> Option<String> {
+    use evertrace_domain::canonical::{CanonicalValue, sha256};
+    let review = item
+        .proposal_review
+        .as_ref()
+        .filter(|review| review.proposal.status.is_open())?;
+    let body = crate::frame::canonical_json(&(frontier, review, &item.proposal_base)).ok()?;
+    let digest = sha256(
+        "evertrace.proposal_review_confirmation",
+        1,
+        &CanonicalValue::Bytes(body),
+    )
+    .ok()?;
+    Some(evertrace_domain::evidence::hex(&digest))
 }
 
 impl HumanGovernanceRequest {
@@ -882,6 +910,9 @@ impl HumanReadRequest {
                 expected_revision_ref,
                 ..
             } => valid_ref(object_ref) && expected_revision_ref.as_deref().is_none_or(valid_ref),
+            Self::ProposalReview {
+                expected_digest, ..
+            } => expected_digest.as_deref().is_none_or(valid_hex),
             Self::Related {
                 source_stable_key,
                 expected_source_revision_ref,
@@ -1194,6 +1225,23 @@ impl HumanGovernanceResponse {
                         .windows(2)
                         .all(|pair| pair[0].stable_key < pair[1].stable_key)
             }
+            Self::ProposalReview {
+                item,
+                confirmation_digest,
+                ..
+            } => match item {
+                Some(item) => {
+                    item.validate()
+                        && item.proposal.is_some()
+                        && confirmation_digest.as_deref().is_none_or(valid_hex)
+                        && (confirmation_digest.is_some()
+                            == item
+                                .proposal_review
+                                .as_ref()
+                                .is_some_and(|review| review.proposal.status.is_open()))
+                }
+                None => confirmation_digest.is_none(),
+            },
             Self::Action { result } => result.validate(),
             Self::Conflict {
                 current_revision_ref,

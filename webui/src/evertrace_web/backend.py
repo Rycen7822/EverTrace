@@ -608,6 +608,19 @@ class Backend:
             }
         )
 
+    async def proposal_review(self, proposal_id, revision, frontier, expected_digest=None):
+        result = await self._request({
+            "kind": "proposal_review", "proposal_id": proposal_id, "expected_revision_id": revision,
+            "expected_frontier": frontier, "expected_digest": expected_digest,
+        })
+        if result["kind"] not in ("conflict", "proposal_review"):
+            raise BackendError("invalid_read_response")
+        if result["kind"] == "proposal_review":
+            item = result["item"]
+            if item is not None and (item["object_ref"] != proposal_id or item["revision_ref"] != revision):
+                raise BackendError("invalid_read_response")
+        return result
+
     async def job(self, job_id, frontier):
         if not isinstance(job_id, str):
             raise BackendError("invalid_input")
@@ -747,6 +760,7 @@ class Backend:
                     "snapshot",
                     "memory_page",
                     "compiled_projections",
+                    "proposal_review",
                     "source_archive",
                     "conflict",
                 ):

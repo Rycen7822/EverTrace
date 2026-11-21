@@ -619,9 +619,18 @@ class App:
                         "state": result["status"],
                     }
             elif payload.get("kind") == "proposal_confirmation" and set(payload) == {
-                "kind", "proposal_id", "revision", "frontier", "fingerprint",
+                "kind", "proposal_id", "revision", "frontier", "review_digest",
             }:
-                data = {"confirmation": await confirm_proposal_revision(self.backend, payload)}
+                proposal_id, revision = proposal_coordinates(payload["proposal_id"], payload["revision"])
+                digest = payload["review_digest"]
+                if not isinstance(digest, str) or len(digest) != 64 or any(c not in "0123456789abcdef" for c in digest):
+                    raise BackendError("invalid_input")
+                result = await self.backend.proposal_review(proposal_id, revision, parse_frontier(payload["frontier"]), digest)
+                if result["kind"] == "conflict":
+                    confirmation = "conflict"
+                else:
+                    confirmation = "matches" if result["confirmation_digest"] == digest else "unavailable"
+                data = {"confirmation": confirmation}
             elif payload.get("kind") == "detail" and set(payload) == {
                 "kind",
                 "reference",
@@ -643,6 +652,12 @@ class App:
                 if payload["object_kind"] in ("source_receipt", "source_observation"):
                     result = await read_source_detail(self.backend, payload["reference"], frontier,
                         payload["revision"], payload["object_kind"])
+                elif surface == "inbox" and payload["object_kind"] == "revision_proposal_revision":
+                    proposal_id, revision = proposal_coordinates(payload["reference"], payload["revision"])
+                    result = await self.backend.proposal_review(proposal_id, revision, frontier)
+                    if result["kind"] == "proposal_review":
+                        item = result.pop("item")
+                        result["items"] = [item] if item is not None else []
                 elif payload["object_kind"] in DETAIL_KINDS and (
                     surface == "explorer" or payload["object_kind"] in NATIVE_DETAIL_KINDS
                 ):
@@ -670,30 +685,12 @@ class App:
         return JSONResponse(data)
 
 
-async def confirm_proposal_revision(backend, expected):
-    """Re-read the view the human selected; this is not an acceptance or an authorization receipt."""
-    proposal_id, revision, fingerprint = (expected[key] for key in ("proposal_id", "revision", "fingerprint"))
-    frontier = parse_frontier(expected["frontier"])
+def proposal_coordinates(proposal_id, revision):
     prefix = "proposal:"
     if (not isinstance(proposal_id, str) or not proposal_id.startswith(prefix)
-        or not _uuid7(proposal_id[len(prefix):]) or not _uuid7(revision)
-        or not isinstance(fingerprint, str) or len(fingerprint) != 64
-        or any(char not in "0123456789abcdef" for char in fingerprint)):
+        or not _uuid7(proposal_id[len(prefix):]) or not _uuid7(revision)):
         raise BackendError("invalid_input")
-    result = await backend.detail(proposal_id, frontier, revision, "inbox")
-    if result["kind"] == "conflict":
-        return "conflict"
-    if result["kind"] != "snapshot" or len(result["items"]) != 1:
-        return "unavailable"
-    item, = result["items"]
-    summary = item.get("proposal")
-    if item["object_kind"] != "revision_proposal_revision" or not summary or not item.get("proposal_review"):
-        return "unavailable"
-    if (result["frontier"] != frontier or item["object_ref"] != proposal_id or item["revision_ref"] != revision
-        or summary["proposal_id"] != proposal_id or summary["current_revision_id"] != revision
-        or summary["fingerprint"] != fingerprint or summary["status"] not in ("pending", "validating")):
-        return "conflict"
-    return "matches"
+    return proposal_id, revision
 
 
 def _uuid7(value):
@@ -739,7 +736,8 @@ def present_detail(templates, result, surface):
         else None
     )
     return {
-        "html": templates.get_template(template).render(items=result["items"], surface=surface, frontier=result.get("frontier")),
+        "html": templates.get_template(template).render(items=result["items"], surface=surface,
+            frontier=result.get("frontier"), confirmation_digest=result.get("confirmation_digest")),
         "source_preview": preview,
         "semantic_text": semantic_text,
         "selection": selection,

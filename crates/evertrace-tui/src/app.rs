@@ -497,6 +497,7 @@ impl App {
                         | HumanGovernanceResponse::Search { .. }
                         | HumanGovernanceResponse::MemoryPage { .. }
                         | HumanGovernanceResponse::CompiledProjections { .. }
+                        | HumanGovernanceResponse::ProposalReview { .. }
                         | HumanGovernanceResponse::Export { .. },
                     ) => UiCommand::None,
                     (HumanReadLocator::Page { .. } | HumanReadLocator::View { .. }, _) => {
@@ -535,6 +536,7 @@ impl App {
                     | HumanGovernanceResponse::Snapshot { .. }
                     | HumanGovernanceResponse::Search { .. }
                     | HumanGovernanceResponse::MemoryPage { .. }
+                    | HumanGovernanceResponse::ProposalReview { .. }
                     | HumanGovernanceResponse::CompiledProjections { .. } => {
                         return UiCommand::None;
                     }

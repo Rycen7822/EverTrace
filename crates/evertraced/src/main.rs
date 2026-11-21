@@ -1108,6 +1108,15 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
                                             }
                                         }
                                     },
+                                HumanReadRequest::ProposalReview {
+                                    proposal_id, expected_revision_id, expected_frontier, expected_digest,
+                                } => {
+                                    if context.client_kind != ClientKind::Web { return Err(ErrorCode::Untrusted); }
+                                    Box::pin(read_proposal_review(
+                                        &human_governance, &proposal_id.to_string(), &expected_revision_id.to_string(),
+                                        expected_frontier, expected_digest.as_deref(),
+                                    )).await.map_err(map_human_error)?
+                                }
                                 HumanReadRequest::Related {
                                     relation,
                                     source_stable_key,
@@ -1630,6 +1639,57 @@ fn map_semantic_detail(
             }
         }),
     }
+}
+
+async fn read_proposal_review(
+    service: &evertrace_engine::HumanGovernanceService,
+    proposal: &str,
+    revision: &str,
+    frontier: u64,
+    expected_digest: Option<&str>,
+) -> Result<HumanGovernanceResponse, HumanGovernanceError> {
+    let conflict = |current_frontier| HumanGovernanceResponse::Conflict {
+        current_frontier,
+        current_revision_ref: None,
+    };
+    let page = match service
+        .detail(
+            EngineHumanSurface::Inbox,
+            proposal,
+            frontier,
+            Some(revision),
+        )
+        .await?
+    {
+        Ok(page) => page,
+        Err((current_frontier, _)) => return Ok(conflict(current_frontier)),
+    };
+    let mut items = page.items;
+    let item = if items.len() == 1 {
+        items
+            .pop()
+            .filter(|item| {
+                item.object_ref.as_deref() == Some(proposal)
+                    && item.revision_ref.as_deref() == Some(revision)
+                    && item.proposal.is_some()
+            })
+            .map(map_human_item)
+    } else {
+        None
+    };
+    let digest = item.as_ref().and_then(|item| {
+        evertrace_protocol::dto::proposal_confirmation_digest(item, page.frontier)
+    });
+    if let Some(expected) = expected_digest
+        && (page.frontier != frontier || digest.as_deref().is_some_and(|value| value != expected))
+    {
+        return Ok(conflict(page.frontier));
+    }
+    Ok(HumanGovernanceResponse::ProposalReview {
+        frontier: page.frontier,
+        item: item.map(Box::new),
+        confirmation_digest: digest,
+    })
 }
 
 fn map_human_page(page: evertrace_engine::HumanPage) -> HumanGovernanceResponse {
