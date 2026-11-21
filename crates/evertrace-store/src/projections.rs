@@ -13850,7 +13850,18 @@ impl JournalAdmissionState {
             JournalPayload::RevisionProposalRecorded(value) => Some(value.as_ref()),
             _ => None,
         }) {
-            match self.classify_deletion_proposal(proposal)? {
+            let admission = self.classify_deletion_proposal(proposal)?;
+            if let Some(ProposalAcceptanceAuthority::WebAcceptance { intent, .. }) = proposal
+                .acceptance
+                .as_ref()
+                .map(|audit| &audit.authority_basis)
+            {
+                if !admission.permits_web_acceptance(intent.reauthorization.as_deref()) {
+                    return Err(error);
+                }
+                continue;
+            }
+            match admission {
                 ObjectDeletionCandidateAdmission::Clear => {}
                 ObjectDeletionCandidateAdmission::FixedSuppression => return Err(error),
                 admission @ ObjectDeletionCandidateAdmission::HistoricalConflict { .. } => {

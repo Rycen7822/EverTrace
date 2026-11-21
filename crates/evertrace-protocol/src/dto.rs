@@ -255,6 +255,8 @@ pub enum HumanActionRequest {
         atom_edit: Option<Box<WebAtomEdit>>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         procedure_edit: Option<Box<WebProcedureEdit>>,
+        #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+        reauthorize: bool,
     },
     WebProposalDisposition {
         review: ProposalConfirmation,
@@ -928,12 +930,19 @@ fn review_intent(
     item: &HumanSnapshotItem,
     frontier: u64,
 ) -> Option<evertrace_domain::semantic::WebAcceptanceIntent> {
-    let review = item.proposal_review.as_ref().filter(|review| {
-        let merge = review.proposal.operation == ProposalOperation::Merge;
-        review.plain_accept_eligible == !merge
-            && review.merge_and_accept_eligible == merge
-            && review.reauthorization.is_none()
-    })?;
+    let review = item.proposal_review.as_ref()?;
+    if let Some(reference) = &review.reauthorization {
+        return WebAcceptanceIntent::for_reauthorization(
+            &review.proposal,
+            frontier,
+            reference,
+            review.capability_coverage.as_ref(),
+        );
+    }
+    let merge = review.proposal.operation == ProposalOperation::Merge;
+    if review.plain_accept_eligible == merge || review.merge_and_accept_eligible != merge {
+        return None;
+    }
     if let Some(revision) = review.proposal.base_revision_id {
         let base = item
             .proposal_base
@@ -1155,8 +1164,10 @@ impl HumanActionRequest {
                 review,
                 atom_edit,
                 procedure_edit,
+                reauthorize,
             } => {
                 (atom_edit.is_none() || procedure_edit.is_none())
+                    && (!reauthorize || (atom_edit.is_none() && procedure_edit.is_none()))
                     && valid_hex(&review.expected_digest)
             }
             Self::WebProposalDisposition { review, .. } => valid_hex(&review.expected_digest),

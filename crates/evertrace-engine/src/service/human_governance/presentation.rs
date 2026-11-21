@@ -192,6 +192,26 @@ impl HumanGovernanceService {
         Ok(snapshot.frontier == frontier && self.web_base_accessible(&snapshot, proposal).await?)
     }
 
+    pub async fn web_reauthorization_current(
+        &self,
+        proposal: &RevisionProposal,
+        frontier: u64,
+        reference: &ObjectReauthorizationRef,
+    ) -> Result<bool, HumanGovernanceError> {
+        let snapshot = self
+            .writer
+            .project_objects()
+            .await
+            .map_err(|_| HumanGovernanceError::Store)?;
+        if snapshot.frontier != frontier {
+            return Ok(false);
+        }
+        let admission = ObjectDeletionCandidateAdmissionView::from_snapshot(&snapshot)
+            .and_then(|view| view.classify_proposal(proposal))
+            .map_err(|_| HumanGovernanceError::Store)?;
+        Ok(admission.permits_web_acceptance(Some(reference)))
+    }
+
     pub async fn web_procedure_edit_coverage(
         &self,
         proposal: &RevisionProposal,

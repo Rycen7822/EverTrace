@@ -391,6 +391,7 @@ function showAcceptanceReceipt() {
     pending: "正在核对审核结果…",
     applied: receipt.authoring === "correction" ? "已提交修正提案；请前往审核。"
       : receipt.authoring === "creation" ? "已提交新建提案；请前往审核。"
+      : receipt.reauthorize ? "已再授权为新记录，原删除不变。"
       : decision === "defer" ? "已延期。" : decision === "reject" ? "已拒绝。" : "已接受。",
     no_delta: "此请求已处理；没有再次写入。",
     conflict: "提案或水位有变化；本请求未应用。",
@@ -410,6 +411,7 @@ async function resolveAcceptance(receipt, lookup) {
     const input = { ...receipt.input };
     delete receipt.input.atom_edit;
     delete receipt.input.procedure_edit;
+    delete receipt.input.reauthorize;
     if (receipt.authoring) {
       delete receipt.input.content;
       delete receipt.input.frontier;
@@ -435,6 +437,11 @@ function actOnProposal(button) {
     if (button.dataset.atomEditValue) input.atom_edit = JSON.parse(button.dataset.atomEditValue);
     else input.procedure_edit = JSON.parse(button.dataset.procedureEditValue);
   }
+  const reauthorize = action === "reauthorize";
+  if (reauthorize) {
+    input.reauthorize = true;
+    prompt = "将提案修订 " + revision + " 再授权为新记录？原删除不变，不会恢复旧对象或来源。";
+  }
   if (proposalDisposition === "defer") {
     const fields = button.closest("[data-disposition-fields]");
     const wait = fields.querySelector("[data-proposal-waiting]");
@@ -450,7 +457,7 @@ function actOnProposal(button) {
     prompt = "拒绝刚才显示的提案修订 " + revision + "？相同内容与证据不会重新提交审核。";
   }
   if (!window.confirm(prompt)) return;
-  sendProposalAction({ input });
+  sendProposalAction({ input, reauthorize });
 }
 function submitAtomCorrection(button) {
   const { atomId, revision, frontier, requestId } = button.dataset;

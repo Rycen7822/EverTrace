@@ -160,7 +160,7 @@ impl AtomAcceptanceContext {
                 intent,
             } => {
                 require_user_source(observation, receipt)?;
-                if WebAcceptanceIntent::scope(proposal).as_ref() != Some(authorized_scope_ceiling)
+                if intent.reviewed_scope(proposal).as_ref() != Some(authorized_scope_ceiling)
                     || !intent.capture_matches(proposal, receipt, observation)
                     || receipt.recorded_at_us < proposal.created_at_us
                     || receipt.recorded_at_us > accepted_at_us
@@ -852,10 +852,14 @@ impl RevisionProposalService {
                     ..
                 }
             );
+        let global_web_reauthorization = matches!(&acceptance_context, AtomAcceptanceContext::Web {
+            authorized_scope_ceiling: AtomScope::Global, intent, ..
+        } if intent.reauthorization.is_some());
         if !matches!(
             requested_scope,
             AtomScope::Task { .. } | AtomScope::Repository { .. }
-        ) && !(matches!(requested_scope, AtomScope::Global) && global_tui)
+        ) && !(matches!(requested_scope, AtomScope::Global)
+            && (global_tui || global_web_reauthorization))
         {
             return Err(SemanticServiceError::UnsupportedTarget);
         }

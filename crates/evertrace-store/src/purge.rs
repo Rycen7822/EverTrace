@@ -5,8 +5,9 @@ use evertrace_domain::{
     procedure::ProcedureStateEvent,
     purge::{
         OBJECT_DELETION_LEDGER_SCHEMA_VERSION, ObjectDeletionGuards, ObjectDeletionLedgerEvent,
-        ObjectDeletionPhase, ObjectDeletionTarget, RepositoryPurgeBlocker,
-        SCOPE_PURGE_PROGRESS_SCHEMA_VERSION, ScopePurgeProgress, ScopePurgeStage, ScopePurgeTarget,
+        ObjectDeletionPhase, ObjectDeletionTarget, ObjectReauthorizationRef,
+        RepositoryPurgeBlocker, SCOPE_PURGE_PROGRESS_SCHEMA_VERSION, ScopePurgeProgress,
+        ScopePurgeStage, ScopePurgeTarget,
     },
     recall::RecallLedgerEvent,
     revision::RevisionId,
@@ -83,6 +84,22 @@ pub enum ObjectDeletionCandidateAdmission {
 }
 
 impl ObjectDeletionCandidateAdmission {
+    /// Only completed deletion conflicts can be explicitly acknowledged, never fixed suppression.
+    pub fn permits_web_acceptance(&self, reference: Option<&ObjectReauthorizationRef>) -> bool {
+        match (self, reference) {
+            (Self::Clear, None) => true,
+            (Self::HistoricalConflict { deletions }, Some(reference)) => {
+                deletions
+                    .iter()
+                    .all(|deletion| deletion.phase == ObjectDeletionPhase::Purged)
+                    && self
+                        .representative_historical_deletion()
+                        .is_some_and(|deletion| reference.matches(deletion))
+            }
+            _ => false,
+        }
+    }
+
     pub fn representative_historical_deletion(&self) -> Option<&ObjectDeletionLedgerEvent> {
         match self {
             Self::HistoricalConflict { deletions } => deletions

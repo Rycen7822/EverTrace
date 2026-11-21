@@ -1644,7 +1644,7 @@ fn validate_proposal_relations(
             } = &acceptance.authority_basis
             {
                 if *user_source_observation_ref != sources.observation_id
-                    || WebAcceptanceIntent::scope(sources.reviewed).as_ref()
+                    || intent.reviewed_scope(sources.reviewed).as_ref()
                         != Some(authorized_scope_ceiling)
                     || !intent.capture_matches(
                         sources.reviewed,

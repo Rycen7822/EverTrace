@@ -1226,10 +1226,11 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
                                             &human_governance, request_id, expected_frontier, intent,
                                         )).await
                                     }
-                                    HumanActionRequest::WebAccept { review, atom_edit, procedure_edit } => Box::pin(accept_web_review(
-                                        &human_governance, request_id, expected_frontier, review,
-                                        web_edit_input(atom_edit.as_deref(), procedure_edit.as_deref()),
-                                    )).await,
+                                    HumanActionRequest::WebAccept { review, atom_edit, procedure_edit, reauthorize } => Box::pin(
+                                        accept_web_review(&human_governance, request_id, expected_frontier, review,
+                                            web_edit_input(atom_edit.as_deref(), procedure_edit.as_deref()), reauthorize,
+                                        )
+                                    ).await,
                                     HumanActionRequest::WebProposalDisposition { review, decision } => Box::pin(dispose_web_review(
                                         &human_governance, request_id, expected_frontier, review, decision,
                                     )).await,
@@ -1865,7 +1866,7 @@ async fn read_proposal_review(
             }
         }
     }
-    let web_accept_available = edit.is_none()
+    let mut web_accept_available = edit.is_none()
         && item
             .as_ref()
             .zip(digest.as_deref())
@@ -1878,6 +1879,17 @@ async fn read_proposal_review(
                 )
                 .is_some()
             });
+    if web_accept_available
+        && let Some(review) = item.as_ref().and_then(|item| item.proposal_review.as_ref())
+        && let Some(reference) = &review.reauthorization
+    {
+        web_accept_available = Box::pin(service.web_reauthorization_current(
+            &review.proposal,
+            page.frontier,
+            reference,
+        ))
+        .await?;
+    }
     Ok(HumanGovernanceResponse::ProposalReview {
         frontier: page.frontier,
         web_disposition_available: edit.is_none()
@@ -1900,6 +1912,7 @@ async fn accept_web_review(
     frontier: u64,
     review: evertrace_protocol::dto::ProposalConfirmation,
     edit: Option<WebProposalEdit<'_>>,
+    reauthorize: bool,
 ) -> Result<EngineHumanActionOutcome, HumanGovernanceError> {
     let acceptance = service.acceptance();
     let (id, revision, digest) = (
@@ -1915,7 +1928,7 @@ async fn accept_web_review(
         request_id,
         frontier,
         (id, revision, &digest),
-        Some(edit),
+        Some((edit, reauthorize)),
     ))
     .await?
     {
@@ -1961,13 +1974,21 @@ async fn accept_web_review(
                 ..
             },
             None,
-        ) => evertrace_protocol::dto::web_acceptance_intent(
-            &item,
-            frontier,
-            &digest,
-            core_anchor.as_deref(),
-        )
-        .ok_or(HumanGovernanceError::Store)?,
+        ) => {
+            let intent = evertrace_protocol::dto::web_acceptance_intent(
+                &item,
+                frontier,
+                &digest,
+                core_anchor.as_deref(),
+            )
+            .ok_or(HumanGovernanceError::Store)?;
+            if intent.reauthorization.is_some() != reauthorize {
+                return Ok(EngineHumanActionOutcome::Unavailable {
+                    reason: "web_acceptance_action_does_not_match_review",
+                });
+            }
+            intent
+        }
         (HumanGovernanceResponse::Conflict { .. }, _) => {
             return Ok(EngineHumanActionOutcome::Conflict {
                 current_revision_ref: None,

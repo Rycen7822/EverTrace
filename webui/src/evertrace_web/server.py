@@ -314,6 +314,9 @@ class App:
                 if disposition:
                     fields.add("decision")
                 edit_fields = payload.keys() & PROPOSAL_EDIT_FIELDS.keys() if path == "/api/proposal-accept" else set()
+                reauthorize = path == "/api/proposal-accept" and payload.get("reauthorize") is True
+                if reauthorize and not edit_fields:
+                    fields.add("reauthorize")
                 if len(edit_fields) > 1 or set(payload) != fields | edit_fields or not _uuid7(payload["request_id"]):
                     raise BackendError("invalid_input")
                 proposal, revision = proposal_coordinates(payload["proposal_id"], payload["revision"])
@@ -326,7 +329,7 @@ class App:
                 try:
                     data = await self.backend.web_proposal_action(
                         payload["request_id"], proposal, revision, frontier, digest,
-                        lookup=path.endswith("-result"), decision=decision, edit=edit,
+                        lookup=path.endswith("-result"), decision=decision, edit=edit, reauthorize=reauthorize,
                     )
                 except BackendError:
                     # No reply is not evidence of rollback, and must not trigger another write.

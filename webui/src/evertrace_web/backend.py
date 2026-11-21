@@ -655,13 +655,18 @@ class Backend:
             reply = await self._request(None, confirmation=True, action=action, request_id=request_id)
         return proposal_action_result(reply)
 
-    async def web_proposal_action(self, request_id, proposal, revision, frontier, digest, *, lookup, decision, edit=None):
+    async def web_proposal_action(
+        self, request_id, proposal, revision, frontier, digest, *, lookup, decision, edit=None, reauthorize=False,
+    ):
         review = {"proposal_id": proposal, "expected_revision_id": revision, "expected_digest": digest}
         fields = {"review": review}
         if decision is not None:
             fields["decision"] = decision
-        if edit is not None and not lookup:
-            fields.update(edit)
+        if not lookup:
+            if edit is not None:
+                fields.update(edit)
+            if reauthorize:
+                fields["reauthorize"] = True
         if lookup:
             kind = "web_acceptance_outcome" if decision is None else "web_proposal_disposition_outcome"
             reply = await self._request({"kind": kind, "request_id": request_id, "expected_frontier": frontier, **fields})

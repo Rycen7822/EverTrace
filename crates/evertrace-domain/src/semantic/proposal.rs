@@ -12,6 +12,7 @@ use crate::{
     },
     inventory::{CapabilityCoverageOmission, CapabilityCoverageSummary, CapabilityEvidenceLevel},
     procedure::{ProcedureAutoFullAudit, ProcedureDone, ProcedureDraft, ProcedureScope},
+    purge::{ObjectDeletionTarget, ObjectReauthorizationRef},
     revision::RevisionId,
 };
 
@@ -75,6 +76,8 @@ pub struct WebAcceptanceIntent {
     pub atom_edit: Option<Box<WebAtomEdit>>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub procedure_edit: Option<Box<WebProcedureEdit>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reauthorization: Option<Box<ObjectReauthorizationRef>>,
 }
 
 /// Content-only edit; identity, authority, conditions and provenance stay with the reviewed proposal.
@@ -711,7 +714,82 @@ impl WebAcceptanceIntent {
             procedure_coverage,
             atom_edit: None,
             procedure_edit: None,
+            reauthorization: None,
         })
+    }
+
+    pub fn for_reauthorization(
+        proposal: &RevisionProposal,
+        frontier: u64,
+        reference: &ObjectReauthorizationRef,
+        coverage: Option<&CapabilityCoverageSummary>,
+    ) -> Option<Self> {
+        let mut intent = Self {
+            reviewed_frontier: frontier,
+            review_digest: [0; 32],
+            procedure_coverage: match coverage {
+                Some(value) => Some(Box::new(WebProcedureCoverage::from_summary(value)?)),
+                None => None,
+            },
+            atom_edit: None,
+            procedure_edit: None,
+            reauthorization: Some(Box::new(reference.clone())),
+        };
+        intent.review_digest = intent.reauthorization_digest(proposal, reference)?;
+        Some(intent)
+    }
+
+    fn reauthorization_scope(
+        proposal: &RevisionProposal,
+        target: ObjectDeletionTarget,
+    ) -> Option<AtomScope> {
+        if proposal.eligibility != ProposalEligibility::ManualRequired
+            || !proposal.status.is_open()
+            || proposal.operation != ProposalOperation::Create
+            || proposal.base_revision_id.is_some()
+            || proposal.target_id.is_some()
+        {
+            return None;
+        }
+        match (target, &proposal.payload) {
+            (ObjectDeletionTarget::Atom { .. }, ProposalPayload::Atom(payload)) => {
+                let AtomProposalPayload::Create { draft } = payload.as_ref() else {
+                    return None;
+                };
+                matches!(
+                    draft.scope,
+                    AtomScope::Task { .. } | AtomScope::Repository { .. } | AtomScope::Global
+                )
+                .then(|| draft.scope.clone())
+            }
+            (ObjectDeletionTarget::Procedure { .. }, ProposalPayload::Procedure(_))
+            | (ObjectDeletionTarget::CoreMembership { .. }, ProposalPayload::CoreMembership(_)) => {
+                Self::scope(proposal)
+            }
+            _ => None,
+        }
+    }
+
+    fn reauthorization_digest(
+        &self,
+        proposal: &RevisionProposal,
+        reference: &ObjectReauthorizationRef,
+    ) -> Option<[u8; 32]> {
+        Self::reauthorization_scope(proposal, reference.target)?;
+        let coverage = self.procedure_coverage.as_deref();
+        if self.reviewed_frontier == 0
+            || self.edit().is_some()
+            || reference.deletion_generation == 0
+            || reference.purge_job_audit_ref.is_empty()
+            || !Self::manual_coverage_valid(proposal, coverage)
+        {
+            return None;
+        }
+        proposal_review_digest(
+            self.reviewed_frontier,
+            ("reauthorize", proposal, reference, coverage),
+            proposal.base_revision_id,
+        )
     }
 
     pub fn digest_hex(&self) -> String {
@@ -730,6 +808,7 @@ impl WebAcceptanceIntent {
             procedure_coverage: None,
             atom_edit: Some(edit),
             procedure_edit: None,
+            reauthorization: None,
         })
     }
 
@@ -746,6 +825,7 @@ impl WebAcceptanceIntent {
             procedure_coverage: Some(coverage),
             atom_edit: None,
             procedure_edit: Some(edit),
+            reauthorization: None,
         })
     }
 
@@ -798,7 +878,9 @@ impl WebAcceptanceIntent {
     }
 
     pub fn reviewed_scope(&self, original: &RevisionProposal) -> Option<AtomScope> {
-        if self.atom_edit.is_some() {
+        if let Some(reference) = &self.reauthorization {
+            Self::reauthorization_scope(original, reference.target)
+        } else if self.atom_edit.is_some() {
             WebAtomEdit::draft(original).map(|draft| draft.scope.clone())
         } else {
             Self::scope(original)
@@ -836,14 +918,8 @@ impl WebAcceptanceIntent {
             return None;
         }
         Self::scope(proposal)?;
-        match (&proposal.payload, coverage) {
-            (ProposalPayload::Procedure(_), Some(value))
-                if value.permits_manual(proposal.operation) =>
-            {
-                ()
-            }
-            (ProposalPayload::Procedure(_), _) | (_, Some(_)) => return None,
-            _ => (),
+        if !Self::manual_coverage_valid(proposal, coverage) {
+            return None;
         }
         let merge = proposal.operation == ProposalOperation::Merge;
         let review = Review {
@@ -856,17 +932,35 @@ impl WebAcceptanceIntent {
         proposal_review_digest(frontier, review, proposal.base_revision_id)
     }
 
+    fn manual_coverage_valid(
+        proposal: &RevisionProposal,
+        coverage: Option<&WebProcedureCoverage>,
+    ) -> bool {
+        match (&proposal.payload, coverage) {
+            (ProposalPayload::Procedure(_), Some(value)) => {
+                value.permits_manual(proposal.operation)
+            }
+            (ProposalPayload::Procedure(_), None) | (_, Some(_)) => false,
+            _ => true,
+        }
+    }
+
     pub fn canonical(&self, proposal: &RevisionProposal) -> Option<String> {
         if self.atom_edit.is_some() && self.procedure_edit.is_some() {
             return None;
         }
-        let (action, digest) = match self.edit() {
-            Some(WebProposalEdit::Atom(edit)) if self.procedure_coverage.is_none() => (
+        let (action, digest) = match (self.reauthorization.as_deref(), self.edit()) {
+            (Some(reference), None) => (
+                "reauthorize",
+                self.reauthorization_digest(proposal, reference)?,
+            ),
+            (Some(_), Some(_)) => return None,
+            (None, Some(WebProposalEdit::Atom(edit))) if self.procedure_coverage.is_none() => (
                 "edit_and_accept",
                 Self::edit_digest(proposal, self.reviewed_frontier, edit)?,
             ),
-            Some(WebProposalEdit::Atom(_)) => return None,
-            Some(WebProposalEdit::Procedure(edit)) => (
+            (None, Some(WebProposalEdit::Atom(_))) => return None,
+            (None, Some(WebProposalEdit::Procedure(edit))) => (
                 "edit_and_accept",
                 Self::procedure_edit_digest(
                     proposal,
@@ -875,7 +969,7 @@ impl WebAcceptanceIntent {
                     self.procedure_coverage.as_deref()?,
                 )?,
             ),
-            None => (
+            (None, None) => (
                 "accept",
                 Self::digest(
                     proposal,

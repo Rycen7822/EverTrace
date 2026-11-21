@@ -412,10 +412,8 @@ impl HumanAcceptanceService {
             return Err(HumanGovernanceError::Store);
         }
         if view.proposals.get(&reviewed.proposal_id) != Some(reviewed)
-            || !matches!(
-                deletion_admission(snapshot, reviewed)?,
-                ObjectDeletionCandidateAdmission::Clear
-            )
+            || !deletion_admission(snapshot, reviewed)?
+                .permits_web_acceptance(intent.reauthorization.as_deref())
         {
             return Ok(());
         }
@@ -629,7 +627,7 @@ impl HumanAcceptanceService {
                 service, &snapshot, proposal,
             ))
             .await?
-            || (intent.edit().is_some()
+            || ((intent.edit().is_some() || intent.reauthorization.is_some())
                 && !service.proposal_accessible(&snapshot, proposal).await?)
         {
             return Ok(conflict());
@@ -642,10 +640,12 @@ impl HumanAcceptanceService {
         {
             return Ok(conflict());
         }
-        if !matches!(
-            deletion_admission(&snapshot, proposal)?,
-            ObjectDeletionCandidateAdmission::Clear
-        ) {
+        if !deletion_admission(&snapshot, proposal)?
+            .permits_web_acceptance(intent.reauthorization.as_deref())
+        {
+            if intent.reauthorization.is_some() {
+                return Ok(conflict());
+            }
             return Ok(HumanActionOutcome::Unavailable {
                 reason: "web_acceptance_requires_reauthorization",
             });
@@ -729,7 +729,7 @@ impl HumanAcceptanceService {
         request_id: RequestId,
         frontier: u64,
         (id, revision, digest): (RevisionProposalId, RevisionId, &str),
-        submitted_edit: Option<Option<WebProposalEdit<'_>>>,
+        submitted_action: Option<(Option<WebProposalEdit<'_>>, bool)>,
     ) -> Result<HumanActionOutcome, HumanGovernanceError> {
         let command = CommandId::from_uuid(request_id.as_uuid())
             .map_err(|_| HumanGovernanceError::InvalidInput)?;
@@ -758,7 +758,9 @@ impl HumanAcceptanceService {
         let Some(outcome) = web_acceptance_outcome(&committed, proposal, |saved| {
             saved.reviewed_frontier == frontier
                 && hex(&saved.review_digest) == digest
-                && submitted_edit.is_none_or(|edit| saved.edit() == edit)
+                && submitted_action.is_none_or(|(edit, reauthorize)| {
+                    saved.edit() == edit && saved.reauthorization.is_some() == reauthorize
+                })
                 && saved.canonical(proposal).is_some()
         }) else {
             return Ok(HumanActionOutcome::Unknown);
