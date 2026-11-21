@@ -71,6 +71,7 @@ pub(super) struct NativeRetrieval<'a> {
     pub sequence_scope: Option<&'a super::SourceSequenceScope>,
     pub time_scope: Option<&'a super::TemporalReadScope<'a>>,
     pub relation_sources: Option<RelationSources<'a>>,
+    pub lineage: Option<&'a super::read_context::LineageRead>,
     pub include_hit_window: bool,
 }
 
@@ -675,6 +676,11 @@ impl NativeRetrieval<'_> {
             .into_iter()
             .filter(|kind| relation_allowed(kind))
             .collect();
+        let persisted_kinds = kinds
+            .iter()
+            .filter(|kind| !super::read_context::LINEAGE_RELATIONS.contains(&kind.as_str()))
+            .cloned()
+            .collect::<Vec<_>>();
         let mut relation_links = BTreeSet::new();
         let mut incomplete = BTreeSet::new();
         let mut visited = BTreeSet::new();
@@ -691,9 +697,9 @@ impl NativeRetrieval<'_> {
             self.result.budget.hops_remaining -= 1;
             let sources: Vec<_> = frontier.difference(&visited).take(64).cloned().collect();
             visited.extend(sources.iter().cloned());
-            let edges = match self
+            let mut edges = match self
                 .deadline
-                .run(snapshot.adjacent_relations(&sources, &kinds, 65))
+                .run(snapshot.adjacent_relations(&sources, &persisted_kinds, 65))
                 .await
             {
                 Ok(Ok(Some(rows))) => rows,
@@ -707,6 +713,22 @@ impl NativeRetrieval<'_> {
                     break;
                 }
             };
+            if let Some(lineage) = self.lineage {
+                edges.extend(
+                    lineage
+                        .edges
+                        .iter()
+                        .filter(|edge| sources.contains(&edge.0) && kinds.contains(&edge.2))
+                        .map(|(source, target, kind)| {
+                            evertrace_store::relations::RelationProjectionRow::edge(
+                                kind,
+                                snapshot.frontier(),
+                                source.clone(),
+                                target.clone(),
+                            )
+                        }),
+                );
+            }
             if edges.len() > 64 {
                 self.degraded("relation_fanout_truncated");
             }

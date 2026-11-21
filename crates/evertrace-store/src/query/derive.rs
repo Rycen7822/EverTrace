@@ -182,6 +182,40 @@ pub fn canonical_physical_source(
     exact_identifier_row(row, row.source_event_seq, true)?.ok_or(StoreError::StoreCorrupt)
 }
 
+/// A frozen lineage operand is exact-only; descriptive metadata does not grant verification authority.
+pub fn canonical_lineage_source(
+    row: &crate::ObjectRow,
+    repository: evertrace_domain::ids::RepositoryId,
+    is_current: bool,
+) -> Result<SearchProjectionRow, StoreError> {
+    let payload: JournalPayload = serde_json::from_str(
+        row.payload_json
+            .as_deref()
+            .ok_or(StoreError::StoreCorrupt)?,
+    )
+    .map_err(|_| StoreError::StoreCorrupt)?;
+    let (text, worktree) = match &payload {
+        JournalPayload::WorktreeTransitionRecorded(transition) if transition.validate().is_ok() => (
+            serde_json::json!({"kind":transition.kind,"lineage_assessment":transition.lineage_assessment}).to_string(), None,
+        ),
+        JournalPayload::WorktreeSnapshotRecorded(snapshot) if snapshot.validate().is_ok() => (
+            serde_json::json!({"capture_status":snapshot.capture_status}).to_string(), Some(snapshot.worktree_instance_id),
+        ),
+        _ => return Err(StoreError::StoreCorrupt),
+    };
+    let mut source = object_identifier_row(
+        row,
+        &payload,
+        is_current,
+        vec![text],
+        0,
+        row.source_event_seq,
+    )?;
+    source.repository_id = Some(repository.to_string());
+    source.worktree_id = worktree.map(|id| id.to_string());
+    Ok(source)
+}
+
 /// Structured canonical Work sources are request-local, never an open-Episode FTS row.
 pub fn canonical_work_episode_source(
     row: &crate::ObjectRow,

@@ -5,7 +5,7 @@ mod projection;
 mod relation_assembly;
 
 pub use derive::{
-    DefaultRetrievalSuppressionGeneration, canonical_physical_source,
+    DefaultRetrievalSuppressionGeneration, canonical_lineage_source, canonical_physical_source,
     canonical_work_binding_source, canonical_work_episode_source,
     default_retrieval_suppression_ref_hash,
 };

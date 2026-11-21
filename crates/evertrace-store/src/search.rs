@@ -922,7 +922,14 @@ impl SearchProjectionRow {
         if self.row_variant != "object"
             || !matches!(
                 self.object_kind.as_deref(),
-                Some("work_episode" | "work_binding" | "operation" | "scope_effect")
+                Some(
+                    "work_episode"
+                        | "work_binding"
+                        | "operation"
+                        | "scope_effect"
+                        | "worktree_transition"
+                        | "worktree_snapshot"
+                )
             )
         {
             return Err(StoreError::StoreCorrupt);
@@ -984,7 +991,11 @@ impl SearchProjectionRow {
                     .object_kind
                     .as_deref()
                     .is_some_and(is_searchable_object_kind)
-                    || canonical && self.object_kind.as_deref() == Some("work_binding"))
+                    || canonical
+                        && matches!(
+                            self.object_kind.as_deref(),
+                            Some("work_binding" | "worktree_transition" | "worktree_snapshot")
+                        ))
                 || (self.object_kind.as_deref() == Some("work_episode")
                     && !canonical
                     && (generation < 2 || self.lifecycle.as_deref() != Some("terminal")))
@@ -1107,6 +1118,14 @@ fn valid_physical_reference(row: &SearchProjectionRow) -> bool {
             id == source
                 && source
                     .parse::<evertrace_domain::ids::ScopeEffectId>()
+                    .is_ok()
+        }
+        Some("worktree_transition") => evertrace_domain::query::parse_transition_revision(id)
+            .is_some_and(|(transition, _)| transition.to_string() == source),
+        Some("worktree_snapshot") => {
+            id == source
+                && source
+                    .parse::<evertrace_domain::ids::WorktreeSnapshotId>()
                     .is_ok()
         }
         Some("work_binding") => {

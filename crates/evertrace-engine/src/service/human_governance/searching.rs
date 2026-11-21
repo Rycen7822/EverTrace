@@ -6,11 +6,62 @@ use evertrace_domain::{
 };
 
 use crate::search::read_context::{
-    RelationArchiveBudget, check_relation_archive, current_operation_binding,
-    operation_binding_read,
+    LINEAGE_RELATIONS, LineageQuery, LineageRead, RelationArchiveBudget, check_relation_archive,
+    current_operation_binding, operation_binding_read,
 };
 
 const SEARCH_HIT_ORDER_REVISION: u32 = 12;
+
+fn lineage_anchor(
+    selection: MemoryScopeSelection,
+    facets: &QueryFacetSet,
+    index: &export::SearchReadIndex<'_>,
+) -> Option<LineageQuery> {
+    let MemoryScopeSelection::Repository { repository_id } = selection else {
+        return None;
+    };
+    let [anchor] = facets.target_anchors.as_slice() else {
+        return None;
+    };
+    let requested = LINEAGE_RELATIONS.map(|kind| {
+        facets
+            .relation_requirements
+            .iter()
+            .any(|value| value == kind)
+    });
+    if !requested.into_iter().any(|value| value)
+        || !facets.temporal_qualifiers.is_empty()
+        || !matches!(
+            facets.temporal_mode,
+            TemporalMode::Current | TemporalMode::Any
+        )
+    {
+        return None;
+    }
+    let exact = parse_transition_revision(anchor);
+    let id = exact.map(|(id, _)| id).or_else(|| anchor.parse().ok())?;
+    let (head, _) = index
+        .get(id.to_string().as_str())?
+        .iter()
+        .filter_map(|row| {
+            let reference = row.current_revision_id.as_deref()?;
+            let (key, version) = parse_transition_revision(reference)?;
+            (key == id && row.object_kind.as_deref() == Some("worktree_transition"))
+                .then_some((reference, version))
+        })
+        .max_by_key(|(_, version)| *version)?;
+    let revision = if exact.is_some() { anchor } else { head };
+    let current = head == revision;
+    if facets.temporal_mode == TemporalMode::Current && !current {
+        return None;
+    }
+    Some(LineageQuery {
+        repository: repository_id,
+        revision: revision.to_owned(),
+        current,
+        requested,
+    })
+}
 
 type SearchPolicy = Option<(String, Option<evertrace_codex::policy::PolicyEvidence>)>;
 
@@ -1132,6 +1183,26 @@ impl HumanGovernanceService {
         }
     }
 
+    async fn read_lineage(
+        &self,
+        query: &LineageQuery,
+        frontier: u64,
+        report: Option<&evertrace_codex::HostProbeReport>,
+        deadline: std::time::Instant,
+    ) -> Option<LineageRead> {
+        Box::pin(
+            crate::search::read_context::SearchReadAccess {
+                writer: &self.writer,
+                authority: RepositoryReadAuthority::retained(report),
+                frontier,
+                config_hash: self.effective_config_hash,
+                deadline,
+            }
+            .lineage(query),
+        )
+        .await
+    }
+
     async fn resume_hits(
         &self,
         query: &HumanSearchQuery,
@@ -1190,7 +1261,15 @@ impl HumanGovernanceService {
                 export::SearchReadIndex::new(&snapshot, &query.facets, query.selection, deadline)
                     .map_err(|_| HumanGovernanceError::Store)?;
             let mut checks = BTreeSet::new();
+            let mut lineage_checks = BTreeSet::new();
             for hit in cursor.after.iter().chain(&cursor.remaining) {
+                if matches!(
+                    hit.object_kind.as_deref(),
+                    Some("worktree_transition" | "worktree_snapshot")
+                ) {
+                    lineage_checks.insert(hit.access_reference());
+                    continue;
+                }
                 if let Some(deps) = cursor.wiki_inputs.get(&hit.candidate_id) {
                     checks.extend(deps.iter().cloned());
                 } else {
@@ -1232,6 +1311,24 @@ impl HumanGovernanceService {
                 return conflict();
             }
             let current_report = self.search_report().await;
+            if !lineage_checks.is_empty() {
+                let Some(query) = lineage_anchor(query.selection, &query.facets, &index) else {
+                    return conflict();
+                };
+                let Some(lineage) = Box::pin(self.read_lineage(
+                    &query,
+                    cursor.frontier,
+                    current_report.as_ref(),
+                    deadline,
+                ))
+                .await
+                else {
+                    return conflict();
+                };
+                if !lineage_checks.into_iter().all(|id| lineage.covers(id)) {
+                    return conflict();
+                }
+            }
             // Hit checks cannot detect changes to shards that contributed no hits.
             if search_policy(current_report.as_ref()) != cursor.policy
                 || self
@@ -1549,6 +1646,22 @@ impl HumanGovernanceService {
                     }
                 }
             }
+            let pinned_lineage = lineage_anchor(query.selection, &protected.facets, &index);
+            let lineage = if let Some(query) = &pinned_lineage {
+                Box::pin(self.read_lineage(query, snapshot.frontier, report.as_ref(), deadline))
+                    .await
+                    .map(std::sync::Arc::new)
+            } else {
+                None
+            };
+            if let Some(lineage) = &lineage {
+                refs.extend(
+                    lineage
+                        .rows
+                        .iter()
+                        .filter_map(|row| row.candidate_id.clone()),
+                );
+            }
             let suppression = ObjectDeletionCurrentView::from_snapshot(&snapshot)
                 .map_err(|_| HumanGovernanceError::Store)?;
             let boundary = query.selection.boundary();
@@ -1666,6 +1779,9 @@ impl HumanGovernanceService {
                 false,
             )?;
             canonical_sources.extend(physical_operands);
+            if let Some(lineage) = &lineage {
+                canonical_sources.extend(lineage.rows.iter().cloned());
+            }
             let relation_sources = |targets: &[String], readable: &BTreeSet<String>| {
                 let mut sources = canonical_episode_sources(
                     snapshot.frontier,
@@ -1792,6 +1908,7 @@ impl HumanGovernanceService {
             let (mut page, projection_version) =
                 crate::search::ProductionSearch::new(search.clone())
                     .with_canonical_sources(snapshot.frontier, canonical_sources)
+                    .with_lineage(lineage.clone())
                     .with_recall_sources(recall_sources)
                     .with_matched_sources(matched.references, matched.contexts)
                     .with_sequence_scope(sequence_scope)
@@ -1829,6 +1946,9 @@ impl HumanGovernanceService {
             // Trust/report state can change without a new journal event. Recheck
             // returned and interpretation dependencies before exposing fields.
             let mut recheck = |id: &str| {
+                if lineage.as_ref().is_some_and(|lineage| lineage.covers(id)) {
+                    return; // Exact lineage is checked together, below, against the same frontier.
+                }
                 if let Some(inputs) = wiki.get(id) {
                     checks.extend(inputs.iter().cloned());
                 } else {
@@ -1869,6 +1989,17 @@ impl HumanGovernanceService {
                 )
                 .await;
             let current_report = self.search_report().await;
+            if let (Some(lineage), Some(query)) = (&lineage, &pinned_lineage) {
+                access_changed |= Box::pin(self.read_lineage(
+                    query,
+                    snapshot.frontier,
+                    current_report.as_ref(),
+                    deadline,
+                ))
+                .await
+                .as_ref()
+                    != Some(lineage.as_ref());
+            }
             if let Ok(Some(repository)) = selected_repository
                 && !self
                     .search_shards_readable(

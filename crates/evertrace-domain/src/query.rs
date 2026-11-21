@@ -395,6 +395,7 @@ pub fn valid_object_reference(value: &str) -> bool {
     value.parse::<AnyPublicId>().is_ok()
         || value.parse::<RevisionId>().is_ok()
         || parse_operation_revision(value).is_some()
+        || parse_transition_revision(value).is_some()
 }
 
 pub fn valid_target_reference(value: &str) -> bool {
@@ -695,6 +696,9 @@ pub enum EvidenceRole {
     ConstraintSupport,
 }
 
+pub const TRANSITION_FROM_SNAPSHOT: &str = "worktree_transition_from_snapshot";
+pub const TRANSITION_TO_SNAPSHOT: &str = "worktree_transition_to_snapshot";
+
 impl EvidenceRole {
     pub fn for_relation(kind: &str) -> Option<Self> {
         match kind {
@@ -717,6 +721,8 @@ impl EvidenceRole {
             | "artifact_produced_by_run"
             | "artifact_produced_by_operation"
             | "operation_to_scope_effect"
+            | TRANSITION_FROM_SNAPSHOT
+            | TRANSITION_TO_SNAPSHOT
             | "binding_to_scope_effect"
             | "binding_to_primary_task"
             | "binding_to_primary_workstream"
@@ -1607,6 +1613,14 @@ impl GroundedEvidenceView {
                     || statement.ordering_basis != step.role.ordering_basis()
                     || statement.derivation_kind != DerivationKind::DeterministicDerived
                     || clause.relation_kind != *kind
+                    || (matches!(
+                        kind.as_str(),
+                        TRANSITION_FROM_SNAPSHOT | TRANSITION_TO_SNAPSHOT
+                    ) && (parse_transition_revision(&clause.source_ref).is_none()
+                        || clause
+                            .target_ref
+                            .parse::<crate::ids::WorktreeSnapshotId>()
+                            .is_err()))
                     || statement.support_refs
                         != BTreeSet::from([clause.source_ref, clause.target_ref])
                     || frontier.is_some_and(|expected| clause.frontier != expected)

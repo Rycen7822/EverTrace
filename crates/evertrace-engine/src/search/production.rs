@@ -512,6 +512,7 @@ pub struct ProductionSearch {
     candidate_grants: Option<CandidateGrants>,
     semantics: Option<std::sync::Arc<super::resolution::SemanticSearchResolution>>,
     canonical_sources: Option<(u64, Vec<SearchProjectionRow>)>,
+    lineage: Option<std::sync::Arc<super::read_context::LineageRead>>,
     recall_sources: BTreeSet<String>,
     matched_sources: BTreeSet<String>,
     matched_contexts: BTreeSet<String>,
@@ -530,6 +531,7 @@ impl ProductionSearch {
             candidate_grants: None,
             semantics: None,
             canonical_sources: None,
+            lineage: None,
             recall_sources: BTreeSet::new(),
             matched_sources: BTreeSet::new(),
             matched_contexts: BTreeSet::new(),
@@ -587,6 +589,14 @@ impl ProductionSearch {
 
     pub(crate) fn with_recall_sources(mut self, refs: BTreeSet<String>) -> Self {
         self.recall_sources = refs;
+        self
+    }
+
+    pub(crate) fn with_lineage(
+        mut self,
+        lineage: Option<std::sync::Arc<super::read_context::LineageRead>>,
+    ) -> Self {
+        self.lineage = lineage;
         self
     }
 
@@ -786,6 +796,7 @@ impl ProductionSearch {
             sequence_scope: self.sequence_scope.as_ref(),
             time_scope,
             relation_sources: Some(relation_sources),
+            lineage: self.lineage.as_deref(),
             include_hit_window: true,
         }
         .run(snapshot)
@@ -1137,6 +1148,7 @@ impl ProductionSearch {
             sequence_scope: None,
             time_scope,
             relation_sources: None,
+            lineage: None,
             include_hit_window: false,
         };
         if source_count || time_scope.is_some() {
@@ -1259,6 +1271,7 @@ impl ProductionSearch {
             sequence_scope: self.sequence_scope.as_ref(),
             time_scope: None,
             relation_sources: None,
+            lineage: None,
             include_hit_window: false,
         };
         let has_unread_source = self.candidate_grants.as_ref().is_some_and(|grants| {

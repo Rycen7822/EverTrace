@@ -705,6 +705,137 @@ pub(crate) fn operation_binding_read<'a>(
     })
 }
 
+pub(crate) const LINEAGE_RELATIONS: [&str; 2] = [
+    evertrace_domain::query::TRANSITION_FROM_SNAPSHOT,
+    evertrace_domain::query::TRANSITION_TO_SNAPSHOT,
+];
+
+pub(crate) struct LineageQuery {
+    pub repository: evertrace_domain::ids::RepositoryId,
+    pub revision: String,
+    pub current: bool,
+    pub requested: [bool; 2],
+}
+
+#[derive(PartialEq)]
+pub(crate) struct LineageRead {
+    pub rows: Vec<evertrace_store::SearchProjectionRow>,
+    pub edges: Vec<(String, String, String)>,
+}
+
+impl LineageRead {
+    pub(crate) fn covers(&self, reference: &str) -> bool {
+        self.rows
+            .iter()
+            .any(|row| row.candidate_id.as_deref() == Some(reference))
+    }
+}
+
+impl SearchReadAccess<'_> {
+    /// Read only the nominated Transition and its immutable snapshot coordinates, not Worktree current pointers.
+    pub(crate) async fn lineage(&self, query: &LineageQuery) -> Option<LineageRead> {
+        use evertrace_domain::repository::{LineageAssessment, SnapshotCaptureStatus};
+        let (id, version) = evertrace_domain::query::parse_transition_revision(&query.revision)?;
+        let key = id.to_string();
+        let context = self
+            .check_exact_record(&key, &query.revision, "worktree_transition")
+            .await
+            .ok()?;
+        let row = context.selected.as_ref()?;
+        let JournalPayload::WorktreeTransitionRecorded(transition) =
+            serde_json::from_str(row.payload_json.as_deref()?).ok()?
+        else {
+            return None;
+        };
+        if transition.worktree_transition_id != id || transition.transition_revision != version {
+            return None;
+        }
+        let tree_in_repository = |tree: evertrace_domain::ids::WorktreeId| {
+            let row = context
+                .rows
+                .iter()
+                .find(|row| row.row_id == evertrace_store::repository::worktree_row_id(&tree))?;
+            let JournalPayload::WorktreeInstanceRecorded(value) =
+                serde_json::from_str(row.payload_json.as_deref()?).ok()?
+            else {
+                return None;
+            };
+            (value.worktree_instance_id == tree && value.repository_instance_id == query.repository)
+                .then_some(())
+        };
+        tree_in_repository(transition.from_worktree_instance_id)?;
+        tree_in_repository(transition.to_worktree_instance_id)?;
+        let mut result = LineageRead {
+            rows: vec![
+                evertrace_store::query::canonical_lineage_source(
+                    row,
+                    query.repository,
+                    query.current,
+                )
+                .ok()?,
+            ],
+            edges: Vec::new(),
+        };
+        if transition.lineage_assessment != LineageAssessment::Proven {
+            return Some(result);
+        }
+        let endpoints = [
+            (
+                transition.from_worktree_instance_id,
+                transition.from_snapshot_id,
+            ),
+            (
+                transition.to_worktree_instance_id,
+                transition.to_snapshot_id,
+            ),
+        ];
+        for ((kind, requested), (tree, snapshot)) in LINEAGE_RELATIONS
+            .into_iter()
+            .zip(query.requested)
+            .zip(endpoints)
+        {
+            let Some(snapshot) = snapshot.filter(|_| requested) else {
+                continue;
+            };
+            let reference = snapshot.to_string();
+            let Ok(endpoint) = self
+                .check_record(&reference, &reference, "worktree_snapshot")
+                .await
+            else {
+                continue;
+            };
+            let Some(row) = endpoint.selected.as_ref() else {
+                continue;
+            };
+            let JournalPayload::WorktreeSnapshotRecorded(value) =
+                serde_json::from_str(row.payload_json.as_deref()?).ok()?
+            else {
+                return None;
+            };
+            if value.worktree_instance_id != tree
+                || value.worktree_snapshot_id != snapshot
+                || value.capture_status != SnapshotCaptureStatus::Complete
+            {
+                continue;
+            }
+            if !result
+                .rows
+                .iter()
+                .any(|row| row.candidate_id.as_ref() == Some(&reference))
+            {
+                result.rows.push(
+                    evertrace_store::query::canonical_lineage_source(row, query.repository, true)
+                        .ok()?,
+                );
+            }
+            result
+                .edges
+                .push((query.revision.clone(), reference, kind.to_owned()));
+        }
+        Some(result)
+    }
+}
+
 /// Assess only the canonical source and repository closure; observation recording belongs to callers.
 pub(crate) async fn check_source_access(
     writer: &WriterHandle,
@@ -989,6 +1120,29 @@ impl SearchReadAccess<'_> {
             expected_selection: None,
         });
         self.check(query, revision, kind).await
+    }
+
+    async fn check_exact_record(
+        &self,
+        key: &str,
+        revision: &str,
+        kind: &str,
+    ) -> Result<Box<StoredFieldsContext>, ErrorCode> {
+        self.check(
+            ExactReadQuery::Record(ExactRecordQuery {
+                reference: ExactRecordRef {
+                    stable_key: key.to_owned(),
+                    revision_ref: Some(revision.to_owned()),
+                },
+                field: None,
+                range: None,
+                expected_data_identity: None,
+                expected_selection: None,
+            }),
+            revision,
+            kind,
+        )
+        .await
     }
 
     async fn check(
