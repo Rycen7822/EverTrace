@@ -306,11 +306,29 @@ fn independent_search_member(
     use evertrace_domain::work::{AttemptExecutionStatus, EpisodeLifecycle};
     // Only shapes whose actual dependencies are covered by the canonical read closure.
     let (task, stream, repository) = match payload {
-        JournalPayload::WorkstreamRecorded(value) => (
-            value.task_id,
-            value.workstream_id,
-            value.repository_instance_id,
-        ),
+        JournalPayload::WorkstreamRecorded(value) => {
+            // The indexed goal text can use exact lineage observations without reading the shared lane
+            // or interpreting its active Episode. Other Work candidates still need their own closure.
+            return Ok(independently_scoped_workstream(row, value)
+                || workstream_scope_identity(row, value)
+                    && !value.worktree_lineage_refs.is_empty()
+                    && value.worktree_lineage_refs.iter().all(|reference| {
+                        let mut observations = index
+                            .get(reference.as_str())
+                            .into_iter()
+                            .flatten()
+                            .filter(|row| {
+                                row.row_class == Some(ObjectRowClass::Object)
+                                    && row.object_kind.as_deref() == Some("source_observation")
+                                    && row.object_id.as_ref() == Some(reference)
+                            });
+                        reference
+                            .parse::<evertrace_domain::ids::SourceObservationId>()
+                            .is_ok()
+                            && observations.next().is_some()
+                            && observations.next().is_none()
+                    }));
+        }
         JournalPayload::WorkEpisodeRecorded(value)
             if value.lifecycle_status == EpisodeLifecycle::Closed
                 && value.execution_lane_ids.is_empty()
@@ -363,35 +381,34 @@ fn independent_search_member(
     {
         return Ok(false);
     }
-    let (parent, decoded) = if matches!(payload, JournalPayload::WorkstreamRecorded(_)) {
-        (row, None)
-    } else {
-        let Some([candidate]) = index.get(stream_key.as_str()).map(Vec::as_slice) else {
-            return Ok(false);
-        };
-        (*candidate, Some(decode(candidate)?))
+    let Some([parent]) = index.get(stream_key.as_str()).map(Vec::as_slice) else {
+        return Ok(false);
     };
-    let JournalPayload::WorkstreamRecorded(work) = decoded.as_ref().unwrap_or(payload) else {
+    let JournalPayload::WorkstreamRecorded(work) = decode(parent)? else {
         return Ok(false);
     };
     Ok(work.workstream_id == stream
         && work.task_id == task
         && work.repository_instance_id == Some(repository)
-        && independently_scoped_workstream(parent, work))
+        && independently_scoped_workstream(parent, &work))
 }
 
 fn independently_scoped_workstream(
     row: &ObjectRow,
     work: &evertrace_domain::work::Workstream,
 ) -> bool {
+    workstream_scope_identity(row, work)
+        && work.worktree_lineage_refs.is_empty()
+        && work.active_episode_id.is_none()
+        && work.execution_lane_ids.is_empty()
+}
+
+fn workstream_scope_identity(row: &ObjectRow, work: &evertrace_domain::work::Workstream) -> bool {
     work.repository_instance_id
         .is_some_and(|id| row.repository_id.as_deref() == Some(id.to_string().as_str()))
         && row.task_id.as_deref() == Some(work.task_id.to_string().as_str())
         && row.object_id.as_ref() == row.workstream_id.as_ref()
         && row.object_id.as_deref() == Some(work.workstream_id.to_string().as_str())
-        && work.worktree_lineage_refs.is_empty()
-        && work.active_episode_id.is_none()
-        && work.execution_lane_ids.is_empty()
 }
 
 pub(super) fn presentation_index(
