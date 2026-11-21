@@ -1128,21 +1128,21 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
                                         }
                                     },
                                 HumanReadRequest::ProposalReview {
-                                    proposal_id, expected_revision_id, expected_frontier, expected_digest,
+                                    proposal_id, expected_revision_id, expected_frontier, expected_digest, atom_edit,
                                 } => {
                                     if context.client_kind != ClientKind::Web || expected_digest.is_some() && !context.web_launcher {
                                         return Err(ErrorCode::Untrusted);
                                     }
                                     Box::pin(read_proposal_review(
                                         &human_governance, &proposal_id.to_string(), &expected_revision_id.to_string(),
-                                        expected_frontier, expected_digest.as_deref(),
+                                        expected_frontier, expected_digest.as_deref(), atom_edit,
                                     )).await.map_err(map_human_error)?
                                 }
                                 HumanReadRequest::WebAcceptanceOutcome { request_id, expected_frontier, review } => {
                                     if context.client_kind != ClientKind::Web { return Err(ErrorCode::Untrusted); }
                                     let outcome = Box::pin(human_governance.acceptance().reviewed_web_outcome(
-                                        &human_governance, request_id, expected_frontier, review.proposal_id,
-                                        review.expected_revision_id, &review.expected_digest,
+                                        &human_governance, request_id, expected_frontier,
+                                        (review.proposal_id, review.expected_revision_id, &review.expected_digest), None,
                                     )).await.map_err(map_human_error)?;
                                     HumanGovernanceResponse::Action { result: map_human_action(outcome) }
                                 }
@@ -1194,8 +1194,8 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
                                 action,
                             } => {
                                 let outcome = match action {
-                                    HumanActionRequest::WebAccept { review } => Box::pin(accept_web_review(
-                                        &human_governance, request_id, expected_frontier, review,
+                                    HumanActionRequest::WebAccept { review, atom_edit } => Box::pin(accept_web_review(
+                                        &human_governance, request_id, expected_frontier, review, atom_edit,
                                     )).await,
                                     HumanActionRequest::WebProposalDisposition { review, decision } => Box::pin(dispose_web_review(
                                         &human_governance, request_id, expected_frontier, review, decision,
@@ -1690,6 +1690,7 @@ async fn read_proposal_review(
     revision: &str,
     frontier: u64,
     expected_digest: Option<&str>,
+    atom_edit: Option<Box<evertrace_protocol::dto::WebAtomEdit>>,
 ) -> Result<HumanGovernanceResponse, HumanGovernanceError> {
     let conflict = |current_frontier| HumanGovernanceResponse::Conflict {
         current_frontier,
@@ -1726,7 +1727,7 @@ async fn read_proposal_review(
     {
         review.merge_and_accept_eligible = false;
     }
-    let digest = item.as_ref().and_then(|item| {
+    let mut digest = item.as_ref().and_then(|item| {
         evertrace_protocol::dto::proposal_confirmation_digest(item, page.frontier)
     });
     if let Some(expected) = expected_digest
@@ -1743,8 +1744,37 @@ async fn read_proposal_review(
         } else {
             None
         };
-    let web_accept_available =
-        item.as_ref()
+    use evertrace_protocol::dto::{WebAcceptanceIntent, WebAtomEdit};
+    let editable = item
+        .as_ref()
+        .and_then(|item| item.proposal_review.as_ref())
+        .filter(|review| {
+            review.plain_accept_eligible
+                && review.reauthorization.is_none()
+                && WebAtomEdit::available(&review.proposal)
+        });
+    let web_edit_available = if let Some(review) = editable {
+        Box::pin(service.web_atom_edit_base_current(&review.proposal, page.frontier)).await?
+    } else {
+        false
+    };
+    let atom_edit_preview = if let Some(edit) = atom_edit {
+        let review = editable
+            .filter(|_| web_edit_available)
+            .ok_or(HumanGovernanceError::InvalidInput)?;
+        let candidate = edit
+            .edited_draft(&review.proposal)
+            .ok_or(HumanGovernanceError::InvalidInput)?;
+        let intent = WebAcceptanceIntent::for_atom_edit(&review.proposal, page.frontier, edit)
+            .ok_or(HumanGovernanceError::InvalidInput)?;
+        digest = Some(intent.digest_hex());
+        Some(Box::new(candidate))
+    } else {
+        None
+    };
+    let web_accept_available = atom_edit_preview.is_none()
+        && item
+            .as_ref()
             .zip(digest.as_deref())
             .is_some_and(|(item, digest)| {
                 evertrace_protocol::dto::web_acceptance_intent(
@@ -1757,12 +1787,15 @@ async fn read_proposal_review(
             });
     Ok(HumanGovernanceResponse::ProposalReview {
         frontier: page.frontier,
-        web_disposition_available: item
-            .as_ref()
-            .is_some_and(evertrace_protocol::dto::web_disposition_available),
+        web_disposition_available: atom_edit_preview.is_none()
+            && item
+                .as_ref()
+                .is_some_and(evertrace_protocol::dto::web_disposition_available),
         item: item.map(Box::new),
         confirmation_digest: digest,
         web_accept_available,
+        web_edit_available,
+        atom_edit_preview,
         core_anchor,
     })
 }
@@ -1772,6 +1805,7 @@ async fn accept_web_review(
     request_id: evertrace_protocol::dto::RequestId,
     frontier: u64,
     review: evertrace_protocol::dto::ProposalConfirmation,
+    atom_edit: Option<Box<evertrace_protocol::dto::WebAtomEdit>>,
 ) -> Result<EngineHumanActionOutcome, HumanGovernanceError> {
     let acceptance = service.acceptance();
     let (id, revision, digest) = (
@@ -1782,37 +1816,70 @@ async fn accept_web_review(
     if let EngineHumanActionOutcome::Applied {
         current_revision_ref,
         ..
-    } = Box::pin(
-        acceptance.reviewed_web_outcome(service, request_id, frontier, id, revision, &digest),
-    )
+    } = Box::pin(acceptance.reviewed_web_outcome(
+        service,
+        request_id,
+        frontier,
+        (id, revision, &digest),
+        Some(atom_edit.as_deref()),
+    ))
     .await?
     {
         return Ok(EngineHumanActionOutcome::NoDelta {
             current_revision_ref,
         });
     }
-    let intent = match Box::pin(read_proposal_review(
+    let response = Box::pin(read_proposal_review(
         service,
         &id.to_string(),
         &revision.to_string(),
         frontier,
-        Some(&digest),
+        atom_edit.is_none().then_some(digest.as_str()),
+        None,
     ))
-    .await?
-    {
-        HumanGovernanceResponse::ProposalReview {
-            item: Some(item),
-            web_accept_available: true,
-            core_anchor,
-            ..
-        } => evertrace_protocol::dto::web_acceptance_intent(
+    .await?;
+    let intent = match (response, atom_edit) {
+        (
+            HumanGovernanceResponse::ProposalReview {
+                item: Some(item),
+                web_edit_available: true,
+                ..
+            },
+            Some(edit),
+        ) => {
+            let intent = item
+                .proposal_review
+                .and_then(|review| {
+                    evertrace_protocol::dto::WebAcceptanceIntent::for_atom_edit(
+                        &review.proposal,
+                        frontier,
+                        edit,
+                    )
+                })
+                .filter(|intent| intent.digest_hex() == digest);
+            let Some(intent) = intent else {
+                return Ok(EngineHumanActionOutcome::Conflict {
+                    current_revision_ref: None,
+                });
+            };
+            intent
+        }
+        (
+            HumanGovernanceResponse::ProposalReview {
+                item: Some(item),
+                web_accept_available: true,
+                core_anchor,
+                ..
+            },
+            None,
+        ) => evertrace_protocol::dto::web_acceptance_intent(
             &item,
             frontier,
             &digest,
             core_anchor.as_deref(),
         )
         .ok_or(HumanGovernanceError::Store)?,
-        HumanGovernanceResponse::Conflict { .. } => {
+        (HumanGovernanceResponse::Conflict { .. }, _) => {
             return Ok(EngineHumanActionOutcome::Conflict {
                 current_revision_ref: None,
             });
@@ -1866,6 +1933,7 @@ async fn dispose_web_review(
         &revision.to_string(),
         frontier,
         Some(digest),
+        None,
     ))
     .await?
     {

@@ -1,4 +1,3 @@
-pub use evertrace_domain::query::ExactReadQuery;
 use evertrace_domain::{
     ids::{
         AttemptId, JobId, ProcedureNegativeEvidenceId, RepositoryId, RevisionProposalId, WorktreeId,
@@ -7,11 +6,15 @@ use evertrace_domain::{
     purge::{ObjectDeletionTarget, ObjectReauthorizationRef},
     revision::RevisionId,
     semantic::{
-        AtomProposalPayload, CoreMembershipProposalPayload, GlobalSupportState,
+        AtomDraft, AtomProposalPayload, CoreMembershipProposalPayload, GlobalSupportState,
         ProcedureProposalPayload, ProposalEligibility, ProposalOperation, ProposalPayload,
         ProposalStatus, ProposalTargetId, ProposalTargetKind, RevisionProposal,
         SupportThresholdSnapshot,
     },
+};
+pub use evertrace_domain::{
+    query::ExactReadQuery,
+    semantic::{WebAcceptanceIntent, WebAtomEdit},
 };
 use serde::{Deserialize, Serialize};
 
@@ -140,6 +143,8 @@ pub enum HumanReadRequest {
         expected_revision_id: RevisionId,
         expected_frontier: u64,
         expected_digest: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        atom_edit: Option<Box<WebAtomEdit>>,
     },
     WebAcceptanceOutcome {
         request_id: RequestId,
@@ -221,6 +226,8 @@ pub enum RepositoryAccessAction {
 pub enum HumanActionRequest {
     WebAccept {
         review: ProposalConfirmation,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        atom_edit: Option<Box<WebAtomEdit>>,
     },
     WebProposalDisposition {
         review: ProposalConfirmation,
@@ -836,6 +843,10 @@ pub enum HumanGovernanceResponse {
         web_accept_available: bool,
         #[serde(default, skip_serializing_if = "std::ops::Not::not")]
         web_disposition_available: bool,
+        #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+        web_edit_available: bool,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        atom_edit_preview: Option<Box<AtomDraft>>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         core_anchor: Option<Box<HumanSemanticDetail>>,
     },
@@ -1065,8 +1076,13 @@ impl HumanReadRequest {
                 ..
             } => *expected_frontier != 0 && valid_hex(&review.expected_digest),
             Self::ProposalReview {
-                expected_digest, ..
-            } => expected_digest.as_deref().is_none_or(valid_hex),
+                expected_digest,
+                atom_edit,
+                ..
+            } => {
+                (atom_edit.is_none() || expected_digest.is_some())
+                    && expected_digest.as_deref().is_none_or(valid_hex)
+            }
             Self::Related {
                 source_stable_key,
                 expected_source_revision_ref,
@@ -1086,7 +1102,7 @@ impl HumanReadRequest {
 impl HumanActionRequest {
     fn validate(&self) -> bool {
         match self {
-            Self::WebAccept { review } | Self::WebProposalDisposition { review, .. } => {
+            Self::WebAccept { review, .. } | Self::WebProposalDisposition { review, .. } => {
                 valid_hex(&review.expected_digest)
             }
             Self::Proposal {
@@ -1387,6 +1403,8 @@ impl HumanGovernanceResponse {
                 confirmation_digest,
                 web_accept_available: available,
                 web_disposition_available: can_dispose,
+                web_edit_available: can_edit,
+                atom_edit_preview,
                 core_anchor,
                 frontier,
             } => match item {
@@ -1394,6 +1412,22 @@ impl HumanGovernanceResponse {
                     item.validate()
                         && item.proposal.is_some()
                         && (!can_dispose || web_disposition_available(item))
+                        && (!can_edit || item.proposal_review.as_ref().is_some_and(|review| {
+                            review.plain_accept_eligible && review.reauthorization.is_none() && WebAtomEdit::available(&review.proposal)
+                        }))
+                        && atom_edit_preview.as_deref().is_none_or(|draft| {
+                            *can_edit && !available && !can_dispose && item.proposal_review.as_ref().is_some_and(|review| {
+                                let value = &draft.value;
+                                let edit = Box::new(WebAtomEdit {
+                                    text: value.text.clone(), subject: value.subject.clone(),
+                                    predicate: value.predicate.clone(), object: value.object.clone(),
+                                });
+                                edit.edited_draft(&review.proposal).as_ref() == Some(draft)
+                                    && evertrace_domain::semantic::WebAcceptanceIntent::for_atom_edit(&review.proposal, *frontier, edit)
+                                        .is_some_and(|intent| confirmation_digest.as_deref()
+                                            == Some(evertrace_domain::evidence::hex(&intent.review_digest).as_str()))
+                            })
+                        })
                         && core_anchor.as_ref().is_none_or(|anchor| anchor.validate())
                         && (!available
                             || confirmation_digest.as_deref().is_some_and(|digest| {
@@ -1415,8 +1449,10 @@ impl HumanGovernanceResponse {
                 None => {
                     confirmation_digest.is_none()
                         && core_anchor.is_none()
+                        && atom_edit_preview.is_none()
                         && !available
                         && !can_dispose
+                        && !can_edit
                 }
             },
             Self::Action { result } => result.validate(),

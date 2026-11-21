@@ -251,6 +251,25 @@ impl AtomAcceptanceContext {
         proposal: &RevisionProposal,
         accepted_at_us: i64,
     ) -> Result<(), SemanticServiceError> {
+        if let Self::Web {
+            observation,
+            receipt,
+            authorized_scope_ceiling,
+            intent,
+        } = self
+        {
+            require_user_source(observation, receipt)?;
+            if intent.atom_edit.is_none()
+                || intent.reviewed_scope(original).as_ref() != Some(authorized_scope_ceiling)
+                || !intent.matches_reviewed(original, proposal)
+                || !intent.capture_matches(original, receipt, observation)
+                || receipt.recorded_at_us != proposal.created_at_us
+                || receipt.recorded_at_us > accepted_at_us
+            {
+                return Err(SemanticServiceError::InvalidInput);
+            }
+            return Ok(());
+        }
         let (observation, receipt) = match self {
             Self::RepositoryTui {
                 observation,

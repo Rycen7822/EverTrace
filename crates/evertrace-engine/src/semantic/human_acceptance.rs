@@ -23,8 +23,8 @@ use evertrace_domain::{
         ProposalAcceptanceAuthority, ProposalCreatedBy, ProposalEligibility, ProposalOperation,
         ProposalPayload, ProposalStatus, ProposalTargetId, ProposalWaitingOn, RevisionProposal,
         SupportThresholdSnapshot, TUI_ACCEPTANCE_EVENT_MANIFEST_REF,
-        WEB_ACCEPTANCE_EVENT_MANIFEST_REF, WebAcceptanceIntent, tui_acceptance_capture_matches,
-        tui_acceptance_event_payload,
+        WEB_ACCEPTANCE_EVENT_MANIFEST_REF, WebAcceptanceIntent, WebAtomEdit,
+        tui_acceptance_capture_matches, tui_acceptance_event_payload,
     },
 };
 use evertrace_store::{
@@ -418,10 +418,8 @@ impl HumanAcceptanceService {
                     .web_core_anchor_at(snapshot, view, reviewed)
                     .await?
                     .is_none())
-            || (intent.procedure_coverage.is_some()
-                && !service
-                    .web_procedure_base_accessible(snapshot, reviewed)
-                    .await?)
+            || ((intent.procedure_coverage.is_some() || intent.atom_edit.is_some())
+                && !service.web_base_accessible(snapshot, reviewed).await?)
             || !service.web_merge_accessible_at(snapshot, reviewed).await?
         {
             return Ok(());
@@ -464,10 +462,65 @@ impl HumanAcceptanceService {
         let authority = AtomAcceptanceContext::Web {
             observation: Box::new(verified.observation.clone()),
             receipt: Box::new(verified.receipt.clone()),
-            authorized_scope_ceiling: WebAcceptanceIntent::scope(reviewed)
+            authorized_scope_ceiling: intent
+                .reviewed_scope(reviewed)
                 .ok_or(HumanGovernanceError::Store)?,
             intent: intent.clone(),
         };
+        let accepted_events = if let Some(edit) = &intent.atom_edit {
+            let payload = edit
+                .payload(reviewed)
+                .ok_or(HumanGovernanceError::InvalidInput)?;
+            let (prepared, _) = prepare_edit_candidate(
+                view,
+                reviewed,
+                payload,
+                context.command_id,
+                verified.receipt.recorded_at_us,
+                self.effective_config_hash,
+                None,
+            )?;
+            if !matches!(
+                deletion_admission(snapshot, &prepared.new_proposal)?,
+                ObjectDeletionCandidateAdmission::Clear
+            ) {
+                return Err(HumanGovernanceError::InvalidInput);
+            }
+            compose_edited_acceptance(EditedAcceptanceInput {
+                snapshot,
+                view,
+                original: reviewed,
+                reviewed: &prepared.new_proposal,
+                acceptance: authority,
+                command_context: context,
+                effective_config_hash: self.effective_config_hash,
+                global_promotion: &self.global_promotion,
+                support: None,
+            })?
+            .events
+        } else {
+            self.web_plain_acceptance(snapshot, view, reviewed, context, authority)?
+        };
+        let mut events = capture_event_drafts(
+            verified,
+            None,
+            self.effective_config_hash,
+            ALGORITHM_REVISION,
+        )
+        .map_err(|_| HumanGovernanceError::Store)?;
+        events.extend(accepted_events);
+        JournalCommand::new(verified.body.command_id, events)
+            .map_err(|_| HumanGovernanceError::Store)
+    }
+
+    fn web_plain_acceptance(
+        &self,
+        snapshot: &ProjectionSnapshot,
+        view: &SemanticCurrentView,
+        reviewed: &RevisionProposal,
+        context: ProposalCommandContext,
+        authority: AtomAcceptanceContext,
+    ) -> Result<Vec<evertrace_store::JournalEventDraft>, HumanGovernanceError> {
         let accepted = if let Some((revision, scope)) = reviewed.core_creation() {
             let atom = scope
                 .reviewable_atom(revision, view.atoms.values())
@@ -514,16 +567,7 @@ impl HumanAcceptanceService {
             crate::semantic::SemanticServiceError::Store(_) => HumanGovernanceError::Store,
             _ => HumanGovernanceError::InvalidInput,
         })?;
-        let mut events = capture_event_drafts(
-            verified,
-            None,
-            self.effective_config_hash,
-            ALGORITHM_REVISION,
-        )
-        .map_err(|_| HumanGovernanceError::Store)?;
-        events.extend(accepted.events().iter().cloned());
-        JournalCommand::new(verified.body.command_id, events)
-            .map_err(|_| HumanGovernanceError::Store)
+        Ok(accepted.events().to_vec())
     }
 
     pub async fn accept_reviewed_web(
@@ -566,10 +610,10 @@ impl HumanAcceptanceService {
         }) else {
             return Ok(conflict());
         };
-        if intent.procedure_coverage.is_some()
-            && !service
-                .web_procedure_base_accessible(&snapshot, proposal)
-                .await?
+        if ((intent.procedure_coverage.is_some() || intent.atom_edit.is_some())
+            && !service.web_base_accessible(&snapshot, proposal).await?)
+            || (intent.atom_edit.is_some()
+                && !service.proposal_accessible(&snapshot, proposal).await?)
         {
             return Ok(conflict());
         }
@@ -667,9 +711,8 @@ impl HumanAcceptanceService {
         service: &crate::HumanGovernanceService,
         request_id: RequestId,
         frontier: u64,
-        id: RevisionProposalId,
-        revision: RevisionId,
-        digest: &str,
+        (id, revision, digest): (RevisionProposalId, RevisionId, &str),
+        submitted_edit: Option<Option<&WebAtomEdit>>,
     ) -> Result<HumanActionOutcome, HumanGovernanceError> {
         let command = CommandId::from_uuid(request_id.as_uuid())
             .map_err(|_| HumanGovernanceError::InvalidInput)?;
@@ -698,6 +741,7 @@ impl HumanAcceptanceService {
         let Some(outcome) = web_acceptance_outcome(&committed, proposal, |saved| {
             saved.reviewed_frontier == frontier
                 && hex(&saved.review_digest) == digest
+                && submitted_edit.is_none_or(|edit| saved.atom_edit.as_deref() == edit)
                 && saved.canonical(proposal).is_some()
         }) else {
             return Ok(HumanActionOutcome::Unknown);
@@ -2808,22 +2852,47 @@ fn web_acceptance_outcome(
     proposal: &RevisionProposal,
     matches_intent: impl Fn(&WebAcceptanceIntent) -> bool,
 ) -> Option<HumanActionOutcome> {
-    committed.payloads.iter().zip(&committed.event_ids).find_map(|(payload, event)| {
-        let JournalPayload::RevisionProposalRecorded(value) = payload else { return None; };
-        let audit = value.acceptance.as_ref()?;
-        if value.status == ProposalStatus::Accepted
-            && value.proposal_id == proposal.proposal_id
-            && audit.reviewed_proposal_revision_id == proposal.proposal_revision_id
-            && audit.reviewed_fingerprint == proposal.fingerprint
-            && matches!(&audit.authority_basis, ProposalAcceptanceAuthority::WebAcceptance { intent, .. } if matches_intent(intent))
-        {
-            return Some(HumanActionOutcome::Applied {
-                current_revision_ref: value.proposal_revision_id.to_string(),
-                audit_event_ref: event.clone(),
-            });
-        }
-        None
-    })
+    committed
+        .payloads
+        .iter()
+        .zip(&committed.event_ids)
+        .find_map(|(payload, event)| {
+            let JournalPayload::RevisionProposalRecorded(value) = payload else {
+                return None;
+            };
+            if valid_web_accepted_candidate(&committed.payloads, proposal, value, &matches_intent) {
+                return Some(HumanActionOutcome::Applied {
+                    current_revision_ref: value.proposal_revision_id.to_string(),
+                    audit_event_ref: event.clone(),
+                });
+            }
+            None
+        })
+}
+
+fn valid_web_accepted_candidate(
+    payloads: &[JournalPayload],
+    original: &RevisionProposal,
+    accepted: &RevisionProposal,
+    matches_intent: impl Fn(&WebAcceptanceIntent) -> bool,
+) -> bool {
+    let Some(audit) = &accepted.acceptance else {
+        return false;
+    };
+    let ProposalAcceptanceAuthority::WebAcceptance { intent, .. } = &audit.authority_basis else {
+        return false;
+    };
+    if accepted.status != ProposalStatus::Accepted || !matches_intent(intent) {
+        return false;
+    }
+    if intent.atom_edit.is_none() {
+        return accepted.proposal_id == original.proposal_id
+            && audit.reviewed_proposal_revision_id == original.proposal_revision_id
+            && audit.reviewed_fingerprint == original.fingerprint;
+    }
+    payloads.iter().any(|payload| matches!(payload, JournalPayload::RevisionProposalRecorded(edited)
+        if edited.proposal_id == accepted.proposal_id && edited.proposal_revision_id == audit.reviewed_proposal_revision_id
+            && edited.fingerprint == audit.reviewed_fingerprint && intent.matches_reviewed(original, edited)))
 }
 
 fn verify_acceptance_payload_cohort(
@@ -2883,45 +2952,45 @@ fn verify_acceptance_payload_cohort(
     }
     let accepted = payloads
         .iter()
-        .filter_map(|payload| match payload {
-            JournalPayload::RevisionProposalRecorded(value)
-                if value.proposal_id == reviewed.proposal_id
-                    && value.status == ProposalStatus::Accepted
-                    && value.acceptance.as_ref().is_some_and(|acceptance| {
-                        acceptance.reviewed_proposal_revision_id == reviewed.proposal_revision_id
-                            && acceptance.reviewed_fingerprint == reviewed.fingerprint
-                            && acceptance.acceptance_event_ref
-                                == verified.observation.source_observation_id.to_string()
-                            && match (expected_web_intent, &acceptance.authority_basis) {
-                                (
-                                    None,
-                                    ProposalAcceptanceAuthority::TuiAcceptance {
-                                        user_source_observation_ref,
-                                        ..
-                                    },
-                                ) => {
-                                    *user_source_observation_ref
-                                        == verified.observation.source_observation_id
-                                }
-                                (
-                                    Some(expected),
-                                    ProposalAcceptanceAuthority::WebAcceptance {
-                                        user_source_observation_ref,
-                                        intent,
-                                        ..
-                                    },
-                                ) => {
-                                    *user_source_observation_ref
-                                        == verified.observation.source_observation_id
-                                        && intent == expected
-                                }
-                                _ => false,
-                            }
-                    }) =>
+        .filter_map(|payload| {
+            let JournalPayload::RevisionProposalRecorded(value) = payload else {
+                return None;
+            };
+            let audit = value.acceptance.as_ref()?;
+            let source = verified.observation.source_observation_id;
+            if value.status != ProposalStatus::Accepted
+                || audit.acceptance_event_ref != source.to_string()
             {
-                Some(value.as_ref())
+                return None;
             }
-            _ => None,
+            let matches = match (expected_web_intent, &audit.authority_basis) {
+                (
+                    Some(expected),
+                    ProposalAcceptanceAuthority::WebAcceptance {
+                        user_source_observation_ref,
+                        ..
+                    },
+                ) => {
+                    *user_source_observation_ref == source
+                        && valid_web_accepted_candidate(payloads, reviewed, value, |saved| {
+                            saved == expected
+                        })
+                }
+                (
+                    None,
+                    ProposalAcceptanceAuthority::TuiAcceptance {
+                        user_source_observation_ref,
+                        ..
+                    },
+                ) => {
+                    *user_source_observation_ref == source
+                        && value.proposal_id == reviewed.proposal_id
+                        && audit.reviewed_proposal_revision_id == reviewed.proposal_revision_id
+                        && audit.reviewed_fingerprint == reviewed.fingerprint
+                }
+                _ => false,
+            };
+            matches.then_some(value.as_ref())
         })
         .collect::<Vec<_>>();
     let [accepted] = accepted.as_slice() else {

@@ -176,13 +176,31 @@ impl HumanGovernanceService {
         Ok(false)
     }
 
-    pub(crate) async fn web_procedure_base_accessible(
+    pub async fn web_atom_edit_base_current(
+        &self,
+        proposal: &RevisionProposal,
+        frontier: u64,
+    ) -> Result<bool, HumanGovernanceError> {
+        if proposal.base_revision_id.is_none() {
+            return Ok(true);
+        }
+        let snapshot = self
+            .writer
+            .project_objects()
+            .await
+            .map_err(|_| HumanGovernanceError::Store)?;
+        Ok(snapshot.frontier == frontier && self.web_base_accessible(&snapshot, proposal).await?)
+    }
+
+    pub(crate) async fn web_base_accessible(
         &self,
         snapshot: &ProjectionSnapshot,
         proposal: &RevisionProposal,
     ) -> Result<bool, HumanGovernanceError> {
-        let Some(ProposalTargetId::Procedure(id)) = proposal.target_id else {
-            return Ok(proposal.base_revision_id.is_none());
+        let (kind, id) = match proposal.target_id {
+            Some(ProposalTargetId::Procedure(id)) => ("procedure_revision", id.to_string()),
+            Some(ProposalTargetId::Atom(id)) => ("atom_revision", id.to_string()),
+            _ => return Ok(proposal.base_revision_id.is_none()),
         };
         let Some(base) = proposal.base_revision_id else {
             return Ok(false);
@@ -193,8 +211,8 @@ impl HumanGovernanceService {
         else {
             return Ok(false);
         };
-        if row.object_kind.as_deref() != Some("procedure_revision")
-            || row.object_id.as_deref() != Some(id.to_string().as_str())
+        if row.object_kind.as_deref() != Some(kind)
+            || row.object_id.as_deref() != Some(id.as_str())
             || row.current_revision_id.as_deref() != Some(reference.as_str())
         {
             return Ok(false);

@@ -819,10 +819,17 @@ fn validate_web_acceptance_boundary(
             }
             _ => return Err(error),
         };
-    let (reviewed, seq) = proposals.get(&proposal.proposal_id).ok_or(error)?;
-    if reviewed.proposal_revision_id != acceptance.reviewed_proposal_revision_id
+    let original_id = receipt
+        .source_ref
+        .parse::<RevisionProposalId>()
+        .map_err(|_| error)?;
+    let (reviewed, seq) = proposals.get(&original_id).ok_or(error)?;
+    if (intent.atom_edit.is_none()
+        && (original_id != proposal.proposal_id
+            || reviewed.proposal_revision_id != acceptance.reviewed_proposal_revision_id))
+        || (intent.atom_edit.is_some() && original_id == proposal.proposal_id)
         || !(*seq..=frontier).contains(&intent.reviewed_frontier)
-        || WebAcceptanceIntent::scope(reviewed).as_ref() != Some(scope)
+        || intent.reviewed_scope(reviewed).as_ref() != Some(scope)
         || receipt.source_revision_mode != SourceRevisionMode::Append
         || receipt.previous_source_revision.is_some()
         || receipt.recorded_at_us < reviewed.created_at_us
@@ -888,16 +895,17 @@ fn validate_accepted_edit_boundary(
     let Some(acceptance) = accepted.acceptance.as_ref() else {
         return Err(error);
     };
-    if !matches!(
-        acceptance.authority_basis,
-        ProposalAcceptanceAuthority::TuiAcceptance { .. }
-    ) {
-        return if expected_original_id.is_some() {
-            Err(error)
-        } else {
-            Ok(None)
-        };
-    }
+    let web_edit = match &acceptance.authority_basis {
+        ProposalAcceptanceAuthority::TuiAcceptance { .. } => None,
+        ProposalAcceptanceAuthority::WebAcceptance { intent, .. } if intent.atom_edit.is_some() => {
+            if expected_original_id.is_none() {
+                return Err(error);
+            }
+            Some(intent)
+        }
+        _ if expected_original_id.is_some() => return Err(error),
+        _ => return Ok(None),
+    };
     let observation_id = acceptance
         .acceptance_event_ref
         .parse::<SourceObservationId>()
@@ -984,16 +992,16 @@ fn validate_accepted_edit_boundary(
     original
         .validate_edit_candidate(reviewed)
         .map_err(|_| error)?;
-    let edit_canonical = original.edit_intent_toml(reviewed).map_err(|_| error)?;
+    let capture_matches = if let Some(intent) = web_edit {
+        intent.matches_reviewed(original, reviewed)
+            && intent.capture_matches(original, receipt.1, observation.1)
+    } else {
+        let canonical = original.edit_intent_toml(reviewed).map_err(|_| error)?;
+        tui_acceptance_capture_matches(original, &canonical, "tui-accept", receipt.1, observation.1)
+    };
     if receipt.1.source_revision_mode != SourceRevisionMode::Append
         || receipt.1.previous_source_revision.is_some()
-        || !tui_acceptance_capture_matches(
-            original,
-            &edit_canonical,
-            "tui-accept",
-            receipt.1,
-            observation.1,
-        )
+        || !capture_matches
     {
         return Err(error);
     }
@@ -1747,7 +1755,7 @@ fn validate_proposal_relations(
                 if *user_source_observation_ref != acceptance_observation_id
                     || authorized_scope_ceiling != &atom.scope
                     || acceptance_receipt.task_id != atom.scope.task_id()
-                    || !intent.capture_matches(reviewed, acceptance_receipt, acceptance_observation)
+                    || !validate_web_atom_capture(intent, &sources, input)?
                 {
                     return Err(StoreError::StoreCorrupt);
                 }
@@ -1958,6 +1966,30 @@ fn validate_acceptance_sources<'a>(
         receipt,
         reviewed,
     })
+}
+
+fn validate_web_atom_capture(
+    intent: &WebAcceptanceIntent,
+    sources: &AcceptanceSources<'_>,
+    input: &SemanticRelationInputs<'_>,
+) -> Result<bool, StoreError> {
+    let original = if intent.atom_edit.is_some() {
+        let revision = sources
+            .receipt
+            .source_revision
+            .as_str()
+            .parse::<RevisionId>()
+            .map_err(|_| StoreError::StoreCorrupt)?;
+        &input
+            .proposal_revisions
+            .get(&revision)
+            .ok_or(StoreError::StoreCorrupt)?
+            .0
+    } else {
+        sources.reviewed
+    };
+    Ok(intent.matches_reviewed(original, sources.reviewed)
+        && intent.capture_matches(original, sources.receipt, sources.observation))
 }
 
 fn validate_accepted_authority(

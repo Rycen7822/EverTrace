@@ -1,0 +1,11 @@
+<section aria-label="Atom 编辑确认稿">
+  <h4>确认稿：仅在接受后发布</h4>
+  <p>将结束原提案 {{ revision }}，另存编辑后的提案和接受审计。原有记录不改写。</p>
+  <p>目标基准：{{ base or '无，接受后创建新 Atom' }}。下列范围、条件和证据随确认一同冻结。</p>
+  {% with content={'kind': 'atom_draft', 'value': candidate}, atom_confirmation=true %}
+    {% include 'semantic_content.html' %}
+  {% endwith %}
+  <button class="button" type="button" data-proposal-accept="edit" data-proposal-id="{{ proposal }}"
+    data-request-id="{{ request_id }}" data-revision="{{ revision }}" data-frontier="{{ frontier }}"
+    data-review-digest="{{ digest }}" data-atom-edit-value='{{ edit|tojson }}'>确认编辑并接受</button>
+</section>

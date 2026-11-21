@@ -55,6 +55,68 @@ pub struct WebAcceptanceIntent {
     /// The Native-reviewed observation is not an automatic eligibility certificate.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub procedure_coverage: Option<Box<WebProcedureCoverage>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub atom_edit: Option<Box<WebAtomEdit>>,
+}
+
+/// Content-only edit; identity, authority, conditions and provenance stay with the reviewed proposal.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct WebAtomEdit {
+    pub text: String,
+    pub subject: String,
+    pub predicate: String,
+    pub object: Option<String>,
+}
+
+impl WebAtomEdit {
+    fn draft(proposal: &RevisionProposal) -> Option<&AtomDraft> {
+        if !proposal.status.is_open()
+            || proposal.eligibility == ProposalEligibility::AutoEligibleFull
+        {
+            return None;
+        }
+        let ProposalPayload::Atom(payload) = &proposal.payload else {
+            return None;
+        };
+        let draft = match (proposal.operation, payload.as_ref()) {
+            (ProposalOperation::Create, AtomProposalPayload::Create { draft })
+            | (ProposalOperation::Replace, AtomProposalPayload::Replace { draft })
+            | (ProposalOperation::Reclassify, AtomProposalPayload::Reclassify { draft }) => draft,
+            _ => return None,
+        };
+        matches!(
+            draft.scope,
+            AtomScope::Task { .. } | AtomScope::Repository { .. }
+        )
+        .then_some(draft)
+    }
+
+    pub fn available(proposal: &RevisionProposal) -> bool {
+        Self::draft(proposal).is_some()
+    }
+
+    pub fn edited_draft(&self, proposal: &RevisionProposal) -> Option<AtomDraft> {
+        let original = Self::draft(proposal)?;
+        let mut draft = original.clone();
+        draft.value.text = self.text.clone();
+        draft.value.subject = self.subject.clone();
+        draft.value.predicate = self.predicate.clone();
+        draft.value.object = self.object.clone();
+        draft.validate_unprivileged().ok()?;
+        (draft != *original).then_some(draft)
+    }
+
+    pub fn payload(&self, proposal: &RevisionProposal) -> Option<ProposalPayload> {
+        let draft = self.edited_draft(proposal)?;
+        let atom = match proposal.operation {
+            ProposalOperation::Create => AtomProposalPayload::Create { draft },
+            ProposalOperation::Replace => AtomProposalPayload::Replace { draft },
+            ProposalOperation::Reclassify => AtomProposalPayload::Reclassify { draft },
+            _ => return None,
+        };
+        Some(ProposalPayload::Atom(Box::new(atom)))
+    }
 }
 
 /// Only the displayed coverage, with no inventory identifiers or protected CAS locators.
@@ -171,7 +233,64 @@ impl WebAcceptanceIntent {
             reviewed_frontier: frontier,
             review_digest: Self::digest(proposal, frontier, procedure_coverage.as_deref())?,
             procedure_coverage,
+            atom_edit: None,
         })
+    }
+
+    pub fn digest_hex(&self) -> String {
+        hex(&self.review_digest)
+    }
+
+    pub fn for_atom_edit(
+        proposal: &RevisionProposal,
+        frontier: u64,
+        edit: Box<WebAtomEdit>,
+    ) -> Option<Self> {
+        let review_digest = Self::edit_digest(proposal, frontier, &edit)?;
+        Some(Self {
+            reviewed_frontier: frontier,
+            review_digest,
+            procedure_coverage: None,
+            atom_edit: Some(edit),
+        })
+    }
+
+    fn edit_digest(
+        proposal: &RevisionProposal,
+        frontier: u64,
+        edit: &WebAtomEdit,
+    ) -> Option<[u8; 32]> {
+        if frontier == 0 {
+            return None;
+        }
+        let edited = edit.edited_draft(proposal)?;
+        proposal_review_digest(
+            frontier,
+            ("edit_and_accept", proposal, edited),
+            proposal.base_revision_id,
+        )
+    }
+
+    pub fn reviewed_scope(&self, original: &RevisionProposal) -> Option<AtomScope> {
+        if self.atom_edit.is_some() {
+            WebAtomEdit::draft(original).map(|draft| draft.scope.clone())
+        } else {
+            Self::scope(original)
+        }
+    }
+
+    pub fn matches_reviewed(
+        &self,
+        original: &RevisionProposal,
+        reviewed: &RevisionProposal,
+    ) -> bool {
+        match &self.atom_edit {
+            Some(edit) => {
+                original.validate_edit_candidate(reviewed).is_ok()
+                    && edit.payload(original).as_ref() == Some(&reviewed.payload)
+            }
+            None => original == reviewed,
+        }
     }
 
     fn digest(
@@ -212,17 +331,27 @@ impl WebAcceptanceIntent {
     }
 
     pub fn canonical(&self, proposal: &RevisionProposal) -> Option<String> {
-        if Self::digest(
-            proposal,
-            self.reviewed_frontier,
-            self.procedure_coverage.as_deref(),
-        )? != self.review_digest
-        {
+        let (action, digest) = match &self.atom_edit {
+            Some(edit) if self.procedure_coverage.is_none() => (
+                "edit_and_accept",
+                Self::edit_digest(proposal, self.reviewed_frontier, edit)?,
+            ),
+            Some(_) => return None,
+            None => (
+                "accept",
+                Self::digest(
+                    proposal,
+                    self.reviewed_frontier,
+                    self.procedure_coverage.as_deref(),
+                )?,
+            ),
+        };
+        if digest != self.review_digest {
             return None;
         }
         serde_json::to_string(&(
             WEB_ACCEPTANCE_EVENT_MANIFEST_REF,
-            "accept",
+            action,
             proposal.proposal_id,
             proposal.proposal_revision_id,
             hex(&proposal.fingerprint),
@@ -250,7 +379,7 @@ impl WebAcceptanceIntent {
         receipt: &SourceReceipt,
         observation: &SourceObservation,
     ) -> bool {
-        Self::scope(source).is_some_and(|scope| {
+        self.reviewed_scope(source).is_some_and(|scope| {
             let worktree = match scope {
                 AtomScope::Worktree {
                     worktree_instance_id,

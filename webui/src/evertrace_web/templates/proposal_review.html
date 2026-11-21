@@ -97,6 +97,22 @@
           data-frontier="{{ frontier }}" data-review-digest="{{ confirmation_digest }}">
           {{ '确认合并并接受' if summary.operation == 'merge' else '确认接受这份提案' }}</button>
       {% endif %}
+      {% if web_edit_available %}
+        {% set value = change.draft.value %}
+        <fieldset data-atom-edit>
+          <legend>编辑 Atom 正文</legend>
+          <p>编辑不会立即写入。先查看确认稿；范围、来源、条件和引用保持不变。</p>
+          <label>规范正文 <textarea name="text" required rows="6">{{ value.text }}</textarea></label>
+          <label>主体 <input name="subject" required value="{{ value.subject }}"></label>
+          <label>关系 <input name="predicate" required value="{{ value.predicate }}"></label>
+          <label>对象 <input name="object" value="{{ value.object if value.object is not none else '' }}"></label>
+          <button class="button" type="button" data-atom-edit-preview data-proposal-id="{{ summary.proposal_id }}"
+            data-revision="{{ summary.current_revision_id }}" data-frontier="{{ frontier }}"
+            data-review-digest="{{ confirmation_digest }}">查看编辑确认稿</button>
+          <p data-atom-edit-status role="status"></p>
+          <div data-atom-edit-content></div>
+        </fieldset>
+      {% endif %}
       {% if disposition_request_id %}
         <fieldset data-disposition-fields>
           <legend>暂不接受</legend>

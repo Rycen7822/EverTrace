@@ -48,7 +48,7 @@
   <h2>{{ value.value.subject }}</h2>
   <p class="muted">类型：{{ value.kind }}</p>
   <div class="memory-prose semantic-body">{{ value.value.text }}</div>
-  <details>
+  <details{% if atom_confirmation|default(false) %} open{% endif %}>
     <summary>结构化信息与限定</summary>
     <dl><dt>关系</dt><dd class="memory-prose">{{ value.value.predicate }}</dd>
       <dt>对象</dt><dd class="memory-prose">{{ value.value.object if value.value.object is not none else '未记录' }}</dd>
@@ -58,7 +58,7 @@
     {% endfor %}</dl>{% else %}<p class="muted">未记录额外限定。</p>{% endif %}
     {{ text_list('关键修订引用', value.value.critical_revision_refs) }}
   </details>
-  <details>
+  <details{% if atom_confirmation|default(false) %} open{% endif %}>
     <summary>范围、适用条件与有效期</summary>
     <h3>已存范围</h3><pre>{{ value.scope|pretty }}</pre>
     <h3>原生适用条件{% if content.kind == 'atom' %}（IR v{{ value.condition_ir_version }}）{% endif %}</h3>
@@ -68,7 +68,7 @@
     <h3>未来提示生命周期条件</h3><pre>{{ value.future_cue_lifecycle_exprs|pretty }}</pre>
     {% endif %}
   </details>
-  <details>
+  <details{% if atom_confirmation|default(false) %} open{% endif %}>
     <summary>来源、支持与冲突</summary>
     {{ text_list('来源观察', value.source_observation_refs, record_kind='source_observation', exact_revision=true) }}
     {{ text_list('证据引用', value.evidence_refs) }}

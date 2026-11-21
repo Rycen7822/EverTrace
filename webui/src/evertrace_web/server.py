@@ -279,17 +279,21 @@ class App:
                 disposition = path.startswith("/api/proposal-disposition")
                 if disposition:
                     fields.add("decision")
+                if path == "/api/proposal-accept" and "atom_edit" in payload:
+                    fields.add("atom_edit")
                 if set(payload) != fields or not _uuid7(payload["request_id"]):
                     raise BackendError("invalid_input")
                 proposal, revision = proposal_coordinates(payload["proposal_id"], payload["revision"])
                 frontier = parse_frontier(payload["frontier"])
                 digest = proposal_digest(payload["review_digest"])
                 decision = proposal_disposition(payload["decision"]) if disposition else None
+                atom_edit = proposal_atom_edit(payload["atom_edit"]) if "atom_edit" in fields else None
                 if frontier == 0:
                     raise BackendError("invalid_input")
                 try:
                     data = await self.backend.web_proposal_action(
-                        payload["request_id"], proposal, revision, frontier, digest, lookup=path.endswith("-result"), decision=decision,
+                        payload["request_id"], proposal, revision, frontier, digest,
+                        lookup=path.endswith("-result"), decision=decision, atom_edit=atom_edit,
                     )
                 except BackendError:
                     # No reply is not evidence of rollback, and must not trigger another write.
@@ -654,6 +658,23 @@ class App:
                 else:
                     confirmation = "matches" if result["confirmation_digest"] == digest else "unavailable"
                 data = {"confirmation": confirmation}
+            elif payload.get("kind") == "proposal_atom_edit" and set(payload) == {
+                "kind", "proposal_id", "revision", "frontier", "review_digest", "atom_edit",
+            }:
+                proposal, revision = proposal_coordinates(payload["proposal_id"], payload["revision"])
+                frontier = parse_frontier(payload["frontier"])
+                digest = proposal_digest(payload["review_digest"])
+                edit = proposal_atom_edit(payload["atom_edit"])
+                result = await self.backend.proposal_review(proposal, revision, frontier, digest, atom_edit=edit)
+                if result["kind"] == "conflict":
+                    data = {"conflict": True}
+                elif (candidate := result.get("atom_edit_preview")) is not None and result["confirmation_digest"]:
+                    data = {"html": self.templates.get_template("proposal_atom_edit.html").render(
+                        proposal=proposal, revision=revision, frontier=frontier, digest=result["confirmation_digest"],
+                        edit=edit, candidate=candidate, request_id=_request_id(), base=result["item"]["proposal"].get("base_revision_id"),
+                    )}
+                else:
+                    data = {"unavailable": True}
             elif payload.get("kind") == "detail" and set(payload) == {
                 "kind",
                 "reference",
@@ -712,6 +733,18 @@ def proposal_digest(digest):
     if not isinstance(digest, str) or len(digest) != 64 or any(c not in "0123456789abcdef" for c in digest):
         raise BackendError("invalid_input")
     return digest
+
+
+def proposal_atom_edit(value):
+    fields = ("text", "subject", "predicate", "object")
+    if not isinstance(value, dict) or set(value) != set(fields):
+        raise BackendError("invalid_input")
+    if any(not isinstance(value[key], str) for key in fields[:-1]):
+        raise BackendError("invalid_input")
+    if value["object"] is not None and not isinstance(value["object"], str):
+        raise BackendError("invalid_input")
+    # Native wire frames require the DTO field order, not the browser's JSON key order.
+    return {key: value[key] for key in fields}
 
 
 def proposal_disposition(value):
@@ -779,7 +812,8 @@ def present_detail(templates, result, surface):
         "html": templates.get_template(template).render(items=result["items"], surface=surface,
             frontier=result.get("frontier"), confirmation_digest=result.get("confirmation_digest"),
             core_anchor=result.get("core_anchor"), acceptance_request_id=_request_id() if result.get("web_accept_available") else None,
-            disposition_request_id=_request_id() if result.get("web_disposition_available") else None),
+            disposition_request_id=_request_id() if result.get("web_disposition_available") else None,
+            web_edit_available=result.get("web_edit_available", False)),
         "source_preview": preview,
         "semantic_text": semantic_text,
         "selection": selection,
