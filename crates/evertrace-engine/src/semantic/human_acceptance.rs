@@ -311,8 +311,13 @@ impl HumanAcceptanceService {
                     .map_err(|_| HumanGovernanceError::Store)?;
                 continue;
             };
+            // A reservation is a record of intent, not permission to bypass a later deletion.
             if proposal.proposal_revision_id.to_string() != verified.body.source_revision.as_str()
                 || !proposal.status.is_open()
+                || !matches!(
+                    deletion_admission(&snapshot, proposal)?,
+                    ObjectDeletionCandidateAdmission::Clear
+                )
             {
                 spool
                     .acknowledge_segment(segment, 1)
@@ -434,10 +439,7 @@ impl HumanAcceptanceService {
                 current_revision_ref: Some(current.proposal_revision_id.to_string()),
             });
         }
-        let deletion_admission = ObjectDeletionCandidateAdmissionView::from_snapshot(&snapshot)
-            .map_err(|_| HumanGovernanceError::Store)?
-            .classify_proposal(current)
-            .map_err(|_| HumanGovernanceError::Store)?;
+        let deletion_admission = deletion_admission(&snapshot, current)?;
         if matches!(
             &decision,
             HumanProposalDecision::Accept
@@ -796,10 +798,7 @@ impl HumanAcceptanceService {
                 reason: "atomic_tui_acceptance_source_unavailable",
             });
         };
-        let admission = ObjectDeletionCandidateAdmissionView::from_snapshot(snapshot)
-            .map_err(|_| HumanGovernanceError::Store)?
-            .classify_proposal(original)
-            .map_err(|_| HumanGovernanceError::Store)?;
+        let admission = deletion_admission(snapshot, original)?;
         let deletion = admission
             .representative_historical_deletion()
             .cloned()
@@ -1231,6 +1230,15 @@ impl HumanAcceptanceService {
             audit_event_ref,
         })
     }
+}
+
+fn deletion_admission(
+    snapshot: &ProjectionSnapshot,
+    proposal: &RevisionProposal,
+) -> Result<ObjectDeletionCandidateAdmission, HumanGovernanceError> {
+    ObjectDeletionCandidateAdmissionView::from_snapshot(snapshot)
+        .and_then(|view| view.classify_proposal(proposal))
+        .map_err(|_| HumanGovernanceError::Store)
 }
 
 pub(crate) fn proposal_acceptance_eligibility(
