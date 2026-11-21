@@ -240,7 +240,7 @@ impl HumanGovernanceService {
         snapshot: &ProjectionSnapshot,
         row: &ObjectRow,
         index: &BTreeMap<&str, Vec<&ObjectRow>>,
-        allow_independent_workstream: bool,
+        allow_independent_member: bool,
         deadline: Instant,
     ) -> Result<(), Failure> {
         let mut charged = BTreeSet::new();
@@ -255,28 +255,17 @@ impl HumanGovernanceService {
             deadline,
         )?;
         let mut root = row.clone();
-        if allow_independent_workstream
-            && let JournalPayload::WorkstreamRecorded(work) = payload
-            && row.repository_id.as_deref()
-                == work
-                    .repository_instance_id
-                    .map(|id| id.to_string())
-                    .as_deref()
-            && row.repository_id.is_some()
-            && row.task_id.as_deref() == Some(work.task_id.to_string().as_str())
-            && work.parent_workstream_id.is_none()
-            && work.dependency_workstream_ids.is_empty()
-            && work.worktree_lineage_refs.is_empty()
-            && work.active_episode_id.is_none()
-            && work.execution_lane_ids.is_empty()
+        if allow_independent_member
+            && let Some(stream) = independent_search_workstream(row, &payload, &dependencies)?
             && let Some(task) = &row.task_id
         {
-            // A standalone member already has a canonical shard. Keep the Task and all its
-            // source dependencies, but don't treat other memberships as this member's scopes.
+            // Keep the Task record and its roots in the dependency closure. Only the
+            // selected member and its structural parents omit the Task's sibling shards.
             root.task_id = None;
             for dependency in dependencies.values_mut().flatten().filter(|dependency| {
-                dependency.object_kind.as_deref() == Some("task")
-                    && dependency.object_id.as_ref() == Some(task)
+                dependency.row_id == stream
+                    || dependency.object_kind.as_deref() == Some("task")
+                        && dependency.object_id.as_ref() == Some(task)
             }) {
                 dependency.task_id = None;
             }
@@ -291,6 +280,97 @@ impl HumanGovernanceService {
         )
         .await
     }
+}
+
+fn independent_search_workstream(
+    row: &ObjectRow,
+    payload: &JournalPayload,
+    dependencies: &BTreeMap<String, Vec<ObjectRow>>,
+) -> ExportResult<Option<String>> {
+    use evertrace_domain::work::{AttemptExecutionStatus, EpisodeLifecycle};
+    // Only shapes whose actual dependencies are covered by the canonical read closure.
+    let (task, stream, repository) = match payload {
+        JournalPayload::WorkstreamRecorded(value) => (
+            value.task_id,
+            value.workstream_id,
+            value.repository_instance_id,
+        ),
+        JournalPayload::WorkEpisodeRecorded(value)
+            if value.lifecycle_status == EpisodeLifecycle::Closed
+                && value.execution_lane_ids.is_empty()
+                && value.attempt_ids.is_empty()
+                && value.competing_attempt_group_ids.is_empty()
+                && value.worktree_transition_refs.is_empty()
+                && value.interruption_refs.is_empty()
+                && value.completed_outcome_refs.is_empty()
+                && value.selected_outcome_refs.is_empty()
+                && value.checkpoint_refs.is_empty()
+                && value.capture_gap_refs.is_empty()
+                && value.capture_outage_refs.is_empty()
+                && value.work_artifact_refs.is_empty()
+                && value.segmentation_correction_refs.is_empty() =>
+        {
+            (
+                value.task_id,
+                value.workstream_id,
+                value.repository_instance_id,
+            )
+        }
+        JournalPayload::AttemptRecorded(value)
+            if value.execution_status == AttemptExecutionStatus::Proposed
+                && value.revision_generation == 1
+                && value.resume_state_assessment.is_none()
+                && value.composed_from_attempt_ids.is_empty()
+                && value.competing_group_ids.is_empty()
+                && value.worktree_transition_refs.is_empty()
+                && value.work_binding_revision_refs.is_empty()
+                && value.strategy_contract.search_policy_ref.is_none()
+                && value.strategy_contract.objective_ref.is_none()
+                && value.strategy_contract.target_refs.as_slice()
+                    == [value.workstream_id.to_string()] =>
+        {
+            (
+                value.task_id,
+                value.workstream_id,
+                value.repository_instance_id,
+            )
+        }
+        _ => return Ok(None),
+    };
+    let Some(repository) = repository else {
+        return Ok(None);
+    };
+    let (task_key, stream_key, repository_key) =
+        (task.to_string(), stream.to_string(), repository.to_string());
+    let same_shard = |candidate: &ObjectRow| {
+        candidate.repository_id.as_deref() == Some(repository_key.as_str())
+            && candidate.task_id.as_deref() == Some(task_key.as_str())
+            && candidate.workstream_id.as_deref() == Some(stream_key.as_str())
+    };
+    if !same_shard(row) {
+        return Ok(None);
+    }
+    let (parent, decoded) = if matches!(payload, JournalPayload::WorkstreamRecorded(_)) {
+        (row, None)
+    } else {
+        let Some([candidate]) = dependencies.get(&stream_key).map(Vec::as_slice) else {
+            return Ok(None);
+        };
+        (candidate, Some(decode(candidate)?))
+    };
+    let JournalPayload::WorkstreamRecorded(work) = decoded.as_ref().unwrap_or(payload) else {
+        return Ok(None);
+    };
+    Ok((same_shard(parent)
+        && work.workstream_id == stream
+        && work.task_id == task
+        && work.repository_instance_id == Some(repository)
+        && work.parent_workstream_id.is_none()
+        && work.dependency_workstream_ids.is_empty()
+        && work.worktree_lineage_refs.is_empty()
+        && work.active_episode_id.is_none()
+        && work.execution_lane_ids.is_empty())
+    .then(|| parent.row_id.clone()))
 }
 
 pub(super) fn presentation_index(
