@@ -5,7 +5,7 @@ use evertrace_domain::{
     semantic::{NormativeResolutionState, SemanticResolution},
 };
 
-const SEARCH_HIT_ORDER_REVISION: u32 = 5;
+const SEARCH_HIT_ORDER_REVISION: u32 = 6;
 
 type SearchPolicy = Option<(String, Option<evertrace_codex::policy::PolicyEvidence>)>;
 

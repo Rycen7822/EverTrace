@@ -240,36 +240,52 @@ impl HumanGovernanceService {
         snapshot: &ProjectionSnapshot,
         row: &ObjectRow,
         index: &BTreeMap<&str, Vec<&ObjectRow>>,
-        allow_independent_member: bool,
+        for_search: bool,
         deadline: Instant,
     ) -> Result<(), Failure> {
         let mut charged = BTreeSet::new();
         let mut remaining = MAX_METADATA_BYTES;
         charge_metadata(row, &mut charged, &mut remaining, deadline)?;
         let payload = decode(row)?;
-        let mut dependencies = collect_dependencies(
+        let mut root = row.clone();
+        let member_task = if for_search && independent_search_member(row, &payload, index)? {
+            // Only authorization coordinates change; the original Task and all its roots stay in the closure.
+            root.task_id.take()
+        } else {
+            None
+        };
+        let references = |row: &ObjectRow, payload: &JournalPayload| {
+            let mut refs = dependencies_for(row, payload);
+            if for_search && let JournalPayload::WorkstreamRecorded(work) = payload {
+                for id in work
+                    .parent_workstream_id
+                    .iter()
+                    .chain(&work.dependency_workstream_ids)
+                {
+                    let reference = id.to_string();
+                    let Some([linked]) = index.get(reference.as_str()).map(Vec::as_slice) else {
+                        return Err(Failure::Denied);
+                    };
+                    if linked.object_kind.as_deref() != Some("workstream")
+                        || linked.object_id.as_deref() != Some(reference.as_str())
+                        || linked.task_id.as_deref() != Some(work.task_id.to_string().as_str())
+                    {
+                        return Err(Failure::Denied);
+                    }
+                    refs.insert(reference);
+                }
+            }
+            Ok(refs)
+        };
+        let dependencies = collect_dependencies(
             index,
-            dependencies_for(row, &payload),
+            references(row, &payload)?,
             &mut charged,
             &mut remaining,
             deadline,
+            references,
+            member_task.as_deref(),
         )?;
-        let mut root = row.clone();
-        if allow_independent_member
-            && let Some(stream) = independent_search_workstream(row, &payload, &dependencies)?
-            && let Some(task) = &row.task_id
-        {
-            // Keep the Task record and its roots in the dependency closure. Only the
-            // selected member and its structural parents omit the Task's sibling shards.
-            root.task_id = None;
-            for dependency in dependencies.values_mut().flatten().filter(|dependency| {
-                dependency.row_id == stream
-                    || dependency.object_kind.as_deref() == Some("task")
-                        && dependency.object_id.as_ref() == Some(task)
-            }) {
-                dependency.task_id = None;
-            }
-        }
         self.export_access(
             snapshot,
             &Selection {
@@ -282,11 +298,11 @@ impl HumanGovernanceService {
     }
 }
 
-fn independent_search_workstream(
+fn independent_search_member(
     row: &ObjectRow,
     payload: &JournalPayload,
-    dependencies: &BTreeMap<String, Vec<ObjectRow>>,
-) -> ExportResult<Option<String>> {
+    index: &BTreeMap<&str, Vec<&ObjectRow>>,
+) -> ExportResult<bool> {
     use evertrace_domain::work::{AttemptExecutionStatus, EpisodeLifecycle};
     // Only shapes whose actual dependencies are covered by the canonical read closure.
     let (task, stream, repository) = match payload {
@@ -335,42 +351,47 @@ fn independent_search_workstream(
                 value.repository_instance_id,
             )
         }
-        _ => return Ok(None),
+        _ => return Ok(false),
     };
     let Some(repository) = repository else {
-        return Ok(None);
+        return Ok(false);
     };
-    let (task_key, stream_key, repository_key) =
-        (task.to_string(), stream.to_string(), repository.to_string());
-    let same_shard = |candidate: &ObjectRow| {
-        candidate.repository_id.as_deref() == Some(repository_key.as_str())
-            && candidate.task_id.as_deref() == Some(task_key.as_str())
-            && candidate.workstream_id.as_deref() == Some(stream_key.as_str())
-    };
-    if !same_shard(row) {
-        return Ok(None);
+    let stream_key = stream.to_string();
+    if row.repository_id.as_deref() != Some(repository.to_string().as_str())
+        || row.task_id.as_deref() != Some(task.to_string().as_str())
+        || row.workstream_id.as_deref() != Some(stream_key.as_str())
+    {
+        return Ok(false);
     }
     let (parent, decoded) = if matches!(payload, JournalPayload::WorkstreamRecorded(_)) {
         (row, None)
     } else {
-        let Some([candidate]) = dependencies.get(&stream_key).map(Vec::as_slice) else {
-            return Ok(None);
+        let Some([candidate]) = index.get(stream_key.as_str()).map(Vec::as_slice) else {
+            return Ok(false);
         };
-        (candidate, Some(decode(candidate)?))
+        (*candidate, Some(decode(candidate)?))
     };
     let JournalPayload::WorkstreamRecorded(work) = decoded.as_ref().unwrap_or(payload) else {
-        return Ok(None);
+        return Ok(false);
     };
-    Ok((same_shard(parent)
-        && work.workstream_id == stream
+    Ok(work.workstream_id == stream
         && work.task_id == task
         && work.repository_instance_id == Some(repository)
-        && work.parent_workstream_id.is_none()
-        && work.dependency_workstream_ids.is_empty()
+        && independently_scoped_workstream(parent, work))
+}
+
+fn independently_scoped_workstream(
+    row: &ObjectRow,
+    work: &evertrace_domain::work::Workstream,
+) -> bool {
+    work.repository_instance_id
+        .is_some_and(|id| row.repository_id.as_deref() == Some(id.to_string().as_str()))
+        && row.task_id.as_deref() == Some(work.task_id.to_string().as_str())
+        && row.object_id.as_ref() == row.workstream_id.as_ref()
+        && row.object_id.as_deref() == Some(work.workstream_id.to_string().as_str())
         && work.worktree_lineage_refs.is_empty()
         && work.active_episode_id.is_none()
-        && work.execution_lane_ids.is_empty())
-    .then(|| parent.row_id.clone()))
+        && work.execution_lane_ids.is_empty()
 }
 
 pub(super) fn presentation_index(
@@ -574,8 +595,15 @@ fn select(
         pending.extend(dependencies_for(row, &payload));
         rows.insert(row.row_id.clone(), row.clone());
     }
-    let dependencies =
-        collect_dependencies(&index, pending, &mut charged, &mut remaining, deadline)?;
+    let dependencies = collect_dependencies(
+        &index,
+        pending,
+        &mut charged,
+        &mut remaining,
+        deadline,
+        |row, payload| Ok(dependencies_for(row, payload)),
+        None,
+    )?;
     Ok(Selection {
         rows: rows.into_values().collect(),
         dependencies,
@@ -588,6 +616,8 @@ fn collect_dependencies(
     charged: &mut BTreeSet<String>,
     remaining: &mut u64,
     deadline: Instant,
+    references: impl Fn(&ObjectRow, &JournalPayload) -> ExportResult<BTreeSet<String>>,
+    member_task: Option<&str>,
 ) -> ExportResult<BTreeMap<String, Vec<ObjectRow>>> {
     let mut dependencies = BTreeMap::new();
     // The bounded dependency closure is checked, never exported implicitly.
@@ -599,12 +629,29 @@ fn collect_dependencies(
         if dependencies.len() + pending.len() >= MAX_DEPENDENCIES {
             return Err(Failure::Limit);
         }
-        let referenced = index.get(reference.as_str()).cloned().unwrap_or_default();
-        for row in &referenced {
+        let mut referenced = Vec::new();
+        for row in index.get(reference.as_str()).into_iter().flatten() {
             charge_metadata(row, charged, remaining, deadline)?;
-            pending.extend(dependencies_for(row, &decode(row)?));
+            let payload = decode(row)?;
+            pending.extend(references(row, &payload)?);
+            let mut authorization = (*row).clone();
+            if member_task.is_some()
+                && row.task_id.as_deref() == member_task
+                && match &payload {
+                    JournalPayload::TaskRecorded(task) => {
+                        row.object_id.as_deref() == Some(task.task_id.to_string().as_str())
+                    }
+                    JournalPayload::WorkstreamRecorded(work) => {
+                        independently_scoped_workstream(row, work)
+                    }
+                    _ => false,
+                }
+            {
+                authorization.task_id = None;
+            }
+            referenced.push(authorization);
         }
-        dependencies.insert(reference, referenced.into_iter().cloned().collect());
+        dependencies.insert(reference, referenced);
     }
     Ok(dependencies)
 }
