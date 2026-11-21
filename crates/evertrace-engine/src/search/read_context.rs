@@ -735,15 +735,17 @@ pub(crate) fn operation_binding_read<'a>(
     .then_some(read)
 }
 
-/// A current physical proof can be read without any WorkBinding assignment.
+/// Read an authorized physical prefix independently of WorkBinding. The persisted
+/// relation channel covers the current physical revision only, even for exact pins.
 pub(crate) fn repository_operation_read<'a>(
     selection: evertrace_domain::query::MemoryScopeSelection,
     facets: &evertrace_domain::query::QueryFacetSet,
     index: &BTreeMap<&str, Vec<&'a ObjectRow>>,
 ) -> Option<OperationRead<'a>> {
-    use evertrace_domain::query::{MemoryScopeSelection as Scope, TemporalMode};
+    use evertrace_domain::query::{
+        MemoryScopeSelection as Scope, TemporalMode, parse_operation_revision,
+    };
     if !matches!(selection, Scope::Repository { .. } | Scope::Worktree { .. })
-        || facets.temporal_mode != TemporalMode::Current
         || !facets.temporal_qualifiers.is_empty()
         || !facets
             .relation_requirements
@@ -755,7 +757,15 @@ pub(crate) fn repository_operation_read<'a>(
     let [anchor] = facets.target_anchors.as_slice() else {
         return None;
     };
-    let read = operation_read(anchor.parse().ok()?, None, index)?;
+    let (id, exact) = match (facets.temporal_mode, parse_operation_revision(anchor)) {
+        (TemporalMode::Current | TemporalMode::Any, Some((id, _))) => (id, true),
+        (TemporalMode::Current, None) => (anchor.parse().ok()?, false),
+        _ => return None,
+    };
+    let read = operation_read(id, None, index)?;
+    if exact && read.operation.current_revision_id.as_ref() != Some(anchor) {
+        return None;
+    }
     let (Some(repo), tree) = read.shard()? else {
         return None;
     };
