@@ -121,6 +121,7 @@ pub(crate) const SCOPED_OBJECT_KINDS: &[&str] = &[
     "attempt",
     "procedure_revision",
     "revision_proposal_revision",
+    "semantic_digest",
 ];
 
 impl SearchReadAccess<'_> {
@@ -148,8 +149,11 @@ impl SearchReadAccess<'_> {
         if row.object_id.as_deref() != Some(key) {
             return Err(ErrorCode::StoreCorrupt);
         }
-        if matches!(kind, "procedure_revision" | "revision_proposal_revision") {
-            // A missing or suppressed dependency is not permission to use indexed method text.
+        if matches!(
+            kind,
+            "procedure_revision" | "revision_proposal_revision" | "semantic_digest"
+        ) {
+            // A missing or suppressed dependency is not permission to use compiled text.
             let present = |reference: &str| {
                 context.rows.iter().any(|fact| {
                     fact.object_id.as_deref() == Some(reference)
@@ -176,6 +180,17 @@ impl SearchReadAccess<'_> {
                         return Err(ErrorCode::Untrusted);
                     }
                     method.draft()
+                }
+                JournalPayload::SemanticDigestRecorded(digest) => {
+                    return if digest.selected_direct_refs.iter().all(|id| present(id))
+                        && digest
+                            .episode_revision_id
+                            .is_none_or(|id| present(&id.to_string()))
+                    {
+                        Ok(())
+                    } else {
+                        Err(ErrorCode::Untrusted)
+                    };
                 }
                 _ => return Err(ErrorCode::StoreCorrupt),
             };

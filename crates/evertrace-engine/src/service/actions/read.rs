@@ -1478,8 +1478,9 @@ impl McpActionService {
         };
         let field_restricted = if restricted {
             true
-        } else if let Some(kind @ ("atom_revision" | "revision_proposal_revision")) =
-            row.object_kind.as_deref()
+        } else if let Some(
+            kind @ ("atom_revision" | "revision_proposal_revision" | "semantic_digest"),
+        ) = row.object_kind.as_deref()
         {
             let revision = row
                 .current_revision_id

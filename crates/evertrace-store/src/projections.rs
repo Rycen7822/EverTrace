@@ -6414,6 +6414,15 @@ impl JournalAdmissionState {
             }
             return Ok(rows);
         }
+        if let Ok(id) = reference.parse::<evertrace_domain::ids::SemanticDigestId>() {
+            return self
+                .synthesis
+                .digests()
+                .get(&id)
+                .map(|(value, seq)| synthesis::digest_row(id, value.clone(), *seq))
+                .transpose()
+                .map(|row| row.into_iter().collect());
+        }
         if let Ok(revision) = reference.parse::<RevisionId>()
             && let Some((value, seq)) = self.attempt_revisions.get(&revision)
         {
