@@ -1,12 +1,17 @@
 //! Request-local interpretation of readable canonical semantic revisions.
-use std::collections::{BTreeMap, BTreeSet};
+use std::{
+    collections::{BTreeMap, BTreeSet},
+    time::Instant,
+};
 
 use evertrace_codex::HostProbeReport;
 use evertrace_domain::{
     ids::SourceObservationId,
     query::SearchContext,
+    revision::RevisionId,
     semantic::{
-        AtomAuthority, DescriptiveResolutionState, NormativeResolutionState, SemanticResolution,
+        AtomAuthority, DescriptiveResolutionState, NormativeResolutionState,
+        ProposalAcceptanceAuthority, SemanticResolution,
     },
 };
 use evertrace_store::{JournalPayload, ObjectRow, ProjectionSnapshot, SemanticCurrentView};
@@ -32,8 +37,11 @@ impl SemanticSearchResolution {
         query: &SearchContext,
         report: Option<&HostProbeReport>,
         now_us: i64,
+        deadline: Instant,
     ) -> Result<(Self, BTreeSet<String>), SearchError> {
         let view = SemanticCurrentView::from_snapshot(snapshot)?;
+        let (unavailable_core_revisions, mut dependencies) =
+            core_read_state(snapshot, readable, index, deadline)?;
         // A human read has no managed execution binding. Unknown phase/verifier
         // fields stay absent rather than borrowing another session's state.
         let mut context = ResolverContext {
@@ -53,6 +61,7 @@ impl SemanticSearchResolution {
                 })
                 .filter_map(|row| row.current_revision_id.as_deref()?.parse().ok())
                 .collect(),
+            unavailable_core_revisions,
             ..ResolverContext::default()
         };
         let atoms = view
@@ -82,10 +91,7 @@ impl SemanticSearchResolution {
         }
         // An unreturned rule can still shadow a returned one. Its source
         // permission is part of this interpretation and must be rechecked too.
-        let dependencies = atoms
-            .iter()
-            .map(|atom| atom.revision_id.to_string())
-            .collect();
+        dependencies.extend(atoms.iter().map(|atom| atom.revision_id.to_string()));
         let (normative_atoms, descriptive_atoms): (Vec<_>, Vec<_>) =
             atoms.into_iter().partition(|atom| atom.kind.is_normative());
         let normative = NormativeInstructionResolver.resolve(&normative_atoms, &context);
@@ -149,6 +155,97 @@ impl SemanticSearchResolution {
             .map(|(reference, _)| reference.clone())
             .collect()
     }
+}
+
+fn core_read_state(
+    snapshot: &ProjectionSnapshot,
+    readable: &BTreeSet<String>,
+    index: &BTreeMap<&str, Vec<&ObjectRow>>,
+    deadline: Instant,
+) -> Result<(BTreeSet<RevisionId>, BTreeSet<String>), SearchError> {
+    let mut members = BTreeMap::new();
+    let mut unavailable = BTreeSet::new();
+    for row in snapshot
+        .data_rows()
+        .filter(|row| row.object_kind.as_deref() == Some("core_membership"))
+    {
+        if Instant::now() >= deadline {
+            return Err(SearchError::Unsupported);
+        }
+        let JournalPayload::CoreMembershipRecorded(member) = decode(row)? else {
+            return Err(SearchError::Corrupt);
+        };
+        if readable.contains(&member.atom_revision_id.to_string()) {
+            unavailable.insert(member.atom_revision_id);
+            members.insert(member.membership_revision_id, member);
+        }
+    }
+    let mut checks = BTreeSet::new();
+    for row in snapshot
+        .data_rows()
+        .filter(|row| row.object_kind.as_deref() == Some("l3_core_projection"))
+    {
+        let projection =
+            evertrace_store::projections::l3_core_projection(row)?.ok_or(SearchError::Corrupt)?;
+        'candidates: for revision in projection.active_membership_revision_ids {
+            if Instant::now() >= deadline {
+                return Err(SearchError::Unsupported);
+            }
+            let Some(member) = members.get(&revision) else {
+                continue;
+            };
+            // The compiler chooses current, conflict-free memberships with valid support; the request
+            // still needs present and readable contract, authorization, and acknowledgement sources.
+            if !member.active
+                || member.scope_identity != projection.scope_identity
+                || projection
+                    .atom_revision_ids
+                    .binary_search(&member.atom_revision_id)
+                    .is_err()
+            {
+                return Err(SearchError::Corrupt);
+            }
+            let mut required = vec![
+                revision.to_string(),
+                member.support_contract_ref.to_string(),
+            ];
+            for authorization in &member.authorization_revision_refs {
+                let authorization = authorization.to_string();
+                let Some([row]) = index.get(authorization.as_str()).map(Vec::as_slice) else {
+                    continue 'candidates;
+                };
+                let JournalPayload::RevisionProposalRecorded(proposal) = decode(row)? else {
+                    return Err(SearchError::Corrupt);
+                };
+                let Some(acceptance) = proposal.acceptance else {
+                    continue 'candidates;
+                };
+                let source = match acceptance.authority_basis {
+                    ProposalAcceptanceAuthority::CurrentTaskExactMessage {
+                        user_source_observation_ref,
+                    }
+                    | ProposalAcceptanceAuthority::TuiAcceptance {
+                        user_source_observation_ref,
+                        ..
+                    }
+                    | ProposalAcceptanceAuthority::ObjectiveEvidence {
+                        user_source_observation_ref,
+                    } => user_source_observation_ref,
+                };
+                required.extend([authorization, source.to_string()]);
+            }
+            if required.iter().all(|id| readable.contains(id)) {
+                unavailable.remove(&member.atom_revision_id);
+                checks.extend(required);
+            }
+        }
+    }
+    Ok((unavailable, checks))
+}
+
+fn decode(row: &ObjectRow) -> Result<JournalPayload, SearchError> {
+    serde_json::from_str(row.payload_json.as_deref().ok_or(SearchError::Corrupt)?)
+        .map_err(|_| SearchError::Corrupt)
 }
 
 fn policy_binding(

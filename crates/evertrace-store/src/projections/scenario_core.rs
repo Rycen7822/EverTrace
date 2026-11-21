@@ -1142,9 +1142,11 @@ impl ScenarioCoreState {
             .collect()
     }
 
-    pub(super) fn restore_projection(row: &ObjectRow) -> Result<bool, StoreError> {
+    pub(super) fn restore_projection(
+        row: &ObjectRow,
+    ) -> Result<Option<L3CoreProjection>, StoreError> {
         if row.object_kind.as_deref() != Some(CORE_PROJECTION_KIND) {
-            return Ok(false);
+            return Ok(None);
         }
         let value: L3CoreProjection = serde_json::from_str(
             row.payload_json
@@ -1162,7 +1164,7 @@ impl ScenarioCoreState {
         {
             return Err(StoreError::StoreCorrupt);
         }
-        Ok(true)
+        Ok(Some(value))
     }
 }
 

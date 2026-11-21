@@ -428,7 +428,7 @@ pub(super) fn update_capture_relations(
     for row in changed_rows {
         if crate::projections::recall_trigger_contract(row)?.is_some()
             || crate::projections::recall_need(row)?.is_some()
-            || crate::projections::l3_core_projection(row)?
+            || crate::projections::l3_core_projection(row)?.is_some()
             || crate::projections::wiki_projection(row)?.is_some()
             || crate::projections::procedure_context_effect(row)?.is_some()
             || crate::session_import::restore_current(row)?.is_some()

@@ -195,6 +195,8 @@ pub struct ResolverContext {
     pub previous_fields: Option<ConstraintState>,
     pub current_policy_bindings: BTreeSet<CurrentPolicyBinding>,
     pub globally_supported_revisions: BTreeSet<RevisionId>,
+    /// Core-bound revisions whose current membership/support or read authority was not proved.
+    pub unavailable_core_revisions: BTreeSet<RevisionId>,
 }
 
 pub use evertrace_domain::semantic::{DescriptiveResolutionState, NormativeResolutionState};
@@ -332,10 +334,13 @@ fn normative_precondition(atom: &Atom, context: &ResolverContext) -> NormativeRe
     if !scope_applies(&atom.scope, context) || !atom.validity_interval.contains(context.now_us) {
         return NormativeResolutionState::Inapplicable;
     }
-    if matches!(atom.scope, AtomScope::Global)
-        && !context
-            .globally_supported_revisions
-            .contains(&atom.revision_id)
+    if context
+        .unavailable_core_revisions
+        .contains(&atom.revision_id)
+        || matches!(atom.scope, AtomScope::Global)
+            && !context
+                .globally_supported_revisions
+                .contains(&atom.revision_id)
     {
         return NormativeResolutionState::SupportUnavailable;
     }

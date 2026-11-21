@@ -45,19 +45,7 @@ fn compiled_projection_data(row: &ObjectRow) -> Result<Option<CompiledProjection
         Some("wiki_projection") => {
             synthesis::restore_wiki_projection(row)?.map(CompiledProjectionData::Wiki)
         }
-        Some("l3_core_projection") => {
-            if !scenario_core::ScenarioCoreState::restore_projection(row)? {
-                return Err(StoreError::StoreCorrupt);
-            }
-            Some(CompiledProjectionData::Core(
-                serde_json::from_str(
-                    row.payload_json
-                        .as_deref()
-                        .ok_or(StoreError::StoreCorrupt)?,
-                )
-                .map_err(|_| StoreError::StoreCorrupt)?,
-            ))
-        }
+        Some("l3_core_projection") => l3_core_projection(row)?.map(CompiledProjectionData::Core),
         _ => return Ok(None),
     };
     if let Some(value) = &value {

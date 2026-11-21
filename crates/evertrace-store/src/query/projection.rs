@@ -689,7 +689,7 @@ fn derive_l0002_projection_rows(
     {
         if recall_trigger_contract(row)?.is_some()
             || recall_need(row)?.is_some()
-            || l3_core_projection(row)?
+            || l3_core_projection(row)?.is_some()
             || wiki_projection(row)?.is_some()
             || procedure_context_effect(row)?.is_some()
             || crate::session_import::restore_current(row)?.is_some()
@@ -715,7 +715,7 @@ fn derive_l0002_projection_rows(
     {
         if recall_trigger_contract(row)?.is_some()
             || recall_need(row)?.is_some()
-            || l3_core_projection(row)?
+            || l3_core_projection(row)?.is_some()
             || procedure_context_effect(row)?.is_some()
             || crate::session_import::restore_current(row)?.is_some()
         {

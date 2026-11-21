@@ -870,6 +870,7 @@ impl HumanGovernanceService {
                 &context,
                 report.as_ref(),
                 now_us()?,
+                deadline,
             )
             .map_err(|_| HumanGovernanceError::Store)?;
             let semantics = std::sync::Arc::new(semantics);

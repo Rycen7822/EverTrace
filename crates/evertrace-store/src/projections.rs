@@ -125,7 +125,10 @@ pub fn recall_need(
     recall_ledger::need(row)
 }
 
-pub(crate) fn l3_core_projection(row: &ObjectRow) -> Result<bool, StoreError> {
+/// Decode and validate the current compiled Core membership projection.
+pub fn l3_core_projection(
+    row: &ObjectRow,
+) -> Result<Option<evertrace_domain::semantic::L3CoreProjection>, StoreError> {
     scenario_core::ScenarioCoreState::restore_projection(row)
 }
 
@@ -373,7 +376,7 @@ impl ProjectionSnapshot {
         for row in self.data_rows() {
             if recall_projection::contract(row)?.is_some()
                 || crate::session_import::restore_current(row)?.is_some()
-                || scenario_core::ScenarioCoreState::restore_projection(row)?
+                || l3_core_projection(row)?.is_some()
                 || procedure_effect::restore(row)?.is_some()
                 || recall_ledger::need(row)?.is_some()
             {
@@ -17135,7 +17138,7 @@ impl ReducerState {
                 }
                 continue;
             }
-            if scenario_core::ScenarioCoreState::restore_projection(row)? {
+            if l3_core_projection(row)?.is_some() {
                 continue;
             }
             if synthesis::restore_wiki_projection(row)?.is_some() {
