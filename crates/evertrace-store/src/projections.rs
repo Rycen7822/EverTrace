@@ -382,8 +382,8 @@ impl ProjectionSnapshot {
             {
                 continue;
             }
-            if let Some(wiki) = synthesis::restore_wiki_projection(row)? {
-                retain(cas_ref_string(wiki.rendered_blob_ref));
+            // Wiki's render identity is recomputed from its sources, not written to CAS.
+            if synthesis::restore_wiki_projection(row)?.is_some() {
                 continue;
             }
             let payload_json = row

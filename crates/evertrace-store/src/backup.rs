@@ -1710,9 +1710,10 @@ fn backup_watermarks(
     let mut source = Vec::new();
     let mut outbox = 0_u64;
     for row in snapshot.data_rows() {
-        if crate::session_import::restore_current(row)
-            .map_err(map_store)?
-            .is_some()
+        if row.row_class != Some(crate::ObjectRowClass::Runtime)
+            || crate::session_import::restore_current(row)
+                .map_err(map_store)?
+                .is_some()
         {
             continue;
         }
