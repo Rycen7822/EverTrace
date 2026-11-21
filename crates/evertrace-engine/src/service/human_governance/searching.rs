@@ -5,7 +5,7 @@ use evertrace_domain::{
     semantic::{NormativeResolutionState, SemanticResolution},
 };
 
-const SEARCH_HIT_ORDER_REVISION: u32 = 3;
+const SEARCH_HIT_ORDER_REVISION: u32 = 4;
 
 type SearchPolicy = Option<(String, Option<evertrace_codex::policy::PolicyEvidence>)>;
 
@@ -710,6 +710,36 @@ struct MatchedSources {
     unknown: bool,
 }
 
+fn selected_shard_repository(
+    selection: MemoryScopeSelection,
+    snapshot: &ProjectionSnapshot,
+) -> Result<Option<RepositoryId>, &'static str> {
+    const UNRESOLVED: &str = "scope_unresolved";
+    match selection {
+        MemoryScopeSelection::Repository { repository_id } => Ok(Some(repository_id)),
+        MemoryScopeSelection::Worktree { worktree_id } => {
+            let key = evertrace_store::repository::worktree_row_id(&worktree_id);
+            let mut rows = snapshot.data_rows().filter(|row| row.row_id == key);
+            let row = rows.next().ok_or(UNRESOLVED)?;
+            if rows.next().is_some() {
+                return Err(UNRESOLVED);
+            }
+            let JournalPayload::WorktreeInstanceRecorded(tree) =
+                serde_json::from_str(row.payload_json.as_deref().ok_or(UNRESOLVED)?)
+                    .map_err(|_| UNRESOLVED)?
+            else {
+                return Err(UNRESOLVED);
+            };
+            if tree.worktree_instance_id != worktree_id || tree.validate().is_err() {
+                return Err(UNRESOLVED);
+            }
+            // The retained identity authorizes the scope only. It says nothing about live Git state.
+            Ok(Some(tree.repository_instance_id))
+        }
+        _ => Ok(None),
+    }
+}
+
 fn task_search_shards(
     index: &std::collections::BTreeMap<&str, Vec<&ObjectRow>>,
     id: evertrace_domain::ids::TaskId,
@@ -1063,12 +1093,27 @@ impl HumanGovernanceService {
             if snapshot.frontier != cursor.frontier {
                 return conflict();
             }
-            let index = export::presentation_index(&snapshot, deadline)
-                .map_err(|_| HumanGovernanceError::Store)?;
             let report = self.search_report().await;
             if search_policy(report.as_ref()) != cursor.policy {
                 return conflict();
             }
+            let Ok(selected_repository) = selected_shard_repository(query.selection, &snapshot)
+            else {
+                return conflict();
+            };
+            if let Some(repository) = selected_repository
+                && !self
+                    .search_shards_readable(
+                        &[repository],
+                        RepositoryReadAuthority::retained(report.as_ref()),
+                        deadline,
+                    )
+                    .await?
+            {
+                return conflict();
+            }
+            let index = export::presentation_index(&snapshot, deadline)
+                .map_err(|_| HumanGovernanceError::Store)?;
             let mut checks = BTreeSet::new();
             for hit in cursor.after.iter().chain(&cursor.remaining) {
                 if let Some(deps) = cursor.wiki_inputs.get(&hit.candidate_id) {
@@ -1280,26 +1325,26 @@ impl HumanGovernanceService {
                 });
             };
             let report = self.search_report().await;
-            let selected_repository = match query.selection {
-                MemoryScopeSelection::Repository { repository_id } => Some(repository_id),
-                _ => None,
-            };
-            if let Some(repository) = selected_repository
-                && !self
+            let selected_repository = selected_shard_repository(query.selection, &snapshot);
+            let scope_gap = match selected_repository {
+                Err(reason) => Some(reason),
+                Ok(Some(repository)) => (!self
                     .search_shards_readable(
                         &[repository],
                         RepositoryReadAuthority::retained(report.as_ref()),
                         deadline,
                     )
-                    .await?
-            {
+                    .await?)
+                    .then_some("source_read_restricted"),
+                Ok(None) => None,
+            };
+            if let Some(reason) = scope_gap {
                 // Report inaccessible selection, not whether any hidden candidate matches the query.
                 let pinned = search
                     .snapshot_after_validated_frontier(snapshot.frontier)
                     .await
                     .map_err(|_| HumanGovernanceError::Store)?;
-                let mut page =
-                    cursor_unavailable(pinned.authoritative_frontier(), "source_read_restricted");
+                let mut page = cursor_unavailable(pinned.authoritative_frontier(), reason);
                 page.result.projection_frontier = pinned.frontier();
                 if pinned.frontier() != pinned.authoritative_frontier() {
                     page.result
@@ -1658,7 +1703,7 @@ impl HumanGovernanceService {
                 .search_checks_readable(&snapshot, &index, &checks, deadline)
                 .await;
             let current_report = self.search_report().await;
-            if let Some(repository) = selected_repository
+            if let Ok(Some(repository)) = selected_repository
                 && !self
                     .search_shards_readable(
                         &[repository],
