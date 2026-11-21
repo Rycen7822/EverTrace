@@ -1,29 +1,28 @@
-//! Authored correction commands, sharing the protected human capture and proposal lifecycle.
+//! Human proposals share one protected authoring reservation and the normal proposal compiler.
 use super::*;
-use evertrace_domain::{
-    ids::AtomId,
-    semantic::{Atom, HumanAtomCorrection, ProposalTargetKind},
+use evertrace_domain::semantic::{
+    Atom, HumanAtomAuthoring, HumanAuthoringTarget, ProposalTargetKind,
 };
 
 impl HumanAcceptanceService {
-    pub async fn submit_web_correction(
+    pub async fn submit_web_authoring(
         &self,
         service: &crate::HumanGovernanceService,
-        request_id: RequestId,
+        request: RequestId,
         frontier: u64,
-        intent: HumanAtomCorrection,
+        intent: HumanAtomAuthoring,
     ) -> Result<HumanActionOutcome, HumanGovernanceError> {
         let conflict = || HumanActionOutcome::Conflict {
             current_revision_ref: None,
         };
         let Some(runtime) = &self.runtime_snapshot else {
             return Ok(HumanActionOutcome::Unavailable {
-                reason: "web_correction_source_unavailable",
+                reason: "web_proposal_source_unavailable",
             });
         };
-        let command_id = CommandId::from_uuid(request_id.as_uuid())
+        let command_id = CommandId::from_uuid(request.as_uuid())
             .map_err(|_| HumanGovernanceError::InvalidInput)?;
-        let id = correction_proposal_id(command_id)?;
+        let id = authored_proposal_id(command_id)?;
         if let Some(previous) = self
             .writer
             .committed_command(command_id)
@@ -32,13 +31,7 @@ impl HumanAcceptanceService {
         {
             return Ok(
                 match self
-                    .correction_outcome(
-                        service,
-                        &previous,
-                        id,
-                        (intent.atom_id, intent.base_revision_id),
-                        Some(&intent),
-                    )
+                    .authoring_outcome(service, &previous, id, intent.target(), Some(&intent))
                     .await?
                 {
                     HumanActionOutcome::Applied {
@@ -56,58 +49,44 @@ impl HumanAcceptanceService {
             .project_objects()
             .await
             .map_err(|_| HumanGovernanceError::Store)?;
-        let view = SemanticCurrentView::from_snapshot(&snapshot)
-            .map_err(|_| HumanGovernanceError::Store)?;
-        let Some(base) = view.atoms.get(&intent.atom_id).filter(|base| {
-            snapshot.frontier == frontier
-                && intent.base_revision_id == base.revision_id
-                && HumanAtomCorrection::eligible_base(base)
-        }) else {
-            return Ok(conflict());
-        };
-        if !service
-            .web_current_object_accessible(
-                &snapshot,
-                "atom_revision",
-                &base.atom_id.to_string(),
-                &base.revision_id.to_string(),
-            )
-            .await?
-        {
+        if snapshot.frontier != frontier {
             return Ok(conflict());
         }
-        if intent.replacement_value(base).is_none() {
+        let view = SemanticCurrentView::from_snapshot(&snapshot)
+            .map_err(|_| HumanGovernanceError::Store)?;
+        let base = authoring_base(&view, intent.target());
+        let Some(scope) = authoring_scope(service, &snapshot, &intent, base).await? else {
+            return Ok(conflict());
+        };
+        let valid = match &intent {
+            HumanAtomAuthoring::Correct(value) => base
+                .and_then(|base| value.replacement_value(base))
+                .is_some(),
+            HumanAtomAuthoring::Create(value) => value.value().is_some(),
+        };
+        if !valid {
             return Ok(HumanActionOutcome::Unavailable {
-                reason: "invalid_atom_correction",
+                reason: "invalid_atom_proposal",
             });
         }
         let revision = RevisionId::new_v7();
         let canonical = intent
             .canonical(id, revision)
             .ok_or(HumanGovernanceError::InvalidInput)?;
-        let record = format!("human-correct-{id}-{revision}");
-        let scope = AcceptanceCaptureScope {
-            task_id: base.scope.task_id(),
-            repository_id: base.scope.repository_id(),
+        let (instance, prefix, manifest) = intent.capture_identity();
+        let record = format!("{prefix}-{id}-{revision}");
+        let capture_scope = AcceptanceCaptureScope {
+            task_id: scope.task_id(),
+            repository_id: scope.repository_id(),
             worktree_id: None,
         };
         let input = human_capture_input(
             (id, revision),
             &canonical,
             &record,
-            scope,
-            ("human-correction", HUMAN_CORRECTION_MANIFEST),
+            capture_scope,
+            (instance, manifest),
         )?;
-        let mut capture = CaptureRuntime::open_for_admission(runtime.clone())
-            .map_err(|_| HumanGovernanceError::Store)?;
-        let routing_hint = format!("web-{}", command_id.as_uuid().hyphenated());
-        let segment = match capture.capture_isolated(input, command_id, &routing_hint) {
-            Ok(result) if matches!(result.outcome, CaptureOutcome::Durable { .. }) => {
-                result.segment
-            }
-            Err(CaptureError::ReservationExists) => return Ok(HumanActionOutcome::Unknown),
-            _ => return Err(HumanGovernanceError::Store),
-        };
         let spool = DurableSpool::open_read_only(
             runtime.spool_dir.clone(),
             runtime
@@ -117,21 +96,34 @@ impl HumanAcceptanceService {
         .map_err(|_| HumanGovernanceError::Store)?;
         let cas =
             CasStore::open(runtime.cas_dir.clone()).map_err(|_| HumanGovernanceError::Store)?;
+        let mut capture = CaptureRuntime::open_for_admission(runtime.clone())
+            .map_err(|_| HumanGovernanceError::Store)?;
+        let segment = match capture.capture_isolated(
+            input,
+            command_id,
+            &format!("web-{}", command_id.as_uuid().hyphenated()),
+        ) {
+            Ok(result) if matches!(result.outcome, CaptureOutcome::Durable { .. }) => {
+                result.segment
+            }
+            Err(CaptureError::ReservationExists) => return Ok(HumanActionOutcome::Unknown),
+            _ => return Err(HumanGovernanceError::Store),
+        };
         let [frame] = segment.frames() else {
             return Err(HumanGovernanceError::Store);
         };
         let verified =
             verify_capture_frame(frame, &cas).map_err(|_| HumanGovernanceError::Store)?;
-        if !HumanAtomCorrection::exact_capture(&verified.receipt) {
+        if !HumanAtomAuthoring::exact_capture(&verified.receipt) {
             acknowledge_web_reservation(&spool, &segment).await?;
             return Ok(HumanActionOutcome::Unavailable {
-                reason: "correction_source_not_exact",
+                reason: "authoring_source_not_exact",
             });
         }
-        let Some(batch) = self.web_correction_command(
+        let Some(batch) = self.web_authoring_command(
             &snapshot,
             &view,
-            base,
+            (base, &scope),
             (id, revision),
             &intent,
             &verified,
@@ -152,14 +144,9 @@ impl HumanAcceptanceService {
                     .await
                     .map_err(|_| HumanGovernanceError::Store)?
                     .ok_or(HumanGovernanceError::Store)?;
-                correction_result(
-                    &previous,
-                    id,
-                    (intent.atom_id, intent.base_revision_id),
-                    Some(&intent),
-                )
-                .map(|(_, outcome)| outcome)
-                .ok_or(HumanGovernanceError::Store)?
+                authoring_result(&previous, id, intent.target(), Some(&intent))
+                    .map(|(_, result)| result)
+                    .ok_or(HumanGovernanceError::Store)?
             }
             Err(
                 crate::WriterActorError::StaleFrontier
@@ -171,13 +158,13 @@ impl HumanAcceptanceService {
         Ok(outcome)
     }
 
-    pub async fn reviewed_web_correction_outcome(
+    pub async fn reviewed_web_authoring_outcome(
         &self,
         service: &crate::HumanGovernanceService,
-        request_id: RequestId,
-        target: (AtomId, RevisionId),
+        request: RequestId,
+        target: HumanAuthoringTarget,
     ) -> Result<HumanActionOutcome, HumanGovernanceError> {
-        let id = CommandId::from_uuid(request_id.as_uuid())
+        let id = CommandId::from_uuid(request.as_uuid())
             .map_err(|_| HumanGovernanceError::InvalidInput)?;
         let Some(committed) = self
             .writer
@@ -187,25 +174,19 @@ impl HumanAcceptanceService {
         else {
             return Ok(HumanActionOutcome::Unknown);
         };
-        self.correction_outcome(
-            service,
-            &committed,
-            correction_proposal_id(id)?,
-            target,
-            None,
-        )
-        .await
+        self.authoring_outcome(service, &committed, authored_proposal_id(id)?, target, None)
+            .await
     }
 
-    async fn correction_outcome(
+    async fn authoring_outcome(
         &self,
         service: &crate::HumanGovernanceService,
         committed: &evertrace_store::CommittedCommand,
         id: RevisionProposalId,
-        target: (AtomId, RevisionId),
-        expected: Option<&HumanAtomCorrection>,
+        target: HumanAuthoringTarget,
+        expected: Option<&HumanAtomAuthoring>,
     ) -> Result<HumanActionOutcome, HumanGovernanceError> {
-        let Some((proposal, outcome)) = correction_result(committed, id, target, expected) else {
+        let Some((proposal, outcome)) = authoring_result(committed, id, target, expected) else {
             return Ok(HumanActionOutcome::Unknown);
         };
         let snapshot = self
@@ -219,12 +200,12 @@ impl HumanAcceptanceService {
         Ok(outcome)
     }
 
-    pub(super) async fn reconcile_web_correction(
+    pub(super) async fn reconcile_web_authoring(
         &self,
         verified: &crate::capture::VerifiedCapture,
         cas: &CasStore,
     ) -> Result<(), HumanGovernanceError> {
-        if !HumanAtomCorrection::exact_capture(&verified.receipt)
+        if !HumanAtomAuthoring::exact_capture(&verified.receipt)
             || self
                 .writer
                 .committed_command(verified.body.command_id)
@@ -235,7 +216,7 @@ impl HumanAcceptanceService {
             // A later or changed use of an already settled request cannot replace it.
             return Ok(());
         }
-        let id = correction_proposal_id(verified.body.command_id)?;
+        let id = authored_proposal_id(verified.body.command_id)?;
         let revision = verified
             .body
             .source_revision
@@ -245,7 +226,7 @@ impl HumanAcceptanceService {
         let digest =
             CasDigest::from_str(&verified.body.cas_ref).map_err(|_| HumanGovernanceError::Store)?;
         let payload = cas.read(&digest).map_err(|_| HumanGovernanceError::Store)?;
-        let intent = HumanAtomCorrection::read_canonical(&payload, id, revision)
+        let intent = HumanAtomAuthoring::read_canonical(&payload, id, revision)
             .ok_or(HumanGovernanceError::Store)?;
         let snapshot = self
             .writer
@@ -254,29 +235,20 @@ impl HumanAcceptanceService {
             .map_err(|_| HumanGovernanceError::Store)?;
         let view = SemanticCurrentView::from_snapshot(&snapshot)
             .map_err(|_| HumanGovernanceError::Store)?;
-        let Some(base) = view
-            .atoms
-            .get(&intent.atom_id)
-            .filter(|value| value.revision_id == intent.base_revision_id)
-        else {
-            return Ok(());
-        };
+        let base = authoring_base(&view, intent.target());
         let service =
             crate::HumanGovernanceService::new(self.writer.clone(), self.effective_config_hash);
-        if !service
-            .web_current_object_accessible(
-                &snapshot,
-                "atom_revision",
-                &base.atom_id.to_string(),
-                &base.revision_id.to_string(),
-            )
-            .await?
-        {
+        let Some(scope) = authoring_scope(&service, &snapshot, &intent, base).await? else {
             return Ok(());
-        }
-        if let Some(batch) =
-            self.web_correction_command(&snapshot, &view, base, (id, revision), &intent, verified)?
-        {
+        };
+        if let Some(batch) = self.web_authoring_command(
+            &snapshot,
+            &view,
+            (base, &scope),
+            (id, revision),
+            &intent,
+            verified,
+        )? {
             self.writer
                 .commit_if_frontier(batch, now_us()?, snapshot.frontier)
                 .await
@@ -285,21 +257,32 @@ impl HumanAcceptanceService {
         Ok(())
     }
 
-    fn web_correction_command(
+    fn web_authoring_command(
         &self,
         snapshot: &ProjectionSnapshot,
         view: &SemanticCurrentView,
-        base: &Atom,
+        (base, scope): (Option<&Atom>, &AtomScope),
         (id, revision): (RevisionProposalId, RevisionId),
-        intent: &HumanAtomCorrection,
+        intent: &HumanAtomAuthoring,
         verified: &crate::capture::VerifiedCapture,
     ) -> Result<Option<JournalCommand>, HumanGovernanceError> {
-        if !intent.capture_matches(base, id, revision, &verified.receipt, &verified.observation) {
+        if !intent.capture_matches(
+            scope,
+            id,
+            revision,
+            &verified.receipt,
+            &verified.observation,
+        ) {
             return Err(HumanGovernanceError::Store);
         }
         let source = verified.observation.source_observation_id;
-        let Some(draft) = intent.draft(base, source) else {
+        let Some(payload) = intent.payload(base, source, verified.receipt.recorded_at_us) else {
             return Ok(None);
+        };
+        let (AtomProposalPayload::Replace { draft } | AtomProposalPayload::Create { draft }) =
+            &payload
+        else {
+            return Err(HumanGovernanceError::Store);
         };
         let context = ProposalCommandContext {
             command_id: verified.body.command_id,
@@ -309,11 +292,11 @@ impl HumanAcceptanceService {
         };
         let request = SubmitProposalRequest {
             target_kind: ProposalTargetKind::Atom,
-            target_id: Some(ProposalTargetId::Atom(base.atom_id)),
-            base_revision_id: Some(base.revision_id),
-            operation: ProposalOperation::Replace,
+            target_id: base.map(|base| ProposalTargetId::Atom(base.atom_id)),
+            base_revision_id: base.map(|base| base.revision_id),
+            operation: intent.operation(),
             evidence_refs: draft.evidence_refs.clone(),
-            payload: ProposalPayload::Atom(Box::new(AtomProposalPayload::Replace { draft })),
+            payload: ProposalPayload::Atom(Box::new(payload)),
             source_cohort_refs: vec![source.to_string()],
             eligibility: ProposalEligibility::ManualRequired,
             created_by: ProposalCreatedBy::User,
@@ -344,21 +327,58 @@ impl HumanAcceptanceService {
     }
 }
 
-fn correction_proposal_id(
-    command_id: CommandId,
-) -> Result<RevisionProposalId, HumanGovernanceError> {
+fn authoring_base(view: &SemanticCurrentView, target: HumanAuthoringTarget) -> Option<&Atom> {
+    match target {
+        HumanAuthoringTarget::Correct(id, revision) => view
+            .atoms
+            .get(&id)
+            .filter(|atom| atom.revision_id == revision),
+        HumanAuthoringTarget::Create(_) => None,
+    }
+}
+
+async fn authoring_scope(
+    service: &crate::HumanGovernanceService,
+    snapshot: &ProjectionSnapshot,
+    intent: &HumanAtomAuthoring,
+    base: Option<&Atom>,
+) -> Result<Option<AtomScope>, HumanGovernanceError> {
+    let Some(scope) = intent.scope(base) else {
+        return Ok(None);
+    };
+    let accessible = match intent.target() {
+        HumanAuthoringTarget::Correct(id, revision) => {
+            service
+                .web_current_object_accessible(
+                    snapshot,
+                    "atom_revision",
+                    &id.to_string(),
+                    &revision.to_string(),
+                )
+                .await?
+        }
+        HumanAuthoringTarget::Create(scope) => {
+            service
+                .web_creation_scope_accessible(snapshot, scope)
+                .await?
+        }
+    };
+    Ok(accessible.then_some(scope))
+}
+
+fn authored_proposal_id(command_id: CommandId) -> Result<RevisionProposalId, HumanGovernanceError> {
     RevisionProposalId::from_uuid(command_id.as_uuid())
         .map_err(|_| HumanGovernanceError::InvalidInput)
 }
 
-fn correction_result<'a>(
+fn authoring_result<'a>(
     committed: &'a evertrace_store::CommittedCommand,
     id: RevisionProposalId,
-    target: (AtomId, RevisionId),
-    expected: Option<&HumanAtomCorrection>,
+    target: HumanAuthoringTarget,
+    expected: Option<&HumanAtomAuthoring>,
 ) -> Option<(&'a RevisionProposal, HumanActionOutcome)> {
     let got_source = committed.payloads.iter().any(|payload| matches!(payload, JournalPayload::SourceReceiptRecorded(value)
-        if value.eligible_event_manifest_ref == HUMAN_CORRECTION_MANIFEST && value.source_ref == id.to_string()));
+        if is_human_authoring_manifest(&value.eligible_event_manifest_ref) && value.source_ref == id.to_string()));
     if !got_source {
         return None;
     }
@@ -370,9 +390,9 @@ fn correction_result<'a>(
             let JournalPayload::RevisionProposalRecorded(proposal) = payload else {
                 return None;
             };
-            let intent = HumanAtomCorrection::from_pending(proposal)?;
+            let intent = HumanAtomAuthoring::from_pending(proposal)?;
             (proposal.proposal_id == id
-                && (intent.atom_id, intent.base_revision_id) == target
+                && intent.target() == target
                 && expected.is_none_or(|value| *value == intent))
             .then(|| {
                 (

@@ -215,6 +215,8 @@ class App:
             "/api/proposal-disposition-result": "POST",
             "/api/proposal-correction": "POST",
             "/api/proposal-correction-result": "POST",
+            "/api/proposal-creation": "POST",
+            "/api/proposal-creation-result": "POST",
         }.get(path)
         if expected_method is None:
             return Response(status_code=404)
@@ -275,20 +277,34 @@ class App:
             response.delete_cookie(self.cookie, httponly=True, samesite="strict", path="/")
             return response
         try:
-            if path in ("/api/proposal-correction", "/api/proposal-correction-result"):
+            if path in ("/api/proposal-correction", "/api/proposal-correction-result",
+                        "/api/proposal-creation", "/api/proposal-creation-result"):
                 submit = not path.endswith("-result")
-                fields = {"request_id", "atom_id", "base_revision_id"} | ({"frontier", "content"} if submit else set())
+                creation = path.startswith("/api/proposal-creation")
+                fields = {"request_id", "scope"} if creation else {"request_id", "atom_id", "base_revision_id"}
+                if submit:
+                    fields.update(("frontier", "content"))
+                    if creation:
+                        fields.add("kind")
                 if set(payload) != fields or not _uuid7(payload["request_id"]):
                     raise BackendError("invalid_input")
-                atom, revision = payload["atom_id"], payload["base_revision_id"]
-                if not isinstance(atom, str) or not atom.startswith("atom:") or not _uuid7(atom[5:]) or not _uuid7(revision):
-                    raise BackendError("invalid_input")
+                kind = payload.get("kind")
+                if creation:
+                    _, scope = proposal_creation_scope(payload["scope"])
+                    target = {"scope": scope}
+                    if submit and kind not in ("constraint", "claim"):
+                        raise BackendError("invalid_input")
+                else:
+                    atom, revision = payload["atom_id"], payload["base_revision_id"]
+                    if not isinstance(atom, str) or not atom.startswith("atom:") or not _uuid7(atom[5:]) or not _uuid7(revision):
+                        raise BackendError("invalid_input")
+                    target = {"atom_id": atom, "base_revision_id": revision}
                 frontier = parse_frontier(payload["frontier"]) if submit else None
                 content = proposal_atom_edit(payload["content"]) if submit else None
                 if frontier == 0:
                     raise BackendError("invalid_input")
                 try:
-                    data = await self.backend.web_atom_correction(payload["request_id"], atom, revision, frontier=frontier, content=content)
+                    data = await self.backend.web_atom_authoring(payload["request_id"], target, frontier=frontier, content=content, kind=kind)
                 except BackendError:
                     data = {"status": "unknown"}
             elif path in ("/api/proposal-accept", "/api/proposal-acceptance-result",
@@ -676,6 +692,14 @@ class App:
                 else:
                     confirmation = "matches" if result["confirmation_digest"] == digest else "unavailable"
                 data = {"confirmation": confirmation}
+            elif payload.get("kind") == "proposal_creation_form" and set(payload) == {"kind", "scope", "frontier"}:
+                reference, scope = proposal_creation_scope(payload["scope"])
+                frontier = parse_frontier(payload["frontier"])
+                if not frontier or not await self.backend.web_creation_scope_available(scope, frontier):
+                    data = {"conflict": True}
+                else:
+                    data = {"html": self.templates.get_template("proposal_creation.html").render(
+                        reference=reference, scope=scope, frontier=frontier, request_id=_request_id())}
             elif payload.get("kind") == "proposal_atom_edit" and set(payload) == {
                 "kind", "proposal_id", "revision", "frontier", "review_digest", "atom_edit",
             }:
@@ -759,6 +783,18 @@ def proposal_digest(digest):
     if not isinstance(digest, str) or len(digest) != 64 or any(c not in "0123456789abcdef" for c in digest):
         raise BackendError("invalid_input")
     return digest
+
+
+def proposal_creation_scope(value):
+    if not isinstance(value, dict):
+        raise BackendError("invalid_input")
+    for kind, field, prefix in (("task", "task_id", "task:"), ("repository", "repository_instance_id", "repo:")):
+        if value.get("kind") != kind or set(value) != {"kind", field}:
+            continue
+        reference = value[field]
+        if isinstance(reference, str) and reference.startswith(prefix) and _uuid7(reference[len(prefix):]):
+            return reference, {"kind": kind, field: reference}
+    raise BackendError("invalid_input")
 
 
 def proposal_atom_edit(value):

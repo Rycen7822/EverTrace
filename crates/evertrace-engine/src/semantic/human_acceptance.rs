@@ -20,11 +20,11 @@ use evertrace_domain::{
     revision::RevisionId,
     semantic::{
         AcceptedProposalTarget, AtomProposalPayload, AtomScope, CoreMembershipProposalPayload,
-        HUMAN_CORRECTION_MANIFEST, ProposalAcceptanceAuthority, ProposalCreatedBy,
-        ProposalEligibility, ProposalOperation, ProposalPayload, ProposalStatus, ProposalTargetId,
-        ProposalWaitingOn, RevisionProposal, SupportThresholdSnapshot,
-        TUI_ACCEPTANCE_EVENT_MANIFEST_REF, WEB_ACCEPTANCE_EVENT_MANIFEST_REF, WebAcceptanceIntent,
-        WebAtomEdit, tui_acceptance_capture_matches, tui_acceptance_event_payload,
+        HumanAtomAuthoring, ProposalAcceptanceAuthority, ProposalCreatedBy, ProposalEligibility,
+        ProposalOperation, ProposalPayload, ProposalStatus, ProposalTargetId, ProposalWaitingOn,
+        RevisionProposal, SupportThresholdSnapshot, TUI_ACCEPTANCE_EVENT_MANIFEST_REF,
+        WEB_ACCEPTANCE_EVENT_MANIFEST_REF, WebAcceptanceIntent, WebAtomEdit,
+        is_human_authoring_manifest, tui_acceptance_capture_matches, tui_acceptance_event_payload,
     },
 };
 use evertrace_store::{
@@ -49,7 +49,7 @@ use crate::{
     },
 };
 
-mod correction;
+mod authoring;
 
 pub(crate) const ALGORITHM_REVISION: &str = "s31-human-governance-v1";
 
@@ -193,8 +193,8 @@ impl HumanAcceptanceService {
                 .ok_or(HumanGovernanceError::Store)?;
             let verified =
                 verify_capture_frame(frame, &cas).map_err(|_| HumanGovernanceError::Store)?;
-            if verified.body.eligible_event_manifest_ref == HUMAN_CORRECTION_MANIFEST {
-                Box::pin(self.reconcile_web_correction(&verified, &cas)).await?;
+            if is_human_authoring_manifest(&verified.body.eligible_event_manifest_ref) {
+                Box::pin(self.reconcile_web_authoring(&verified, &cas)).await?;
                 spool
                     .acknowledge_segment(segment, 1)
                     .map_err(|_| HumanGovernanceError::Store)?;
@@ -422,6 +422,10 @@ impl HumanAcceptanceService {
         let service =
             crate::HumanGovernanceService::new(self.writer.clone(), self.effective_config_hash);
         if !service.proposal_accessible(snapshot, reviewed).await?
+            || !Box::pin(authored_creation_scope_current(
+                &service, snapshot, reviewed,
+            ))
+            .await?
             || (reviewed.core_creation().is_some()
                 && service
                     .web_core_anchor_at(snapshot, view, reviewed)
@@ -621,6 +625,10 @@ impl HumanAcceptanceService {
         };
         if ((proposal.operation == ProposalOperation::Replace || intent.atom_edit.is_some())
             && !service.web_base_accessible(&snapshot, proposal).await?)
+            || !Box::pin(authored_creation_scope_current(
+                service, &snapshot, proposal,
+            ))
+            .await?
             || (intent.atom_edit.is_some()
                 && !service.proposal_accessible(&snapshot, proposal).await?)
         {
@@ -1975,6 +1983,17 @@ fn acceptance_capture_scope(
     Ok(capture)
 }
 
+async fn authored_creation_scope_current(
+    service: &crate::HumanGovernanceService,
+    snapshot: &ProjectionSnapshot,
+    proposal: &RevisionProposal,
+) -> Result<bool, HumanGovernanceError> {
+    match HumanAtomAuthoring::creation_scope_for_review(proposal) {
+        Some(scope) => service.web_creation_scope_accessible(snapshot, scope).await,
+        None => Ok(true),
+    }
+}
+
 fn acceptance_capture_input(
     proposal: &RevisionProposal,
     payload: &str,
@@ -2059,7 +2078,7 @@ fn human_capture_input(
         source_role: SourceRole::User,
         content_trust: ContentTrust::UserStatement,
         capture_completeness: CaptureCompleteness::Complete,
-        surface_eligible: manifest != HUMAN_CORRECTION_MANIFEST,
+        surface_eligible: !is_human_authoring_manifest(manifest),
         adapter_revision: 1,
         adapter_manifest_ref: manifest.into(),
         eligible_event_manifest_ref: manifest.into(),

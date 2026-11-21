@@ -637,13 +637,21 @@ class Backend:
                 raise BackendError("invalid_read_response")
         return result
 
-    async def web_atom_correction(self, request_id, atom, revision, *, frontier=None, content=None):
-        target = {"atom_id": atom, "base_revision_id": revision}
+    async def web_creation_scope_available(self, scope, frontier):
+        result = await self._request({"kind": "web_creation_scope", "scope": scope, "expected_frontier": frontier})
+        if result["kind"] != "proposal_creation_scope":
+            raise BackendError("invalid_read_response")
+        return result["available"]
+
+    async def web_atom_authoring(self, request_id, target, *, frontier=None, content=None, kind=None):
+        creation = "scope" in target
         if content is None:
-            reply = await self._request({"kind": "web_correction_outcome", "request_id": request_id, **target})
+            read = "web_creation_outcome" if creation else "web_correction_outcome"
+            reply = await self._request({"kind": read, "request_id": request_id, **target})
         else:
+            intent = {**target, "kind": kind, "content": content} if creation else {**target, "content": content}
             action = {"operation": "act", "expected_frontier": frontier,
-                      "action": {"kind": "web_correct_atom", "intent": {**target, "content": content}}}
+                      "action": {"kind": "web_create_atom" if creation else "web_correct_atom", "intent": intent}}
             reply = await self._request(None, confirmation=True, action=action, request_id=request_id)
         return proposal_action_result(reply)
 
@@ -783,7 +791,8 @@ class Backend:
                     return health
                 response = await call({"human_governance": {"operation": "read", "request": read}})
                 result = response["human_governance"]
-                if read["kind"] in ("web_acceptance_outcome", "web_proposal_disposition_outcome", "web_correction_outcome"):
+                if read["kind"] in ("web_acceptance_outcome", "web_proposal_disposition_outcome",
+                                    "web_correction_outcome", "web_creation_outcome"):
                     return result
                 if result.get("kind") not in (
                     "state",
@@ -796,6 +805,7 @@ class Backend:
                     "snapshot",
                     "memory_page",
                     "compiled_projections",
+                    "proposal_creation_scope",
                     "proposal_review",
                     "source_archive",
                     "conflict",

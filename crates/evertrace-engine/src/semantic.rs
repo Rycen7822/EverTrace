@@ -11,6 +11,7 @@ pub use emission::{
     SparseAtomSignal, SparseNoDeltaReason, VerifiedHumanAcceptance, exact_task_constraint_draft,
     materialize_atom,
 };
+pub use evertrace_domain::semantic::{HumanAtomAuthoring, HumanAuthoringTarget};
 pub use human_acceptance::HumanAcceptanceService;
 pub use proposal::{
     AcceptedProposalCommand, AtomAcceptanceContext, DeletionAwareProposalResolution,

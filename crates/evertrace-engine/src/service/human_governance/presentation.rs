@@ -209,6 +209,81 @@ impl HumanGovernanceService {
             .await
     }
 
+    pub async fn web_creation_scope_available(
+        &self,
+        scope: evertrace_domain::semantic::HumanCreationScope,
+        frontier: u64,
+    ) -> Result<bool, HumanGovernanceError> {
+        let snapshot = self
+            .writer
+            .project_objects()
+            .await
+            .map_err(|_| HumanGovernanceError::Store)?;
+        Ok(snapshot.frontier == frontier
+            && self.web_creation_scope_accessible(&snapshot, scope).await?)
+    }
+
+    pub(crate) async fn web_creation_scope_accessible(
+        &self,
+        snapshot: &ProjectionSnapshot,
+        scope: evertrace_domain::semantic::HumanCreationScope,
+    ) -> Result<bool, HumanGovernanceError> {
+        use evertrace_domain::semantic::HumanCreationScope;
+        let deadline = std::time::Instant::now() + READ_DEADLINE;
+        let (kind, id) = match scope {
+            HumanCreationScope::Task { task_id } => ("task", task_id.to_string()),
+            HumanCreationScope::Repository {
+                repository_instance_id,
+            } => ("repository", repository_instance_id.to_string()),
+        };
+        let Some((row, true)) = super::super::actions::select_object_row(snapshot, &id)
+            .map_err(|_| HumanGovernanceError::Store)?
+        else {
+            return Ok(false);
+        };
+        if row.object_kind.as_deref() != Some(kind) || row.object_id.as_deref() != Some(&id) {
+            return Ok(false);
+        }
+        let payload: JournalPayload = serde_json::from_str(
+            row.payload_json
+                .as_deref()
+                .ok_or(HumanGovernanceError::Store)?,
+        )
+        .map_err(|_| HumanGovernanceError::Store)?;
+        match (scope, payload) {
+            (HumanCreationScope::Task { task_id }, JournalPayload::TaskRecorded(task))
+                if task.task_id == task_id && !task.lifecycle.is_terminal() =>
+            {
+                match self.readable_row(snapshot, row, deadline).await {
+                    Ok(()) => Ok(true),
+                    Err(export::Failure::Denied) => Ok(false),
+                    Err(_) => Err(HumanGovernanceError::Store),
+                }
+            }
+            (
+                HumanCreationScope::Repository {
+                    repository_instance_id,
+                },
+                JournalPayload::RepositoryInstanceRecorded(repository),
+            ) if repository.repository_id == repository_instance_id => {
+                let report = match &self.session_report {
+                    Some(value) => value.read().await.clone(),
+                    None => None,
+                };
+                let (denied, _) = crate::repository::repository_read_assessment(
+                    &self.writer,
+                    [repository_instance_id].into_iter().collect(),
+                    &crate::repository::RepositoryReadAuthority::retained(report.as_ref()),
+                    deadline,
+                )
+                .await
+                .map_err(|_| HumanGovernanceError::Store)?;
+                Ok(denied.is_empty())
+            }
+            _ => Ok(false),
+        }
+    }
+
     pub(crate) async fn web_current_object_accessible(
         &self,
         snapshot: &ProjectionSnapshot,

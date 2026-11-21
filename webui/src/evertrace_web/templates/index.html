@@ -104,6 +104,7 @@
             ><label class="muted"
               ><input id="include-global" type="checkbox" disabled /> 同时列 global</label
             ><button id="refresh" class="button">刷新</button>
+            <button id="atom-create-open" class="button" type="button" hidden>新建记忆提案</button>
           </div>
         </div>
         <div id="notice" class="notice" role="status">正在验证本机网页会话…</div>
@@ -328,6 +329,13 @@
         <button id="scope-first" class="text-button" type="button">目录首页</button
         ><button id="scope-next" class="text-button" type="button" disabled>目录下一页</button>
       </footer>
+    </dialog>
+    <dialog id="atom-create-dialog" class="action-dialog" aria-labelledby="atom-create-title">
+      <header>
+        <h2 id="atom-create-title">新建记忆提案</h2>
+        <button id="atom-create-close" class="text-button" type="button">关闭</button>
+      </header>
+      <div id="atom-create-body"></div>
     </dialog>
     <script type="module" src="/app.js"></script>
   </body>

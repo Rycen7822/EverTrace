@@ -120,6 +120,8 @@ async fn send_human(
             | HumanReadRequest::Search { .. }
             | HumanReadRequest::ProposalReview { .. }
             | HumanReadRequest::WebAcceptanceOutcome { .. }
+            | HumanReadRequest::WebCreationScope { .. }
+            | HumanReadRequest::WebCreationOutcome { .. }
             | HumanReadRequest::WebCorrectionOutcome { .. }
             | HumanReadRequest::WebProposalDispositionOutcome { .. }
             | HumanReadRequest::BrowseMemories { .. } => {

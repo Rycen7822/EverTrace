@@ -50,6 +50,7 @@ function clear() {
   $("system-status").replaceChildren();
   $("page-count").textContent = "";
   $("next-page").disabled = true;
+  $("atom-create-open").hidden = true;
 }
 function cancel() {
   state.controller?.abort();
@@ -94,6 +95,8 @@ function closed(text, broadcast = false) {
   updateScopeControls();
   clearDirectory();
   if ($("scope-dialog").open) $("scope-dialog").close();
+  if ($("atom-create-dialog").open) $("atom-create-dialog").close();
+  $("atom-create-body").replaceChildren();
   state.selected = null;
   state.content = null;
   state.revisions = null;
@@ -378,7 +381,8 @@ function showAcceptanceReceipt() {
   const decision = receipt?.input.decision?.kind;
   $("acceptance-status").textContent = !receipt ? "" : ({
     pending: "正在核对审核结果…",
-    applied: receipt.correction ? "已提交修正提案；请前往审核。"
+    applied: receipt.authoring === "correction" ? "已提交修正提案；请前往审核。"
+      : receipt.authoring === "creation" ? "已提交新建提案；请前往审核。"
       : decision === "defer" ? "已延期。" : decision === "reject" ? "已拒绝。" : "已接受。",
     no_delta: "此请求已处理；没有再次写入。",
     conflict: "提案或水位有变化；本请求未应用。",
@@ -392,14 +396,15 @@ async function resolveAcceptance(receipt, lookup) {
   receipt.status = "pending";
   showAcceptanceReceipt();
   try {
-    const path = receipt.correction ? (lookup ? "proposal-correction-result" : "proposal-correction")
+    const path = receipt.authoring ? "proposal-" + receipt.authoring + (lookup ? "-result" : "")
       : receipt.input.decision ? (lookup ? "proposal-disposition-result" : "proposal-disposition")
       : (lookup ? "proposal-acceptance-result" : "proposal-accept");
     const input = { ...receipt.input };
     delete receipt.input.atom_edit;
-    if (receipt.correction) {
+    if (receipt.authoring) {
       delete receipt.input.content;
       delete receipt.input.frontier;
+      delete receipt.input.kind;
     }
     receipt.result = await api(path, input);
     receipt.status = receipt.result.status;
@@ -441,8 +446,54 @@ function submitAtomCorrection(button) {
   if (["pending", "unknown"].includes(state.acceptance?.status)) return;
   const content = readAtomEdit(button.closest("[data-atom-correction]"));
   if (!content || !window.confirm("为所选修订提交修正提案？当前记忆不会改写。")) return;
-  sendProposalAction({ correction: true, input: { request_id: requestId, atom_id: atomId, base_revision_id: revision, frontier, content } });
+  sendProposalAction({
+    authoring: "correction", input: { request_id: requestId, atom_id: atomId, base_revision_id: revision, frontier, content },
+  });
 }
+function atomCreationScope() {
+  const { kind, task_id, repository_id } = state.query.selection;
+  if (kind === "task") return { kind, task_id };
+  if (kind === "repository") return { kind, repository_instance_id: repository_id };
+  return null;
+}
+$("atom-create-open").onclick = async () => {
+  const scope = atomCreationScope();
+  if (!scope || !state.frontier || !state.active || document.hidden || state.route !== "memories") return;
+  if (["pending", "unknown"].includes(state.acceptance?.status)) return;
+  const dialog = $("atom-create-dialog"), body = $("atom-create-body");
+  cancel();
+  const controller = new AbortController();
+  state.controller = controller;
+  body.textContent = "正在核对范围…";
+  dialog.showModal();
+  try {
+    const result = await api("read", { kind: "proposal_creation_form", scope, frontier: state.frontier }, controller.signal);
+    if (state.controller !== controller || !dialog.open || document.hidden) return;
+    if (result.html) fragmentInto(body, result.html);
+    else body.textContent = "所选范围已变化或不可新建；关闭后刷新再试。";
+  } catch {
+    if (state.controller === controller && dialog.open) body.textContent = "无法打开新建表单；没有写入。";
+  } finally {
+    if (state.controller === controller) state.controller = null;
+  }
+};
+$("atom-create-close").onclick = () => $("atom-create-dialog").close();
+$("atom-create-dialog").onclose = () => $("atom-create-body").replaceChildren();
+$("atom-create-body").onsubmit = (event) => {
+  event.preventDefault();
+  const form = event.target;
+  if (form.id !== "atom-creation-form" || !state.active || document.hidden || !$("atom-create-dialog").open) return;
+  if (["pending", "unknown"].includes(state.acceptance?.status)) return;
+  const scope = atomCreationScope();
+  const formScope = JSON.parse(form.dataset.scope);
+  if (!scope || scope.kind !== formScope.kind || (scope.task_id || scope.repository_instance_id)
+    !== (formScope.task_id || formScope.repository_instance_id)) return;
+  const content = readAtomEdit(form.querySelector("[data-creation-content]"));
+  if (!content || !window.confirm("在所选范围内提交新建提案？此操作不会发布记忆。")) return;
+  const input = { request_id: form.dataset.requestId, frontier: form.dataset.frontier, scope, kind: form.elements.kind.value, content };
+  $("atom-create-dialog").close();
+  sendProposalAction({ authoring: "creation", input });
+};
 function sendProposalAction(receipt) {
   cancel();
   state.selected = null;
@@ -1034,7 +1085,7 @@ async function readOverview(controller) {
   }
 }
 async function refresh() {
-  if (!state.active || document.hidden) return;
+  if (!state.active || document.hidden || $("atom-create-dialog").open) return;
   if ($("scope-dialog").open) {
     await loadDirectory();
     return;
@@ -1093,6 +1144,7 @@ async function refresh() {
     }
     state.frontier = page.frontier;
     state.next = page.next_cursor;
+    $("atom-create-open").hidden = !(page.scope_available && atomCreationScope());
     fragmentInto($("memory-items"), page.html);
     $("memory-items").scrollTop = listScroll;
     showTimeRange(page.query.time_range, page.query.order);
@@ -1116,7 +1168,7 @@ async function refresh() {
             (page.unresolved_scope_count !== "0"
               ? " 另有 " + page.unresolved_scope_count + " 条元数据归属尚未判定。"
               : "") +
-            " 搜索和网页修改尚未接入。",
+            " 正式搜索尚未开放。",
     );
     const anchor = state.selected?.path?.[0]?.item || state.selected;
     if (

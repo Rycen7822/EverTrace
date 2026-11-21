@@ -1,0 +1,13 @@
+<form id="atom-creation-form" data-scope='{{ scope|tojson }}' data-frontier="{{ frontier }}" data-request-id="{{ request_id }}">
+  <p>仅限所选 {{ 'Task' if scope.kind == 'task' else '仓库' }}：<code>{{ reference }}</code>。无基准，不替换既有记忆。</p>
+  <p>提案默认在此范围内适用，起始为提交时间，无固定截止。提交只保存原文和待审提案；另行接受后才发布。</p>
+  <label>类型 <select name="kind"><option value="constraint">规则</option><option value="claim">未验证陈述</option></select></label>
+  <fieldset data-creation-content>
+    <legend>提案正文</legend>
+    <label>正文 <textarea name="text" required rows="6"></textarea></label>
+    <label>主体 <input name="subject" required></label>
+    <label>关系 <input name="predicate" required></label>
+    <label>对象 <input name="object"></label>
+  </fieldset>
+  <button type="submit" class="button">提交新建提案</button>
+</form>

@@ -18,6 +18,7 @@ use std::{
     time::{Duration, Instant},
 };
 
+use evertrace_engine::semantic::{HumanAtomAuthoring, HumanAuthoringTarget};
 use evertrace_engine::{
     BackgroundScheduler, EngineService, HealthDispatchError,
     HumanActionOutcome as EngineHumanActionOutcome, HumanBackupSummary as EngineHumanBackupSummary,
@@ -1138,10 +1139,23 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
                                         expected_frontier, expected_digest.as_deref(), atom_edit,
                                     )).await.map_err(map_human_error)?
                                 }
-                                HumanReadRequest::WebCorrectionOutcome { request_id, atom_id, base_revision_id } => {
+                                HumanReadRequest::WebCreationScope { scope, expected_frontier } => {
                                     if context.client_kind != ClientKind::Web { return Err(ErrorCode::Untrusted); }
-                                    let outcome = Box::pin(human_governance.acceptance().reviewed_web_correction_outcome(
-                                        &human_governance, request_id, (atom_id, base_revision_id),
+                                    let available = Box::pin(human_governance.web_creation_scope_available(scope, expected_frontier))
+                                        .await.map_err(map_human_error)?;
+                                    HumanGovernanceResponse::ProposalCreationScope { available }
+                                }
+                                request @ (HumanReadRequest::WebCorrectionOutcome { .. } | HumanReadRequest::WebCreationOutcome { .. }) => {
+                                    if context.client_kind != ClientKind::Web { return Err(ErrorCode::Untrusted); }
+                                    let (request_id, target) = match request {
+                                        HumanReadRequest::WebCorrectionOutcome { request_id, atom_id, base_revision_id } =>
+                                            (request_id, HumanAuthoringTarget::Correct(atom_id, base_revision_id)),
+                                        HumanReadRequest::WebCreationOutcome { request_id, scope } =>
+                                            (request_id, HumanAuthoringTarget::Create(scope)),
+                                        _ => unreachable!(),
+                                    };
+                                    let outcome = Box::pin(human_governance.acceptance().reviewed_web_authoring_outcome(
+                                        &human_governance, request_id, target,
                                     )).await.map_err(map_human_error)?;
                                     HumanGovernanceResponse::Action { result: map_human_action(outcome) }
                                 }
@@ -1201,9 +1215,16 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
                                 action,
                             } => {
                                 let outcome = match action {
-                                    HumanActionRequest::WebCorrectAtom { intent } => Box::pin(
-                                        human_governance.acceptance().submit_web_correction(&human_governance, request_id, expected_frontier, *intent)
-                                    ).await,
+                                    action @ (HumanActionRequest::WebCorrectAtom { .. } | HumanActionRequest::WebCreateAtom { .. }) => {
+                                        let intent = match action {
+                                            HumanActionRequest::WebCorrectAtom { intent } => HumanAtomAuthoring::Correct(*intent),
+                                            HumanActionRequest::WebCreateAtom { intent } => HumanAtomAuthoring::Create(*intent),
+                                            _ => unreachable!(),
+                                        };
+                                        Box::pin(human_governance.acceptance().submit_web_authoring(
+                                            &human_governance, request_id, expected_frontier, intent,
+                                        )).await
+                                    }
                                     HumanActionRequest::WebAccept { review, atom_edit } => Box::pin(accept_web_review(
                                         &human_governance, request_id, expected_frontier, review, atom_edit,
                                     )).await,

@@ -16,11 +16,12 @@ use evertrace_domain::{
     semantic::{
         Atom, AtomAuthority, AtomDraft, AtomLifecycleStatus, AtomProposalPayload, AtomScope,
         CoreMembershipProposalPayload, EpistemicStatus, GlobalSupportState,
-        HUMAN_CORRECTION_MANIFEST, HumanAtomCorrection, ProcedureProposalPayload,
-        ProposalAcceptanceAuthority, ProposalCreatedBy, ProposalEligibility, ProposalOperation,
-        ProposalPayload, ProposalStatus, ProposalTargetId, ProposalTargetKind, RevisionProposal,
-        TUI_ACCEPTANCE_EVENT_MANIFEST_REF, UserAuthorizationMode, VerifierStatus,
-        WEB_ACCEPTANCE_EVENT_MANIFEST_REF, WebAcceptanceIntent, tui_acceptance_capture_matches,
+        HUMAN_CREATION_MANIFEST, HumanAtomAuthoring, HumanAuthoringTarget, HumanCreationScope,
+        ProcedureProposalPayload, ProposalAcceptanceAuthority, ProposalCreatedBy,
+        ProposalEligibility, ProposalOperation, ProposalPayload, ProposalStatus, ProposalTargetId,
+        ProposalTargetKind, RevisionProposal, TUI_ACCEPTANCE_EVENT_MANIFEST_REF,
+        UserAuthorizationMode, VerifierStatus, WEB_ACCEPTANCE_EVENT_MANIFEST_REF,
+        WebAcceptanceIntent, is_human_authoring_manifest, tui_acceptance_capture_matches,
         tui_acceptance_event_payload,
     },
     work::{ArtifactPayloadStatus, Task, WorkArtifact},
@@ -344,6 +345,11 @@ pub(crate) fn validate_relations(input: SemanticRelationInputs<'_>) -> Result<()
     Ok(())
 }
 
+type AuthoringScopes<'a> = (
+    &'a BTreeMap<TaskId, (Task, u64)>,
+    &'a BTreeMap<RepositoryId, (RepositoryInstance, u64)>,
+);
+
 pub(crate) fn validate_command_boundary<'a>(
     current_atoms: &BTreeMap<AtomId, (Atom, u64)>,
     current_proposals: &BTreeMap<RevisionProposalId, (RevisionProposal, u64)>,
@@ -351,6 +357,7 @@ pub(crate) fn validate_command_boundary<'a>(
     current_support: &super::scenario_core::ScenarioCoreState,
     frontier: u64,
     command_id: CommandId,
+    authoring_scopes: AuthoringScopes<'_>,
     events: impl IntoIterator<Item = (&'a JournalPayload, i64, [u8; 32])>,
     error: StoreError,
 ) -> Result<BTreeSet<RevisionProposalId>, StoreError> {
@@ -359,7 +366,13 @@ pub(crate) fn validate_command_boundary<'a>(
         .iter()
         .map(|(payload, _, _)| *payload)
         .collect::<Vec<_>>();
-    validate_human_correction_boundary(current_atoms, command_id, &payloads, error)?;
+    validate_human_authoring_boundary(
+        current_atoms,
+        authoring_scopes,
+        command_id,
+        &payloads,
+        error,
+    )?;
     validate_web_acceptance_boundary(
         current_atoms,
         current_proposals,
@@ -771,8 +784,9 @@ fn exact_edit_pairs(
 }
 
 /// An authored source is admitted only alongside its single, non-authoritative proposal.
-fn validate_human_correction_boundary(
+fn validate_human_authoring_boundary(
     atoms: &BTreeMap<AtomId, (Atom, u64)>,
+    (tasks, repositories): AuthoringScopes<'_>,
     command_id: CommandId,
     payloads: &[&JournalPayload],
     error: StoreError,
@@ -784,7 +798,8 @@ fn validate_human_correction_boundary(
                 receipt.adapter_manifest_ref.as_str(),
                 receipt.eligible_event_manifest_ref.as_str(),
             ]
-            .contains(&HUMAN_CORRECTION_MANIFEST) =>
+            .into_iter()
+            .any(is_human_authoring_manifest) =>
         {
             Some(receipt.as_ref())
         }
@@ -817,11 +832,45 @@ fn validate_human_correction_boundary(
         }
     }
     let (observation, proposal) = (observation.ok_or(error)?, candidate.ok_or(error)?);
-    let intent = HumanAtomCorrection::from_pending(proposal).ok_or(error)?;
-    let base = &atoms.get(&intent.atom_id).ok_or(error)?.0;
-    let draft = intent
-        .draft(base, observation.source_observation_id)
+    let intent = HumanAtomAuthoring::from_pending(proposal).ok_or(error)?;
+    let base = match intent.target() {
+        HumanAuthoringTarget::Correct(id, _) => Some(&atoms.get(&id).ok_or(error)?.0),
+        HumanAuthoringTarget::Create(HumanCreationScope::Task { task_id })
+            if tasks
+                .get(&task_id)
+                .is_some_and(|(task, _)| !task.lifecycle.is_terminal()) =>
+        {
+            None
+        }
+        HumanAuthoringTarget::Create(HumanCreationScope::Repository {
+            repository_instance_id,
+        }) if repositories
+            .get(&repository_instance_id)
+            .is_some_and(|(repo, _)| {
+                !repo.user_disabled
+                    && !repo
+                        .capability_state
+                        .as_ref()
+                        .is_some_and(|state| state.trust_revoked)
+            }) =>
+        {
+            None
+        }
+        HumanAuthoringTarget::Create(_) => return Err(error),
+    };
+    let scope = intent.scope(base).ok_or(error)?;
+    let expected = intent
+        .payload(
+            base,
+            observation.source_observation_id,
+            receipt.recorded_at_us,
+        )
         .ok_or(error)?;
+    let (AtomProposalPayload::Create { draft } | AtomProposalPayload::Replace { draft }) =
+        &expected
+    else {
+        return Err(error);
+    };
     let canonical = intent
         .canonical(proposal.proposal_id, proposal.proposal_revision_id)
         .ok_or(error)?;
@@ -830,14 +879,13 @@ fn validate_human_correction_boundary(
         || proposal.review_reason.is_some()
         || proposal.source_cohort_refs != [observation.source_observation_id.to_string()]
         || proposal.evidence_refs != draft.evidence_refs
-        || !matches!(&proposal.payload, ProposalPayload::Atom(payload)
-            if matches!(payload.as_ref(), AtomProposalPayload::Replace { draft: actual } if actual == &draft))
+        || !matches!(&proposal.payload, ProposalPayload::Atom(payload) if payload.as_ref() == &expected)
         || receipt.source_revision_mode != SourceRevisionMode::Append
         || receipt.previous_source_revision.is_some()
         || receipt.cas_ref
             != evertrace_capture::CasDigest::for_protected_bytes(canonical.as_bytes()).to_string()
         || !intent.capture_matches(
-            base,
+            &scope,
             proposal.proposal_id,
             proposal.proposal_revision_id,
             receipt,
@@ -1309,7 +1357,7 @@ fn validate_atom_relations(
             .ok_or(StoreError::StoreCorrupt)?
             .0;
         if observation.source_role != SourceRole::User
-            || receipt.eligible_event_manifest_ref == HUMAN_CORRECTION_MANIFEST
+            || is_human_authoring_manifest(&receipt.eligible_event_manifest_ref)
             || observation.content_trust != ContentTrust::UserStatement
             || observation.observation_role != ObservationRole::Message
             || receipt.observation_role != ObservationRole::Message
@@ -2071,6 +2119,27 @@ fn validate_web_atom_capture(
     } else {
         sources.reviewed
     };
+    if HumanAtomAuthoring::creation_scope_for_review(original).is_some() {
+        let [source] = original.source_cohort_refs.as_slice() else {
+            return Err(StoreError::StoreCorrupt);
+        };
+        let source = source
+            .parse::<SourceObservationId>()
+            .map_err(|_| StoreError::StoreCorrupt)?;
+        let Some((author, _)) = input.source_observations.get(&source) else {
+            return Err(StoreError::StoreCorrupt);
+        };
+        if input
+            .source_receipts
+            .get(&author.source_receipt_ref)
+            .is_none_or(|(receipt, _)| {
+                receipt.eligible_event_manifest_ref != HUMAN_CREATION_MANIFEST
+                    || receipt.source_ref != original.proposal_id.to_string()
+            })
+        {
+            return Err(StoreError::StoreCorrupt);
+        }
+    }
     Ok(intent.matches_reviewed(original, sources.reviewed)
         && intent.capture_matches(original, sources.receipt, sources.observation))
 }

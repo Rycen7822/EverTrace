@@ -6,15 +6,19 @@ use crate::{
         CaptureCompleteness, ContentTrust, EvidenceSourceKind, IdentityStrength, ObservationRole,
         SourceArchiveMode, SourceObservation, SourceReceipt, SourceRole, hex, payload_fingerprint,
     },
-    ids::{AtomId, CoreMembershipId, ProcedureId, RevisionProposalId, SourceObservationId},
+    ids::{
+        AtomId, CoreMembershipId, ProcedureId, RepositoryId, RevisionProposalId,
+        SourceObservationId, TaskId,
+    },
     inventory::{CapabilityCoverageOmission, CapabilityCoverageSummary, CapabilityEvidenceLevel},
     procedure::{ProcedureAutoFullAudit, ProcedureDraft, ProcedureScope},
     revision::RevisionId,
 };
 
 use super::{
-    Atom, AtomDraft, AtomLifecycleStatus, AtomProvenance, AtomScope, AtomValue, CoreScopeIdentity,
-    EpistemicStatus, SemanticError, valid_identifier,
+    ApplicabilityExpr, Atom, AtomDraft, AtomKind, AtomLifecycleStatus, AtomProvenance, AtomScope,
+    AtomValue, CoreScopeIdentity, EpistemicStatus, SemanticError, ValidityInterval,
+    valid_identifier,
 };
 
 const MAX_REFS: usize = 256;
@@ -24,6 +28,14 @@ const MAX_REVIEW_TEXT: usize = 2048;
 pub const TUI_ACCEPTANCE_EVENT_MANIFEST_REF: &str = "evertrace_tui_acceptance_v1";
 pub const WEB_ACCEPTANCE_EVENT_MANIFEST_REF: &str = "evertrace_web_acceptance_v1";
 pub const HUMAN_CORRECTION_MANIFEST: &str = "evertrace_human_atom_correction_v1";
+pub const HUMAN_CREATION_MANIFEST: &str = "evertrace_human_atom_creation_v1";
+
+pub fn is_human_authoring_manifest(manifest: &str) -> bool {
+    matches!(
+        manifest,
+        HUMAN_CORRECTION_MANIFEST | HUMAN_CREATION_MANIFEST
+    )
+}
 const PROPOSAL_EDIT_INTENT_SCHEMA_VERSION: u32 = 1;
 
 pub fn tui_acceptance_event_payload(
@@ -228,13 +240,232 @@ impl HumanAtomCorrection {
             content: WebAtomEdit::from_value(&draft.value),
         })
     }
+}
+
+/// New material can name exactly one existing Task or repository, not a guessed or global scope.
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(tag = "kind", deny_unknown_fields, rename_all = "snake_case")]
+pub enum HumanCreationScope {
+    Task {
+        task_id: TaskId,
+    },
+    Repository {
+        repository_instance_id: RepositoryId,
+    },
+}
+
+impl From<HumanCreationScope> for AtomScope {
+    fn from(value: HumanCreationScope) -> Self {
+        match value {
+            HumanCreationScope::Task { task_id } => Self::Task { task_id },
+            HumanCreationScope::Repository {
+                repository_instance_id,
+            } => Self::Repository {
+                repository_instance_id,
+            },
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum HumanCreationKind {
+    Constraint,
+    Claim,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct HumanAtomCreation {
+    pub scope: HumanCreationScope,
+    pub kind: HumanCreationKind,
+    pub content: WebAtomEdit,
+}
+
+impl HumanAtomCreation {
+    pub fn value(&self) -> Option<AtomValue> {
+        let value = AtomValue {
+            text: self.content.text.clone(),
+            subject: self.content.subject.clone(),
+            predicate: self.content.predicate.clone(),
+            object: self.content.object.clone(),
+            qualifiers: Vec::new(),
+            critical_revision_refs: Vec::new(),
+        };
+        value.validate().ok()?;
+        Some(value)
+    }
+
+    fn draft(&self, source: SourceObservationId, recorded_at_us: i64) -> Option<AtomDraft> {
+        let (kind, epistemic_status) = match self.kind {
+            HumanCreationKind::Constraint => (AtomKind::Constraint, EpistemicStatus::NotApplicable),
+            HumanCreationKind::Claim => (AtomKind::Claim, EpistemicStatus::Unverified),
+        };
+        Some(AtomDraft {
+            kind,
+            epistemic_status,
+            value: self.value()?,
+            scope: self.scope.into(),
+            applicability_expr: ApplicabilityExpr::Always,
+            future_cue_lifecycle_exprs: None,
+            validity_interval: ValidityInterval {
+                valid_from_us: recorded_at_us,
+                valid_until_us: None,
+            },
+            provenance: vec![AtomProvenance::UserAsserted],
+            source_observation_refs: vec![source],
+            evidence_refs: vec![source.to_string()],
+            supersedes_revision_refs: Vec::new(),
+            supports_revision_refs: Vec::new(),
+            contradicts_revision_refs: Vec::new(),
+        })
+    }
+
+    fn from_draft(draft: &AtomDraft, authored_at: i64) -> Option<Self> {
+        let scope = match draft.scope {
+            AtomScope::Task { task_id } => HumanCreationScope::Task { task_id },
+            AtomScope::Repository {
+                repository_instance_id,
+            } => HumanCreationScope::Repository {
+                repository_instance_id,
+            },
+            _ => return None,
+        };
+        let kind = match draft.kind {
+            AtomKind::Constraint => HumanCreationKind::Constraint,
+            AtomKind::Claim => HumanCreationKind::Claim,
+            _ => return None,
+        };
+        let [source] = draft.source_observation_refs.as_slice() else {
+            return None;
+        };
+        let intent = Self {
+            scope,
+            kind,
+            content: WebAtomEdit::from_value(&draft.value),
+        };
+        (intent.draft(*source, authored_at).as_ref() == Some(draft)).then_some(intent)
+    }
+}
+
+/// Both variants share one reservation/commit path. The old correction encoding stays unchanged.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(untagged)]
+pub enum HumanAtomAuthoring {
+    Correct(HumanAtomCorrection),
+    Create(HumanAtomCreation),
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum HumanAuthoringTarget {
+    Correct(AtomId, RevisionId),
+    Create(HumanCreationScope),
+}
+
+impl HumanAtomAuthoring {
+    pub fn target(&self) -> HumanAuthoringTarget {
+        match self {
+            Self::Correct(value) => {
+                HumanAuthoringTarget::Correct(value.atom_id, value.base_revision_id)
+            }
+            Self::Create(value) => HumanAuthoringTarget::Create(value.scope),
+        }
+    }
+
+    pub fn scope(&self, base: Option<&Atom>) -> Option<AtomScope> {
+        match self {
+            Self::Correct(value) => base
+                .filter(|base| {
+                    base.atom_id == value.atom_id
+                        && base.revision_id == value.base_revision_id
+                        && HumanAtomCorrection::eligible_base(base)
+                })
+                .map(|base| base.scope.clone()),
+            Self::Create(value) => Some(value.scope.into()),
+        }
+    }
+
+    pub fn operation(&self) -> ProposalOperation {
+        match self {
+            Self::Correct(_) => ProposalOperation::Replace,
+            Self::Create(_) => ProposalOperation::Create,
+        }
+    }
+
+    pub fn payload(
+        &self,
+        base: Option<&Atom>,
+        source: SourceObservationId,
+        recorded_at_us: i64,
+    ) -> Option<AtomProposalPayload> {
+        match self {
+            Self::Correct(value) => Some(AtomProposalPayload::Replace {
+                draft: value.draft(base?, source)?,
+            }),
+            Self::Create(value) => Some(AtomProposalPayload::Create {
+                draft: value.draft(source, recorded_at_us)?,
+            }),
+        }
+    }
+
+    pub fn from_pending(proposal: &RevisionProposal) -> Option<Self> {
+        if proposal.status != ProposalStatus::Pending
+            || proposal.created_by != ProposalCreatedBy::User
+            || proposal.eligibility != ProposalEligibility::ManualRequired
+            || proposal.parent_proposal_revision_id.is_some()
+        {
+            return None;
+        }
+        if proposal.operation == ProposalOperation::Replace {
+            return HumanAtomCorrection::from_pending(proposal).map(Self::Correct);
+        }
+        Self::creation_for_review(proposal).map(Self::Create)
+    }
+
+    pub fn creation_scope_for_review(proposal: &RevisionProposal) -> Option<HumanCreationScope> {
+        Self::creation_for_review(proposal).map(|value| value.scope)
+    }
+
+    fn creation_for_review(proposal: &RevisionProposal) -> Option<HumanAtomCreation> {
+        if proposal.operation != ProposalOperation::Create
+            || proposal.target_id.is_some()
+            || proposal.base_revision_id.is_some()
+            || proposal.created_by != ProposalCreatedBy::User
+            || proposal.eligibility != ProposalEligibility::ManualRequired
+        {
+            return None;
+        }
+        let ProposalPayload::Atom(payload) = &proposal.payload else {
+            return None;
+        };
+        let AtomProposalPayload::Create { draft } = payload.as_ref() else {
+            return None;
+        };
+        if draft.evidence_refs != proposal.evidence_refs
+            || draft.evidence_refs != proposal.source_cohort_refs
+        {
+            return None;
+        }
+        HumanAtomCreation::from_draft(draft, proposal.created_at_us)
+    }
+
+    pub fn capture_identity(&self) -> (&'static str, &'static str, &'static str) {
+        match self {
+            Self::Correct(_) => (
+                "human-correction",
+                "human-correct",
+                HUMAN_CORRECTION_MANIFEST,
+            ),
+            Self::Create(_) => ("human-creation", "human-create", HUMAN_CREATION_MANIFEST),
+        }
+    }
 
     pub fn canonical(
         &self,
         proposal_id: RevisionProposalId,
         revision: RevisionId,
     ) -> Option<String> {
-        serde_json::to_string(&(HUMAN_CORRECTION_MANIFEST, proposal_id, revision, self)).ok()
+        serde_json::to_string(&(self.capture_identity().2, proposal_id, revision, self)).ok()
     }
 
     pub fn read_canonical(
@@ -256,14 +487,15 @@ impl HumanAtomCorrection {
 
     pub fn capture_matches(
         &self,
-        base: &Atom,
+        scope: &AtomScope,
         proposal_id: RevisionProposalId,
         revision: RevisionId,
         receipt: &SourceReceipt,
         observation: &SourceObservation,
     ) -> bool {
-        receipt.task_id == base.scope.task_id()
-            && receipt.repository_instance_id == base.scope.repository_id()
+        let (instance, record, manifest) = self.capture_identity();
+        receipt.task_id == scope.task_id()
+            && receipt.repository_instance_id == scope.repository_id()
             && receipt.worktree_instance_id.is_none()
             && self
                 .canonical(proposal_id, revision)
@@ -271,9 +503,9 @@ impl HumanAtomCorrection {
                     human_capture_matches(
                         (proposal_id, revision),
                         &canonical,
-                        "human-correct",
-                        "human-correction",
-                        HUMAN_CORRECTION_MANIFEST,
+                        record,
+                        instance,
+                        manifest,
                         receipt,
                         observation,
                     )
@@ -354,8 +586,9 @@ impl WebAcceptanceIntent {
             ProposalPayload::Atom(payload) => match payload.as_ref() {
                 AtomProposalPayload::Create { draft }
                     if proposal.operation == ProposalOperation::Create
-                        && draft.scope.task_id().is_some()
-                        && proposal.eligibility == ProposalEligibility::ManualRequired =>
+                        && proposal.eligibility == ProposalEligibility::ManualRequired
+                        && (draft.scope.task_id().is_some()
+                            || HumanAtomAuthoring::creation_for_review(proposal).is_some()) =>
                 {
                     Some(draft.scope.clone())
                 }

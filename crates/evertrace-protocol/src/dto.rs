@@ -15,7 +15,10 @@ use evertrace_domain::{
 };
 pub use evertrace_domain::{
     query::ExactReadQuery,
-    semantic::{HumanAtomCorrection, WebAcceptanceIntent, WebAtomEdit},
+    semantic::{
+        HumanAtomCorrection, HumanAtomCreation, HumanCreationScope, WebAcceptanceIntent,
+        WebAtomEdit,
+    },
 };
 use serde::{Deserialize, Serialize};
 
@@ -147,6 +150,14 @@ pub enum HumanReadRequest {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         atom_edit: Option<Box<WebAtomEdit>>,
     },
+    WebCreationScope {
+        scope: HumanCreationScope,
+        expected_frontier: u64,
+    },
+    WebCreationOutcome {
+        request_id: RequestId,
+        scope: HumanCreationScope,
+    },
     WebCorrectionOutcome {
         request_id: RequestId,
         atom_id: AtomId,
@@ -230,6 +241,9 @@ pub enum RepositoryAccessAction {
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
 pub enum HumanActionRequest {
+    WebCreateAtom {
+        intent: Box<HumanAtomCreation>,
+    },
     WebCorrectAtom {
         intent: Box<HumanAtomCorrection>,
     },
@@ -844,6 +858,9 @@ pub enum HumanGovernanceResponse {
         items: Vec<HumanSnapshotItem>,
         next_cursor: Option<String>,
     },
+    ProposalCreationScope {
+        available: bool,
+    },
     ProposalReview {
         frontier: u64,
         item: Option<Box<HumanSnapshotItem>>,
@@ -994,6 +1011,7 @@ impl HumanGovernanceRequest {
             self,
             Self::Act {
                 action: HumanActionRequest::WebAccept { .. }
+                    | HumanActionRequest::WebCreateAtom { .. }
                     | HumanActionRequest::WebCorrectAtom { .. }
                     | HumanActionRequest::WebProposalDisposition { .. },
                 ..
@@ -1075,7 +1093,10 @@ impl HumanReadRequest {
                 expected_revision_ref,
                 ..
             } => valid_ref(object_ref) && expected_revision_ref.as_deref().is_none_or(valid_ref),
-            Self::WebCorrectionOutcome { .. } => true,
+            Self::WebCreationScope {
+                expected_frontier, ..
+            } => *expected_frontier != 0,
+            Self::WebCreationOutcome { .. } | Self::WebCorrectionOutcome { .. } => true,
             Self::WebAcceptanceOutcome {
                 review,
                 expected_frontier,
@@ -1113,7 +1134,7 @@ impl HumanReadRequest {
 impl HumanActionRequest {
     fn validate(&self) -> bool {
         match self {
-            Self::WebCorrectAtom { .. } => true,
+            Self::WebCreateAtom { .. } | Self::WebCorrectAtom { .. } => true,
             Self::WebAccept { review, .. } | Self::WebProposalDisposition { review, .. } => {
                 valid_hex(&review.expected_digest)
             }
@@ -1467,6 +1488,7 @@ impl HumanGovernanceResponse {
                         && !can_edit
                 }
             },
+            Self::ProposalCreationScope { .. } => true,
             Self::Action { result } => result.validate(),
             Self::Conflict {
                 current_revision_ref,
