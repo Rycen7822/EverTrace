@@ -581,12 +581,17 @@ impl NativeRetrieval<'_> {
                 grounded_view: None,
             });
         }
-        self.read_evidence(
-            &snapshot,
-            &self.context.protected_query,
-            &self.context.query_facets.exact_identifiers,
-        )
-        .await?;
+        if self
+            .sequence_scope
+            .is_none_or(|scope| scope.source_prefix_ranges.is_none())
+        {
+            self.read_evidence(
+                &snapshot,
+                &self.context.protected_query,
+                &self.context.query_facets.exact_identifiers,
+            )
+            .await?;
+        }
         self.finish(snapshot, None).await
     }
 
@@ -1208,12 +1213,25 @@ impl NativeRetrieval<'_> {
                 view.completeness = RetrievalCompleteness::Partial;
             }
         }
-        view.candidate_count =
-            view.derive_candidate_count(&self.result.candidates, &matching_constraints);
+        let mut count_budget = self.result.budget.clone();
+        if let Some(ranges) = self
+            .sequence_scope
+            .and_then(|scope| scope.source_prefix_ranges.as_ref())
+            // Two u64 decimal endpoints plus JSON delimiters per authorized receipt.
+            && ranges.iter().all(|_| count_budget.consume_candidate_text(44).is_ok())
+            && view.set_source_prefix_count(ranges.clone())
+        {
+            self.result.budget = count_budget;
+        } else {
+            view.candidate_count =
+                view.derive_candidate_count(&self.result.candidates, &matching_constraints);
+        }
         let count_gaps = view.count_temporal_gaps(&self.result.candidates);
         let count_domain_unverified = view.candidate_count.as_ref().is_some_and(|count| {
-            view.evidence_need.target.is_empty()
-                || (view.completeness == RetrievalCompleteness::Complete && count.value.is_none())
+            count.source_prefix_ranges.is_none()
+                && (view.evidence_need.target.is_empty()
+                    || (view.completeness == RetrievalCompleteness::Complete
+                        && count.value.is_none()))
         });
         if count_domain_unverified {
             self.degraded("count_domain_unverified");

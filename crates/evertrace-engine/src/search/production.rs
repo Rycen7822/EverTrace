@@ -28,6 +28,7 @@ pub(crate) struct SourceSequenceScope {
     pub source_anchor: evertrace_domain::ids::SourceObservationId,
     pub positions: BTreeMap<String, u64>,
     pub coverage_complete: bool,
+    pub source_prefix_ranges: Option<Vec<[u64; 2]>>,
 }
 
 impl SourceSequenceScope {
@@ -1356,6 +1357,24 @@ impl ProductionSearch {
                 candidates: Vec::new(),
                 completeness: RetrievalCompleteness::Unknown,
                 degraded_reasons: changed_frontiers,
+                omitted_refs: BTreeSet::new(),
+                budget: context.budget,
+            });
+        }
+        if self
+            .sequence_scope
+            .as_ref()
+            .is_some_and(|scope| scope.source_prefix_ranges.is_some())
+        {
+            // The exact metadata operand set was admitted from canonical receipts at this frontier.
+            // Do not make its count depend on unrelated lexical or presentation candidates.
+            return Ok(SearchResult {
+                layer: RetrievalLayer::A,
+                projection_frontier: frontiers.0,
+                authoritative_frontier: frontiers.1,
+                candidates: Vec::new(),
+                completeness: RetrievalCompleteness::Complete,
+                degraded_reasons: BTreeSet::new(),
                 omitted_refs: BTreeSet::new(),
                 budget: context.budget,
             });

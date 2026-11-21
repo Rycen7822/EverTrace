@@ -8,6 +8,7 @@ fn source_sequence_scope(
     index: &std::collections::BTreeMap<&str, Vec<&ObjectRow>>,
     readable: &BTreeSet<String>,
     facets: &QueryFacetSet,
+    prefix_count_limit: Option<u32>,
     deadline: std::time::Instant,
 ) -> Option<crate::search::SourceSequenceScope> {
     let [qualifier] = facets.temporal_qualifiers.as_slice() else {
@@ -20,6 +21,7 @@ fn source_sequence_scope(
     }
     let anchor = source_receipt(index, &reference)?;
     let mut positions = std::collections::BTreeMap::new();
+    let mut count_ranges = prefix_count_limit.map(|_| Vec::new());
     for reference in readable {
         if std::time::Instant::now() >= deadline {
             return None;
@@ -32,6 +34,19 @@ fn source_sequence_scope(
             && qualifier.matches_sequence(receipt.source_sequence) == Some(true)
         {
             positions.insert(reference.clone(), receipt.source_sequence);
+            if let Some(ranges) = &mut count_ranges {
+                if receipt.source_kind == anchor.source_kind
+                    && receipt.source_sequence_origin == Some(0)
+                    && let Some(range) = receipt.source_byte_range
+                    && range.start < range.end
+                    && range.end == receipt.source_sequence
+                    && ranges.len() < prefix_count_limit.unwrap_or(0) as usize
+                {
+                    ranges.push([range.start, range.end]);
+                } else {
+                    count_ranges = None;
+                }
+            }
         }
     }
     let through = match qualifier {
@@ -42,11 +57,46 @@ fn source_sequence_scope(
         TemporalQualifier::SourceSequenceAfter { .. } => None,
         _ => return None,
     };
+    let coverage_complete = source_coverage_complete(index, &anchor, through);
+    let source_prefix_ranges = count_ranges
+        .filter(|_| coverage_complete)
+        .and_then(|mut ranges| {
+            // The watermark proves ingestion, not permission or current visibility for each receipt.
+            ranges.sort_unstable();
+            (ranges.first().is_none_or(|range| range[0] == 0)
+                && ranges.windows(2).all(|pair| pair[0][1] == pair[1][0])
+                && Some(ranges.last().map_or(0, |range| range[1])) == through)
+                .then_some(ranges)
+        });
     Some(crate::search::SourceSequenceScope {
         source_anchor: source_ref,
         positions,
-        coverage_complete: source_coverage_complete(index, &anchor, through),
+        coverage_complete,
+        source_prefix_ranges,
     })
+}
+
+fn prefix_count_limit(selection: MemoryScopeSelection, context: &SearchContext) -> Option<u32> {
+    let facets = &context.query_facets;
+    // This exact metadata domain has no lexical, relation, lifecycle, or shard predicate.
+    (selection == MemoryScopeSelection::All
+        && facets.count_unit() == Some(CountUnit::SourceObservation)
+        && matches!(facets.temporal_qualifiers.as_slice(),
+            [TemporalQualifier::SourceSequenceAtMost { source_ref, .. }]
+                if context.protected_query == source_ref.to_string())
+        && facets.parse_status == FacetParseStatus::Complete
+        && facets.polarity == Polarity::Positive
+        && facets.source_boundary.is_none()
+        && facets.statement_role == StatementRole::Unknown
+        && facets.lifecycle_boundary == LifecycleBoundary::Any
+        && facets.target_anchors.is_empty()
+        && facets.exact_identifiers.is_empty()
+        && facets.condition_literals.is_empty()
+        && facets.explicit_exclusions.is_empty()
+        && facets.relation_requirements.is_empty()
+        && context.protected_facets.is_empty()
+        && context.raw_query == context.protected_query)
+        .then_some(context.budget.candidates_remaining)
 }
 
 fn source_receipt(
@@ -923,10 +973,18 @@ impl HumanGovernanceService {
                 Default::default()
             };
             refs.extend(wiki.keys().cloned());
-            let sequence_scope =
-                source_sequence_scope(&index, &refs, &context.query_facets, deadline);
+            let sequence_scope = source_sequence_scope(
+                &index,
+                &refs,
+                &context.query_facets,
+                prefix_count_limit(query.selection, &context),
+                deadline,
+            );
             if let Some(scope) = &sequence_scope {
                 checks.insert(scope.source_anchor.to_string());
+                if scope.source_prefix_ranges.is_some() {
+                    checks.extend(scope.positions.keys().cloned());
+                }
             }
             let (recall_sources, recall_checks, recall_incomplete) = self
                 .recall_source_refs(&snapshot, &index, &refs, deadline)
@@ -1193,6 +1251,10 @@ impl HumanGovernanceService {
                     view.completeness = page.result.completeness;
                     if let Some(count) = &mut view.candidate_count {
                         count.value = None;
+                        if count.source_prefix_ranges.is_some() {
+                            view.candidate_count = view
+                                .derive_candidate_count(&page.result.candidates, &BTreeSet::new());
+                        }
                     }
                 }
             }

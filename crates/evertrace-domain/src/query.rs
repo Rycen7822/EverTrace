@@ -800,6 +800,32 @@ pub struct GroundedCount {
     pub operator_revision: u32,
     pub value: Option<u32>,
     pub statement_indices: BTreeSet<u32>,
+    /// Consecutive, authorized receipt byte ranges from zero; metadata, not body matches.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source_prefix_ranges: Option<Vec<[u64; 2]>>,
+}
+
+impl GroundedCount {
+    fn source_prefix_value(&self, need: &EvidenceNeed) -> Option<u32> {
+        let ranges = self.source_prefix_ranges.as_ref()?;
+        let [TemporalQualifier::SourceSequenceAtMost { sequence, .. }] =
+            need.temporal_scope.qualifiers.as_slice()
+        else {
+            return None;
+        };
+        (need.count_unit == Some(CountUnit::SourceObservation)
+            && need.target.is_empty()
+            && need.source_boundary.is_none()
+            && need.statement_role == StatementRole::Unknown
+            && need.parse_status == FacetParseStatus::Complete
+            && self.statement_indices.is_empty()
+            && ranges.len() <= MAX_FACET_ITEMS
+            && ranges.first().is_none_or(|range| range[0] == 0)
+            && ranges.last().map_or(0, |range| range[1]) == *sequence
+            && ranges.iter().all(|[start, end]| start < end)
+            && ranges.windows(2).all(|pair| pair[0][1] == pair[1][0]))
+        .then_some(ranges.len() as u32)
+    }
 }
 
 /// Entity identities describe the bounded answer, not a count of all stored entities.
@@ -1056,7 +1082,29 @@ impl GroundedEvidenceView {
             .then(|| u32::try_from(identities.len()).ok())
             .flatten(),
             statement_indices,
+            source_prefix_ranges: None,
         })
+    }
+
+    pub fn set_source_prefix_count(&mut self, ranges: Vec<[u64; 2]>) -> bool {
+        if self.completeness != RetrievalCompleteness::Complete {
+            return false;
+        }
+        let mut count = GroundedCount {
+            operator_revision: 1,
+            value: None,
+            statement_indices: BTreeSet::new(),
+            source_prefix_ranges: Some(ranges),
+        };
+        count.value = count.source_prefix_value(&self.evidence_need);
+        if count.value.is_none()
+            || serde_json::to_vec(&count)
+                .map_or(true, |bytes| bytes.len() > MAX_GROUNDED_COUNT_BYTES)
+        {
+            return false;
+        }
+        self.candidate_count = Some(count);
+        true
     }
 
     fn count_domain_proven(
@@ -1525,7 +1573,11 @@ impl GroundedEvidenceView {
                 || self.evidence_need.count_unit.is_none()
                 || count.operator_revision != 1
                 || (self.evidence_need.target.is_empty()
-                    && self.completeness == RetrievalCompleteness::Complete)
+                    && self.completeness == RetrievalCompleteness::Complete
+                    && count.source_prefix_ranges.is_none())
+                || (count.source_prefix_ranges.is_some()
+                    && (count.source_prefix_value(&self.evidence_need) != count.value
+                        || self.completeness != RetrievalCompleteness::Complete))
                 || count.value.is_some() != (self.completeness == RetrievalCompleteness::Complete)
                 || count.statement_indices.iter().any(|index| {
                     self.active_evidence
@@ -4151,6 +4203,9 @@ impl HumanSearchPage {
             && !view.count_temporal_gaps(&self.result.candidates).is_empty()
         {
             return false;
+        }
+        if count.source_prefix_ranges.is_some() {
+            return self.result.candidates.is_empty();
         }
         // Ordinary answer evidence is required. Constraint-only matches are
         // declared by the Native protected-IR predicate, not inferred from prose.
