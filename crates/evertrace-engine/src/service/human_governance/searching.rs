@@ -5,7 +5,7 @@ use evertrace_domain::{
     semantic::{NormativeResolutionState, SemanticResolution},
 };
 
-const SEARCH_HIT_ORDER_REVISION: u32 = 8;
+const SEARCH_HIT_ORDER_REVISION: u32 = 9;
 
 type SearchPolicy = Option<(String, Option<evertrace_codex::policy::PolicyEvidence>)>;
 
@@ -26,6 +26,7 @@ struct SearchHitCursor {
     projection_version: u64,
     policy: SearchPolicy,
     inherited_repository: Option<RepositoryId>,
+    blocked_task_shards: Option<BTreeSet<RepositoryId>>,
     wiki_inputs: std::collections::BTreeMap<String, BTreeSet<String>>,
     after: Option<HumanSearchHit>,
     remaining: Vec<HumanSearchHit>,
@@ -770,11 +771,24 @@ impl HumanGovernanceService {
         authority: RepositoryReadAuthority<'_>,
         deadline: std::time::Instant,
     ) -> Result<bool, HumanGovernanceError> {
+        Ok(self
+            .blocked_search_shards(repositories, authority, deadline)
+            .await?
+            .is_some_and(|blocked| blocked.is_empty()))
+    }
+
+    async fn blocked_search_shards(
+        &self,
+        repositories: &[RepositoryId],
+        authority: RepositoryReadAuthority<'_>,
+        deadline: std::time::Instant,
+    ) -> Result<Option<BTreeSet<RepositoryId>>, HumanGovernanceError> {
+        let mut blocked = BTreeSet::new();
         for batch in repositories.chunks(usize::from(METADATA_READ_LIMIT)) {
             if std::time::Instant::now() >= deadline {
-                return Ok(false);
+                return Ok(None);
             }
-            let (blocked, _) = crate::repository::repository_read_assessment(
+            let (denied, _) = crate::repository::repository_read_assessment(
                 &self.writer,
                 batch.iter().copied().collect(),
                 &authority,
@@ -782,11 +796,26 @@ impl HumanGovernanceService {
             )
             .await
             .map_err(|_| HumanGovernanceError::Store)?;
-            if !blocked.is_empty() {
-                return Ok(false);
-            }
+            blocked.extend(denied);
         }
-        Ok(std::time::Instant::now() < deadline)
+        Ok((std::time::Instant::now() < deadline).then_some(blocked))
+    }
+
+    async fn blocked_task_shards(
+        &self,
+        index: &std::collections::BTreeMap<&str, Vec<&ObjectRow>>,
+        selection: MemoryScopeSelection,
+        report: Option<&evertrace_codex::HostProbeReport>,
+        deadline: std::time::Instant,
+    ) -> Result<Option<BTreeSet<RepositoryId>>, HumanGovernanceError> {
+        let MemoryScopeSelection::Task { task_id } = selection else {
+            return Ok(None);
+        };
+        let Some(shards) = task_search_shards(index, task_id) else {
+            return Ok(None);
+        };
+        self.blocked_search_shards(&shards, RepositoryReadAuthority::retained(report), deadline)
+            .await
     }
 
     async fn source_dependency_access(
@@ -1150,7 +1179,14 @@ impl HumanGovernanceService {
             {
                 return conflict();
             }
-            if search_policy(self.search_report().await.as_ref()) != cursor.policy {
+            let current_report = self.search_report().await;
+            // Hit checks cannot detect changes to shards that contributed no hits.
+            if search_policy(current_report.as_ref()) != cursor.policy
+                || self
+                    .blocked_task_shards(&index, query.selection, current_report.as_ref(), deadline)
+                    .await?
+                    != cursor.blocked_task_shards
+            {
                 return conflict();
             }
             if reader
@@ -1403,21 +1439,14 @@ impl HumanGovernanceService {
                 Some(ScopeBoundary::Worktree { worktree_id }) => (None, None, Some(worktree_id)),
                 None => (None, None, None),
             };
-            let task_shards = task_id.map(|id| task_search_shards(&index, id));
+            let blocked_task_shards = self
+                .blocked_task_shards(&index, query.selection, report.as_ref(), deadline)
+                .await?;
             // A Task may have readable local work even with an unavailable repository shard.
-            let task_restricted = match &task_shards {
-                None => false,
-                Some(None) => true,
-                Some(Some(shards)) => {
-                    !self
-                        .search_shards_readable(
-                            shards,
-                            RepositoryReadAuthority::retained(report.as_ref()),
-                            deadline,
-                        )
-                        .await?
-                }
-            };
+            let task_restricted = task_id.is_some()
+                && blocked_task_shards
+                    .as_ref()
+                    .is_none_or(|blocked| !blocked.is_empty());
             let budget = budget();
             if budget.latency_us_remaining == 0 {
                 return Err(HumanGovernanceError::Store);
@@ -1714,16 +1743,10 @@ impl HumanGovernanceService {
             {
                 access_changed = true;
             }
-            if let Some(Some(shards)) = &task_shards {
-                let readable = self
-                    .search_shards_readable(
-                        shards,
-                        RepositoryReadAuthority::retained(current_report.as_ref()),
-                        deadline,
-                    )
-                    .await?;
-                access_changed |= readable == task_restricted;
-            }
+            access_changed |= self
+                .blocked_task_shards(&index, query.selection, current_report.as_ref(), deadline)
+                .await?
+                != blocked_task_shards;
             if let Some(before) = start_state {
                 let state = self
                     .writer
@@ -1835,6 +1858,7 @@ impl HumanGovernanceService {
                     projection_version,
                     policy,
                     inherited_repository,
+                    blocked_task_shards,
                     wiki_inputs,
                     after: None,
                     remaining,
