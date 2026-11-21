@@ -1708,7 +1708,7 @@ async fn read_proposal_review(
         Err((current_frontier, _)) => return Ok(conflict(current_frontier)),
     };
     let mut items = page.items;
-    let item = if items.len() == 1 {
+    let mut item = if items.len() == 1 {
         items
             .pop()
             .filter(|item| {
@@ -1720,6 +1720,12 @@ async fn read_proposal_review(
     } else {
         None
     };
+    if let Some(review) = item.as_mut().and_then(|item| item.proposal_review.as_mut())
+        && review.merge_and_accept_eligible
+        && !Box::pin(service.web_merge_accessible(&review.proposal, page.frontier)).await?
+    {
+        review.merge_and_accept_eligible = false;
+    }
     let digest = item.as_ref().and_then(|item| {
         evertrace_protocol::dto::proposal_confirmation_digest(item, page.frontier)
     });

@@ -879,8 +879,9 @@ fn review_intent(
     frontier: u64,
 ) -> Option<evertrace_domain::semantic::WebAcceptanceIntent> {
     let review = item.proposal_review.as_ref().filter(|review| {
-        review.plain_accept_eligible
-            && !review.merge_and_accept_eligible
+        let merge = review.proposal.operation == ProposalOperation::Merge;
+        review.plain_accept_eligible == !merge
+            && review.merge_and_accept_eligible == merge
             && review.reauthorization.is_none()
     })?;
     if let Some(revision) = review.proposal.base_revision_id {
@@ -888,12 +889,19 @@ fn review_intent(
             .proposal_base
             .as_ref()
             .filter(|base| base.state == HumanContentState::Ready)?;
-        let Some(HumanSemanticContent::Procedure(base)) = base.content.as_ref() else {
-            return None;
+        let matches_base = match base.content.as_ref() {
+            Some(HumanSemanticContent::Procedure(base)) => {
+                base.revision_id == revision
+                    && review.proposal.target_id
+                        == Some(ProposalTargetId::Procedure(base.procedure_id))
+            }
+            Some(HumanSemanticContent::Atom(base)) => {
+                base.revision_id == revision
+                    && review.proposal.target_id == Some(ProposalTargetId::Atom(base.atom_id))
+            }
+            _ => false,
         };
-        if base.revision_id != revision
-            || review.proposal.target_id != Some(ProposalTargetId::Procedure(base.procedure_id))
-        {
+        if !matches_base {
             return None;
         }
     }

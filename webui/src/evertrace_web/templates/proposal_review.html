@@ -22,7 +22,8 @@
       <h4>弃用理由</h4><div class="memory-prose semantic-body">{{ change.reason }}</div>
     {% elif payload.kind == 'atom' %}
       {% if summary.operation == 'merge' %}
-        {{ text_list('拟合并的修订', change.merged_revision_refs, record_kind='atom_revision', exact_revision=true) }}
+        {{ text_list('拟合并的精确修订', change.merged_revision_refs, record_kind='atom_revision', exact_revision=true) }}
+        <p>可逐项查看这些原修订。合并只提交下面的草案作为目标的后继，不改写原修订。</p>
       {% endif %}
       {% if summary.operation == 'split' %}
         {% for draft in change.drafts %}
@@ -91,9 +92,10 @@
         data-review-digest="{{ confirmation_digest }}">复核当前提案</button>
       <p data-proposal-confirmation-result role="status">只核对这份提案；不会提交审核决定。</p>
       {% if acceptance_request_id %}
-        <button class="button" type="button" data-proposal-accept data-proposal-id="{{ summary.proposal_id }}"
+        <button class="button" type="button" data-proposal-accept="{{ summary.operation }}" data-proposal-id="{{ summary.proposal_id }}"
           data-request-id="{{ acceptance_request_id }}" data-revision="{{ summary.current_revision_id }}"
-          data-frontier="{{ frontier }}" data-review-digest="{{ confirmation_digest }}">确认接受这份提案</button>
+          data-frontier="{{ frontier }}" data-review-digest="{{ confirmation_digest }}">
+          {{ '确认合并并接受' if summary.operation == 'merge' else '确认接受这份提案' }}</button>
       {% endif %}
       {% if disposition_request_id %}
         <fieldset data-disposition-fields>

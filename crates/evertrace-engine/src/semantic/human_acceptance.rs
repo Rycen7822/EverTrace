@@ -422,6 +422,7 @@ impl HumanAcceptanceService {
                 && !service
                     .web_procedure_base_accessible(snapshot, reviewed)
                     .await?)
+            || !service.web_merge_accessible_at(snapshot, reviewed).await?
         {
             return Ok(());
         }
@@ -572,6 +573,14 @@ impl HumanAcceptanceService {
         {
             return Ok(conflict());
         }
+        if proposal.atom_merge_inputs().is_some()
+            && (RevisionProposalService
+                .validate_atom_merge(&view, id)
+                .is_err()
+                || !service.web_merge_accessible_at(&snapshot, proposal).await?)
+        {
+            return Ok(conflict());
+        }
         if !matches!(
             deletion_admission(&snapshot, proposal)?,
             ObjectDeletionCandidateAdmission::Clear
@@ -693,7 +702,9 @@ impl HumanAcceptanceService {
         }) else {
             return Ok(HumanActionOutcome::Unknown);
         };
-        if !service.proposal_accessible(&snapshot, proposal).await? {
+        if !service.proposal_accessible(&snapshot, proposal).await?
+            || !service.web_merge_accessible_at(&snapshot, proposal).await?
+        {
             return Ok(HumanActionOutcome::Unknown);
         }
         Ok(outcome)

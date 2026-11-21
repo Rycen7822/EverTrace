@@ -364,7 +364,8 @@ function actOnProposal(button) {
   if (document.hidden || !state.active || proposalId !== state.selected?.object || revision !== state.selected?.revision) return;
   if (["pending", "unknown"].includes(state.acceptance?.status)) return;
   const input = { request_id: requestId, proposal_id: proposalId, revision, frontier, review_digest: reviewDigest };
-  let prompt = "接受刚才显示的提案修订 " + revision + "？";
+  let prompt = (button.dataset.proposalAccept === "merge" ? "合并并接受" : "接受")
+    + "刚才显示的提案修订 " + revision + "？";
   if (proposalDisposition === "defer") {
     const fields = button.closest("[data-disposition-fields]");
     const wait = fields.querySelector("[data-proposal-waiting]");

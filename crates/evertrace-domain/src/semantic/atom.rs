@@ -630,7 +630,11 @@ impl Atom {
                     }
                     UserAuthorizationMode::TuiAcceptance | UserAuthorizationMode::WebAcceptance => {
                         if user.mode == UserAuthorizationMode::WebAcceptance
-                            && !matches!(self.scope, AtomScope::Task { .. })
+                            && (user.authorized_scope_ceiling != self.scope
+                                || !matches!(
+                                    self.scope,
+                                    AtomScope::Task { .. } | AtomScope::Repository { .. }
+                                ))
                         {
                             return Err(SemanticError::InvalidAtom);
                         }

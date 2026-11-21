@@ -1191,15 +1191,18 @@ fn acceptance_basis(
         AtomAcceptanceContext::Web {
             observation,
             receipt,
+            authorized_scope_ceiling,
             ..
         } => {
-            let task_id = receipt.task_id.ok_or(SemanticServiceError::InvalidInput)?;
+            if authorized_scope_ceiling != &draft.scope {
+                return Err(SemanticServiceError::InvalidInput);
+            }
             Ok(AtomAuthorityBasis::HumanAcceptance(
                 VerifiedHumanAcceptance::new(
                     UserAuthorizationMode::WebAcceptance,
                     observation.clone(),
                     receipt.clone(),
-                    AtomScope::Task { task_id },
+                    authorized_scope_ceiling.clone(),
                 ),
             ))
         }

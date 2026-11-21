@@ -127,17 +127,25 @@ impl WebAcceptanceIntent {
             return None;
         }
         match &proposal.payload {
-            ProposalPayload::Atom(payload) if proposal.operation == ProposalOperation::Create => {
-                match payload.as_ref() {
-                    AtomProposalPayload::Create { draft }
-                        if draft.scope.task_id().is_some()
-                            && proposal.eligibility == ProposalEligibility::ManualRequired =>
-                    {
-                        Some(draft.scope.clone())
-                    }
-                    _ => None,
+            ProposalPayload::Atom(payload) => match payload.as_ref() {
+                AtomProposalPayload::Create { draft }
+                    if proposal.operation == ProposalOperation::Create
+                        && draft.scope.task_id().is_some()
+                        && proposal.eligibility == ProposalEligibility::ManualRequired =>
+                {
+                    Some(draft.scope.clone())
                 }
-            }
+                AtomProposalPayload::Merge { draft, .. }
+                    if proposal.operation == ProposalOperation::Merge
+                        && matches!(
+                            draft.scope,
+                            AtomScope::Task { .. } | AtomScope::Repository { .. }
+                        ) =>
+                {
+                    Some(draft.scope.clone())
+                }
+                _ => None,
+            },
             ProposalPayload::CoreMembership(payload)
                 if proposal.operation == ProposalOperation::Create =>
             {
@@ -192,10 +200,11 @@ impl WebAcceptanceIntent {
             (ProposalPayload::Procedure(_), _) | (_, Some(_)) => return None,
             _ => (),
         }
+        let merge = proposal.operation == ProposalOperation::Merge;
         let review = Review {
             proposal,
-            plain_accept_eligible: true,
-            merge_and_accept_eligible: false,
+            plain_accept_eligible: !merge,
+            merge_and_accept_eligible: merge,
             capability_coverage: coverage,
         };
         // The original base and Core anchor are immutable revisions bound by the proposal, not re-encoded presentation.
@@ -800,6 +809,19 @@ impl ClosedProposalEditIntent {
 }
 
 impl RevisionProposal {
+    pub fn atom_merge_inputs(&self) -> Option<&[RevisionId]> {
+        let ProposalPayload::Atom(payload) = &self.payload else {
+            return None;
+        };
+        match payload.as_ref() {
+            AtomProposalPayload::Merge {
+                merged_revision_refs,
+                ..
+            } if self.operation == ProposalOperation::Merge => Some(merged_revision_refs),
+            _ => None,
+        }
+    }
+
     pub fn core_creation(&self) -> Option<(RevisionId, &CoreScopeIdentity)> {
         let ProposalPayload::CoreMembership(payload) = &self.payload else {
             return None;

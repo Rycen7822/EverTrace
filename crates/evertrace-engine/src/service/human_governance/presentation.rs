@@ -119,6 +119,63 @@ impl HumanGovernanceService {
         }
     }
 
+    pub async fn web_merge_accessible(
+        &self,
+        proposal: &RevisionProposal,
+        frontier: u64,
+    ) -> Result<bool, HumanGovernanceError> {
+        let snapshot = self
+            .writer
+            .project_objects()
+            .await
+            .map_err(|_| HumanGovernanceError::Store)?;
+        if frontier != snapshot.frontier {
+            return Ok(false);
+        }
+        self.web_merge_accessible_at(&snapshot, proposal).await
+    }
+
+    pub(crate) async fn web_merge_accessible_at(
+        &self,
+        snapshot: &ProjectionSnapshot,
+        proposal: &RevisionProposal,
+    ) -> Result<bool, HumanGovernanceError> {
+        let Some(inputs) = proposal.atom_merge_inputs() else {
+            return Ok(true);
+        };
+        let mut pending = inputs
+            .iter()
+            .map(ToString::to_string)
+            .collect::<BTreeSet<_>>();
+        let deadline = std::time::Instant::now() + READ_DEADLINE;
+        let index = export::presentation_index(snapshot, deadline)
+            .map_err(|_| HumanGovernanceError::Store)?;
+        for row in snapshot
+            .data_rows()
+            .filter(|row| row.object_kind.as_deref() == Some("atom_revision"))
+        {
+            if !row
+                .current_revision_id
+                .as_deref()
+                .is_some_and(|id| pending.remove(id))
+            {
+                continue;
+            }
+            match self
+                .readable_indexed_row(snapshot, row, &index, deadline)
+                .await
+            {
+                Ok(()) => (),
+                Err(export::Failure::Corrupt) => return Err(HumanGovernanceError::Store),
+                Err(_) => return Ok(false),
+            }
+            if pending.is_empty() {
+                return Ok(true);
+            }
+        }
+        Ok(false)
+    }
+
     pub(crate) async fn web_procedure_base_accessible(
         &self,
         snapshot: &ProjectionSnapshot,
