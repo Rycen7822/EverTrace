@@ -11,7 +11,7 @@ use super::{
         RelationSources, RequestDeadline, candidate_limit, exact_query_reference,
         exact_slot_primary, hard_compatible,
     },
-    read_context::SearchReadAccess,
+    read_context::{ATTEMPT_RUN_RELATION, RUN_RESULT_RELATION, SearchReadAccess},
 };
 
 pub(super) struct ScopedCandidateRead<'a> {
@@ -803,13 +803,27 @@ impl NativeRetrieval<'_> {
                             }
                         }
                     }
-                } else if access.is_some()
-                    && let Some(kind) = &edge.relation_kind
-                {
-                    incomplete.insert(kind.clone());
+                } else if let Some(kind) = &edge.relation_kind {
+                    if access.is_some()
+                        || matches!(kind.as_str(), ATTEMPT_RUN_RELATION | RUN_RESULT_RELATION)
+                    {
+                        incomplete.insert(kind.clone());
+                    }
                 }
             }
             frontier = refs.difference(&visited).cloned().collect();
+        }
+        if kinds.iter().any(|kind| kind == RUN_RESULT_RELATION) {
+            let verified_runs: BTreeSet<_> = relation_links
+                .iter()
+                .filter_map(|(_, run, kind)| (kind == RUN_RESULT_RELATION).then_some(run))
+                .collect();
+            if relation_links
+                .iter()
+                .any(|(run, _, kind)| kind == ATTEMPT_RUN_RELATION && !verified_runs.contains(run))
+            {
+                incomplete.insert(RUN_RESULT_RELATION.into());
+            }
         }
         let revision_bridge = self.time_scope.and_then(|scope| {
             scope.missing_revision_bridge(&self.result.candidates, &self.deadline)
@@ -873,6 +887,11 @@ impl NativeRetrieval<'_> {
                 incomplete.insert(kind);
                 self.degraded("relation_endpoint_omitted_or_ambiguous");
             }
+        }
+        if incomplete.contains(ATTEMPT_RUN_RELATION)
+            && kinds.iter().any(|kind| kind == RUN_RESULT_RELATION)
+        {
+            incomplete.insert(RUN_RESULT_RELATION.into());
         }
         witnessed.retain(|kind| !incomplete.contains(kind));
         let pending_gaps = self.gaps(&witnessed, &clipped_exact);

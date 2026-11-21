@@ -182,6 +182,26 @@ pub fn canonical_physical_source(
     exact_identifier_row(row, row.source_event_seq, true)?.ok_or(StoreError::StoreCorrupt)
 }
 
+/// Exact research neighbors inherit only their validated Attempt's scope, never an FTS grant.
+pub fn scoped_research_source(
+    row: &crate::ObjectRow,
+    attempt: &crate::ObjectRow,
+) -> Result<SearchProjectionRow, StoreError> {
+    if !matches!(
+        row.object_kind.as_deref(),
+        Some("experiment_run" | "result_evidence")
+    ) || attempt.object_kind.as_deref() != Some("attempt")
+    {
+        return Err(StoreError::InvalidInput);
+    }
+    let mut source =
+        exact_identifier_row(row, row.source_event_seq, true)?.ok_or(StoreError::StoreCorrupt)?;
+    source.task_id.clone_from(&attempt.task_id);
+    source.repository_id.clone_from(&attempt.repository_id);
+    source.worktree_id.clone_from(&attempt.worktree_id);
+    Ok(source)
+}
+
 /// A frozen lineage operand is exact-only; descriptive metadata does not grant verification authority.
 pub fn canonical_lineage_source(
     row: &crate::ObjectRow,

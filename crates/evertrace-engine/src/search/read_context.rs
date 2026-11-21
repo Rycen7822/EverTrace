@@ -85,7 +85,7 @@ pub(crate) async fn check_relation_archive(
     budget: &mut RelationArchiveBudget,
     deadline: Instant,
 ) -> bool {
-    use evertrace_capture::{CasError, CasStore, cas::SourceArchiveVerifier};
+    use evertrace_capture::cas::SourceArchiveVerifier;
     use evertrace_domain::ids::SourceObservationId;
     let archives = || {
         sources
@@ -108,6 +108,63 @@ pub(crate) async fn check_relation_archive(
     {
         return false;
     }
+    read_relation_archive(
+        writer,
+        cas_dir,
+        budget,
+        deadline,
+        move |cas, remaining, check| {
+            for (receipt, observation) in archives {
+                let digest = receipt.cas_ref.parse()?;
+                let mut source = SourceArchiveVerifier::new(&receipt, &observation)?;
+                remaining.verify(cas, &digest, check, &mut |chunk| source.update(chunk))?;
+                source.finish()?;
+            }
+            Ok(())
+        },
+    )
+    .await
+}
+
+type ArchiveCheck<'a> = dyn FnMut() -> Result<(), evertrace_capture::CasError> + 'a;
+
+impl RelationArchiveBudget {
+    fn verify(
+        &mut self,
+        cas: &evertrace_capture::CasStore,
+        digest: &evertrace_capture::CasDigest,
+        check: &mut ArchiveCheck<'_>,
+        visitor: &mut dyn FnMut(&[u8]) -> Result<(), evertrace_capture::CasError>,
+    ) -> Result<(), evertrace_capture::CasError> {
+        check()?;
+        let window = cas.read_bounded_window_checked(
+            digest,
+            self.encoded,
+            self.decoded,
+            0..0,
+            check,
+            visitor,
+        )?;
+        self.encoded -= window.encoded_bytes;
+        self.decoded -= window.total_bytes;
+        Ok(())
+    }
+}
+
+async fn read_relation_archive(
+    writer: &WriterHandle,
+    cas_dir: &std::path::Path,
+    budget: &mut RelationArchiveBudget,
+    deadline: Instant,
+    verify: impl FnOnce(
+        &evertrace_capture::CasStore,
+        &mut RelationArchiveBudget,
+        &mut ArchiveCheck<'_>,
+    ) -> Result<(), evertrace_capture::CasError>
+    + Send
+    + 'static,
+) -> bool {
+    use evertrace_capture::{CasError, CasStore};
     let cas_dir = cas_dir.to_path_buf();
     let mut remaining = *budget;
     let read = writer
@@ -115,32 +172,16 @@ pub(crate) async fn check_relation_archive(
         .read_blocking(move |cancel| {
             let mut check = || {
                 cancel.check().map_err(|_| CasError::ReadCancelled)?;
-                if Instant::now() >= deadline {
-                    return Err(CasError::ReadCancelled);
+                if Instant::now() < deadline {
+                    Ok(())
+                } else {
+                    Err(CasError::ReadCancelled)
                 }
-                Ok(())
             };
-            let verify = || -> Result<(), CasError> {
-                let cas = CasStore::open_existing(cas_dir)?;
-                for (receipt, observation) in archives {
-                    check()?;
-                    let digest = receipt.cas_ref.parse()?;
-                    let mut source = SourceArchiveVerifier::new(&receipt, &observation)?;
-                    let window = cas.read_bounded_window_checked(
-                        &digest,
-                        remaining.encoded,
-                        remaining.decoded,
-                        0..0,
-                        &mut check,
-                        &mut |chunk| source.update(chunk),
-                    )?;
-                    source.finish()?;
-                    remaining.encoded -= window.encoded_bytes;
-                    remaining.decoded -= window.total_bytes;
-                }
+            let result = CasStore::open_existing(cas_dir).and_then(|cas| {
+                verify(&cas, &mut remaining, &mut check)?;
                 check()
-            };
-            let result = verify();
+            });
             Ok((result, remaining))
         })
         .await;
@@ -703,6 +744,72 @@ pub(crate) fn operation_binding_read<'a>(
         sources,
         physical_sources,
     })
+}
+
+pub(crate) const ATTEMPT_RUN_RELATION: &str = "run_to_attempt";
+pub(crate) const RUN_RESULT_RELATION: &str = "result_produced_by_run";
+
+pub(crate) async fn check_research_archive(
+    row: &ObjectRow,
+    writer: &WriterHandle,
+    cas_dir: &std::path::Path,
+    index: &BTreeMap<&str, Vec<&ObjectRow>>,
+    budget: &mut RelationArchiveBudget,
+    deadline: Instant,
+) -> bool {
+    let Some(payload) = row
+        .payload_json
+        .as_deref()
+        .and_then(|raw| serde_json::from_str(raw).ok())
+    else {
+        return false;
+    };
+    match payload {
+        JournalPayload::ExperimentRunRecorded(run) => {
+            let observations = run
+                .source_receipt_refs
+                .iter()
+                .chain(&run.terminal_evidence_refs)
+                .map(|id| {
+                    let key = format!("object:evidence:source_receipt:{id}");
+                    let [row] = index.get(key.as_str())?.as_slice() else {
+                        return None;
+                    };
+                    let JournalPayload::SourceReceiptRecorded(receipt) =
+                        serde_json::from_str(row.payload_json.as_deref()?).ok()?
+                    else {
+                        return None;
+                    };
+                    (receipt.source_receipt_id == *id)
+                        .then(|| receipt.source_observation_id.to_string())
+                })
+                .collect::<Option<BTreeSet<_>>>();
+            let Some(observations) = observations else {
+                return false;
+            };
+            check_relation_archive(&observations, writer, cas_dir, index, budget, deadline).await
+        }
+        JournalPayload::ResultEvidenceRecorded(result)
+            if !result.raw_cas_refs.is_empty() && result.raw_cas_refs.len() <= 64 =>
+        {
+            read_relation_archive(
+                writer,
+                cas_dir,
+                budget,
+                deadline,
+                move |cas, remaining, check| {
+                    for id in &result.raw_cas_refs {
+                        let id = id.to_string();
+                        let digest = id[4..].parse()?;
+                        remaining.verify(cas, &digest, check, &mut |_| Ok(()))?;
+                    }
+                    Ok(())
+                },
+            )
+            .await
+        }
+        _ => false,
+    }
 }
 
 pub(crate) const LINEAGE_RELATIONS: [&str; 2] = [

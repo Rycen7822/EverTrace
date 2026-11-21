@@ -929,6 +929,8 @@ impl SearchProjectionRow {
                         | "scope_effect"
                         | "worktree_transition"
                         | "worktree_snapshot"
+                        | "experiment_run"
+                        | "result_evidence"
                 )
             )
         {

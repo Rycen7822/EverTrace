@@ -6,7 +6,8 @@ use evertrace_domain::{
 };
 
 use crate::search::read_context::{
-    LINEAGE_RELATIONS, LineageQuery, LineageRead, RelationArchiveBudget, check_relation_archive,
+    ATTEMPT_RUN_RELATION, LINEAGE_RELATIONS, LineageQuery, LineageRead, RUN_RESULT_RELATION,
+    RelationArchiveBudget, check_relation_archive, check_research_archive,
     current_operation_binding, operation_binding_read,
 };
 
@@ -61,6 +62,143 @@ fn lineage_anchor(
         current,
         requested,
     })
+}
+
+fn research_anchor<'a>(
+    selection: MemoryScopeSelection,
+    text: &str,
+    facets: &'a QueryFacetSet,
+) -> Option<&'a str> {
+    let [anchor] = facets.target_anchors.as_slice() else {
+        return None;
+    };
+    (matches!(selection, MemoryScopeSelection::Repository { .. })
+        && text == anchor
+        && anchor.parse::<evertrace_domain::ids::AttemptId>().is_ok()
+        && matches!(facets.exact_identifiers.as_slice(), [exact] if exact == anchor)
+        && facets.parse_status == FacetParseStatus::Complete
+        && facets.temporal_mode == TemporalMode::Current
+        && facets.temporal_qualifiers.is_empty()
+        && facets.statement_role == StatementRole::Unknown
+        && facets.answer_shape == Some(AnswerShape::SourceSnippet)
+        && facets.source_boundary.is_none()
+        && facets.condition_literals.is_empty()
+        && facets.explicit_exclusions.is_empty()
+        && (facets.relation_requirements.is_empty()
+            || facets
+                .relation_requirements
+                .iter()
+                .any(|kind| kind == ATTEMPT_RUN_RELATION))
+        && facets
+            .relation_requirements
+            .iter()
+            .all(|kind| matches!(kind.as_str(), ATTEMPT_RUN_RELATION | RUN_RESULT_RELATION)))
+    .then_some(anchor)
+}
+
+/// The index nominates access checks, not relations that are already authorized.
+async fn research_neighbours(
+    search: &evertrace_store::SearchIndex,
+    frontier: u64,
+    anchor: &str,
+    results: bool,
+) -> Result<(BTreeSet<String>, bool), HumanGovernanceError> {
+    let unavailable = |_| HumanGovernanceError::Store;
+    let snapshot = search
+        .snapshot_after_validated_frontier(frontier)
+        .await
+        .map_err(unavailable)?;
+    let mut keys = BTreeSet::from([anchor.to_owned()]);
+    if snapshot.frontier() != frontier || snapshot.authoritative_frontier() != frontier {
+        return Ok((keys, true));
+    }
+    let runs = snapshot
+        .adjacent_relations(&[anchor.to_owned()], &[ATTEMPT_RUN_RELATION.into()], 32)
+        .await
+        .map_err(unavailable)?
+        .ok_or(HumanGovernanceError::Store)?;
+    let truncated = runs.len() >= 32;
+    let runs: Vec<_> = runs
+        .into_iter()
+        .take(31)
+        .filter_map(|edge| edge.source_id)
+        .collect();
+    keys.extend(runs.iter().cloned());
+    if !results || keys.len() == 32 {
+        return Ok((keys, truncated || results));
+    }
+    let limit = 32 - keys.len();
+    let outcomes = snapshot
+        .adjacent_relations(&runs, &[RUN_RESULT_RELATION.into()], limit + 1)
+        .await
+        .map_err(unavailable)?
+        .ok_or(HumanGovernanceError::Store)?;
+    let truncated = truncated || outcomes.len() > limit;
+    keys.extend(
+        outcomes
+            .into_iter()
+            .take(limit)
+            .filter_map(|edge| edge.source_id),
+    );
+    Ok((keys, truncated))
+}
+
+fn research_head<'a>(index: &export::SearchReadIndex<'a>, key: &str) -> Option<&'a ObjectRow> {
+    index
+        .get(key)?
+        .iter()
+        .copied()
+        .filter(|row| row.object_id.as_deref() == Some(key))
+        .max_by_key(|row| row.source_event_seq)
+}
+
+fn research_endpoint_matches(
+    row: &ObjectRow,
+    root: &ObjectRow,
+    index: &export::SearchReadIndex<'_>,
+    readable: &BTreeSet<String>,
+) -> bool {
+    fn decode(row: &ObjectRow) -> Option<evertrace_store::JournalPayload> {
+        serde_json::from_str(row.payload_json.as_deref()?).ok()
+    }
+    use evertrace_store::JournalPayload::{
+        AttemptRecorded, ExperimentRunRecorded, ResultEvidenceRecorded, WorktreeSnapshotRecorded,
+    };
+    let Some(AttemptRecorded(attempt)) = decode(root) else {
+        return false;
+    };
+    use evertrace_domain::{
+        semantic::{EvidenceCompleteness, ResultScope},
+        work::{RunContractValidity, RunExecutionStatus, RunObservability},
+    };
+    let binds = |run: &evertrace_domain::work::ExperimentRun| {
+        run.validate().is_ok()
+            && run.attempt_id == Some(attempt.attempt_id)
+            && run.attempt_binding_status == evertrace_domain::work::AttemptBindingStatus::Resolved
+            && run.workstream_id == attempt.workstream_id
+            && run.strategy_contract_fingerprint == attempt.strategy_contract_fingerprint
+            && matches!(research_head(index, &run.code_snapshot_id.to_string()).and_then(decode),
+                Some(WorktreeSnapshotRecorded(snapshot)) if attempt.worktree_instance_ids.contains(&snapshot.worktree_instance_id)
+                    && snapshot.capture_status == evertrace_domain::repository::SnapshotCaptureStatus::Complete)
+    };
+    match decode(row) {
+        Some(ExperimentRunRecorded(run)) => binds(&run),
+        Some(ResultEvidenceRecorded(result))
+            if result.validate().is_ok()
+                && result.result_scope == ResultScope::Complete
+                && result.completeness == EvidenceCompleteness::Complete =>
+        {
+            let Some(parent) = research_head(index, &result.experiment_run_id.to_string()) else {
+                return false;
+            };
+            parent.current_revision_id.as_ref().is_some_and(|id| {
+                readable.contains(id) && *id == result.experiment_run_revision_id.to_string()
+            }) && matches!(decode(parent), Some(ExperimentRunRecorded(run)) if binds(&run)
+                && run.observability == RunObservability::Full && run.execution_status == RunExecutionStatus::Completed
+                && run.contract_validity == RunContractValidity::Valid)
+        }
+        _ => false,
+    }
 }
 
 type SearchPolicy = Option<(String, Option<evertrace_codex::policy::PolicyEvidence>)>;
@@ -1112,6 +1250,7 @@ impl HumanGovernanceService {
         index: &export::SearchReadIndex<'_>,
         checks: &BTreeSet<String>,
         archive_budget: &mut RelationArchiveBudget,
+        research: bool,
         deadline: std::time::Instant,
     ) -> bool {
         let mut verify_relation_archive = false;
@@ -1130,6 +1269,28 @@ impl HumanGovernanceService {
                     .is_err()
                 {
                     return false;
+                }
+                if research
+                    && matches!(
+                        row.object_kind.as_deref(),
+                        Some("experiment_run" | "result_evidence")
+                    )
+                {
+                    let Some(runtime) = &self.runtime_snapshot else {
+                        return false;
+                    };
+                    if !check_research_archive(
+                        row,
+                        &self.writer,
+                        &runtime.cas_dir,
+                        index,
+                        archive_budget,
+                        deadline,
+                    )
+                    .await
+                    {
+                        return false;
+                    }
                 }
                 if row.object_kind.as_deref() == Some("work_binding") {
                     let (Some(proof), Some(runtime)) =
@@ -1282,6 +1443,7 @@ impl HumanGovernanceService {
                     &index,
                     &checks,
                     &mut cursor.relation_archive_budget,
+                    research_anchor(query.selection, &query.text, &query.facets).is_some(),
                     deadline,
                 )
                 .await
@@ -1545,10 +1707,44 @@ impl HumanGovernanceService {
                 deadline,
             )
             .map_err(|_| HumanGovernanceError::Store)?;
+            let research = if let Some(anchor) =
+                research_anchor(query.selection, &protected.text, &protected.facets)
+            {
+                let results = protected
+                    .facets
+                    .relation_requirements
+                    .iter()
+                    .any(|kind| kind == RUN_RESULT_RELATION);
+                let repository = selected_repository.ok().flatten().map(|id| id.to_string());
+                let (keys, truncated) = if research_head(&index, anchor)
+                    .is_some_and(|root| repository.is_some() && root.repository_id == repository)
+                {
+                    if protected.facets.relation_requirements.is_empty() {
+                        (BTreeSet::from([anchor.to_owned()]), false)
+                    } else {
+                        research_neighbours(&search, snapshot.frontier, anchor, results).await?
+                    }
+                } else {
+                    (BTreeSet::new(), false)
+                };
+                Some((anchor.to_owned(), keys, truncated))
+            } else {
+                None
+            };
             let mut refs = BTreeSet::new();
             let mut proposals = BTreeSet::new();
-            let mut unavailable = false;
-            for row in snapshot.data_rows() {
+            let mut unavailable = research
+                .as_ref()
+                .is_some_and(|(_, _, truncated)| *truncated);
+            let mut relation_archive_budget = RelationArchiveBudget::default();
+            let mut relation_archive_gap = false;
+            let rows: Box<dyn Iterator<Item = &ObjectRow> + Send> =
+                if let Some((_, keys, _)) = &research {
+                    Box::new(keys.iter().filter_map(|key| research_head(&index, key)))
+                } else {
+                    Box::new(snapshot.data_rows())
+                };
+            for row in rows {
                 let kind = row.object_kind.as_deref().unwrap_or_default();
                 if kind == "wiki_projection"
                     || !matches!(kind, "source_observation" | "work_episode")
@@ -1564,6 +1760,21 @@ impl HumanGovernanceService {
                     .await
                 {
                     Ok(()) => {
+                        if research.is_some()
+                            && matches!(kind, "experiment_run" | "result_evidence")
+                            && !check_research_archive(
+                                row,
+                                &self.writer,
+                                &runtime.cas_dir,
+                                &index,
+                                &mut relation_archive_budget,
+                                deadline,
+                            )
+                            .await
+                        {
+                            relation_archive_gap = true;
+                            continue;
+                        }
                         let id = if kind == "source_observation" {
                             row.object_id.as_ref()
                         } else {
@@ -1582,8 +1793,6 @@ impl HumanGovernanceService {
                     Err(_) => unavailable = true,
                 }
             }
-            let mut relation_archive_budget = RelationArchiveBudget::default();
-            let mut relation_archive_gap = false;
             if let Some(proof) = &index.live_episode
                 && proof.admitted(&refs)
                 && !proof
@@ -1779,6 +1988,35 @@ impl HumanGovernanceService {
                 false,
             )?;
             canonical_sources.extend(physical_operands);
+            if let Some((anchor, keys, _)) = &research
+                && let Some(root) = research_head(&index, anchor)
+                && root.repository_id.as_deref()
+                    == repository_id.map(|id| id.to_string()).as_deref()
+                && root
+                    .current_revision_id
+                    .as_ref()
+                    .is_some_and(|id| refs.contains(id))
+            {
+                for key in keys.iter().filter(|key| *key != anchor) {
+                    let Some(row) = research_head(&index, key) else {
+                        continue;
+                    };
+                    if !row
+                        .current_revision_id
+                        .as_ref()
+                        .is_some_and(|id| refs.contains(id))
+                    {
+                        continue;
+                    }
+                    if !research_endpoint_matches(row, root, &index, &refs) {
+                        continue;
+                    }
+                    canonical_sources.push(
+                        evertrace_store::query::scoped_research_source(row, root)
+                            .map_err(|_| HumanGovernanceError::Store)?,
+                    );
+                }
+            }
             if let Some(lineage) = &lineage {
                 canonical_sources.extend(lineage.rows.iter().cloned());
             }
@@ -1985,6 +2223,7 @@ impl HumanGovernanceService {
                     &index,
                     &checks,
                     &mut relation_archive_budget,
+                    research.is_some(),
                     deadline,
                 )
                 .await;
