@@ -1,0 +1,72 @@
+{% from 'semantic_content.html' import text_list, exact_work_link %}
+{% set summary = item.proposal %}
+{% set review = item.get('proposal_review') %}
+<section data-proposal-review>
+  <h3>提案与核对版本</h3>
+  <dl class="observation-facts">
+    <dt>提案</dt><dd>{{ summary.proposal_id }}</dd>
+    <dt>提案修订</dt><dd>{{ summary.current_revision_id }}</dd>
+    <dt>读取水位</dt><dd>{{ frontier }}</dd>
+    <dt>指纹</dt><dd>{{ summary.fingerprint }}</dd>
+    <dt>操作 / 目标类型</dt><dd>{{ summary.operation }} / {{ summary.target_kind }}</dd>
+    <dt>目标</dt><dd>{{ summary.target_id or '尚无目标对象' }}</dd>
+    <dt>基准修订</dt><dd>{{ summary.base_revision_id or '无基准修订' }}</dd>
+    <dt>提案状态 / 资格</dt><dd>{{ summary.status }} / {{ summary.eligibility }}</dd>
+  </dl>
+  {% if review %}
+    <h3>待确认内容（未作为当前记忆发布）</h3>
+    {% set proposal = review.proposal %}
+    {% set payload = proposal.payload %}
+    {% set change = payload.value %}
+    {% if payload.kind == 'atom' and summary.operation == 'deprecate' %}
+      <h4>弃用理由</h4><div class="memory-prose semantic-body">{{ change.reason }}</div>
+    {% elif payload.kind == 'atom' %}
+      {% if summary.operation == 'merge' %}
+        {{ text_list('拟合并的修订', change.merged_revision_refs, record_kind='atom_revision', exact_revision=true) }}
+      {% endif %}
+      {% if summary.operation == 'split' %}
+        {% for draft in change.drafts %}
+          <h4>拟拆分项 {{ loop.index }}</h4>
+          {% with content={'kind': 'atom_draft', 'value': draft} %}{% include 'semantic_content.html' %}{% endwith %}
+        {% endfor %}
+      {% else %}
+        {% with content={'kind': 'atom_draft', 'value': change.draft} %}{% include 'semantic_content.html' %}{% endwith %}
+      {% endif %}
+    {% elif payload.kind == 'procedure' %}
+      {% with content={'kind': 'procedure_draft', 'value': change} %}{% include 'semantic_content.html' %}{% endwith %}
+    {% elif payload.kind == 'core_membership' %}
+      <h4>拟议 Core 范围</h4><p>{{ change.scope_identity.kind }} {{ change.scope_identity.id|default('') }}</p>
+      {% if change.action == 'create' %}
+        <p>拟纳入的修订：{{ exact_work_link('atom_revision', change.atom_revision_id) }}</p>
+      {% else %}
+        <p>冲突双方：{{ exact_work_link('atom_revision', change.left_atom_revision_id) }}
+          {{ exact_work_link('atom_revision', change.right_atom_revision_id) }}</p>
+      {% endif %}
+    {% else %}
+      <p>此目标未开放审核操作。</p>
+      <div class="memory-prose">{{ change.summary }}</div>
+    {% endif %}
+    {{ text_list('原生来源集合', summary.source_cohort_refs) }}
+    {{ text_list('提案证据', proposal.evidence_refs) }}
+    {% if proposal.review_reason %}<p>原生审核原因：{{ proposal.review_reason }}</p>{% endif %}
+    {% if proposal.waiting_on %}{{ text_list('仍在等待', proposal.waiting_on) }}{% endif %}
+    <p>普通接受资格：{{ '具备' if review.plain_accept_eligible else '不具备' }}；
+      合并接受资格：{{ '具备' if review.merge_and_accept_eligible else '不具备' }}。这不是浏览器授权。</p>
+    {% if review.get('reauthorization') %}
+      <p>此前已删除；普通接受不能恢复此记录。需要明确再授权。</p>
+      <dl class="observation-facts">
+        <dt>删除代次</dt><dd>{{ review.reauthorization.deletion_generation }}</dd>
+        <dt>删除审计</dt><dd>{{ review.reauthorization.purge_job_audit_ref }}</dd>
+      </dl>
+    {% endif %}
+  {% else %}
+    <p>本次没有返回可读正文或审核资格；不显示旧正文。</p>
+  {% endif %}
+  {% set base = item.get('proposal_base') %}
+  {% if base and base.state == 'ready' and base.content %}
+    <details><summary>原基准修订</summary>
+    {% with content=base.content %}{% include 'semantic_content.html' %}{% endwith %}</details>
+  {% elif summary.base_revision_id %}
+    <p>未返回原基准正文，不以当前目标代替。</p>
+  {% endif %}
+</section>

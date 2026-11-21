@@ -1,3 +1,6 @@
+{% if surface == 'inbox' %}
+<button class="button" type="button" data-nav-back hidden>返回上一条记录</button>
+{% endif %}
 {% if items|length != 1 %}
 <div class="empty">没有找到这份记录，或当前无法读取。未用其它任务、当前修订或空正文代替。</div>
 {% else %}
@@ -72,33 +75,7 @@
 <p class="notice">
   审核操作尚未开放。这里显示现有原生事实；能看见元数据不代表正文可读、提案可接受或支持已恢复。
 </p>
-{% if item.proposal %}
-<section>
-  <h3>提案与预期修订</h3>
-  <dl class="observation-facts">
-    <dt>操作 / 目标</dt><dd>{{ item.proposal.operation }} / {{ item.proposal.target_kind }}</dd>
-    <dt>提案状态 / 资格</dt><dd>{{ item.proposal.status }} / {{ item.proposal.eligibility }}</dd>
-    <dt>指纹</dt><dd>{{ item.proposal.fingerprint }}</dd>
-    <dt>基准修订</dt><dd>{{ item.proposal.base_revision_id or '无基准修订' }}</dd>
-  </dl>
-</section>
-{% endif %}
-{% if item.proposal_review %}
-<section>
-  <h3>原生提案正文（只读）</h3>
-  <p>
-    普通接受资格：{{ '具备' if item.proposal_review.plain_accept_eligible else '不具备' }}；
-    合并接受资格：{{ '具备' if item.proposal_review.merge_and_accept_eligible else '不具备' }}。
-    这不是浏览器授权。
-  </p>
-  <pre>{{ item.proposal_review.proposal.payload|pretty }}</pre>
-</section>
-{% elif item.proposal %}
-<p>本次没有返回可读提案正文或审核上下文；不显示旧正文。</p>
-{% endif %}
-{% if item.get('proposal_base') %}
-<section><h3>原基准修订</h3><pre>{{ item.proposal_base|pretty }}</pre></section>
-{% endif %}
+{% if item.proposal %}{% include 'proposal_review.html' %}{% endif %}
 {% for field, label in [
   ('negative_review', '负面证据审核'),
   ('support_detail', '支持状态'),

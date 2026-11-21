@@ -35,6 +35,7 @@
   <h4>预期状态变化</h4><div class="memory-prose">{{ phase.expected_state_transition }}</div>
 </section>
 {% endmacro %}
+{% if content is defined %}
 {% set value = content.value %}
 <div class="semantic-content" data-semantic-kind="{{ content.kind }}">
 {% if content.kind == 'recall_need' %}
@@ -43,7 +44,7 @@
 {% include 'global_support.html' %}
 {% elif content.kind in ('procedure_usage', 'procedure_negative', 'procedure_negative_review', 'procedure_effect') %}
   {% include 'usage_ledger.html' %}
-{% elif content.kind == 'atom' %}
+{% elif content.kind in ('atom', 'atom_draft') %}
   <h2>{{ value.value.subject }}</h2>
   <p class="muted">类型：{{ value.kind }}</p>
   <div class="memory-prose semantic-body">{{ value.value.text }}</div>
@@ -60,7 +61,8 @@
   <details>
     <summary>范围、适用条件与有效期</summary>
     <h3>已存范围</h3><pre>{{ value.scope|pretty }}</pre>
-    <h3>原生适用条件（IR v{{ value.condition_ir_version }}）</h3><pre>{{ value.applicability_expr|pretty }}</pre>
+    <h3>原生适用条件{% if content.kind == 'atom' %}（IR v{{ value.condition_ir_version }}）{% endif %}</h3>
+    <pre>{{ value.applicability_expr|pretty }}</pre>
     <h3>有效期</h3><pre>{{ value.validity_interval|pretty }}</pre>
     {% if value.get('future_cue_lifecycle_exprs') is not none %}
     <h3>未来提示生命周期条件</h3><pre>{{ value.future_cue_lifecycle_exprs|pretty }}</pre>
@@ -79,11 +81,12 @@
     {% if value.get('policy_authority_provenance') is not none %}
     <h3>策略权威来源</h3><pre>{{ value.policy_authority_provenance|pretty }}</pre>{% endif %}
   </details>
-{% elif content.kind == 'procedure' %}
+{% elif content.kind in ('procedure', 'procedure_draft') %}
   {% set draft = value.draft %}
   <h2>{{ draft.title }}</h2>
   <div class="memory-prose semantic-body">{{ draft.summary }}</div>
-  <p class="muted">已存方法：{{ draft.kind }}。是否可用于当前执行仍由原生上下文与权限门决定。</p>
+  <p class="muted">{{ '待审核方法' if content.kind == 'procedure_draft' else '已存方法' }}：{{ draft.kind }}。
+    是否可用于当前执行仍由原生上下文与权限门决定。</p>
   {{ text_list('步骤', draft.actions.stages, true) }}
   {% for branch in draft.actions.branches %}
   <section class="semantic-section">
@@ -368,3 +371,4 @@
   data-kind="{{ item.object_kind }}">读取前一修订</button>
 {% endif %}
 </div>
+{% endif %}

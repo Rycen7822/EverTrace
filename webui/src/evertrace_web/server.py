@@ -698,7 +698,7 @@ def present_detail(templates, result, surface):
         else None
     )
     return {
-        "html": templates.get_template(template).render(items=result["items"], surface=surface),
+        "html": templates.get_template(template).render(items=result["items"], surface=surface, frontier=result.get("frontier")),
         "source_preview": preview,
         "semantic_text": semantic_text,
         "selection": selection,

@@ -354,6 +354,7 @@ function followRecord(item, restore = null) {
       revision: current.revision,
       object: current.object,
       kind: current.kind,
+      surface: current.surface,
       compiled: current.compiled ? { ...current.compiled } : null,
     },
     scroll: $("detail-body").scrollTop,
