@@ -15,7 +15,7 @@ import uvicorn
 import orjson
 from uvicorn.protocols.http.h11_impl import H11Protocol
 
-from .backend import Backend, BackendError, _decode
+from .backend import Backend, BackendError, _decode, verify_peer
 from .jobs import read_jobs
 from .comparison import read_comparison
 from .research import read_research_comparison
@@ -784,11 +784,14 @@ def parse_frontier(value, optional=False):
     return value
 
 
-async def serve(context, port):
-    backend = Backend(context["socket"], context["config_hash"], context["build_id"])
-    await backend.health()
+async def serve(context, port, channel):
+    verify_peer(channel)
     listener = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    connection = None
     try:
+        connection = await asyncio.open_unix_connection(sock=channel, limit=16_384)
+        backend = Backend(context["socket"], context["config_hash"], context["build_id"], connection)
+        await backend.health()
         listener.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
         listener.bind(("127.0.0.1", port))
         listener.listen(16)
@@ -813,7 +816,9 @@ async def serve(context, port):
         await uvicorn.Server(config).serve(sockets=[listener])
     finally:
         listener.close()
+        if connection is not None:
+            connection[1].transport.abort()
 
 
-def run(context, port):
-    asyncio.run(serve(context, port))
+def run(context, port, channel):
+    asyncio.run(serve(context, port, channel))

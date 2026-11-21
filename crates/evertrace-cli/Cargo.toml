@@ -13,6 +13,7 @@ evertrace-engine = { path = "../evertrace-engine" }
 evertrace-protocol = { path = "../evertrace-protocol" }
 evertrace-store = { path = "../evertrace-store" }
 evertrace-tui = { path = "../evertrace-tui" }
+rustix.workspace = true
 serde_json.workspace = true
 tokio.workspace = true
 

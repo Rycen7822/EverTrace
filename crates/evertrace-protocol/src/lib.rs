@@ -66,6 +66,7 @@ pub struct ServerOptions {
     pub build_id: String,
     pub frame_timeout: Duration,
     pub connection_limit: usize,
+    web_launcher: Option<fn(dto::PeerCredentials) -> bool>,
 }
 
 #[cfg(feature = "runtime")]
@@ -75,7 +76,13 @@ impl ServerOptions {
             build_id: build_id.into(),
             frame_timeout: Duration::from_secs(2),
             connection_limit: DEFAULT_CONNECTION_LIMIT,
+            web_launcher: None,
         }
+    }
+
+    pub fn with_web_launcher(mut self, verify: fn(dto::PeerCredentials) -> bool) -> Self {
+        self.web_launcher = Some(verify);
+        self
     }
 
     pub fn with_frame_timeout(mut self, value: Duration) -> Self {
@@ -333,22 +340,28 @@ where
         .await;
         return Err(ProtocolError::InvalidNegotiation);
     }
-    if handshake.client_kind == dto::ClientKind::Web
-        && stream.peer_cred().map_err(ProtocolError::Identity)?.uid() != effective_uid()?
-    {
-        return Err(ProtocolError::IdentityUnavailable);
+    let peer_credentials = stream.peer_cred().ok().and_then(|peer| {
+        Some(dto::PeerCredentials {
+            pid: u32::try_from(peer.pid()?).ok()?,
+            uid: peer.uid(),
+            gid: peer.gid(),
+        })
+    });
+    let mut web_launcher = false;
+    if handshake.client_kind == dto::ClientKind::Web {
+        let peer = peer_credentials.ok_or(ProtocolError::IdentityUnavailable)?;
+        if peer.uid != effective_uid()? {
+            return Err(ProtocolError::IdentityUnavailable);
+        }
+        web_launcher = handshake.build_id == options.build_id
+            && options.web_launcher.is_some_and(|verify| verify(peer));
     }
     let negotiated_max = handshake.max_frame.min(MAX_FRAME_SIZE as u32);
     let connection_context = dto::ConnectionContext {
         connection_id,
         client_kind: handshake.client_kind,
-        peer_credentials: stream.peer_cred().ok().and_then(|peer| {
-            Some(dto::PeerCredentials {
-                pid: u32::try_from(peer.pid()?).ok()?,
-                uid: peer.uid(),
-                gid: peer.gid(),
-            })
-        }),
+        peer_credentials,
+        web_launcher,
         mcp_returned: None,
         connection_lifetime: std::sync::Arc::new(()),
     };
@@ -379,11 +392,11 @@ where
     loop {
         let message = tokio::select! {
             result = async {
-                // MCP and interactive CLI/TUI clients keep long-lived connections.
-                // Idle transport is not a disconnected client. Once
-                // a frame starts, the existing prefix/payload limits still
-                // apply; this grants no binding or repository authority.
-                if matches!(connection_context.client_kind, dto::ClientKind::Mcp | dto::ClientKind::Cli) {
+                // Interactive clients and the inherited Web channel may idle.
+                // Once a frame starts, the existing prefix/payload limits still apply.
+                if connection_context.web_launcher
+                    || matches!(connection_context.client_kind, dto::ClientKind::Mcp | dto::ClientKind::Cli)
+                {
                     read_frame_after_idle::<ClientEnvelope>(&mut stream, negotiated_max as usize, options.frame_timeout).await
                 } else {
                     read_frame::<ClientEnvelope>(&mut stream, negotiated_max as usize, options.frame_timeout).await
@@ -771,6 +784,14 @@ impl LocalClient {
             ServerEnvelope::Error(_) => Err(ProtocolError::RequestIdMismatch),
             _ => Err(ProtocolError::UnexpectedMessage),
         }
+    }
+
+    /// Transfer the already-negotiated connection to the packaged Python companion.
+    pub fn into_web_launcher_stream(self) -> Result<StdUnixStream, ProtocolError> {
+        if self.negotiated_max != MAX_FRAME_SIZE {
+            return Err(ProtocolError::InvalidNegotiation);
+        }
+        self.stream.into_std().map_err(ProtocolError::Connect)
     }
 
     pub fn into_split(self) -> (LocalCommandSender, LocalIncomingReceiver) {

@@ -1838,6 +1838,7 @@ dependencies = [
  "evertrace-protocol",
  "evertrace-store",
  "evertrace-tui",
+ "rustix 1.1.4",
  "serde_json",
  "tokio",
 ]

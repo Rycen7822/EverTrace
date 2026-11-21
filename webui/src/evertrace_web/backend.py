@@ -18,6 +18,17 @@ import orjson
 from . import BackendError
 
 
+def verify_peer(peer):
+    if hasattr(socket, "SO_PEERCRED"):
+        uid = struct.unpack("3i", peer.getsockopt(socket.SOL_SOCKET, socket.SO_PEERCRED, 12))[1]
+    elif hasattr(peer, "getpeereid"):
+        uid = peer.getpeereid()[0]
+    else:
+        raise BackendError("peer_identity_unavailable")
+    if uid != os.geteuid():
+        raise BackendError("socket_changed")
+
+
 def normalize_scope(value, boundary=False):
     # Wire shape only. Native identity, membership and permission resolution is
     # never inferred from a path, a label or the most recent session here.
@@ -219,10 +230,12 @@ def normalize_archive_query(query):
 
 
 class Backend:
-    def __init__(self, socket_path, config_hash, build_id):
+    def __init__(self, socket_path, config_hash, build_id, confirmation_channel=None):
         self.path = Path(socket_path)
         self.config_hash = config_hash
         self.build_id = build_id
+        self.confirmation_channel = confirmation_channel
+        self.confirmation_lock = asyncio.Lock() if confirmation_channel is not None else None
 
     async def health(self):
         return await self._request(None)
@@ -612,7 +625,7 @@ class Backend:
         result = await self._request({
             "kind": "proposal_review", "proposal_id": proposal_id, "expected_revision_id": revision,
             "expected_frontier": frontier, "expected_digest": expected_digest,
-        })
+        }, confirmation=expected_digest is not None)
         if result["kind"] not in ("conflict", "proposal_review"):
             raise BackendError("invalid_read_response")
         if result["kind"] == "proposal_review":
@@ -665,23 +678,20 @@ class Backend:
             raise BackendError("invalid_read_response")
         return page
 
-    async def _request(self, read):
+    async def _request(self, read, *, confirmation=False):
         async def execute():
             writer = None
             try:
-                before = _private_socket(self.path)
-                reader, writer = await asyncio.open_unix_connection(str(self.path), limit=16_384)
-                peer = writer.get_extra_info("socket")
-                if hasattr(socket, "SO_PEERCRED"):
-                    uid = struct.unpack(
-                        "3i", peer.getsockopt(socket.SOL_SOCKET, socket.SO_PEERCRED, 12)
-                    )[1]
-                elif hasattr(peer, "getpeereid"):
-                    uid = peer.getpeereid()[0]
+                if confirmation:
+                    if self.confirmation_channel is None:
+                        raise BackendError("confirmation_channel_unavailable")
+                    reader, writer = self.confirmation_channel
                 else:
-                    raise BackendError("peer_identity_unavailable")
-                if uid != os.geteuid() or before != _private_socket(self.path):
-                    raise BackendError("socket_changed")
+                    before = _private_socket(self.path)
+                    reader, writer = await asyncio.open_unix_connection(str(self.path), limit=16_384)
+                    verify_peer(writer.get_extra_info("socket"))
+                    if before != _private_socket(self.path):
+                        raise BackendError("socket_changed")
                 maximum = MAX_FRAME
 
                 async def send(value):
@@ -697,28 +707,21 @@ class Backend:
                         raise BackendError("invalid_frame")
                     return _decode(await reader.readexactly(size), canonical=True)
 
-                await send(
-                    {
-                        "kind": "handshake",
-                        "body": {
-                            "protocol_version": 1,
-                            "client_kind": "web",
-                            "build_id": self.build_id,
-                            "max_frame": maximum,
-                        },
-                    }
-                )
-                ack = await receive()
-                body = ack.get("body", {})
-                if (
-                    ack.get("kind") != "handshake_ack"
-                    or body.get("protocol_version") != 1
-                    or body.get("build_id") != self.build_id
-                    or type(body.get("max_frame")) is not int
-                    or not 0 < body["max_frame"] <= maximum
-                ):
-                    raise BackendError("version_mismatch")
-                maximum = body["max_frame"]
+                if not confirmation:
+                    await send({"kind": "handshake", "body": {
+                        "protocol_version": 1, "client_kind": "web", "build_id": self.build_id, "max_frame": maximum,
+                    }})
+                    ack = await receive()
+                    body = ack.get("body", {})
+                    if (
+                        ack.get("kind") != "handshake_ack"
+                        or body.get("protocol_version") != 1
+                        or body.get("build_id") != self.build_id
+                        or type(body.get("max_frame")) is not int
+                        or not 0 < body["max_frame"] <= maximum
+                    ):
+                        raise BackendError("version_mismatch")
+                    maximum = body["max_frame"]
 
                 async def call(command):
                     identity = _request_id()
@@ -767,16 +770,26 @@ class Backend:
                     raise BackendError("invalid_read_response")
                 return result
             finally:
-                if writer is not None:
-                    writer.close()
-                    # Failed/cancelled reads must not leave a buffered UDS
-                    # transport alive beyond this one request.
+                if writer is not None and not confirmation:
                     writer.transport.abort()
                     with contextlib.suppress(Exception):
                         await writer.wait_closed()
 
+        async def confirm():
+            if self.confirmation_lock is None:
+                raise BackendError("confirmation_channel_unavailable")
+            async with self.confirmation_lock:
+                try:
+                    return await execute()
+                except (Exception, asyncio.CancelledError):
+                    # Never reuse a channel whose request/response boundary may be lost.
+                    if self.confirmation_channel is not None:
+                        self.confirmation_channel[1].transport.abort()
+                        self.confirmation_channel = None
+                    raise
+
         try:
-            return await asyncio.wait_for(execute(), 5)
+            return await asyncio.wait_for(confirm() if confirmation else execute(), 5)
         except BackendError:
             raise
         except (

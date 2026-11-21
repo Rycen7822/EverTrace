@@ -7,9 +7,12 @@ use std::{
     error::Error,
     fs,
     io::Write,
-    os::unix::{
-        fs::{MetadataExt, PermissionsExt},
-        process::CommandExt,
+    os::{
+        fd::AsRawFd,
+        unix::{
+            fs::{MetadataExt, PermissionsExt},
+            process::CommandExt,
+        },
     },
     path::{Path, PathBuf},
     process::{Command, Stdio},
@@ -59,7 +62,7 @@ pub async fn run(config: Option<PathBuf>, port: u16) -> Result<(), Box<dyn Error
     )?;
     let socket = data.join("runtime/evertraced-v1.sock");
     let config_hash = hex(&effective.hash());
-    let health = tokio::time::timeout(Duration::from_secs(5), async {
+    let (client, health) = tokio::time::timeout(Duration::from_secs(5), async {
         let mut client = LocalClient::connect(
             &socket,
             env!("CARGO_PKG_VERSION"),
@@ -67,9 +70,10 @@ pub async fn run(config: Option<PathBuf>, port: u16) -> Result<(), Box<dyn Error
             Duration::from_secs(5),
         )
         .await?;
-        client
+        let health = client
             .request(RequestId::new_v7(), WireCommand::Health)
-            .await
+            .await?;
+        Ok::<_, evertrace_protocol::error::ProtocolError>((client, health))
     })
     .await
     .map_err(
@@ -96,19 +100,22 @@ pub async fn run(config: Option<PathBuf>, port: u16) -> Result<(), Box<dyn Error
     )
     .await
     .map_err(|error| format!("optional Python Web component is unavailable: {error}"))?;
+    let channel = client.into_web_launcher_stream()?;
     let descriptor = serde_json::to_vec(&serde_json::json!({
         "socket": socket,
         "config_hash": config_hash,
         "build_id": env!("CARGO_PKG_VERSION"),
+        "channel_fd": channel.as_raw_fd(),
     }))?;
-    // Linux pipe capacity is at least PIPE_BUF (4096). Write before exec only
-    // within that bound; close the writer so Python observes EOF immediately.
-    if descriptor.len() > 4096 {
-        return Err("Web startup context exceeds 4096 bytes".into());
+    // Bound the anonymous descriptor by Linux's minimum PIPE_BUF before exec.
+    if descriptor.len() > 4096 || channel.as_raw_fd() < 3 {
+        return Err("invalid Web startup descriptor".into());
     }
     let (reader, mut writer) = std::io::pipe()?;
     writer.write_all(&descriptor)?;
     drop(writer);
+    // No child is launched after the component probe except the exec below.
+    rustix::io::fcntl_setfd(&channel, rustix::io::FdFlags::empty())?;
     let error = Command::new(python)
         .arg("-I")
         .arg("-B")

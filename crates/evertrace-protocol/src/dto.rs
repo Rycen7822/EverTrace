@@ -46,6 +46,8 @@ pub struct ConnectionContext {
     pub client_kind: ClientKind,
     /// Kernel observations, never supplied by the handshake or serialized.
     pub peer_credentials: Option<PeerCredentials>,
+    /// Daemon-verified launcher at handshake, preserved only on this connection.
+    pub web_launcher: bool,
     /// Its weak form lets an in-flight observer detect connection termination.
     pub connection_lifetime: std::sync::Arc<()>,
     /// Server-only association from a successfully sent, budgeted response.

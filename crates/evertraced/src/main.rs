@@ -9,6 +9,7 @@ mod mcp_output;
 
 use std::{
     env, fs,
+    os::unix::fs::MetadataExt,
     path::PathBuf,
     sync::{
         Arc,
@@ -68,6 +69,23 @@ use evertrace_protocol::{
 };
 use tokio::sync::{RwLock, mpsc, watch};
 use tracing_subscriber::{Layer, layer::SubscriberExt};
+
+fn is_web_launcher(peer: evertrace_protocol::dto::PeerCredentials) -> bool {
+    let Ok(daemon) = env::current_exe() else {
+        return false;
+    };
+    let Ok(owner) = fs::metadata(&daemon) else {
+        return false;
+    };
+    let Ok(launcher) = fs::symlink_metadata(daemon.with_file_name("evertrace")) else {
+        return false;
+    };
+    if !launcher.is_file() || launcher.uid() != owner.uid() || launcher.mode() & 0o6022 != 0 {
+        return false;
+    }
+    fs::metadata(format!("/proc/{}/exe", peer.pid))
+        .is_ok_and(|exe| (exe.dev(), exe.ino()) == (launcher.dev(), launcher.ino()))
+}
 
 fn lifecycle_filter<S>(engine: Arc<EngineService>) -> impl tracing_subscriber::layer::Filter<S>
 where
@@ -334,7 +352,9 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
         recovery_action_service
             .reconcile_pending_on_startup()
             .await?;
-        let server = LocalServer::bind(&data_dir, ServerOptions::new(env!("CARGO_PKG_VERSION")))?;
+        let options =
+            ServerOptions::new(env!("CARGO_PKG_VERSION")).with_web_launcher(is_web_launcher);
+        let server = LocalServer::bind(&data_dir, options)?;
         let ingestor = evertrace_engine::EvidenceIngestor::new(
             runtime_snapshot.clone(),
             writer_handle.as_ref().ok_or("writer unavailable")?.clone(),
@@ -1111,7 +1131,9 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
                                 HumanReadRequest::ProposalReview {
                                     proposal_id, expected_revision_id, expected_frontier, expected_digest,
                                 } => {
-                                    if context.client_kind != ClientKind::Web { return Err(ErrorCode::Untrusted); }
+                                    if context.client_kind != ClientKind::Web || expected_digest.is_some() && !context.web_launcher {
+                                        return Err(ErrorCode::Untrusted);
+                                    }
                                     Box::pin(read_proposal_review(
                                         &human_governance, &proposal_id.to_string(), &expected_revision_id.to_string(),
                                         expected_frontier, expected_digest.as_deref(),

@@ -3,7 +3,9 @@ import argparse
 import errno
 from importlib.metadata import version
 import json
+import os
 import re
+import socket
 import sys
 
 
@@ -21,19 +23,28 @@ def main():
         return
     if not args.startup_stdin or sys.stdin.isatty() or not 0 <= args.port <= 65535:
         parser.error("a private launcher stdin and valid loopback port are required")
-    raw = sys.stdin.buffer.read(8193)
     try:
+        raw = sys.stdin.buffer.read(4097)
         context = json.loads(raw)
-        if len(raw) > 8192 or set(context) != {"socket", "config_hash", "build_id"}:
+        if len(raw) > 4096 or set(context) != {"socket", "config_hash", "build_id", "channel_fd"}:
             raise ValueError()
-        if not isinstance(context["socket"], str) or not context["socket"].startswith("/") or not re.fullmatch("[0-9a-f]{64}", context["config_hash"]) or context["build_id"] != build:
+        path, config_hash, fd = context["socket"], context["config_hash"], context.pop("channel_fd")
+        if not isinstance(path, str) or not path.startswith("/") or not re.fullmatch("[0-9a-f]{64}", config_hash):
             raise ValueError()
-    except (ValueError, TypeError):
-        parser.error("invalid private startup context")
+        if context["build_id"] != build or type(fd) is not int or fd < 3:
+            raise ValueError()
+        os.set_inheritable(fd, False)
+        channel = socket.socket(fileno=fd)
+        if channel.family != socket.AF_UNIX or channel.type != socket.SOCK_STREAM or channel.getpeername() != path:
+            channel.close()
+            raise ValueError()
+    except (OSError, TypeError, ValueError, KeyError):
+        parser.error("invalid private launcher context")
     from . import BackendError
     try:
         from .server import run
-        run(context, args.port)
+        with channel:
+            run(context, args.port, channel)
     except BackendError as error:
         messages = {
             "version_mismatch": "Web and daemon package versions do not match.",
