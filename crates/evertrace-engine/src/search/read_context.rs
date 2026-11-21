@@ -1124,6 +1124,110 @@ impl SearchReadAccess<'_> {
     }
 }
 
+/// Bulk admission for reciprocal, unscoped observation/receipt pairs only. Their physical scopes still
+/// come from the original live source assessment. Scoped or unfamiliar closures use the ordinary reader.
+pub(crate) async fn search_observation_access<'a>(
+    writer: &WriterHandle,
+    authority: &RepositoryReadAuthority<'_>,
+    snapshot: &'a evertrace_store::ProjectionSnapshot,
+    index: &BTreeMap<&str, Vec<&'a ObjectRow>>,
+    deadline: Instant,
+) -> BTreeMap<&'a str, bool> {
+    use evertrace_domain::query::METADATA_READ_LIMIT;
+    use evertrace_store::projections::ObjectDeletionCandidateAdmissionView;
+    let mut sources = snapshot
+        .data_rows()
+        .filter(|row| row.object_kind.as_deref() == Some("source_observation"));
+    let mut decisions = BTreeMap::new();
+    loop {
+        let pairs: Vec<_> = sources
+            .by_ref()
+            .take_while(|_| Instant::now() < deadline)
+            .filter_map(|row| search_observation_pair(row, index))
+            .take(usize::from(METADATA_READ_LIMIT) / 2)
+            .collect();
+        if pairs.is_empty() || Instant::now() >= deadline {
+            break;
+        }
+        let rows: Vec<_> = pairs
+            .iter()
+            .flat_map(|(observation, receipt, _)| [*observation, *receipt])
+            .collect();
+        let Ok((denied, _)) = crate::session_import::source_rows_read_assessment(
+            writer,
+            authority,
+            &snapshot.rows,
+            &rows,
+            None,
+            Some(deadline),
+        )
+        .await
+        else {
+            continue;
+        };
+        let mut references: Vec<_> = pairs.iter().map(|(_, _, id)| (*id).to_owned()).collect();
+        references.sort_unstable();
+        references.dedup();
+        let Ok(deletion) =
+            ObjectDeletionCandidateAdmissionView::for_source_refs(snapshot, &references)
+        else {
+            continue;
+        };
+        for (observation, receipt, reference) in pairs {
+            if let Ok(suppressed) = deletion.source_refs_suppressed(&[reference.to_owned()]) {
+                let allowed = !suppressed
+                    && !denied.contains(&observation.row_id)
+                    && !denied.contains(&receipt.row_id);
+                decisions.insert(observation.row_id.as_str(), allowed);
+                decisions.insert(receipt.row_id.as_str(), allowed);
+            }
+        }
+    }
+    decisions
+}
+
+fn search_observation_pair<'a>(
+    row: &'a ObjectRow,
+    index: &BTreeMap<&str, Vec<&'a ObjectRow>>,
+) -> Option<(&'a ObjectRow, &'a ObjectRow, &'a str)> {
+    let unscoped = |row: &ObjectRow| {
+        row.task_id.is_none() && row.repository_id.is_none() && row.worktree_id.is_none()
+    };
+    let id = row.object_id.as_deref()?;
+    if !unscoped(row) || !matches!(index.get(id)?.as_slice(), [unique] if unique.row_id==row.row_id)
+    {
+        return None;
+    }
+    let JournalPayload::SourceObservationRecorded(observation) =
+        serde_json::from_str(row.payload_json.as_deref()?).ok()?
+    else {
+        return None;
+    };
+    let receipt_id = observation.source_receipt_ref.to_string();
+    let [receipt_row] = index.get(receipt_id.as_str())?.as_slice() else {
+        return None;
+    };
+    if !unscoped(receipt_row)
+        || receipt_row.object_kind.as_deref() != Some("source_receipt")
+        || receipt_row.object_id.as_ref() != Some(&receipt_id)
+    {
+        return None;
+    }
+    let JournalPayload::SourceReceiptRecorded(receipt) =
+        serde_json::from_str(receipt_row.payload_json.as_deref()?).ok()?
+    else {
+        return None;
+    };
+    (observation.source_observation_id.to_string() == id
+        && receipt.source_receipt_id == observation.source_receipt_ref
+        && receipt.source_observation_id == observation.source_observation_id
+        && receipt.source_instance_id == observation.source_instance_id
+        && receipt.source_revision == observation.source_revision
+        && observation.validate().is_ok()
+        && receipt.validate().is_ok())
+    .then_some((row, *receipt_row, id))
+}
+
 /// Assess only the canonical source and repository closure; observation recording belongs to callers.
 pub(crate) async fn check_source_access(
     writer: &WriterHandle,
@@ -1132,7 +1236,19 @@ pub(crate) async fn check_source_access(
     rows: &[&ObjectRow],
     deadline: Instant,
 ) -> Result<(), ErrorCode> {
-    for chunk in rows.chunks(usize::from(evertrace_domain::query::METADATA_READ_LIMIT)) {
+    check_source_access_split(writer, authority, all_rows, rows, rows, deadline).await
+}
+
+/// `source_rows` may omit already admitted source leaves from the same request, never object scopes.
+pub(crate) async fn check_source_access_split(
+    writer: &WriterHandle,
+    authority: &RepositoryReadAuthority<'_>,
+    all_rows: &[ObjectRow],
+    rows: &[&ObjectRow],
+    source_rows: &[&ObjectRow],
+    deadline: Instant,
+) -> Result<(), ErrorCode> {
+    for chunk in source_rows.chunks(usize::from(evertrace_domain::query::METADATA_READ_LIMIT)) {
         if Instant::now() >= deadline {
             return Err(ErrorCode::ResourceExhausted);
         }

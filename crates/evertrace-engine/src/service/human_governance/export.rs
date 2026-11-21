@@ -93,7 +93,10 @@ impl<'a> SearchReadIndex<'a> {
 #[derive(Clone, Copy)]
 enum ReadUse<'a> {
     Detail,
-    Search(Option<&'a LiveEpisodeRead>),
+    Search(
+        Option<&'a LiveEpisodeRead>,
+        Option<&'a BTreeMap<&'a str, bool>>,
+    ),
 }
 
 impl HumanGovernanceService {
@@ -141,7 +144,8 @@ impl HumanGovernanceService {
         result.frontier = snapshot.frontier;
         let selection = select(&snapshot, &selections, deadline)?;
         result.object_count = selection.rows.len() as u16;
-        self.export_access(&snapshot, &selection, deadline).await?;
+        self.selected_access(&snapshot, &selection, None, deadline)
+            .await?;
         let rows = selection.rows.clone();
         let frontier = snapshot.frontier;
         // CAS decompression and filesystem writes never run inside the Writer actor.
@@ -156,7 +160,8 @@ impl HumanGovernanceService {
         if selection.rows != reselected.rows || selection.dependencies != reselected.dependencies {
             return Err(Failure::Conflict);
         }
-        self.export_access(&current, &reselected, deadline).await?;
+        self.selected_access(&current, &reselected, None, deadline)
+            .await?;
         check_deadline(deadline)?;
         let publication = tokio::task::spawn_blocking(move || stage.publish(deadline))
             .await
@@ -171,28 +176,33 @@ impl HumanGovernanceService {
         Ok(())
     }
 
-    async fn export_access(
+    async fn selected_access(
         &self,
         snapshot: &ProjectionSnapshot,
         selection: &Selection,
+        sources: Option<&BTreeMap<&str, bool>>,
         deadline: Instant,
     ) -> ExportResult<()> {
         let mut rows = selection.rows.iter().collect::<Vec<_>>();
         rows.extend(selection.dependencies.values().flatten());
         rows.sort_by(|left, right| left.row_id.cmp(&right.row_id));
         rows.dedup_by(|left, right| left.row_id == right.row_id);
-        self.resolved_rows_access(snapshot, &rows, deadline).await
-    }
-
-    async fn resolved_rows_access(
-        &self,
-        snapshot: &ProjectionSnapshot,
-        rows: &[&ObjectRow],
-        deadline: Instant,
-    ) -> ExportResult<()> {
-        self.source_repository_access(&snapshot.rows, rows, deadline)
+        let mut unresolved = Vec::new();
+        let source_rows = if let Some(sources) = sources {
+            for row in &rows {
+                match sources.get(row.row_id.as_str()) {
+                    Some(false) => return Err(Failure::Denied),
+                    Some(true) => {}
+                    None => unresolved.push(*row),
+                }
+            }
+            unresolved.as_slice()
+        } else {
+            rows.as_slice()
+        };
+        self.source_repository_access(&snapshot.rows, &rows, source_rows, deadline)
             .await?;
-        let observations = rows
+        let observations = source_rows
             .iter()
             .filter(|row| row.object_kind.as_deref() == Some("source_observation"))
             .filter_map(|row| row.object_id.clone())
@@ -214,17 +224,19 @@ impl HumanGovernanceService {
         &self,
         all_rows: &[ObjectRow],
         rows: &[&ObjectRow],
+        source_rows: &[&ObjectRow],
         deadline: Instant,
     ) -> ExportResult<()> {
         let report = match &self.session_report {
             Some(report) => report.read().await.clone(),
             None => None,
         };
-        super::super::object_read::check_source_access(
+        crate::search::read_context::check_source_access_split(
             &self.writer,
-            report.as_ref(),
+            &crate::repository::RepositoryReadAuthority::retained(report.as_ref()),
             all_rows,
             rows,
+            source_rows,
             deadline,
         )
         .await
@@ -265,14 +277,21 @@ impl HumanGovernanceService {
         snapshot: &ProjectionSnapshot,
         row: &ObjectRow,
         index: &SearchReadIndex<'_>,
+        sources: Option<&BTreeMap<&str, bool>>,
         deadline: Instant,
     ) -> Result<(), Failure> {
         let live = index
             .live_episode
             .as_ref()
             .filter(|proof| proof.contains(row));
-        self.readable_with_dependencies(snapshot, row, index, ReadUse::Search(live), deadline)
-            .await
+        self.readable_with_dependencies(
+            snapshot,
+            row,
+            index,
+            ReadUse::Search(live, sources),
+            deadline,
+        )
+        .await
     }
 
     async fn readable_with_dependencies(
@@ -283,10 +302,10 @@ impl HumanGovernanceService {
         purpose: ReadUse<'_>,
         deadline: Instant,
     ) -> Result<(), Failure> {
-        let for_search = matches!(purpose, ReadUse::Search(_));
-        let live_episode = match purpose {
-            ReadUse::Search(live) => live,
-            ReadUse::Detail => None,
+        let for_search = matches!(purpose, ReadUse::Search(..));
+        let (live_episode, sources) = match purpose {
+            ReadUse::Search(live, sources) => (live, sources),
+            ReadUse::Detail => (None, None),
         };
         let mut charged = BTreeSet::new();
         let mut remaining = MAX_METADATA_BYTES;
@@ -358,12 +377,13 @@ impl HumanGovernanceService {
                     }
             },
         )?;
-        self.export_access(
+        self.selected_access(
             snapshot,
             &Selection {
                 rows: vec![root],
                 dependencies,
             },
+            sources,
             deadline,
         )
         .await

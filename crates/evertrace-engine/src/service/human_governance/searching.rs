@@ -8,7 +8,7 @@ use evertrace_domain::{
 use crate::search::read_context::{
     ATTEMPT_RUN_RELATION, LINEAGE_RELATIONS, LineageQuery, LineageRead, RUN_RESULT_RELATION,
     RelationArchiveBudget, check_relation_archive, check_research_archive,
-    current_operation_binding, operation_binding_read,
+    current_operation_binding, operation_binding_read, search_observation_access,
 };
 
 const SEARCH_HIT_ORDER_REVISION: u32 = 12;
@@ -1041,7 +1041,7 @@ impl HumanGovernanceService {
                 .iter()
                 .filter(|row| row.row_class == Some(ObjectRowClass::Object))
                 .max_by_key(|row| row.source_event_seq)?;
-            self.readable_search_row(snapshot, current, index, deadline)
+            self.readable_search_row(snapshot, current, index, None, deadline)
                 .await
                 .ok()?;
             checks.insert(current.row_id.clone());
@@ -1278,7 +1278,7 @@ impl HumanGovernanceService {
             for row in rows {
                 found = true;
                 if self
-                    .readable_search_row(snapshot, row, index, deadline)
+                    .readable_search_row(snapshot, row, index, None, deadline)
                     .await
                     .is_err()
                 {
@@ -1782,6 +1782,18 @@ impl HumanGovernanceService {
                 .is_some_and(|(_, _, truncated)| *truncated);
             let mut relation_archive_budget = RelationArchiveBudget::default();
             let mut relation_archive_gap = false;
+            let observation_access = if research.is_none() && !exact_lineage {
+                Box::pin(search_observation_access(
+                    &self.writer,
+                    &RepositoryReadAuthority::retained(report.as_ref()),
+                    &snapshot,
+                    &index,
+                    deadline,
+                ))
+                .await
+            } else {
+                Default::default()
+            };
             let rows: Box<dyn Iterator<Item = &ObjectRow> + Send> =
                 if let Some((_, keys, _)) = &research {
                     Box::new(keys.iter().filter_map(|key| research_head(&index, key)))
@@ -1801,8 +1813,20 @@ impl HumanGovernanceService {
                 if std::time::Instant::now() >= deadline {
                     return Err(HumanGovernanceError::Store);
                 }
+                if let Some(allowed) = observation_access.get(row.row_id.as_str()) {
+                    if *allowed && let Some(id) = &row.object_id {
+                        refs.insert(id.clone());
+                    }
+                    continue;
+                }
                 match self
-                    .readable_search_row(&snapshot, row, &index, deadline)
+                    .readable_search_row(
+                        &snapshot,
+                        row,
+                        &index,
+                        (!observation_access.is_empty()).then_some(&observation_access),
+                        deadline,
+                    )
                     .await
                 {
                     Ok(()) => {
@@ -1868,7 +1892,7 @@ impl HumanGovernanceService {
             )
             .await
                 && self
-                    .readable_search_row(&snapshot, row, &index, deadline)
+                    .readable_search_row(&snapshot, row, &index, None, deadline)
                     .await
                     .is_ok()
                 && let Some(proof) = operation_binding_read(row, &index)
