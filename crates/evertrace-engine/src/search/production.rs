@@ -7,10 +7,10 @@ use std::{
 
 use evertrace_domain::query::{
     AnswerShape, CountUnit, FacetParseStatus, HumanSearchPage, LifecycleBoundary, Polarity,
-    QuantityConstraint, QueryError, RetrievalCompleteness, RetrievalLayer, ScopeBoundary,
-    SearchCandidate, SearchContext, SearchResult, SourceBoundary, SuppressionSnapshot,
-    TemporalMode, TemporalOrdering, TemporalQualifier, production_retrieval_layer,
-    requested_ordering,
+    QuantityConstraint, QueryError, QueryFacetSet, RetrievalCompleteness, RetrievalLayer,
+    ScopeBoundary, SearchCandidate, SearchContext, SearchResult, SourceBoundary,
+    SuppressionSnapshot, TemporalMode, TemporalOrdering, TemporalQualifier,
+    production_retrieval_layer, requested_ordering,
 };
 use evertrace_domain::{error::ErrorCode, evidence::SourceRevision};
 use evertrace_store::{
@@ -1368,24 +1368,8 @@ impl ProductionSearch {
         if exact_atom_only {
             filter.object_kind = Some("atom_revision".into());
         }
-        let requested_limit = if context.query_facets.count_unit().is_some()
-            || context.query_facets.answer_shape
-                == Some(evertrace_domain::query::AnswerShape::TemporalComparison)
-        {
-            context.budget.candidates_remaining
-        } else {
-            context
-                .query_facets
-                .quantity_constraints
-                .iter()
-                .filter_map(|constraint| match constraint {
-                    QuantityConstraint::ResultLimit { limit } => Some(*limit),
-                    QuantityConstraint::DistinctCount { .. } => None,
-                })
-                .min()
-                .unwrap_or(context.budget.candidates_remaining)
-                .min(context.budget.candidates_remaining)
-        };
+        let requested_limit =
+            candidate_limit(&context.query_facets, context.budget.candidates_remaining);
         let limit = usize::try_from(requested_limit).map_err(|_| SearchError::Unsupported)?;
         let fetch_limit = if limit >= 32 {
             limit
@@ -1831,6 +1815,28 @@ impl ProductionSearch {
             budget: context.budget,
         })
     }
+}
+
+pub(super) fn candidate_limit(facets: &QueryFacetSet, maximum: u32) -> u32 {
+    // Mechanical operators derive from the bounded candidate set, not display pagination.
+    if facets.count_unit().is_some()
+        || matches!(
+            facets.answer_shape,
+            Some(AnswerShape::Latest | AnswerShape::TemporalComparison)
+        )
+    {
+        return maximum;
+    }
+    facets
+        .quantity_constraints
+        .iter()
+        .filter_map(|constraint| match constraint {
+            QuantityConstraint::ResultLimit { limit } => Some(*limit),
+            QuantityConstraint::DistinctCount { .. } => None,
+        })
+        .min()
+        .unwrap_or(maximum)
+        .min(maximum)
 }
 
 fn target_anchor_position(context: &SearchContext, row: &SearchProjectionRow) -> Option<usize> {

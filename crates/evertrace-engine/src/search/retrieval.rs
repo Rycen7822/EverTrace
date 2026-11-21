@@ -7,7 +7,7 @@ use evertrace_store::{SearchHardFilter, SearchIndex, SearchProjectionRow, Search
 
 use super::{
     SearchError,
-    production::{RelationSources, RequestDeadline, hard_compatible},
+    production::{RelationSources, RequestDeadline, candidate_limit, hard_compatible},
     read_context::SearchReadAccess,
 };
 
@@ -1281,26 +1281,7 @@ impl NativeRetrieval<'_> {
         })
     }
     fn output_limit(&self) -> usize {
-        if self.context.query_facets.count_unit().is_some()
-            || matches!(
-                self.context.query_facets.answer_shape,
-                Some(AnswerShape::Latest | AnswerShape::TemporalComparison)
-            )
-        {
-            // Operators answer over the bounded set, not display pagination.
-            return 32;
-        }
-        self.context
-            .query_facets
-            .quantity_constraints
-            .iter()
-            .filter_map(|constraint| match constraint {
-                QuantityConstraint::ResultLimit { limit } => Some(*limit as usize),
-                QuantityConstraint::DistinctCount { .. } => None,
-            })
-            .min()
-            .unwrap_or(32)
-            .min(32)
+        candidate_limit(&self.context.query_facets, 32) as usize
     }
     fn answer_text_limit(&self) -> usize {
         // A quote occurs twice; metadata and the typed operator occur once.
