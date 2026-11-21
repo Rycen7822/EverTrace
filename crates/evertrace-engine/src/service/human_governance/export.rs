@@ -1,4 +1,5 @@
 use super::*;
+use crate::search::read_context::LiveEpisodeRead;
 use evertrace_capture::confined_read::ConfinedRoot;
 use std::{
     fs::{self, DirBuilder, File, OpenOptions},
@@ -58,6 +59,39 @@ type ExportResult<T> = Result<T, Failure>;
 struct Selection {
     rows: Vec<ObjectRow>,
     dependencies: BTreeMap<String, Vec<ObjectRow>>,
+}
+
+pub(super) struct SearchReadIndex<'a> {
+    references: BTreeMap<&'a str, Vec<&'a ObjectRow>>,
+    live_episode: Option<LiveEpisodeRead>,
+}
+
+impl<'a> std::ops::Deref for SearchReadIndex<'a> {
+    type Target = BTreeMap<&'a str, Vec<&'a ObjectRow>>;
+    fn deref(&self) -> &Self::Target {
+        &self.references
+    }
+}
+
+impl<'a> SearchReadIndex<'a> {
+    pub(super) fn new(
+        snapshot: &'a ProjectionSnapshot,
+        facets: &evertrace_domain::query::QueryFacetSet,
+        deadline: Instant,
+    ) -> ExportResult<Self> {
+        let references = presentation_index(snapshot, deadline)?;
+        let live_episode = LiveEpisodeRead::for_relation(snapshot, &references, facets, deadline);
+        Ok(Self {
+            references,
+            live_episode,
+        })
+    }
+}
+
+#[derive(Clone, Copy)]
+enum ReadUse<'a> {
+    Detail,
+    Search(Option<&'a LiveEpisodeRead>),
 }
 
 impl HumanGovernanceService {
@@ -220,7 +254,7 @@ impl HumanGovernanceService {
         index: &BTreeMap<&str, Vec<&ObjectRow>>,
         deadline: Instant,
     ) -> Result<(), Failure> {
-        self.readable_with_dependencies(snapshot, row, index, false, deadline)
+        self.readable_with_dependencies(snapshot, row, index, ReadUse::Detail, deadline)
             .await
     }
 
@@ -228,10 +262,14 @@ impl HumanGovernanceService {
         &self,
         snapshot: &ProjectionSnapshot,
         row: &ObjectRow,
-        index: &BTreeMap<&str, Vec<&ObjectRow>>,
+        index: &SearchReadIndex<'_>,
         deadline: Instant,
     ) -> Result<(), Failure> {
-        self.readable_with_dependencies(snapshot, row, index, true, deadline)
+        let live = index
+            .live_episode
+            .as_ref()
+            .filter(|proof| proof.contains(row));
+        self.readable_with_dependencies(snapshot, row, index, ReadUse::Search(live), deadline)
             .await
     }
 
@@ -240,15 +278,22 @@ impl HumanGovernanceService {
         snapshot: &ProjectionSnapshot,
         row: &ObjectRow,
         index: &BTreeMap<&str, Vec<&ObjectRow>>,
-        for_search: bool,
+        purpose: ReadUse<'_>,
         deadline: Instant,
     ) -> Result<(), Failure> {
+        let for_search = matches!(purpose, ReadUse::Search(_));
+        let live_episode = match purpose {
+            ReadUse::Search(live) => live,
+            ReadUse::Detail => None,
+        };
         let mut charged = BTreeSet::new();
         let mut remaining = MAX_METADATA_BYTES;
         charge_metadata(row, &mut charged, &mut remaining, deadline)?;
         let payload = decode(row)?;
         let mut root = row.clone();
-        let member_task = if for_search && independent_search_member(row, &payload, index)? {
+        let member_task = if for_search
+            && (live_episode.is_some() || independent_search_member(row, &payload, index)?)
+        {
             // Only authorization coordinates change; the original Task and all its roots stay in the closure.
             root.task_id.take()
         } else {
@@ -277,14 +322,39 @@ impl HumanGovernanceService {
             }
             Ok(refs)
         };
+        let mut pending = references(row, &payload)?;
+        if let Some(live) = live_episode {
+            pending.extend(
+                live.sources
+                    .as_ref()
+                    .ok_or(Failure::Denied)?
+                    .iter()
+                    .cloned(),
+            );
+        }
         let dependencies = collect_dependencies(
             index,
-            references(row, &payload)?,
+            pending,
             &mut charged,
             &mut remaining,
             deadline,
             references,
-            member_task.as_deref(),
+            |row, payload| {
+                member_task
+                    .as_deref()
+                    .is_some_and(|task| row.task_id.as_deref() == Some(task))
+                    && match payload {
+                        JournalPayload::TaskRecorded(task) => {
+                            row.object_id.as_deref() == Some(task.task_id.to_string().as_str())
+                        }
+                        JournalPayload::WorkstreamRecorded(work) => {
+                            independently_scoped_workstream(row, work)
+                                || live_episode
+                                    .is_some_and(|live| row.row_id == live.workstream_row)
+                        }
+                        _ => false,
+                    }
+            },
         )?;
         self.export_access(
             snapshot,
@@ -619,7 +689,7 @@ fn select(
         &mut remaining,
         deadline,
         |row, payload| Ok(dependencies_for(row, payload)),
-        None,
+        |_, _| false,
     )?;
     Ok(Selection {
         rows: rows.into_values().collect(),
@@ -634,7 +704,7 @@ fn collect_dependencies(
     remaining: &mut u64,
     deadline: Instant,
     references: impl Fn(&ObjectRow, &JournalPayload) -> ExportResult<BTreeSet<String>>,
-    member_task: Option<&str>,
+    structural_scope: impl Fn(&ObjectRow, &JournalPayload) -> bool,
 ) -> ExportResult<BTreeMap<String, Vec<ObjectRow>>> {
     let mut dependencies = BTreeMap::new();
     // The bounded dependency closure is checked, never exported implicitly.
@@ -652,18 +722,7 @@ fn collect_dependencies(
             let payload = decode(row)?;
             pending.extend(references(row, &payload)?);
             let mut authorization = (*row).clone();
-            if member_task.is_some()
-                && row.task_id.as_deref() == member_task
-                && match &payload {
-                    JournalPayload::TaskRecorded(task) => {
-                        row.object_id.as_deref() == Some(task.task_id.to_string().as_str())
-                    }
-                    JournalPayload::WorkstreamRecorded(work) => {
-                        independently_scoped_workstream(row, work)
-                    }
-                    _ => false,
-                }
-            {
+            if structural_scope(row, &payload) {
                 authorization.task_id = None;
             }
             referenced.push(authorization);

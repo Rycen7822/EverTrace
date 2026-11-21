@@ -5,7 +5,7 @@ use evertrace_domain::{
     semantic::{NormativeResolutionState, SemanticResolution},
 };
 
-const SEARCH_HIT_ORDER_REVISION: u32 = 7;
+const SEARCH_HIT_ORDER_REVISION: u32 = 8;
 
 type SearchPolicy = Option<(String, Option<evertrace_codex::policy::PolicyEvidence>)>;
 
@@ -792,7 +792,7 @@ impl HumanGovernanceService {
     async fn source_dependency_access(
         &self,
         snapshot: &ProjectionSnapshot,
-        index: &std::collections::BTreeMap<&str, Vec<&ObjectRow>>,
+        index: &export::SearchReadIndex<'_>,
         dependencies: &BTreeSet<String>,
         deadline: std::time::Instant,
     ) -> Option<BTreeSet<String>> {
@@ -814,7 +814,7 @@ impl HumanGovernanceService {
     async fn matched_cue_sources(
         &self,
         snapshot: &ProjectionSnapshot,
-        index: &std::collections::BTreeMap<&str, Vec<&ObjectRow>>,
+        index: &export::SearchReadIndex<'_>,
         readable: &BTreeSet<String>,
         context: &SearchContext,
         deadline: std::time::Instant,
@@ -940,7 +940,7 @@ impl HumanGovernanceService {
     async fn recall_source_refs(
         &self,
         snapshot: &ProjectionSnapshot,
-        index: &std::collections::BTreeMap<&str, Vec<&ObjectRow>>,
+        index: &export::SearchReadIndex<'_>,
         readable: &BTreeSet<String>,
         deadline: std::time::Instant,
     ) -> Result<(BTreeSet<String>, BTreeSet<String>, bool), HumanGovernanceError> {
@@ -1023,7 +1023,7 @@ impl HumanGovernanceService {
     async fn search_checks_readable(
         &self,
         snapshot: &ProjectionSnapshot,
-        index: &std::collections::BTreeMap<&str, Vec<&ObjectRow>>,
+        index: &export::SearchReadIndex<'_>,
         checks: &BTreeSet<String>,
         deadline: std::time::Instant,
     ) -> bool {
@@ -1112,7 +1112,7 @@ impl HumanGovernanceService {
             {
                 return conflict();
             }
-            let index = export::presentation_index(&snapshot, deadline)
+            let index = export::SearchReadIndex::new(&snapshot, &query.facets, deadline)
                 .map_err(|_| HumanGovernanceError::Store)?;
             let mut checks = BTreeSet::new();
             for hit in cursor.after.iter().chain(&cursor.remaining) {
@@ -1353,7 +1353,7 @@ impl HumanGovernanceService {
                 }
                 return Ok(page);
             }
-            let index = export::presentation_index(&snapshot, deadline)
+            let index = export::SearchReadIndex::new(&snapshot, &protected.facets, deadline)
                 .map_err(|_| HumanGovernanceError::Store)?;
             let mut refs = BTreeSet::new();
             let mut proposals = BTreeSet::new();

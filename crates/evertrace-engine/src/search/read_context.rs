@@ -1,6 +1,9 @@
 //! Request-local read admission facts shared by native presentations, never a search cache.
 
-use std::time::Instant;
+use std::{
+    collections::{BTreeMap, BTreeSet},
+    time::Instant,
+};
 
 use evertrace_domain::{
     error::ErrorCode,
@@ -11,6 +14,292 @@ use evertrace_domain::{
 use evertrace_store::{JournalPayload, ObjectRow, projections::StoredFieldsContext};
 
 use crate::{WriterHandle, repository::RepositoryReadAuthority};
+
+/// Exact source inputs for one named current Work path. The rest of the lane is not an authorization operand.
+pub(crate) struct LiveEpisodeRead {
+    pub workstream_row: String,
+    episode_row: String,
+    attempt_row: String,
+    pub sources: Option<BTreeSet<String>>,
+}
+
+impl LiveEpisodeRead {
+    pub(crate) fn contains(&self, row: &ObjectRow) -> bool {
+        row.row_id == self.episode_row || row.row_id == self.attempt_row
+    }
+
+    pub(crate) fn for_relation(
+        snapshot: &evertrace_store::ProjectionSnapshot,
+        index: &BTreeMap<&str, Vec<&ObjectRow>>,
+        facets: &evertrace_domain::query::QueryFacetSet,
+        deadline: Instant,
+    ) -> Option<Self> {
+        use evertrace_domain::{
+            evidence::PairingState,
+            ids::{SourceObservationId, WorkstreamId},
+            query::TemporalMode,
+            work::*,
+        };
+        if facets.temporal_mode != TemporalMode::Current
+            || !facets.temporal_qualifiers.is_empty()
+            || !facets.relation_requirements.iter().any(|kind| {
+                matches!(
+                    kind.as_str(),
+                    "episode_to_workstream" | "episode_to_attempt"
+                )
+            })
+        {
+            return None;
+        }
+        let [anchor] = facets.target_anchors.as_slice() else {
+            return None;
+        };
+        let stream_id = anchor.parse::<WorkstreamId>().ok()?;
+        let current = |reference: &str, kind: &str| {
+            let candidates = index.get(reference)?;
+            if candidates.len() > usize::from(evertrace_domain::query::METADATA_READ_LIMIT) {
+                return None;
+            }
+            let head = candidates
+                .iter()
+                .copied()
+                .filter(|row| {
+                    row.row_class == Some(evertrace_store::ObjectRowClass::Object)
+                        && row.object_kind.as_deref() == Some(kind)
+                        && row.object_id.as_deref() == Some(reference)
+                })
+                .max_by_key(|row| row.source_event_seq)?;
+            let payload: JournalPayload =
+                serde_json::from_str(head.payload_json.as_deref()?).ok()?;
+            payload.validate().ok()?;
+            Some((head, payload))
+        };
+        let (stream_row, JournalPayload::WorkstreamRecorded(work)) = current(anchor, "workstream")?
+        else {
+            return None;
+        };
+        let repository = work.repository_instance_id?;
+        let tree = work.active_worktree_instance_id?;
+        let episode_id = work.active_episode_id?;
+        let (episode_row, JournalPayload::WorkEpisodeRecorded(episode)) =
+            current(&episode_id.to_string(), "work_episode")?
+        else {
+            return None;
+        };
+        let [attempt_id] = episode.attempt_ids.as_slice() else {
+            return None;
+        };
+        let (attempt_row, JournalPayload::AttemptRecorded(attempt)) =
+            current(&attempt_id.to_string(), "attempt")?
+        else {
+            return None;
+        };
+        // This path supports an open plan, not completed work, a verifier, a recovered lane or a whole lane read.
+        if work.workstream_id != stream_id
+            || episode.episode_id != episode_id
+            || attempt.attempt_id != *attempt_id
+            || episode.workstream_id != stream_id
+            || attempt.workstream_id != stream_id
+            || episode.task_id != work.task_id
+            || attempt.task_id != work.task_id
+            || attempt.episode_id != Some(episode_id)
+            || episode.repository_instance_id != Some(repository)
+            || attempt.repository_instance_id != Some(repository)
+            || episode.worktree_instance_id != Some(tree)
+            || attempt.worktree_instance_ids.as_slice() != [tree]
+            || episode.lifecycle_status != EpisodeLifecycle::Open
+            || episode.boundary_candidate.is_some()
+            || episode.capture_receipt_revision_ids.is_empty()
+            || episode.execution_lane_ids.is_empty()
+            || !episode.operation_burst_refs.is_empty()
+            || !episode.open_loops.is_empty()
+            || !episode.checkpoint_refs.is_empty()
+            || !episode.competing_attempt_group_ids.is_empty()
+            || !episode.worktree_transition_refs.is_empty()
+            || !episode.interruption_refs.is_empty()
+            || !episode.completed_outcome_refs.is_empty()
+            || !episode.selected_outcome_refs.is_empty()
+            || !episode.verification_refs.is_empty()
+            || !episode.segmentation_correction_refs.is_empty()
+            || !episode.capture_gap_refs.is_empty()
+            || !episode.capture_outage_refs.is_empty()
+            || !episode.semantic_digest_refs.is_empty()
+            || !episode.failure_refs.is_empty()
+            || !episode.work_artifact_refs.is_empty()
+            || !episode.experiment_run_refs.is_empty()
+            || attempt.lifecycle_status != AttemptLifecycleStatus::Active
+            || attempt.execution_status != AttemptExecutionStatus::Proposed
+            || attempt.outcome_state != AttemptOutcomeState::Unknown
+            || !attempt.experiment_run_ids.is_empty()
+            || attempt.verification != AttemptVerification::Unverified
+            || attempt.adoption_status != AttemptAdoptionStatus::None
+            || !attempt.execution_lane_ids.is_empty()
+            || !attempt.work_binding_revision_refs.is_empty()
+            || attempt.resume_state_assessment.is_some()
+            || !attempt.composed_from_attempt_ids.is_empty()
+            || !attempt.competing_group_ids.is_empty()
+            || !attempt.worktree_transition_refs.is_empty()
+            || !attempt.local_outcome_refs.is_empty()
+            || attempt.strategy_contract.search_policy_ref.is_some()
+            || attempt.strategy_contract.objective_ref.is_some()
+        {
+            return None;
+        }
+        let task_key = work.task_id.to_string();
+        let mut bindings = BTreeMap::new();
+        let count_limit = usize::from(evertrace_domain::query::METADATA_READ_LIMIT);
+        let mut budget = count_limit;
+        let mut bytes = evertrace_store::projections::READ_DEPENDENCY_BYTES;
+        for row in snapshot.data_rows() {
+            if Instant::now() >= deadline {
+                return None;
+            }
+            if row.object_kind.as_deref() != Some("work_binding")
+                || row.workstream_id.as_deref() != Some(anchor.as_str())
+            {
+                continue;
+            }
+            budget = budget.checked_sub(1)?;
+            let payload = row.payload_json.as_deref()?;
+            bytes = bytes.checked_sub(payload.len() as u64)?;
+            let JournalPayload::WorkBindingRecorded(binding) =
+                serde_json::from_str(payload).ok()?
+            else {
+                return None;
+            };
+            // Store admission locks an assigned Episode across successors and verifies its reciprocal scope.
+            if binding.primary_binding.episode_id != Some(episode_id) {
+                continue;
+            }
+            binding.validate().ok()?;
+            if row.task_id.as_deref() != Some(task_key.as_str())
+                || binding.primary_binding.workstream_id != Some(stream_id)
+                || binding.primary_binding.task_id != Some(work.task_id)
+            {
+                return None;
+            }
+            match bindings.entry(binding.operation_id) {
+                std::collections::btree_map::Entry::Vacant(entry) => {
+                    entry.insert(binding);
+                }
+                std::collections::btree_map::Entry::Occupied(mut entry) => {
+                    if entry.get().revision_generation == binding.revision_generation {
+                        return None;
+                    }
+                    if entry.get().revision_generation < binding.revision_generation {
+                        entry.insert(binding);
+                    }
+                }
+            }
+        }
+        if bindings.is_empty() || work.worktree_lineage_refs.is_empty() {
+            return None;
+        }
+        let sources = (|| {
+            let mut evidence = BTreeSet::new();
+            let entry = episode.entry_worktree_snapshot_id?;
+            let (_, JournalPayload::WorktreeSnapshotRecorded(pinned)) =
+                current(&entry.to_string(), "worktree_snapshot")?
+            else {
+                return None;
+            };
+            if pinned.worktree_snapshot_id != entry || pinned.worktree_instance_id != tree {
+                return None;
+            }
+            let mut sources = BTreeSet::from([entry.to_string()]);
+            let source_is_present = |reference: &str| {
+                matches!(current(reference, "source_observation"), Some((_, JournalPayload::SourceObservationRecorded(value)))
+                if reference.parse::<SourceObservationId>().ok() == Some(value.source_observation_id))
+            };
+            for binding in bindings.into_values() {
+                if binding.assignment_status != AssignmentStatus::Resolved
+                    || binding.scope_effect_refs.is_empty()
+                    || !binding.secondary_bindings.is_empty()
+                    || binding
+                        .primary_binding
+                        .attempt_id
+                        .is_some_and(|id| id != *attempt_id)
+                    || binding.primary_binding.experiment_run_id.is_some()
+                    || binding.primary_binding.competing_group_id.is_some()
+                {
+                    return None;
+                }
+                let (_, JournalPayload::OperationDerived(operation)) =
+                    current(&binding.operation_id.to_string(), "operation")?
+                else {
+                    return None;
+                };
+                if operation.operation_id != binding.operation_id
+                    || operation.pairing_state == PairingState::Conflicted
+                    || !operation
+                        .execution_lane_id
+                        .is_some_and(|lane| episode.execution_lane_ids.contains(&lane))
+                {
+                    return None;
+                }
+                for observation in operation
+                    .input_source_observation_refs
+                    .iter()
+                    .chain(&operation.result_source_observation_refs)
+                {
+                    let reference = observation.to_string();
+                    if !source_is_present(&reference) {
+                        return None;
+                    }
+                    sources.insert(reference);
+                }
+                for id in &binding.scope_effect_refs {
+                    let reference = id.to_string();
+                    let (_, JournalPayload::ScopeEffectDerived(effect)) =
+                        current(&reference, "scope_effect")?
+                    else {
+                        return None;
+                    };
+                    if effect.scope_effect_id != *id
+                        || !operation.scope_effect_ids.contains(id)
+                        || effect.operation_id != binding.operation_id
+                        || effect.repository_instance_id != Some(repository)
+                        || effect.worktree_instance_id != Some(tree)
+                    {
+                        return None;
+                    }
+                    sources.insert(reference);
+                    for observation in effect.evidence_refs {
+                        let reference = observation.to_string();
+                        if !source_is_present(&reference) {
+                            return None;
+                        }
+                        sources.insert(reference);
+                    }
+                }
+                for reference in binding.evidence_refs {
+                    if !source_is_present(&reference) {
+                        return None;
+                    }
+                    evidence.insert(reference);
+                }
+                if evidence.len() + sources.len() > count_limit {
+                    return None;
+                }
+            }
+            if !work
+                .worktree_lineage_refs
+                .iter()
+                .all(|reference| evidence.contains(reference))
+            {
+                return None;
+            }
+            sources.extend(evidence);
+            Some(sources)
+        })();
+        Some(Self {
+            workstream_row: stream_row.row_id.clone(),
+            episode_row: episode_row.row_id.clone(),
+            attempt_row: attempt_row.row_id.clone(),
+            sources,
+        })
+    }
+}
 
 /// Assess only the canonical source and repository closure; observation recording belongs to callers.
 pub(crate) async fn check_source_access(
