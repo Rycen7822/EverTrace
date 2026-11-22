@@ -868,6 +868,7 @@ impl ProductionSearch {
                     || source_only
                     || self.exact_object_kind.is_some()
                     || exact_query_reference(&context).is_some()
+                    || identifier_only_comparison(&context)
                 {
                     Vec::new() // Explicit operands are not lexical queries.
                 } else {
@@ -1559,6 +1560,7 @@ impl ProductionSearch {
         let fts_result = if exact_atom_only
             || self.exact_object_kind.is_some()
             || exact_query_reference(&context).is_some()
+            || identifier_only_comparison(&context)
         {
             Ok(Vec::new())
         } else if force_fts_failure {
@@ -1922,6 +1924,23 @@ pub(super) fn exact_query_reference(context: &SearchContext) -> Option<&str> {
             .filter_map(TemporalQualifier::source_sequence_ref)
             .any(|anchor| anchor.to_string() == reference))
     .then_some(reference)
+}
+
+pub(super) fn identifier_only_comparison(context: &SearchContext) -> bool {
+    let facets = &context.query_facets;
+    // A typed pair with no remaining question text is not a lexical query.
+    facets.answer_shape == Some(AnswerShape::TemporalComparison)
+        && facets.target_anchors.len() == 2
+        && context.protected_facets.is_empty()
+        && facets.condition_literals.is_empty()
+        && facets
+            .exact_identifiers
+            .iter()
+            .all(|id| facets.target_anchors.contains(id))
+        && context
+            .protected_query
+            .split_whitespace()
+            .eq(facets.target_anchors.iter().map(String::as_str))
 }
 
 fn exact_identifiers(context: &SearchContext) -> Vec<String> {
