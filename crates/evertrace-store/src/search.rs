@@ -94,22 +94,22 @@ impl SearchIndex {
         let readers = StoreReadHandle::open_read_only(data_dir).await?;
         let connection = crate::connection::connect_native(data_dir).await?;
         readers.bind_read_only_search(connection)?;
-        Self::from_read_handle(data_dir, readers).await
+        Self::from_read_handle(data_dir, readers, true).await
     }
 
-    /// Share the writer's single Lance search lifecycle and read fence. The
-    /// writer publishes its validated binding; a handle without one fails
-    /// closed instead of opening a private connection from the path.
+    /// Share the writer's validated binding. Opening it checks search metadata;
+    /// each retrieval still pins the latest version and validates selected rows.
     pub async fn open_with_read_handle(
         data_dir: &Path,
         readers: StoreReadHandle,
     ) -> Result<Self, StoreError> {
-        Self::from_read_handle(data_dir, readers).await
+        Self::from_read_handle(data_dir, readers, false).await
     }
 
     async fn from_read_handle(
         data_dir: &Path,
         readers: StoreReadHandle,
+        standalone: bool,
     ) -> Result<Self, StoreError> {
         let lease = readers.search_lease().await?;
         let table = lease
@@ -118,7 +118,11 @@ impl SearchIndex {
             .execute()
             .await
             .map_err(|_| StoreError::LanceDb)?;
-        read_search_rows(&table).await?;
+        if standalone {
+            read_search_rows(&table).await?;
+        } else {
+            read_search_checkpoint(&table).await?;
+        }
         let indices = table
             .list_indices()
             .await
