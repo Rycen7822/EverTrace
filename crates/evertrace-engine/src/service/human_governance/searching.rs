@@ -2102,13 +2102,13 @@ impl HumanGovernanceService {
                     deadline,
                 )
                 .map_err(|_| HumanGovernanceError::Store)?;
-            let mut support_sources = BTreeSet::new();
-            let support = if let Some((mut path, archives)) = support_anchor(
+            let support_request = support_anchor(
                 query.selection,
                 &context.protected_query,
                 &context.query_facets,
-            )
-            .and_then(|anchor| {
+            );
+            let mut support_sources = BTreeSet::new();
+            let support = if let Some((mut path, archives)) = support_request.and_then(|anchor| {
                 global_support_path(
                     &index,
                     &refs,
@@ -2368,6 +2368,19 @@ impl HumanGovernanceService {
                 readable_refs: time_refs.as_ref(),
                 source_domain: !validity_query && !sequence_query,
             });
+            if let Some(root) = support_request {
+                // An exact support trace admits only the nominated operand and proven edge endpoints.
+                let operands = support
+                    .iter()
+                    .flat_map(|path| {
+                        path.edges
+                            .iter()
+                            .flat_map(|(from, to, _)| [from.as_str(), to.as_str()])
+                    })
+                    .chain(std::iter::once(root))
+                    .collect::<BTreeSet<_>>();
+                refs.retain(|reference| operands.contains(reference.as_str()));
+            }
             let (mut page, projection_version) =
                 crate::search::ProductionSearch::new(search.clone())
                     .with_canonical_sources(snapshot.frontier, canonical_sources)
