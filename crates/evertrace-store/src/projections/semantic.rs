@@ -1427,10 +1427,11 @@ fn validate_atom_relations(
         input.atom_revisions.contains_key(*revision)
             || !is_forgotten_atom(input.deletions.events(), revision)
     });
-    for revision in predecessors
-        .chain(&atom.supports_revision_refs)
+    let labelled = predecessors
         .chain(&atom.contradicts_revision_refs)
-    {
+        .map(|id| (id, false))
+        .chain(atom.supports_revision_refs.iter().map(|id| (id, true)));
+    for (revision, is_support) in labelled {
         if !input.atom_revisions.contains_key(revision) {
             let support_owner = retired_base
                 .filter(|base| {
@@ -1443,8 +1444,14 @@ fn validate_atom_relations(
                     .any(|refs| refs.binary_search(revision).is_ok())
                 })
                 .map_or(atom.revision_id, |base| base.revision_id);
+            let valid_without_operand = is_support
+                && is_forgotten_atom(input.deletions.events(), revision)
+                && input
+                    .scenario_core
+                    .valid_successor_excludes_support(support_owner, *revision);
             if !input.deleted_revision_ids.contains(revision)
-                || input.scenario_core.atom_support_eligible(support_owner)
+                || (input.scenario_core.atom_support_eligible(support_owner)
+                    && !valid_without_operand)
             {
                 return Err(StoreError::StoreCorrupt);
             }
