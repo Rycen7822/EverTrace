@@ -663,7 +663,12 @@ fn filter_sql_dialect(filter: &SearchHardFilter, dialect: FilterDialect) -> Opti
                 .map(|value| sql_literal(value))
                 .collect::<Vec<_>>()
                 .join(", ");
-            clauses.push(format!("(candidate_id IN ({values}) OR row_variant = 'evidence_surface' AND source_ref IN ({values}))"));
+            if filter.object_only {
+                // Evidence source grants cannot admit an object row.
+                clauses.push(format!("candidate_id IN ({values})"));
+            } else {
+                clauses.push(format!("(candidate_id IN ({values}) OR row_variant = 'evidence_surface' AND source_ref IN ({values}))"));
+            }
         }
     }
     for literal in &filter.condition_literals {
