@@ -21,6 +21,10 @@
     {% set change = payload.value %}
     {% if payload.kind == 'atom' and summary.operation == 'deprecate' %}
       <h4>弃用理由</h4><div class="memory-prose semantic-body">{{ change.reason }}</div>
+      {% if acceptance_request_id %}
+        <p>依据所选支持校验：{{ exact_work_link('global_support_validation', proposal.evidence_refs[0]) }}。</p>
+        <p>确认后目标只追加弃用后继；原正文和授权不改，依赖它的支持合同进入重新校验。</p>
+      {% endif %}
     {% elif payload.kind == 'atom' %}
       {% if summary.operation == 'merge' %}
         {{ text_list('拟合并的精确修订', change.merged_revision_refs, record_kind='atom_revision', exact_revision=true) }}
@@ -83,7 +87,8 @@
           data-request-id="{{ acceptance_request_id }}" data-revision="{{ summary.current_revision_id }}"
           data-frontier="{{ frontier }}" data-review-digest="{{ confirmation_digest }}">
           {% if action == 'reauthorize' %}确认再授权为新记录
-          {% elif action == 'merge' %}确认合并并接受{% else %}确认接受这份提案{% endif %}</button>
+          {% elif action == 'merge' %}确认合并并接受
+          {% elif action == 'deprecate' %}确认弃用此 Atom{% else %}确认接受这份提案{% endif %}</button>
       {% endif %}
       {% if web_edit_available and payload.kind == 'atom' %}
         {% set value = change.draft.value %}
@@ -147,7 +152,7 @@
   {% endif %}
   {% set base = item.get('proposal_base') %}
   {% if base and base.state == 'ready' and base.content %}
-    <details><summary>原基准修订</summary>
+    <details{% if acceptance_request_id and summary.operation == 'deprecate' %} open{% endif %}><summary>原基准修订</summary>
     {% with content=base.content %}{% include 'semantic_content.html' %}{% endwith %}</details>
   {% elif summary.base_revision_id %}
     <p>未返回原基准正文，不以当前目标代替。</p>

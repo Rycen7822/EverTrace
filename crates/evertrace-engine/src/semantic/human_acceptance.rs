@@ -419,7 +419,14 @@ impl HumanAcceptanceService {
         }
         let service =
             crate::HumanGovernanceService::new(self.writer.clone(), self.effective_config_hash);
-        if !service.proposal_accessible(snapshot, reviewed).await?
+        let accessible = if reviewed.operation == ProposalOperation::Deprecate {
+            service
+                .web_support_deprecation_current_at(snapshot, reviewed)
+                .await?
+        } else {
+            service.proposal_accessible(snapshot, reviewed).await?
+        };
+        if !accessible
             || (intent.reauthorization.is_some()
                 && !crate::HumanGovernanceService::web_reauthorization_support_current_at(
                     snapshot, view, reviewed,
@@ -573,6 +580,12 @@ impl HumanAcceptanceService {
                     Err(crate::semantic::SemanticServiceError::BaseConflict)
                 }
             })
+        } else if reviewed.support_deprecation_validation().is_some() {
+            select_support_atom_acceptance(snapshot, reviewed).and_then(|support| {
+                RevisionProposalService
+                    .accept_support_linked(view, context, reviewed.proposal_id, authority, &support)
+                    .map(|accepted| accepted.command)
+            })
         } else {
             RevisionProposalService
                 .accept(view, context, reviewed.proposal_id, authority)
@@ -625,8 +638,12 @@ impl HumanAcceptanceService {
         }) else {
             return Ok(conflict());
         };
-        if ((proposal.operation == ProposalOperation::Replace || intent.edit().is_some())
-            && !service.web_base_accessible(&snapshot, proposal).await?)
+        if (proposal.operation == ProposalOperation::Deprecate
+            && !service
+                .web_support_deprecation_current_at(&snapshot, proposal)
+                .await?)
+            || ((proposal.operation == ProposalOperation::Replace || intent.edit().is_some())
+                && !service.web_base_accessible(&snapshot, proposal).await?)
             || !Box::pin(authored_creation_scope_current(
                 service, &snapshot, proposal,
             ))

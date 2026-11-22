@@ -1332,17 +1332,35 @@ fn validate_atom_relations(
     {
         return Err(StoreError::StoreCorrupt);
     }
+    // A deprecation retains its base's historical support; it never publishes a new contract.
+    let retired_base = atom
+        .parent_revision_id
+        .filter(|_| atom.lifecycle_status == AtomLifecycleStatus::Deprecated)
+        .and_then(|id| input.atom_revisions.get(&id))
+        .map(|(base, _)| base);
     for revision in atom
         .supersedes_revision_refs
         .iter()
         .chain(&atom.supports_revision_refs)
         .chain(&atom.contradicts_revision_refs)
     {
-        if !input.atom_revisions.contains_key(revision)
-            && (!input.deleted_revision_ids.contains(revision)
-                || input.scenario_core.atom_support_eligible(atom.revision_id))
-        {
-            return Err(StoreError::StoreCorrupt);
+        if !input.atom_revisions.contains_key(revision) {
+            let support_owner = retired_base
+                .filter(|base| {
+                    [
+                        &base.supports_revision_refs,
+                        &base.supersedes_revision_refs,
+                        &base.contradicts_revision_refs,
+                    ]
+                    .into_iter()
+                    .any(|refs| refs.binary_search(revision).is_ok())
+                })
+                .map_or(atom.revision_id, |base| base.revision_id);
+            if !input.deleted_revision_ids.contains(revision)
+                || input.scenario_core.atom_support_eligible(support_owner)
+            {
+                return Err(StoreError::StoreCorrupt);
+            }
         }
     }
     if let Some(user) = &atom.user_authorization_provenance {
@@ -1956,6 +1974,19 @@ fn validate_proposal_relations(
                 {
                     return Err(StoreError::StoreCorrupt);
                 }
+                if matches!(
+                    &acceptance.authority_basis,
+                    ProposalAcceptanceAuthority::WebAcceptance { .. }
+                ) && (!accepted_support_global
+                    || *atom
+                        != base.deprecation_successor(
+                            atom.revision_id,
+                            (proposal.proposal_id, proposal.proposal_revision_id),
+                            acceptance.accepted_at_us,
+                        ))
+                {
+                    return Err(StoreError::StoreCorrupt);
+                }
             }
             ProposalOperation::Merge => {
                 let ProposalPayload::Atom(payload) = &proposal.payload else {
@@ -2148,13 +2179,18 @@ fn validate_accepted_authority(
     acceptance: &evertrace_domain::semantic::ProposalAcceptance,
 ) -> Result<(), StoreError> {
     if proposal.operation == ProposalOperation::Deprecate {
-        if !matches!(
-            &acceptance.authority_basis,
-            ProposalAcceptanceAuthority::TuiAcceptance { .. }
-        ) {
-            return Err(StoreError::StoreCorrupt);
-        }
-        return Ok(());
+        return match &acceptance.authority_basis {
+            ProposalAcceptanceAuthority::TuiAcceptance { .. } => Ok(()),
+            ProposalAcceptanceAuthority::WebAcceptance {
+                authorized_scope_ceiling: AtomScope::Global,
+                ..
+            } if atom.scope == AtomScope::Global
+                && proposal.support_deprecation_validation().is_some() =>
+            {
+                Ok(())
+            }
+            _ => Err(StoreError::StoreCorrupt),
+        };
     }
     match &acceptance.authority_basis {
         ProposalAcceptanceAuthority::CurrentTaskExactMessage {

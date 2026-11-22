@@ -1562,6 +1562,52 @@ impl HumanGovernanceService {
         }
     }
 
+    pub async fn web_support_deprecation_current(
+        &self,
+        proposal: &RevisionProposal,
+        frontier: u64,
+    ) -> Result<bool, HumanGovernanceError> {
+        let snapshot = self
+            .writer
+            .project_objects()
+            .await
+            .map_err(|_| HumanGovernanceError::Store)?;
+        if snapshot.frontier != frontier {
+            return Ok(false);
+        }
+        let current =
+            super::actions::select_object_row(&snapshot, &proposal.proposal_id.to_string())
+                .map_err(|_| HumanGovernanceError::Store)?;
+        let revision = proposal.proposal_revision_id.to_string();
+        if !matches!(current, Some((row, true)) if row.current_revision_id.as_deref() == Some(revision.as_str()))
+        {
+            return Ok(false);
+        }
+        self.web_support_deprecation_current_at(&snapshot, proposal)
+            .await
+    }
+
+    pub(crate) async fn web_support_deprecation_current_at(
+        &self,
+        snapshot: &ProjectionSnapshot,
+        proposal: &RevisionProposal,
+    ) -> Result<bool, HumanGovernanceError> {
+        let Some(validation) = proposal.support_deprecation_validation() else {
+            return Ok(false);
+        };
+        match select_support_deprecate(snapshot, validation) {
+            Ok(SupportDeprecateLookup::Available(selection))
+                if proposal.target_id == Some(ProposalTargetId::Atom(selection.atom_id))
+                    && proposal.base_revision_id == Some(selection.base_revision_id) =>
+            {
+                // The validation dependency includes its contract and exact base Atom.
+                self.proposal_accessible(snapshot, proposal).await
+            }
+            Ok(_) | Err(crate::semantic::SemanticServiceError::InvalidInput) => Ok(false),
+            Err(_) => Err(HumanGovernanceError::Store),
+        }
+    }
+
     pub async fn reviewed_web_support_deprecation_outcome(
         &self,
         request_id: RequestId,

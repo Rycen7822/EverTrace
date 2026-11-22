@@ -676,6 +676,11 @@ impl WebAcceptanceIntent {
                 {
                     Some(draft.scope.clone())
                 }
+                AtomProposalPayload::Deprecate { .. }
+                    if proposal.support_deprecation_validation().is_some() =>
+                {
+                    Some(AtomScope::Global)
+                }
                 AtomProposalPayload::Merge { draft, .. }
                     if proposal.operation == ProposalOperation::Merge
                         && matches!(
@@ -1570,6 +1575,25 @@ impl ClosedProposalEditIntent {
 }
 
 impl RevisionProposal {
+    /// The immutable selector in a support-deprecation proposal, not proof that it is still current.
+    pub fn support_deprecation_validation(&self) -> Option<RevisionId> {
+        if self.operation != ProposalOperation::Deprecate
+            || self.target_kind != ProposalTargetKind::Atom
+            || !matches!(self.target_id, Some(ProposalTargetId::Atom(_)))
+            || self.base_revision_id.is_none()
+            || self.eligibility != ProposalEligibility::ManualRequired
+            || self.created_by != ProposalCreatedBy::User
+            || self.evidence_refs != self.source_cohort_refs
+            || !matches!(&self.payload, ProposalPayload::Atom(payload) if matches!(payload.as_ref(), AtomProposalPayload::Deprecate { .. }))
+        {
+            return None;
+        }
+        let [reference] = self.evidence_refs.as_slice() else {
+            return None;
+        };
+        reference.parse().ok()
+    }
+
     pub fn global_atom_creation_draft(&self) -> Option<&AtomDraft> {
         if self.operation != ProposalOperation::Create
             || self.target_id.is_some()

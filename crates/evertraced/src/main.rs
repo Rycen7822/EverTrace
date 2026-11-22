@@ -1902,14 +1902,19 @@ async fn read_proposal_review(
             });
     if web_accept_available
         && let Some(review) = item.as_ref().and_then(|item| item.proposal_review.as_ref())
-        && let Some(reference) = &review.reauthorization
     {
-        web_accept_available = Box::pin(service.web_reauthorization_current(
-            &review.proposal,
-            page.frontier,
-            reference,
-        ))
-        .await?;
+        if let Some(reference) = &review.reauthorization {
+            web_accept_available = Box::pin(service.web_reauthorization_current(
+                &review.proposal,
+                page.frontier,
+                reference,
+            ))
+            .await?;
+        } else if review.proposal.support_deprecation_validation().is_some() {
+            web_accept_available =
+                Box::pin(service.web_support_deprecation_current(&review.proposal, page.frontier))
+                    .await?;
+        }
     }
     Ok(HumanGovernanceResponse::ProposalReview {
         frontier: page.frontier,

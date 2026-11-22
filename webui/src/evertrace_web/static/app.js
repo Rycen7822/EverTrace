@@ -436,6 +436,9 @@ function actOnProposal(button) {
   const action = button.dataset.proposalAccept;
   let prompt = ({ merge: "合并并接受", edit: "编辑并接受" }[action] || "接受")
     + "刚才显示的提案修订 " + revision + "？";
+  if (action === "deprecate") {
+    prompt = "按提案修订 " + revision + " 弃用这份 Atom？原正文与授权保留，依赖将重新校验。";
+  }
   if (action === "edit") {
     if (button.dataset.atomEditValue) input.atom_edit = JSON.parse(button.dataset.atomEditValue);
     else input.procedure_edit = JSON.parse(button.dataset.procedureEditValue);

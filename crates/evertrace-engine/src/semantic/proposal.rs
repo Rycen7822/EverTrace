@@ -855,7 +855,12 @@ impl RevisionProposalService {
         let global_web_reauthorization = matches!(&acceptance_context, AtomAcceptanceContext::Web {
             authorized_scope_ceiling: AtomScope::Global, intent, ..
         } if intent.reauthorization.is_some());
-        let global_manual = global_tui || global_web_reauthorization;
+        let global_web_deprecation = support_linked_global
+            && current.support_deprecation_validation().is_some()
+            && matches!(&acceptance_context, AtomAcceptanceContext::Web {
+                authorized_scope_ceiling: AtomScope::Global, intent, ..
+            } if intent.reauthorization.is_none() && intent.edit().is_none());
+        let global_manual = global_tui || global_web_reauthorization || global_web_deprecation;
         if !matches!(
             requested_scope,
             AtomScope::Task { .. } | AtomScope::Repository { .. }
@@ -868,7 +873,7 @@ impl RevisionProposalService {
                 &acceptance_context,
                 AtomAcceptanceContext::RepositoryTui { .. } | AtomAcceptanceContext::TaskTui { .. }
             )
-            && !(global_tui && support_linked_global)
+            && !(global_tui && support_linked_global || global_web_deprecation)
         {
             return Err(SemanticServiceError::UnsupportedTarget);
         }
@@ -877,22 +882,13 @@ impl RevisionProposalService {
             ProposalPayload::Atom(payload)
                 if matches!(payload.as_ref(), AtomProposalPayload::Deprecate { .. }) =>
             {
-                let mut atom = current_atom
-                    .cloned()
-                    .ok_or(SemanticServiceError::BaseConflict)?;
-                atom.revision_id = RevisionId::new_v7();
-                atom.parent_revision_id = Some(
-                    current
-                        .base_revision_id
-                        .ok_or(SemanticServiceError::BaseConflict)?,
+                let base = current_atom.ok_or(SemanticServiceError::BaseConflict)?;
+                let atom = base.deprecation_successor(
+                    RevisionId::new_v7(),
+                    (current.proposal_id, accepted_revision_id),
+                    context.occurred_at_us,
                 );
-                atom.lifecycle_status = AtomLifecycleStatus::Deprecated;
-                atom.accepted_proposal_id = Some(current.proposal_id);
-                atom.accepted_proposal_revision_id = Some(accepted_revision_id);
-                atom.created_at_us = context.occurred_at_us;
-                current_atom
-                    .ok_or(SemanticServiceError::BaseConflict)?
-                    .validate_successor(&atom)
+                base.validate_successor(&atom)
                     .map_err(|_| SemanticServiceError::ImmutableConflict)?;
                 atom
             }

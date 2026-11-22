@@ -634,7 +634,9 @@ impl Atom {
                                 || match &self.scope {
                                     AtomScope::Task { .. } | AtomScope::Repository { .. } => false,
                                     AtomScope::Global => {
-                                        self.parent_revision_id.is_some()
+                                        (self.parent_revision_id.is_some()
+                                            && self.lifecycle_status
+                                                != AtomLifecycleStatus::Deprecated)
                                             || self.supports_revision_refs.is_empty()
                                     }
                                     _ => true,
@@ -715,6 +717,22 @@ impl Atom {
             return Err(SemanticError::InvalidAtom);
         }
         Ok(())
+    }
+
+    pub fn deprecation_successor(
+        &self,
+        revision: RevisionId,
+        (proposal, proposal_revision): (RevisionProposalId, RevisionId),
+        at: i64,
+    ) -> Self {
+        let mut successor = self.clone();
+        successor.revision_id = revision;
+        successor.parent_revision_id = Some(self.revision_id);
+        successor.lifecycle_status = AtomLifecycleStatus::Deprecated;
+        successor.accepted_proposal_id = Some(proposal);
+        successor.accepted_proposal_revision_id = Some(proposal_revision);
+        successor.created_at_us = at;
+        successor
     }
 
     pub fn validate_successor(&self, next: &Self) -> Result<(), SemanticError> {
