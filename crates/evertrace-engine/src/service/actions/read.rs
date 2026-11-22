@@ -157,6 +157,15 @@ impl McpActionService {
                 "binding_to_scope_effect".into(),
             ]);
         }
+        let support = crate::search::explicit_global_support(&query, &scope.target_anchors);
+        if support.is_some() {
+            use evertrace_domain::query::{SUCCESSOR_SUPPORT_CONTRACT, SUPPORT_CONTRACT_EVIDENCE};
+            relation_requirements.extend([
+                SUCCESSOR_SUPPORT_CONTRACT.into(),
+                SUPPORT_CONTRACT_EVIDENCE.into(),
+            ]);
+        }
+        let explicit_relation = atom_relation || physical.is_some() || support.is_some();
         let source_shape = crate::search::explicit_source_shape(&query, &scope.target_anchors);
         let count_unit = crate::search::explicit_count_unit(&query, &scope.target_anchors);
         let exact_shape = source_shape.is_some() || count_unit.is_some();
@@ -167,7 +176,7 @@ impl McpActionService {
             crate::search::explicit_exact_slots(&query, &scope.target_anchors)
         };
         let explicit_exact = exact_slots.is_some();
-        let explicit_view = atom_relation || physical.is_some() || exact_shape || explicit_exact;
+        let explicit_view = explicit_relation || exact_shape || explicit_exact;
         // A typed Episode target asks for stored work evidence, not stage guidance. Do not infer that intent from prose.
         let episode = (!explicit_view && !entity_list)
             .then(|| match scope.target_anchors.as_slice() {
@@ -200,11 +209,7 @@ impl McpActionService {
                 .execution_context(scope.context.frontier, &scope.context.scope),
             query_facets: QueryFacetSet {
                 statement_role: evertrace_domain::query::StatementRole::Unknown,
-                parse_status: if atom_relation
-                    || physical.is_some()
-                    || exact_shape
-                    || episode_history
-                {
+                parse_status: if explicit_relation || exact_shape || episode_history {
                     FacetParseStatus::Complete
                 } else {
                     FacetParseStatus::Unknown
@@ -216,7 +221,10 @@ impl McpActionService {
                     },
                     |(target, _)| vec![target.into()],
                 ),
-                exact_identifiers: exact_slots.unwrap_or_default(),
+                exact_identifiers: support.map_or_else(
+                    || exact_slots.unwrap_or_default(),
+                    |id| vec![id.to_string()],
+                ),
                 condition_literals: Vec::new(),
                 relation_requirements,
                 polarity: Polarity::Positive,
@@ -240,8 +248,7 @@ impl McpActionService {
                 } else if entity_list {
                     Some(evertrace_domain::query::AnswerShape::EntityList)
                 } else {
-                    (atom_relation || physical.is_some())
-                        .then_some(evertrace_domain::query::AnswerShape::SourceSnippet)
+                    explicit_relation.then_some(evertrace_domain::query::AnswerShape::SourceSnippet)
                 },
                 lifecycle_boundary: if episode_history {
                     LifecycleBoundary::Terminal
@@ -257,11 +264,7 @@ impl McpActionService {
                 candidates_remaining: 3,
                 tokens_remaining: 1_200,
                 latency_us_remaining: latency_us,
-                hops_remaining: if atom_relation || physical.is_some() {
-                    2
-                } else {
-                    0
-                },
+                hops_remaining: if explicit_relation { 2 } else { 0 },
                 follow_ups_remaining: u8::from(explicit_exact),
             },
         };
@@ -301,6 +304,17 @@ impl McpActionService {
         };
         let mut search = ProductionSearch::new(self.search_index.clone())
             .with_validated_frontier(scope.context.frontier);
+        if let Some(successor) = support {
+            return Box::pin(self.global_support_search(
+                request_id,
+                &scope,
+                &read_access,
+                successor,
+                search,
+                context,
+            ))
+            .await;
+        }
         if episode_history {
             search = search.with_exact_object_kind("work_episode");
         } else if physical.is_none() {
@@ -770,6 +784,142 @@ impl McpActionService {
         );
         result.grounded_view = view;
         Ok(result)
+    }
+
+    async fn global_support_search(
+        &self,
+        request_id: RequestId,
+        scope: &NormalSearchScope,
+        access: &SearchReadAccess<'_>,
+        successor: evertrace_domain::revision::RevisionId,
+        search: ProductionSearch,
+        mut context: SearchContext,
+    ) -> Result<McpServiceResult, McpServiceError> {
+        let label = scope_label_for_binding(&scope.binding);
+        let unavailable = |reason| {
+            empty_result(
+                request_id,
+                McpServiceStatus::Partial,
+                &label,
+                "partial",
+                [reason],
+            )
+        };
+        let Some(repository) = scope.anchor.repository_id else {
+            return Ok(unavailable("search_relation_unresolved"));
+        };
+        let shard = (repository, scope.anchor.worktree_id, scope.anchor.task_id);
+        let successor = successor.to_string();
+        if context.query_facets.exact_identifiers.as_slice() != [successor.as_str()] {
+            return Ok(unavailable("search_relation_unresolved"));
+        }
+        let mut archive_budget = RelationArchiveBudget::default();
+        let limit = context.budget.candidates_remaining as usize;
+        let cas = &self.runtime_snapshot.cas_dir;
+        let Some(trace) = Box::pin(access.scoped_support_trace(
+            &successor,
+            shard,
+            limit,
+            cas,
+            &mut archive_budget,
+        ))
+        .await
+        else {
+            return Ok(unavailable("search_relation_unresolved"));
+        };
+        context.budget.latency_us_remaining = access
+            .deadline
+            .saturating_duration_since(std::time::Instant::now())
+            .as_micros()
+            .try_into()
+            .unwrap_or_default();
+        if context.budget.latency_us_remaining == 0 {
+            return Ok(unavailable("search_deadline_exhausted"));
+        }
+        // Only the exact operands of the admitted closure enter the shared retrieval; no unscoped candidates can enter.
+        let refs = trace
+            .rows
+            .iter()
+            .filter_map(|row| row.current_revision_id.clone())
+            .collect();
+        context.task_id = None;
+        context.repository_id = None;
+        context.worktree_id = None;
+        context.execution = None;
+        let search = search
+            .with_procedure_revisions(BTreeSet::from([successor.clone()]))
+            .with_readable_refs(access.frontier, refs)
+            .with_canonical_sources(access.frontier, trace.path.rows.clone())
+            .with_relation_read(Some(std::sync::Arc::new(trace.path.clone())));
+        let (page, _) = Box::pin(search.retrieve(context, false, None, &|_, _| Ok(Vec::new())))
+            .await
+            .map_err(|_| McpServiceError::Store)?;
+        if page.result.projection_frontier != access.frontier
+            || page.result.authoritative_frontier != access.frontier
+            || Box::pin(access.scoped_support_trace(
+                &successor,
+                shard,
+                limit,
+                cas,
+                &mut archive_budget,
+            ))
+            .await
+            .as_ref()
+                != Some(&trace)
+        {
+            return Ok(unavailable("search_relation_unresolved"));
+        }
+        let mut found = page.result;
+        if !trace.omitted.is_empty() {
+            found
+                .degraded_reasons
+                .insert("relation_candidate_budget_exhausted".into());
+        }
+        if trace.archive_gap {
+            found
+                .degraded_reasons
+                .insert("search_relation_source_unavailable".into());
+        }
+        let view = page.grounded_view.and_then(|mut view| {
+            view.omitted_refs.extend(trace.omitted.iter().cloned());
+            view.validate().ok().map(|()| view)
+        });
+        if let Some(view) = &view {
+            if !view.unresolved_gaps.is_empty() {
+                found
+                    .degraded_reasons
+                    .insert("search_relation_unresolved".into());
+            }
+        } else {
+            found
+                .degraded_reasons
+                .insert("grounded_view_unavailable".into());
+        }
+        let now = unix_time_us_for_mcp();
+        let items = found
+            .candidates
+            .iter()
+            .filter_map(|candidate| {
+                let row = trace.rows.iter().find(|row| {
+                    row.current_revision_id.as_ref() == Some(&candidate.candidate_id)
+                })?;
+                let mut item = classify_object_row(row, Some(candidate.text.clone()), true, now);
+                // A support trace is evidence, never Procedure guidance or a normative instruction.
+                item.partition = McpItemPartition::Evidence;
+                Some(item)
+            })
+            .collect();
+        let mut reply = Self::search_result_from_review(
+            request_id,
+            label,
+            scope.anchor.cwd_only,
+            found,
+            items,
+            trace.omitted,
+            BTreeSet::new(),
+        );
+        reply.grounded_view = view.map(Box::new);
+        Ok(reply)
     }
 
     // Keep the explicit relation retrieval future off the common Search stack.

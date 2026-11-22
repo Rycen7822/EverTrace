@@ -63,6 +63,19 @@ pub(crate) fn explicit_operation_binding(
     target.parse().ok()
 }
 
+/// Exact phrase and one revision; a UUID in prose does not open a Global relation.
+pub(crate) fn explicit_global_support(
+    input: &str,
+    targets: &[String],
+) -> Option<evertrace_domain::revision::RevisionId> {
+    let [target] = targets else { return None };
+    let request = input.trim().trim_end_matches('?').trim_end();
+    request
+        .eq_ignore_ascii_case("trace global support")
+        .then(|| target.parse().ok())
+        .flatten()
+}
+
 fn source_target(reference: &str) -> bool {
     use evertrace_domain::{evidence::EvidenceSurface, ids::SourceObservationId};
     reference.parse::<SourceObservationId>().is_ok()

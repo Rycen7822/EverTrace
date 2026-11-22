@@ -921,7 +921,7 @@ pub(crate) struct LineageQuery {
     pub current_only: bool,
 }
 
-#[derive(PartialEq)]
+#[derive(Clone, PartialEq)]
 pub(crate) struct RelationRead {
     pub rows: Vec<evertrace_store::SearchProjectionRow>,
     pub edges: Vec<(String, String, String)>,
@@ -946,38 +946,66 @@ pub(crate) async fn global_support_path(
     candidate_limit: usize,
     access: &SearchReadAccess<'_>,
 ) -> Option<(RelationRead, BTreeMap<String, BTreeSet<String>>)> {
+    let root = exact_support_operand(index, readable, successor)?;
+    let kind = root.object_kind.as_deref()?;
+    let contract_id = access
+        .checked_support_root(successor, Some(kind))
+        .await?
+        .support_contract_ref?;
+    let contract_ref = contract_id.to_string();
+    let head = if include_evidence {
+        access
+            .check_exact_record(&contract_ref, &contract_ref, "global_support_contract")
+            .await
+            .ok()
+            .and_then(|context| context.current_support_validation)
+    } else {
+        None
+    };
+    support_relations(
+        index,
+        readable,
+        successor,
+        contract_id,
+        head,
+        include_evidence,
+        candidate_limit,
+    )
+}
+
+fn exact_support_operand<'a>(
+    index: &BTreeMap<&str, Vec<&'a ObjectRow>>,
+    readable: &BTreeSet<String>,
+    revision: &str,
+) -> Option<&'a ObjectRow> {
+    let mut rows = index
+        .get(revision)?
+        .iter()
+        .copied()
+        .filter(|row| row.current_revision_id.as_deref() == Some(revision));
+    let row = rows.next()?;
+    (readable.contains(revision) && rows.next().is_none()).then_some(row)
+}
+
+fn support_relations(
+    index: &BTreeMap<&str, Vec<&ObjectRow>>,
+    readable: &BTreeSet<String>,
+    successor: &str,
+    contract_id: evertrace_domain::revision::RevisionId,
+    head: Option<evertrace_domain::revision::RevisionId>,
+    include_evidence: bool,
+    candidate_limit: usize,
+) -> Option<(RelationRead, BTreeMap<String, BTreeSet<String>>)> {
     use evertrace_domain::{
         query::{METADATA_READ_LIMIT, SUCCESSOR_SUPPORT_CONTRACT, SUPPORT_CONTRACT_EVIDENCE},
         semantic::GlobalSupportState,
     };
-    let exact = |id: &str| {
-        // A validation uses the contract ID as its stable key, never as its own revision.
-        let mut matches = index
-            .get(id)?
-            .iter()
-            .copied()
-            .filter(|row| row.current_revision_id.as_deref() == Some(id));
-        let row = matches.next()?;
-        (matches.next().is_none() && readable.contains(id)).then_some(row)
-    };
-    let root = exact(successor)?;
+    let exact = |id: &str| exact_support_operand(index, readable, id);
     let decode = |row: &ObjectRow| -> Option<JournalPayload> {
         let payload: JournalPayload = serde_json::from_str(row.payload_json.as_deref()?).ok()?;
         payload.validate().ok()?;
         Some(payload)
     };
-    let kind = root.object_kind.as_deref()?;
-    if !matches!(
-        kind,
-        "atom_revision" | "core_membership" | "procedure_revision"
-    ) {
-        return None;
-    }
-    let contract_id = access
-        .check_exact_record(successor, successor, kind)
-        .await
-        .ok()?
-        .support_contract_ref?;
     let contract_ref = contract_id.to_string();
     let row = exact(&contract_ref)?;
     let JournalPayload::GlobalSupportContractRecorded(contract) = decode(row)? else {
@@ -1003,12 +1031,7 @@ pub(crate) async fn global_support_path(
         return Some((path, archives));
     }
     // The current head belongs to the canonical reducer, never to an ordering over historical rows.
-    let valid = async {
-        let context = access
-            .check_exact_record(&contract_ref, &contract_ref, "global_support_contract")
-            .await
-            .ok()?;
-        let head = context.current_support_validation?;
+    let valid = head.and_then(|head| {
         let JournalPayload::GlobalSupportValidationRecorded(validation) =
             decode(exact(&head.to_string())?)?
         else {
@@ -1025,8 +1048,7 @@ pub(crate) async fn global_support_path(
                         .minimum_surviving_support,
                 ))
         .then_some(validation)
-    }
-    .await;
+    });
     if let Some(validation) = valid {
         let mut archive_refs_remaining = usize::from(METADATA_READ_LIMIT);
         for id in validation
@@ -1072,7 +1094,130 @@ pub(crate) async fn global_support_path(
     Some((path, archives))
 }
 
+#[derive(PartialEq)]
+pub(crate) struct ScopedSupportTrace {
+    pub path: RelationRead,
+    pub rows: Vec<ObjectRow>,
+    pub omitted: BTreeSet<String>,
+    pub archive_gap: bool,
+}
+
 impl SearchReadAccess<'_> {
+    /// MCP verifies the finite closure in its own scope before offering any Global operands.
+    pub(crate) async fn scoped_support_trace(
+        &self,
+        successor: &str,
+        shard: (
+            evertrace_domain::ids::RepositoryId,
+            Option<evertrace_domain::ids::WorktreeId>,
+            Option<evertrace_domain::ids::TaskId>,
+        ),
+        candidate_limit: usize,
+        cas_dir: &std::path::Path,
+        budget: &mut RelationArchiveBudget,
+    ) -> Option<ScopedSupportTrace> {
+        use evertrace_domain::query::{METADATA_READ_LIMIT, SUPPORT_CONTRACT_EVIDENCE};
+        let root = Box::pin(self.checked_support_root(successor, None)).await?;
+        let row = root.selected.as_ref()?;
+        Box::pin(self.check_current(
+            row.object_id.as_deref()?,
+            successor,
+            row.object_kind.as_deref()?,
+        ))
+        .await
+        .ok()?;
+        let contract = root.support_contract_ref?;
+        let key = contract.to_string();
+        let proof = self
+            .check_exact_record(&key, &key, "global_support_contract")
+            .await
+            .ok()?;
+        let selected = proof.selected.as_ref()?;
+        let head = proof.current_support_validation;
+        let validation = if let Some(revision) = head {
+            let id = revision.to_string();
+            self.check_exact_record(&id, &id, "global_support_validation")
+                .await
+                .ok()
+        } else {
+            None
+        };
+        let mut rows = BTreeMap::new();
+        for row in root
+            .rows
+            .iter()
+            .chain(&proof.rows)
+            .chain(validation.iter().flat_map(|value| &value.rows))
+        {
+            if rows
+                .insert(row.row_id.as_str(), row)
+                .is_some_and(|prior| prior != row)
+            {
+                return None;
+            }
+        }
+        let dependencies = rows.into_values().cloned().collect::<Vec<_>>();
+        if !support_closure_in_shard(&dependencies, shard) {
+            return None;
+        }
+        let index = physical_read_index(&dependencies);
+        let readable = index
+            .keys()
+            .map(|reference| (*reference).to_owned())
+            .collect();
+        let lookahead = usize::from(METADATA_READ_LIMIT) + 2;
+        let (mut path, archives) = support_relations(
+            &index, &readable, successor, contract, head, true, lookahead,
+        )?;
+        let mut kept = vec![row.clone(), selected.clone()];
+        let mut omitted = BTreeSet::new();
+        let mut archive_gap = false;
+        for (offset, (reference, sources)) in archives.into_iter().enumerate() {
+            let admitted = if offset >= candidate_limit.saturating_sub(2) {
+                omitted.insert(reference.clone());
+                false
+            } else if check_relation_archive(
+                &sources,
+                self.writer,
+                cas_dir,
+                &index,
+                budget,
+                self.deadline,
+            )
+            .await
+            {
+                kept.push(exact_support_operand(&index, &readable, &reference)?.clone());
+                true
+            } else {
+                archive_gap = true;
+                false
+            };
+            if !admitted {
+                path.edges.retain(|(_, target, kind)| {
+                    kind != SUPPORT_CONTRACT_EVIDENCE || target != &reference
+                });
+                path.missing.insert(SUPPORT_CONTRACT_EVIDENCE);
+            }
+        }
+        let reader = self.writer.read_handle();
+        let observed = tokio::time::timeout_at(
+            tokio::time::Instant::from_std(self.deadline),
+            reader.state(),
+        )
+        .await
+        .ok()?
+        .ok()?;
+        if observed != (self.frontier, proof.state.data_identity) {
+            return None;
+        }
+        Some(ScopedSupportTrace {
+            path,
+            rows: kept,
+            omitted,
+            archive_gap,
+        })
+    }
+
     /// Read only the nominated Transition and its immutable snapshot coordinates, not Worktree current pointers.
     pub(crate) async fn lineage(&self, query: &LineageQuery) -> Option<RelationRead> {
         use evertrace_domain::repository::{LineageAssessment, SnapshotCaptureStatus};
@@ -1612,6 +1757,32 @@ pub(crate) struct SearchReadAccess<'a> {
     pub deadline: Instant,
 }
 
+fn support_closure_in_shard(
+    rows: &[ObjectRow],
+    (repository, worktree, task): (
+        evertrace_domain::ids::RepositoryId,
+        Option<evertrace_domain::ids::WorktreeId>,
+        Option<evertrace_domain::ids::TaskId>,
+    ),
+) -> bool {
+    let worktree = worktree.map(|id| id.to_string());
+    let task = task.map(|id| id.to_string());
+    let selected = rows.iter().collect::<Vec<_>>();
+    let Ok(scopes) = crate::repository::row_repository_contexts_from_scopes(rows.iter(), &selected)
+    else {
+        return false;
+    };
+    // A shard grants no new access to peer repositories or unrelated Work contexts.
+    scopes.values().any(|ids| ids.contains(&repository))
+        && scopes
+            .values()
+            .all(|ids| ids.iter().all(|id| *id == repository))
+        && rows.iter().all(|row| {
+            (row.task_id.is_none() || row.task_id == task)
+                && (worktree.is_none() || row.worktree_id.is_none() || row.worktree_id == worktree)
+        })
+}
+
 /// Ordinary Search families whose public current revision and source/scope closure use exact reads.
 pub(crate) const SCOPED_OBJECT_KINDS: &[&str] = &[
     "atom_revision",
@@ -1631,7 +1802,7 @@ impl SearchReadAccess<'_> {
                 revision_ref: revision.to_owned(),
             }),
             revision,
-            "atom_revision",
+            Some("atom_revision"),
         )
         .await
         .map(drop)
@@ -1783,7 +1954,17 @@ impl SearchReadAccess<'_> {
             expected_data_identity: None,
             expected_selection: None,
         });
-        self.check(query, revision, kind).await
+        self.check(query, revision, Some(kind)).await
+    }
+
+    async fn checked_support_root(
+        &self,
+        revision: &str,
+        kind: Option<&str>,
+    ) -> Option<Box<StoredFieldsContext>> {
+        let context = self.check_exact(revision, revision, kind).await.ok()?;
+        context.support_contract_ref?;
+        Some(context)
     }
 
     async fn check_exact_record(
@@ -1791,6 +1972,15 @@ impl SearchReadAccess<'_> {
         key: &str,
         revision: &str,
         kind: &str,
+    ) -> Result<Box<StoredFieldsContext>, ErrorCode> {
+        self.check_exact(key, revision, Some(kind)).await
+    }
+
+    async fn check_exact(
+        &self,
+        key: &str,
+        revision: &str,
+        kind: Option<&str>,
     ) -> Result<Box<StoredFieldsContext>, ErrorCode> {
         self.check(
             ExactReadQuery::Record(ExactRecordQuery {
@@ -1813,7 +2003,7 @@ impl SearchReadAccess<'_> {
         &self,
         query: ExactReadQuery,
         revision: &str,
-        kind: &str,
+        kind: Option<&str>,
     ) -> Result<Box<StoredFieldsContext>, ErrorCode> {
         let read = async {
             let (cancelled, _cancel_on_drop) =
@@ -1834,7 +2024,7 @@ impl SearchReadAccess<'_> {
             if context.state.frontier != self.frontier
                 || context.selected.as_ref().is_none_or(|row| {
                     row.current_revision_id.as_deref() != Some(revision)
-                        || row.object_kind.as_deref() != Some(kind)
+                        || kind.is_some_and(|kind| row.object_kind.as_deref() != Some(kind))
                 })
             {
                 return Err(ErrorCode::StoreCorrupt);

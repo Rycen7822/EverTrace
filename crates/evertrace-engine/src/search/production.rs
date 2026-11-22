@@ -774,19 +774,18 @@ impl ProductionSearch {
         let mut objects = self.hard_filter(&context, true, time_scope);
         objects.global_only = global_only;
         let evidence = self.evidence_filter(&context, global_only, time_scope);
-        let result = self
-            .search_snapshot(
-                context.clone(),
-                false,
-                &snapshot,
-                &deadline,
-                global_only,
-                evidence.as_ref(),
-                time_scope,
-            )
-            .await?;
+        let result = Box::pin(self.search_snapshot(
+            context.clone(),
+            false,
+            &snapshot,
+            &deadline,
+            global_only,
+            evidence.as_ref(),
+            time_scope,
+        ))
+        .await?;
         let version = snapshot.version();
-        let page = super::retrieval::NativeRetrieval {
+        let retrieval = super::retrieval::NativeRetrieval {
             context: &context,
             result,
             objects,
@@ -798,9 +797,8 @@ impl ProductionSearch {
             relation_sources: Some(relation_sources),
             relation_read: self.relation_read.as_deref(),
             include_hit_window: true,
-        }
-        .run(snapshot)
-        .await?;
+        };
+        let page = Box::pin(retrieval.run(snapshot)).await?;
         Ok((page, Some(version)))
     }
 
@@ -1557,9 +1555,18 @@ impl ProductionSearch {
                 }
             }
         }
+        let exact_support = self.relation_read.is_some()
+            && context.query_facets.target_anchors.len() == 1
+            && context.query_facets.target_anchors == context.query_facets.exact_identifiers
+            && context
+                .query_facets
+                .relation_requirements
+                .iter()
+                .any(|kind| kind == evertrace_domain::query::SUCCESSOR_SUPPORT_CONTRACT);
         let fts_result = if exact_atom_only
             || self.exact_object_kind.is_some()
             || exact_query_reference(&context).is_some()
+            || exact_support
             || identifier_only_comparison(&context)
         {
             Ok(Vec::new())

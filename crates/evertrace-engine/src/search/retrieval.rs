@@ -278,7 +278,15 @@ impl NativeRetrieval<'_> {
             let Some(filter) = filter else { continue };
             let limit = self.remaining();
             if limit == 0 {
-                self.degraded("retrieval_budget_exhausted");
+                if identifiers.iter().any(|id| {
+                    !self
+                        .result
+                        .candidates
+                        .iter()
+                        .any(|candidate| candidate.candidate_id == *id)
+                }) {
+                    self.degraded("retrieval_budget_exhausted");
+                }
                 break;
             }
             match self
