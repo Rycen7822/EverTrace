@@ -144,11 +144,51 @@ fn require_row_identity(
     Ok(())
 }
 
-fn is_forgotten_atom(deletions: &ObjectDeletionState, revision: &RevisionId) -> bool {
-    deletions.events().any(|event| {
+pub(super) fn is_forgotten_atom<'a>(
+    mut deletions: impl Iterator<Item = &'a evertrace_domain::purge::ObjectDeletionLedgerEvent>,
+    revision: &RevisionId,
+) -> bool {
+    deletions.any(|event| {
         matches!(event.target, ObjectDeletionTarget::Atom { .. })
             && event.exact_revision_ids.binary_search(revision).is_ok()
     })
+}
+
+fn introduces_forgotten_predecessor(
+    declared: &[RevisionId],
+    inherited: &[RevisionId],
+    forgotten: &impl Fn(&RevisionId) -> bool,
+) -> bool {
+    declared
+        .iter()
+        .any(|reference| inherited.binary_search(reference).is_err() && forgotten(reference))
+}
+
+pub(super) fn proposal_introduces_forgotten_predecessor(
+    proposal: &RevisionProposal,
+    base: Option<&Atom>,
+    forgotten: impl Fn(&RevisionId) -> bool,
+) -> bool {
+    let ProposalPayload::Atom(payload) = &proposal.payload else {
+        return false;
+    };
+    let inherited = base
+        .filter(|atom| {
+            Some(atom.revision_id) == proposal.base_revision_id
+                && Some(ProposalTargetId::Atom(atom.atom_id)) == proposal.target_id
+        })
+        .map_or(&[][..], |atom| atom.supersedes_revision_refs.as_slice());
+    let introduces = |draft: &AtomDraft, inherited: &[RevisionId]| {
+        introduces_forgotten_predecessor(&draft.supersedes_revision_refs, inherited, &forgotten)
+    };
+    match payload.as_ref() {
+        AtomProposalPayload::Create { draft } => introduces(draft, &[]),
+        AtomProposalPayload::Replace { draft }
+        | AtomProposalPayload::Merge { draft, .. }
+        | AtomProposalPayload::Reclassify { draft } => introduces(draft, inherited),
+        AtomProposalPayload::Split { drafts } => drafts.iter().any(|draft| introduces(draft, &[])),
+        AtomProposalPayload::Deprecate { .. } => false,
+    }
 }
 
 pub(crate) fn record_atom_event(
@@ -160,16 +200,16 @@ pub(crate) fn record_atom_event(
     error: StoreError,
 ) -> Result<(), StoreError> {
     // A successor can keep an immutable declaration, not introduce a link to a forgotten Atom.
-    let parent = value.parent_revision_id.and_then(|id| revisions.get(&id));
-    for reference in &value.supersedes_revision_refs {
-        if parent.is_none_or(|(atom, _)| {
-            atom.supersedes_revision_refs
-                .binary_search(reference)
-                .is_err()
-        }) && is_forgotten_atom(deletions, reference)
-        {
-            return Err(error);
-        }
+    let inherited = value
+        .parent_revision_id
+        .and_then(|id| revisions.get(&id))
+        .map_or(&[][..], |(atom, _)| {
+            atom.supersedes_revision_refs.as_slice()
+        });
+    if introduces_forgotten_predecessor(&value.supersedes_revision_refs, inherited, &|id| {
+        is_forgotten_atom(deletions.events(), id)
+    }) {
+        return Err(error);
     }
     record_atom(current, revisions, value, seq, error)
 }
@@ -1385,7 +1425,7 @@ fn validate_atom_relations(
     // A canonical tombstone removes the edge without invalidating the immutable Atom.
     let predecessors = atom.supersedes_revision_refs.iter().filter(|revision| {
         input.atom_revisions.contains_key(*revision)
-            || !is_forgotten_atom(input.deletions, revision)
+            || !is_forgotten_atom(input.deletions.events(), revision)
     });
     for revision in predecessors
         .chain(&atom.supports_revision_refs)

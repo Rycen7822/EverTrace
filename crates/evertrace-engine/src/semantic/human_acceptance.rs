@@ -339,7 +339,7 @@ impl HumanAcceptanceService {
             if proposal.proposal_revision_id.to_string() != verified.body.source_revision.as_str()
                 || !proposal.status.is_open()
                 || !matches!(
-                    deletion_admission(&snapshot, proposal)?,
+                    deletion_admission(&snapshot, &view, proposal)?,
                     ObjectDeletionCandidateAdmission::Clear
                 )
             {
@@ -416,7 +416,7 @@ impl HumanAcceptanceService {
             return Err(HumanGovernanceError::Store);
         }
         if view.proposals.get(&reviewed.proposal_id) != Some(reviewed)
-            || !deletion_admission(snapshot, reviewed)?
+            || !deletion_admission(snapshot, view, reviewed)?
                 .permits_web_acceptance(intent.reauthorization.as_deref())
         {
             return Ok(());
@@ -510,7 +510,7 @@ impl HumanAcceptanceService {
                 None,
             )?;
             if !matches!(
-                deletion_admission(snapshot, &prepared.new_proposal)?,
+                deletion_admission(snapshot, view, &prepared.new_proposal)?,
                 ObjectDeletionCandidateAdmission::Clear
             ) {
                 return Err(HumanGovernanceError::InvalidInput);
@@ -685,7 +685,7 @@ impl HumanAcceptanceService {
         {
             return Ok(conflict());
         }
-        if !deletion_admission(&snapshot, proposal)?
+        if !deletion_admission(&snapshot, &view, proposal)?
             .permits_web_acceptance(intent.reauthorization.as_deref())
         {
             if intent.reauthorization.is_some() {
@@ -1034,7 +1034,7 @@ impl HumanAcceptanceService {
                 current_revision_ref: Some(current.proposal_revision_id.to_string()),
             });
         }
-        let deletion_admission = deletion_admission(&snapshot, current)?;
+        let deletion_admission = deletion_admission(&snapshot, &view, current)?;
         if matches!(
             &decision,
             HumanProposalDecision::Accept
@@ -1409,7 +1409,7 @@ impl HumanAcceptanceService {
                 reason: "atomic_tui_acceptance_source_unavailable",
             });
         };
-        let admission = deletion_admission(snapshot, original)?;
+        let admission = deletion_admission(snapshot, view, original)?;
         let deletion = admission
             .representative_historical_deletion()
             .cloned()
@@ -1943,10 +1943,14 @@ async fn acknowledge_web_reservation(
 
 fn deletion_admission(
     snapshot: &ProjectionSnapshot,
+    view: &SemanticCurrentView,
     proposal: &RevisionProposal,
 ) -> Result<ObjectDeletionCandidateAdmission, HumanGovernanceError> {
+    let base = proposal
+        .base_revision_id
+        .and_then(|id| view.atom_revisions.get(&id));
     ObjectDeletionCandidateAdmissionView::from_snapshot(snapshot)
-        .and_then(|view| view.classify_proposal(proposal))
+        .and_then(|admission| admission.classify_proposal(proposal, base))
         .map_err(|_| HumanGovernanceError::Store)
 }
 
@@ -2692,10 +2696,7 @@ fn accepted_reauthorization_retry<'a>(
     view: &'a SemanticCurrentView,
     original: &RevisionProposal,
 ) -> Result<Option<&'a RevisionProposal>, HumanGovernanceError> {
-    let deletion = ObjectDeletionCandidateAdmissionView::from_snapshot(snapshot)
-        .map_err(|_| HumanGovernanceError::Store)?
-        .classify_proposal(original)
-        .map_err(|_| HumanGovernanceError::Store)?
+    let deletion = deletion_admission(snapshot, view, original)?
         .representative_historical_deletion()
         .cloned();
     let Some(deletion) = deletion else {

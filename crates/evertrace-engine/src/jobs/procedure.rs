@@ -674,7 +674,7 @@ fn validate_frozen_target(
             snapshot,
             &proposal.source_cohort_refs,
         )?
-        .classify_proposal(proposal)?,
+        .classify_proposal(proposal, None)?,
         ObjectDeletionCandidateAdmission::Clear
     ) {
         return Err(SemanticServiceError::BaseConflict);
@@ -964,7 +964,7 @@ pub(crate) async fn readable_revisions_from_rows(
                 ProposalStatus::Pending | ProposalStatus::Validating
             )
             || !matches!(
-                deletion.classify_proposal(&proposal)?,
+                deletion.classify_proposal(&proposal, None)?,
                 ObjectDeletionCandidateAdmission::Clear
             )
         {

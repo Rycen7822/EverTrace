@@ -4359,22 +4359,31 @@ fn summary(
                 let semantic_view = semantic_view.ok_or(HumanGovernanceError::Store)?;
                 let (plain_accept_eligible, merge_and_accept_eligible) =
                     proposal_acceptance_eligibility(semantic_view, value);
-                let reauthorization =
-                    if value.status.is_open() && value.operation == ProposalOperation::Create {
-                        deletion_admission
-                            .as_ref()
-                            .ok_or(HumanGovernanceError::Store)?
-                            .classify_proposal(value)
-                            .map_err(|_| HumanGovernanceError::Store)?
+                let (admission_clear, reauthorization) = if value.status.is_open() {
+                    let base = value
+                        .base_revision_id
+                        .and_then(|id| semantic_view.atom_revisions.get(&id));
+                    let admission = deletion_admission
+                        .as_ref()
+                        .ok_or(HumanGovernanceError::Store)?
+                        .classify_proposal(value, base)
+                        .map_err(|_| HumanGovernanceError::Store)?;
+                    (
+                        matches!(
+                            admission,
+                            evertrace_store::ObjectDeletionCandidateAdmission::Clear
+                        ),
+                        admission
                             .representative_historical_deletion()
-                            .and_then(ObjectReauthorizationRef::from_deletion)
-                    } else {
-                        None
-                    };
+                            .and_then(ObjectReauthorizationRef::from_deletion),
+                    )
+                } else {
+                    (false, None)
+                };
                 Ok(HumanProposalReview {
                     proposal: Box::new(value.clone()),
-                    plain_accept_eligible: plain_accept_eligible && reauthorization.is_none(),
-                    merge_and_accept_eligible,
+                    plain_accept_eligible: plain_accept_eligible && admission_clear,
+                    merge_and_accept_eligible: merge_and_accept_eligible && admission_clear,
                     reauthorization,
                     capability_coverage: None,
                 })

@@ -534,7 +534,12 @@ impl RevisionProposalService {
             .map_err(|_| SemanticServiceError::InvalidInput)?;
         if let Some(admission) = deletion_admission {
             match admission
-                .classify_proposal(&candidate)
+                .classify_proposal(
+                    &candidate,
+                    candidate
+                        .base_revision_id
+                        .and_then(|id| view.atom_revisions.get(&id)),
+                )
                 .map_err(SemanticServiceError::Store)?
             {
                 ObjectDeletionCandidateAdmission::Clear => {}

@@ -4824,7 +4824,13 @@ impl ObjectDeletionCandidateAdmissionView {
     pub fn classify_proposal(
         &self,
         proposal: &RevisionProposal,
+        atom_base: Option<&Atom>,
     ) -> Result<ObjectDeletionCandidateAdmission, StoreError> {
+        if semantic::proposal_introduces_forgotten_predecessor(proposal, atom_base, |id| {
+            semantic::is_forgotten_atom(self.deletions.iter(), id)
+        }) {
+            return Ok(ObjectDeletionCandidateAdmission::FixedSuppression);
+        }
         let Some(candidate) = deletion_candidate_from_proposal(proposal)? else {
             return Ok(ObjectDeletionCandidateAdmission::Clear);
         };
@@ -12950,6 +12956,22 @@ impl JournalAdmissionState {
             .map(|event| &event.payload)
             .collect::<Vec<_>>();
         self.validate_non_resurrection_command(&command_payloads, StoreError::InvalidInput)?;
+        // Apply the draft gate at ingress. Previously committed pending proposals remain replayable and dismissible.
+        for payload in &command_payloads {
+            if let JournalPayload::RevisionProposalRecorded(proposal) = payload
+                && proposal.status.is_open()
+                && semantic::proposal_introduces_forgotten_predecessor(
+                    proposal,
+                    proposal
+                        .base_revision_id
+                        .and_then(|id| self.atom_revisions.get(&id))
+                        .map(|(atom, _)| atom),
+                    |id| semantic::is_forgotten_atom(self.deletions.events(), id),
+                )
+            {
+                return Err(StoreError::InvalidInput);
+            }
+        }
         let accepted_edits = semantic::validate_command_boundary(
             &self.atoms,
             &self.proposals,

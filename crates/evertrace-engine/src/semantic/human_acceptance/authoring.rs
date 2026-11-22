@@ -308,7 +308,7 @@ impl HumanAcceptanceService {
             return Ok(None);
         };
         if !matches!(
-            deletion_admission(snapshot, &value)?,
+            deletion_admission(snapshot, view, &value)?,
             ObjectDeletionCandidateAdmission::Clear
         ) {
             return Ok(None);

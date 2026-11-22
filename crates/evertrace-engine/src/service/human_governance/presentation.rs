@@ -207,7 +207,7 @@ impl HumanGovernanceService {
             return Ok(false);
         }
         let admission = ObjectDeletionCandidateAdmissionView::from_snapshot(&snapshot)
-            .and_then(|view| view.classify_proposal(proposal))
+            .and_then(|view| view.classify_proposal(proposal, None))
             .map_err(|_| HumanGovernanceError::Store)?;
         if !admission.permits_web_acceptance(Some(reference)) {
             return Ok(false);
