@@ -1179,10 +1179,11 @@ fn dirty_targets_owned_support(
 }
 
 fn journal_payload(row: &ObjectRow) -> Result<Option<JournalPayload>, StoreError> {
-    // Imported-source current rows contain their typed projection, not a
-    // JournalPayload. The repository closure handles them through the existing
-    // non-journal path, including unrelated sources that must remain visible.
-    if crate::session_import::restore_current(row)?.is_some() {
+    // Typed projections are not journal payloads. Cue deletion uses the exact
+    // source revision in the row header, which the cue decoder also validates.
+    if crate::projections::recall_trigger_contract(row)?.is_some()
+        || crate::session_import::restore_current(row)?.is_some()
+    {
         return Ok(None);
     }
     if row.row_class == Some(ObjectRowClass::Projection)
