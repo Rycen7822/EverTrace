@@ -2590,6 +2590,7 @@ fn human_action_label(action: &evertrace_protocol::dto::HumanActionRequest) -> &
         | HumanActionRequest::WebCreateAtom { .. }
         | HumanActionRequest::WebCorrectAtom { .. }
         | HumanActionRequest::WebProposalDisposition { .. }
+        | HumanActionRequest::WebSupportReplace { .. }
         | HumanActionRequest::WebSupportDeprecate { .. } => "unavailable action",
     }
 }

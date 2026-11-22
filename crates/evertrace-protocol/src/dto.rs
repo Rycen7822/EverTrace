@@ -180,6 +180,12 @@ pub enum HumanReadRequest {
         expected_validation_revision_id: RevisionId,
         expected_frontier: u64,
     },
+    WebSupportReplacementOutcome {
+        request_id: RequestId,
+        expected_frontier: u64,
+        expected_validation_revision_id: RevisionId,
+        support_revisions: Vec<RevisionId>,
+    },
     WebSupportDeprecationOutcome {
         request_id: RequestId,
         expected_frontier: u64,
@@ -270,6 +276,10 @@ pub enum HumanActionRequest {
     WebProposalDisposition {
         review: ProposalConfirmation,
         decision: WebProposalDisposition,
+    },
+    WebSupportReplace {
+        expected_validation_revision_id: RevisionId,
+        support_revisions: Vec<RevisionId>,
     },
     WebSupportDeprecate {
         expected_validation_revision_id: RevisionId,
@@ -1052,6 +1062,7 @@ impl HumanGovernanceRequest {
                     | HumanActionRequest::WebCreateAtom { .. }
                     | HumanActionRequest::WebCorrectAtom { .. }
                     | HumanActionRequest::WebProposalDisposition { .. }
+                    | HumanActionRequest::WebSupportReplace { .. }
                     | HumanActionRequest::WebSupportDeprecate { .. },
                 ..
             }
@@ -1141,6 +1152,11 @@ impl HumanReadRequest {
             | Self::WebSupportDeprecationOutcome {
                 expected_frontier, ..
             } => *expected_frontier != 0,
+            Self::WebSupportReplacementOutcome {
+                expected_frontier,
+                support_revisions,
+                ..
+            } => *expected_frontier != 0 && valid_web_support_revisions(support_revisions),
             Self::WebCreationOutcome { .. } | Self::WebCorrectionOutcome { .. } => true,
             Self::WebAcceptanceOutcome {
                 review,
@@ -1177,6 +1193,10 @@ impl HumanReadRequest {
             }
         }
     }
+}
+
+fn valid_web_support_revisions(refs: &[RevisionId]) -> bool {
+    (1..=16).contains(&refs.len()) && refs.windows(2).all(|pair| pair[0] < pair[1])
 }
 
 fn valid_support_deprecation_reason(reason: &str) -> bool {
@@ -1230,6 +1250,9 @@ impl HumanActionRequest {
                         if matches!(payload.as_ref(), ProcedureProposalPayload::Replace { .. })
                 )
             }
+            Self::WebSupportReplace {
+                support_revisions, ..
+            } => valid_web_support_revisions(support_revisions),
             Self::SupportDeprecate { reason, .. } | Self::WebSupportDeprecate { reason, .. } => {
                 valid_support_deprecation_reason(reason)
             }

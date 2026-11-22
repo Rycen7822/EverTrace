@@ -1167,6 +1167,15 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
                                     )).await.map_err(map_human_error)?;
                                     HumanGovernanceResponse::SupportDeprecationEligibility { available }
                                 }
+                                HumanReadRequest::WebSupportReplacementOutcome {
+                                    request_id: reviewed_id, expected_frontier, expected_validation_revision_id, support_revisions,
+                                } => {
+                                    if context.client_kind != ClientKind::Web { return Err(ErrorCode::Untrusted); }
+                                    let outcome = Box::pin(human_governance.reviewed_web_support_replacement_outcome(
+                                        reviewed_id, expected_frontier, expected_validation_revision_id, &support_revisions,
+                                    )).await.map_err(map_human_error)?;
+                                    HumanGovernanceResponse::Action { result: map_human_action(outcome) }
+                                }
                                 HumanReadRequest::WebSupportDeprecationOutcome {
                                     request_id, expected_frontier, expected_validation_revision_id,
                                 } => {
@@ -1339,6 +1348,11 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
                                             )
                                             .await
                                     }
+                                    HumanActionRequest::WebSupportReplace { expected_validation_revision_id, support_revisions } => Box::pin(
+                                        human_governance.submit_web_support_replacement(
+                                            request_id, expected_frontier, expected_validation_revision_id, support_revisions,
+                                        )
+                                    ).await,
                                     HumanActionRequest::WebSupportDeprecate { expected_validation_revision_id, reason } => Box::pin(
                                         human_governance.submit_web_support_deprecate(
                                             request_id, expected_frontier, expected_validation_revision_id, reason,

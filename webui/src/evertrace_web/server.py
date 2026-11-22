@@ -213,6 +213,8 @@ class App:
             "/api/proposal-acceptance-result": "POST",
             "/api/proposal-disposition": "POST",
             "/api/proposal-disposition-result": "POST",
+            "/api/proposal-support-replace": "POST",
+            "/api/proposal-support-replace-result": "POST",
             "/api/proposal-support-deprecate": "POST",
             "/api/proposal-support-deprecate-result": "POST",
             "/api/proposal-correction": "POST",
@@ -307,6 +309,19 @@ class App:
                     raise BackendError("invalid_input")
                 try:
                     data = await self.backend.web_atom_authoring(payload["request_id"], target, frontier=frontier, content=content, kind=kind)
+                except BackendError:
+                    data = {"status": "unknown"}
+            elif path in ("/api/proposal-support-replace", "/api/proposal-support-replace-result"):
+                if set(payload) != {"request_id", "validation_revision", "frontier", "support_revisions"}:
+                    raise BackendError("invalid_input")
+                validation, request_id = payload["validation_revision"], payload["request_id"]
+                frontier, refs = parse_frontier(payload["frontier"]), payload["support_revisions"]
+                if (not _uuid7(request_id) or not _uuid7(validation) or not frontier or not isinstance(refs, list)
+                    or not 1 <= len(refs) <= 16 or not all(_uuid7(ref) for ref in refs) or refs != sorted(set(refs))):
+                    raise BackendError("invalid_input")
+                try:
+                    data = await self.backend.web_support_replace(request_id, validation, frontier, refs,
+                        lookup=path.endswith("-result"))
                 except BackendError:
                     data = {"status": "unknown"}
             elif path in ("/api/proposal-support-deprecate", "/api/proposal-support-deprecate-result"):
@@ -932,6 +947,7 @@ def present_detail(templates, result, surface):
             disposition_request_id=_request_id() if result.get("web_disposition_available") else None,
             web_edit_available=result.get("web_edit_available", False),
             correction_frontier=correction_frontier, correction_request_id=_request_id() if correction_frontier else None,
+            support_replace_request_id=_request_id() if result.get("support_deprecate_available") else None,
             support_deprecate_request_id=_request_id() if result.get("support_deprecate_available") else None),
         "source_preview": preview,
         "semantic_text": semantic_text,

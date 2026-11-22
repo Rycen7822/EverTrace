@@ -125,6 +125,7 @@ async fn send_human(
             | HumanReadRequest::WebCorrectionOutcome { .. }
             | HumanReadRequest::WebProposalDispositionOutcome { .. }
             | HumanReadRequest::WebSupportDeprecationEligibility { .. }
+            | HumanReadRequest::WebSupportReplacementOutcome { .. }
             | HumanReadRequest::WebSupportDeprecationOutcome { .. }
             | HumanReadRequest::BrowseMemories { .. } => {
                 return Err(evertrace_protocol::error::ProtocolError::Wire(

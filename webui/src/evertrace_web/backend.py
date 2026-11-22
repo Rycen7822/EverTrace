@@ -674,6 +674,16 @@ class Backend:
             reply = await self._request(None, confirmation=True, action=action, request_id=request_id)
         return proposal_action_result(reply)
 
+    async def web_support_replace(self, request_id, validation, frontier, support_revisions, *, lookup):
+        selection = {"expected_validation_revision_id": validation, "support_revisions": support_revisions}
+        if lookup:
+            reply = await self._request({"kind": "web_support_replacement_outcome", "request_id": request_id,
+                "expected_frontier": frontier, **selection})
+        else:
+            action = {"operation": "act", "expected_frontier": frontier, "action": {"kind": "web_support_replace", **selection}}
+            reply = await self._request(None, confirmation=True, action=action, request_id=request_id)
+        return proposal_action_result(reply)
+
     async def web_proposal_action(
         self, request_id, proposal, revision, frontier, digest, *, lookup, decision, edit=None, reauthorize=False,
     ):
@@ -816,7 +826,8 @@ class Backend:
                 response = await call({"human_governance": {"operation": "read", "request": read}})
                 result = response["human_governance"]
                 if read["kind"] in ("web_acceptance_outcome", "web_proposal_disposition_outcome",
-                                    "web_correction_outcome", "web_creation_outcome", "web_support_deprecation_outcome"):
+                                    "web_correction_outcome", "web_creation_outcome", "web_support_deprecation_outcome",
+                                    "web_support_replacement_outcome"):
                     return result
                 if result.get("kind") not in (
                     "state",

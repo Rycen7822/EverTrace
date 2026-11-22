@@ -1559,6 +1559,172 @@ impl HumanGovernanceService {
         }
     }
 
+    pub async fn submit_web_support_replacement(
+        &self,
+        request_id: RequestId,
+        frontier: u64,
+        validation: RevisionId,
+        refs: Vec<RevisionId>,
+    ) -> Result<HumanActionOutcome, HumanGovernanceError> {
+        if let Some(outcome) = self
+            .web_support_replacement_outcome(request_id, frontier, validation, &refs)
+            .await?
+        {
+            return Ok(outcome);
+        }
+        let snapshot = self
+            .writer
+            .project_objects()
+            .await
+            .map_err(|_| HumanGovernanceError::Store)?;
+        let conflict = HumanActionOutcome::Conflict {
+            current_revision_ref: None,
+        };
+        let unavailable = HumanActionOutcome::Unavailable {
+            reason: "support_replacement_unavailable",
+        };
+        if snapshot.frontier != frontier {
+            return Ok(conflict);
+        }
+        let selection = match select_support_replacement(&snapshot, validation) {
+            Ok(SupportReplacementLookup::Available(selection))
+                if selection.target_kind == ProposalTargetKind::Atom =>
+            {
+                selection
+            }
+            Ok(SupportReplacementLookup::Conflict { .. }) => return Ok(conflict),
+            Ok(_) | Err(crate::semantic::SemanticServiceError::InvalidInput) => {
+                return Ok(unavailable);
+            }
+            Err(_) => return Err(HumanGovernanceError::Store),
+        };
+        let view = SemanticCurrentView::from_snapshot(&snapshot)
+            .map_err(|_| HumanGovernanceError::Store)?;
+        let base = view
+            .atom_revisions
+            .get(&selection.base_revision_id)
+            .ok_or(HumanGovernanceError::Store)?;
+        if refs == base.supports_revision_refs
+            || !self
+                .new_atom_supports_accessible(&snapshot, &view, validation, base, &refs)
+                .await?
+        {
+            return Ok(unavailable);
+        }
+        let mut draft = selection
+            .initial_payload
+            .atom_support_replacement()
+            .ok_or(HumanGovernanceError::Store)?
+            .clone();
+        draft.supports_revision_refs.clone_from(&refs);
+        let payload = ProposalPayload::Atom(Box::new(AtomProposalPayload::Replace { draft }));
+        let resolution = compose_support_replacement(
+            &view,
+            command_context(request_id, self.effective_config_hash)?,
+            &selection,
+            payload,
+        )
+        .map_err(|_| HumanGovernanceError::InvalidInput)?;
+        let ProposalResolution::Revision { value, command } = resolution else {
+            let mut candidates = view.proposals.values().filter(|proposal| {
+                proposal.base_revision_id == Some(selection.base_revision_id)
+                    && support_replacement_matches(proposal, validation, &refs)
+            });
+            if let Some(current) = candidates.next()
+                && candidates.next().is_none()
+                && self.proposal_accessible(&snapshot, current).await?
+            {
+                return Ok(HumanActionOutcome::NoDelta {
+                    current_revision_ref: current.proposal_revision_id.to_string(),
+                });
+            }
+            return Ok(unavailable);
+        };
+        let [event] = command.events() else {
+            return Err(HumanGovernanceError::Store);
+        };
+        let mut event = event.clone();
+        event.causation_id = Some(support_replacement_cause(frontier));
+        let command = JournalCommand::new(command.command_id(), vec![event])
+            .map_err(|_| HumanGovernanceError::Store)?;
+        match self
+            .writer
+            .commit_if_frontier(command, now_us()?, frontier)
+            .await
+        {
+            Ok(outcome) => {
+                let [audit] = outcome.event_ids.as_slice() else {
+                    return Err(HumanGovernanceError::Store);
+                };
+                Ok(HumanActionOutcome::Applied {
+                    current_revision_ref: value.proposal_revision_id.to_string(),
+                    audit_event_ref: audit.clone(),
+                })
+            }
+            Err(
+                crate::WriterActorError::StaleFrontier
+                | crate::WriterActorError::IdempotencyConflict,
+            ) => Ok(self
+                .web_support_replacement_outcome(request_id, frontier, validation, &refs)
+                .await?
+                .unwrap_or(conflict)),
+            Err(_) => Err(HumanGovernanceError::Store),
+        }
+    }
+
+    pub async fn reviewed_web_support_replacement_outcome(
+        &self,
+        request_id: RequestId,
+        frontier: u64,
+        validation: RevisionId,
+        refs: &[RevisionId],
+    ) -> Result<HumanActionOutcome, HumanGovernanceError> {
+        Ok(self
+            .web_support_replacement_outcome(request_id, frontier, validation, refs)
+            .await?
+            .unwrap_or(HumanActionOutcome::Unknown))
+    }
+
+    async fn web_support_replacement_outcome(
+        &self,
+        request_id: RequestId,
+        frontier: u64,
+        validation: RevisionId,
+        refs: &[RevisionId],
+    ) -> Result<Option<HumanActionOutcome>, HumanGovernanceError> {
+        let command = CommandId::from_uuid(request_id.as_uuid())
+            .map_err(|_| HumanGovernanceError::InvalidInput)?;
+        let Some(receipt) = self
+            .writer
+            .committed_command(command)
+            .await
+            .map_err(|_| HumanGovernanceError::Store)?
+        else {
+            return Ok(None);
+        };
+        if let ([JournalPayload::RevisionProposalRecorded(proposal)], [audit]) =
+            (receipt.payloads.as_slice(), receipt.event_ids.as_slice())
+            && receipt.first_causation_id.as_deref()
+                == Some(support_replacement_cause(frontier).as_str())
+            && proposal.parent_proposal_revision_id.is_none()
+            && proposal.status == ProposalStatus::Pending
+            && support_replacement_matches(proposal, validation, refs)
+        {
+            let snapshot = self
+                .writer
+                .project_objects()
+                .await
+                .map_err(|_| HumanGovernanceError::Store)?;
+            if self.proposal_accessible(&snapshot, proposal).await? {
+                return Ok(Some(HumanActionOutcome::Applied {
+                    current_revision_ref: proposal.proposal_revision_id.to_string(),
+                    audit_event_ref: audit.clone(),
+                }));
+            }
+        }
+        Ok(Some(HumanActionOutcome::Unknown))
+    }
+
     pub async fn web_support_deprecate_available(
         &self,
         frontier: u64,
@@ -3693,6 +3859,22 @@ fn current_support_revision(
         }
     }
     Ok(current.map(|(_, _, revision)| revision))
+}
+
+fn support_replacement_cause(frontier: u64) -> String {
+    format!("web-support-replace:{frontier}")
+}
+
+fn support_replacement_matches(
+    proposal: &RevisionProposal,
+    validation: RevisionId,
+    refs: &[RevisionId],
+) -> bool {
+    proposal
+        .atom_support_replacement()
+        .is_some_and(|(revision, draft)| {
+            revision == validation && draft.supports_revision_refs == refs
+        })
 }
 
 fn support_deprecation_cause(frontier: u64) -> String {

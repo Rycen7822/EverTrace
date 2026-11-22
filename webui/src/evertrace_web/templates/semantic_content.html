@@ -73,7 +73,7 @@
     {{ text_list('来源观察', value.source_observation_refs, record_kind='source_observation', exact_revision=true) }}
     {{ text_list('证据引用', value.evidence_refs) }}
     {{ text_list('替代的修订', value.supersedes_revision_refs) }}
-    {{ text_list('支持的修订', value.supports_revision_refs) }}
+    {{ text_list('支持的修订', value.supports_revision_refs, record_kind='atom_revision', exact_revision=true) }}
     {{ text_list('矛盾修订', value.contradicts_revision_refs) }}
     <h3>记录的 provenance</h3><pre>{{ value.provenance|pretty }}</pre>
     {% if value.get('user_authorization_provenance') is not none %}

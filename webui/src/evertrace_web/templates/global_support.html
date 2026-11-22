@@ -67,6 +67,17 @@
     data-kind="{{ now.metadata.object_kind }}">读取当前资产</button>
   {% endif %}
 </section>
+{% if content.kind == 'support_validation' and support_replace_request_id|default(none) %}
+<details data-support-replacement>
+  <summary>提出替换支持</summary>
+  <p>指定新的支持集合。请从记忆详情复制当前 Atom 的精确修订（每行一个，最多 16 个）。
+    如要保留仍有效的旧支持，也请列入。本步只提交待审提案，不改正文、现有校验或合同；另行接受后才发布。</p>
+  <label>替换支持修订 <textarea data-support-replacement-revisions required rows="5" maxlength="624"></textarea></label>
+  <p class="muted" data-support-replacement-status aria-live="polite"></p>
+  <button class="button" type="button" data-submit-support-replace data-validation-revision="{{ value.validation_revision_id }}"
+    data-frontier="{{ frontier }}" data-request-id="{{ support_replace_request_id }}">提交替换提案</button>
+</details>
+{% endif %}
 {% if content.kind == 'support_validation' and support_deprecate_request_id|default(none) %}
 <details data-support-deprecation>
   <summary>提出弃用</summary>
