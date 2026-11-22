@@ -1727,6 +1727,7 @@ impl JournalWriter {
                     cancelled,
                     deadline,
                     &mut budget,
+                    false,
                 )?
             };
             let source = if matches!(&cached, O::Page(context) if context.selected.is_none())
@@ -2001,7 +2002,7 @@ impl JournalWriter {
             };
             return self
                 .admission_state
-                .stored_fields_context_for_row(row, state, cancelled, deadline, budget);
+                .stored_fields_context_for_row(row, state, cancelled, deadline, budget, false);
         }
         let current = self.admission_state.stored_fields_context(
             query,
@@ -2016,7 +2017,7 @@ impl JournalWriter {
         match self.historical_work_row(query.lookup_ref(), cancelled, deadline)? {
             O::Page(row) if row.is_some() => self
                 .admission_state
-                .stored_fields_context_for_row(*row, state, cancelled, deadline, budget),
+                .stored_fields_context_for_row(*row, state, cancelled, deadline, budget, false),
             O::Page(_) => Ok(current),
             O::TooLarge => Ok(O::TooLarge),
             O::Conflict(frontier) => Ok(O::Conflict(frontier)),

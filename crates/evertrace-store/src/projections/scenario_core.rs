@@ -564,6 +564,19 @@ impl ScenarioCoreState {
             .all(|validation| validation.state == GlobalSupportState::Valid)
     }
 
+    pub(super) fn degraded_support(
+        &self,
+        id: RevisionId,
+    ) -> Option<(
+        &GlobalSuccessorSupportContract,
+        &GlobalSupportValidationEvent,
+    )> {
+        let (contract, _) = self.contracts.get(&id)?;
+        let validation = self.current_validation(id)?;
+        (validation.state == GlobalSupportState::Valid && validation.provenance_degraded)
+            .then_some((contract, validation))
+    }
+
     /// A valid successor may retain a frozen declaration without counting a deleted operand.
     pub(super) fn valid_successor_excludes_support(
         &self,
@@ -574,14 +587,13 @@ impl ScenarioCoreState {
         let (Some(contract), None) = (contracts.next(), contracts.next()) else {
             return false;
         };
-        self.current_validation(contract).is_some_and(|current| {
-            current.state == GlobalSupportState::Valid
-                && current.provenance_degraded
-                && current
+        self.degraded_support(contract)
+            .is_some_and(|(_, validation)| {
+                validation
                     .invalid_or_missing_refs
                     .binary_search(&missing)
                     .is_ok()
-        })
+            })
     }
 
     pub(super) fn global_wiki_support_watermark(&self, revision_id: RevisionId) -> Option<u64> {

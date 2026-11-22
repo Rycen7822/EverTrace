@@ -32,9 +32,10 @@ use evertrace_domain::{
     revision::RevisionId,
     semantic::{
         AcceptedProposalTarget, Atom, AtomLifecycleStatus, AtomProposalPayload, CoreMembership,
-        CoreMembershipProposalPayload, EvidenceCompleteness, GlobalSupportState, ParserStatus,
-        ProcedureProposalPayload, ProposalAcceptanceAuthority, ProposalOperation, ProposalPayload,
-        ProposalStatus, ProposalTargetId, ResultEvidence, ResultScope, RevisionProposal,
+        CoreMembershipProposalPayload, EvidenceCompleteness, GlobalSuccessorSupportContract,
+        GlobalSupportState, GlobalSupportValidationEvent, ParserStatus, ProcedureProposalPayload,
+        ProposalAcceptanceAuthority, ProposalOperation, ProposalPayload, ProposalStatus,
+        ProposalTargetId, ResultEvidence, ResultScope, RevisionProposal,
         TUI_ACCEPTANCE_EVENT_MANIFEST_REF, UserAuthorizationMode, VerifierStatus,
     },
     work::{
@@ -3728,6 +3729,14 @@ fn select_recall_binding<'a>(
 }
 
 pub fn read_dependencies_for(row: &ObjectRow, payload: &JournalPayload) -> BTreeSet<String> {
+    read_dependencies_with_support(row, payload, |_| true)
+}
+
+fn read_dependencies_with_support(
+    row: &ObjectRow,
+    payload: &JournalPayload,
+    keep_support: impl Fn(&RevisionId) -> bool,
+) -> BTreeSet<String> {
     let mut refs = [
         row.task_id.clone(),
         row.worktree_id.clone(),
@@ -3901,7 +3910,13 @@ pub fn read_dependencies_for(row: &ObjectRow, payload: &JournalPayload) -> BTree
                     .map(ToString::to_string),
             );
             refs.extend(value.evidence_refs.iter().cloned());
-            refs.extend(value.supports_revision_refs.iter().map(ToString::to_string));
+            refs.extend(
+                value
+                    .supports_revision_refs
+                    .iter()
+                    .filter(|id| keep_support(id))
+                    .map(ToString::to_string),
+            );
         }
         JournalPayload::ProcedureRevisionRecorded(value) => {
             refs.extend(value.draft.evidence_refs.iter().cloned());
@@ -3936,7 +3951,13 @@ pub fn read_dependencies_for(row: &ObjectRow, payload: &JournalPayload) -> BTree
                         .iter()
                         .map(ToString::to_string),
                 );
-                refs.extend(draft.supports_revision_refs.iter().map(ToString::to_string));
+                refs.extend(
+                    draft
+                        .supports_revision_refs
+                        .iter()
+                        .filter(|id| keep_support(id))
+                        .map(ToString::to_string),
+                );
             }
         }
         JournalPayload::CoreMembershipRecorded(value) => {
@@ -3952,7 +3973,13 @@ pub fn read_dependencies_for(row: &ObjectRow, payload: &JournalPayload) -> BTree
         JournalPayload::GlobalSupportContractRecorded(value) => {
             refs.insert(value.successor_revision_or_membership_ref.clone());
             refs.insert(value.promotion_proposal_revision_id.to_string());
-            refs.extend(value.support_revision_refs.iter().map(ToString::to_string));
+            refs.extend(
+                value
+                    .support_revision_refs
+                    .iter()
+                    .filter(|id| keep_support(id))
+                    .map(ToString::to_string),
+            );
             refs.extend(
                 value
                     .authorization_revision_refs
@@ -6887,7 +6914,8 @@ impl JournalAdmissionState {
                     &JournalPayload::WorkCheckpointRecorded(Box::new(checkpoint.clone())),
                     *seq,
                 )?;
-                return self.stored_fields_context_for_row(row, state, cancelled, deadline, budget);
+                return self
+                    .stored_fields_context_for_row(row, state, cancelled, deadline, budget, false);
             }
             let recall_key = key.strip_prefix("runtime:recall_need:").unwrap_or(key);
             if let Ok(id) = recall_key.parse::<evertrace_domain::ids::RecallNeedId>() {
@@ -6903,7 +6931,8 @@ impl JournalAdmissionState {
                         state.frontier,
                     ));
                 }
-                return self.stored_fields_context_for_row(row, state, cancelled, deadline, budget);
+                return self
+                    .stored_fields_context_for_row(row, state, cancelled, deadline, budget, false);
             }
         }
         // Bind a typed public ID using its existing canonical-current owner, then read that immutable revision.
@@ -7007,6 +7036,7 @@ impl JournalAdmissionState {
             cancelled,
             deadline,
             budget,
+            matches!(query, evertrace_domain::query::ExactReadQuery::Record(record) if record.field.is_none()),
         )
     }
 
@@ -7232,6 +7262,7 @@ impl JournalAdmissionState {
                 cancelled,
                 deadline,
                 &mut budget,
+                false,
             )? {
                 Outcome::Page(context) => sides.push(*context),
                 Outcome::TooLarge => return Ok(Outcome::TooLarge),
@@ -7248,6 +7279,7 @@ impl JournalAdmissionState {
         cancelled: &std::sync::atomic::AtomicBool,
         deadline: std::time::Instant,
         budget: &mut ReadDependencyBudget,
+        current_support_summary: bool,
     ) -> Result<evertrace_domain::query::MetadataReadOutcome<StoredFieldsContext>, StoreError> {
         let selected = self
             .stored_reference_rows(revision_ref)?
@@ -7306,6 +7338,7 @@ impl JournalAdmissionState {
             cancelled,
             deadline,
             budget,
+            current_support_summary,
         )
     }
 
@@ -7316,8 +7349,31 @@ impl JournalAdmissionState {
         cancelled: &std::sync::atomic::AtomicBool,
         deadline: std::time::Instant,
         suppressed: &mut bool,
+        cohort: Option<(
+            &GlobalSuccessorSupportContract,
+            &GlobalSupportValidationEvent,
+        )>,
     ) -> Result<Option<BTreeSet<String>>, StoreError> {
-        let mut refs = read_dependencies_for(row, payload);
+        let own_support = cohort.filter(|(contract, _)| match payload {
+            JournalPayload::AtomRecorded(value) => {
+                row.current_revision_id.as_ref()
+                    == Some(&contract.successor_revision_or_membership_ref)
+                    && value.scope == evertrace_domain::semantic::AtomScope::Global
+            }
+            JournalPayload::GlobalSupportContractRecorded(value) => {
+                value.support_contract_revision_id == contract.support_contract_revision_id
+            }
+            JournalPayload::RevisionProposalRecorded(value) => {
+                value.proposal_revision_id == contract.promotion_proposal_revision_id
+            }
+            _ => false,
+        });
+        let mut refs = read_dependencies_with_support(row, payload, |id| {
+            !own_support.is_some_and(|(_, validation)| {
+                validation.invalid_or_missing_refs.binary_search(id).is_ok()
+                    && semantic::is_forgotten_atom(self.deletions.events(), id)
+            })
+        });
         if let JournalPayload::CaptureReceiptRecorded(capture) = payload {
             let lookup = CandidateSourceLookup::Current {
                 observations: &self.source_observations,
@@ -7384,6 +7440,7 @@ impl JournalAdmissionState {
         cancelled: &std::sync::atomic::AtomicBool,
         deadline: std::time::Instant,
         budget: &mut ReadDependencyBudget,
+        current_support_summary: bool,
     ) -> Result<evertrace_domain::query::MetadataReadOutcome<StoredFieldsContext>, StoreError> {
         use evertrace_domain::query::MetadataReadOutcome as Outcome;
         let mut context = StoredFieldsContext {
@@ -7407,6 +7464,7 @@ impl JournalAdmissionState {
                 Some("source_receipt" | "source_observation" | "capture_receipt")
             );
         let mut effect_scope = None;
+        let mut cohort = None;
         let mut pending = if let Some(value) = procedure_effect::restore(&root)? {
             if let evertrace_domain::procedure::ProcedureContextAnchor::Repository {
                 repository_id,
@@ -7460,12 +7518,29 @@ impl JournalAdmissionState {
             context.current_support_validation = contract
                 .and_then(|id| self.scenario_core.current_validation(id))
                 .map(|event| event.validation_revision_id);
+            // Only summary/search reads consume the current cohort. Full fields still bind frozen provenance.
+            if current_support_summary {
+                cohort = contract
+                    .or(context.support_contract_ref)
+                    .and_then(|id| self.scenario_core.degraded_support(id))
+                    .filter(|(contract, validation)| {
+                        let Ok(revision) = contract.successor_revision_or_membership_ref.parse() else {
+                            return false;
+                        };
+                        self.atom_revisions.get(&revision).is_some_and(|(atom, _)| {
+                            atom.scope == AtomScope::Global
+                                && self.atoms.get(&atom.atom_id).is_some_and(|(current, _)| current.revision_id == revision)
+                        }) && !matches!(&payload, JournalPayload::GlobalSupportValidationRecorded(value)
+                            if value.validation_revision_id != validation.validation_revision_id)
+                    });
+            }
             let Some(mut refs) = self.stored_read_dependencies(
                 &root,
                 &payload,
                 cancelled,
                 deadline,
                 &mut context.source_suppressed,
+                cohort,
             )?
             else {
                 return Ok(Outcome::TooLarge);
@@ -7609,6 +7684,7 @@ impl JournalAdmissionState {
                         cancelled,
                         deadline,
                         &mut context.source_suppressed,
+                        cohort,
                     )?
                     else {
                         return Ok(Outcome::TooLarge);
