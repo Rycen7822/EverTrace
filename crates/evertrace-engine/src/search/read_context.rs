@@ -945,9 +945,9 @@ pub(crate) fn global_support_path(
     include_evidence: bool,
     candidate_limit: usize,
     deadline: Instant,
-) -> Option<(RelationRead, BTreeSet<String>)> {
+) -> Option<(RelationRead, BTreeMap<String, BTreeSet<String>>)> {
     use evertrace_domain::{
-        query::{SUCCESSOR_SUPPORT_CONTRACT, SUPPORT_CONTRACT_EVIDENCE},
+        query::{METADATA_READ_LIMIT, SUCCESSOR_SUPPORT_CONTRACT, SUPPORT_CONTRACT_EVIDENCE},
         semantic::{AtomScope, CoreScopeIdentity, GlobalSupportState},
     };
     use evertrace_store::projections::{READ_DEPENDENCY_BYTES, READ_DEPENDENCY_LIMIT};
@@ -1024,9 +1024,9 @@ pub(crate) fn global_support_path(
         )],
         missing: BTreeSet::new(),
     };
-    let mut sources = BTreeSet::new();
+    let mut archives = BTreeMap::new();
     if !include_evidence {
-        return Some((path, sources));
+        return Some((path, archives));
     }
     let mut head = None;
     for (_, group) in rows("object:atom:global_support_validation:") {
@@ -1054,6 +1054,7 @@ pub(crate) fn global_support_path(
                 )
     });
     if let Some(validation) = valid {
+        let mut archive_refs_remaining = usize::from(METADATA_READ_LIMIT);
         for id in validation
             .surviving_support_refs
             .iter()
@@ -1075,22 +1076,26 @@ pub(crate) fn global_support_path(
                 .iter()
                 .map(ToString::to_string)
                 .collect::<BTreeSet<_>>();
-            if direct.is_empty() || !direct.is_subset(readable) {
+            if direct.is_empty()
+                || !direct.is_subset(readable)
+                || direct.len() > archive_refs_remaining
+            {
                 continue;
             }
+            archive_refs_remaining -= direct.len();
             path.edges.push((
                 contract_ref.clone(),
-                reference,
+                reference.clone(),
                 SUPPORT_CONTRACT_EVIDENCE.into(),
             ));
-            sources.extend(direct);
+            archives.insert(reference, direct);
         }
-        if path.edges.len() - 1 == validation.surviving_support_refs.len() {
-            return Some((path, sources));
+        if archives.len() == validation.surviving_support_refs.len() {
+            return Some((path, archives));
         }
     }
     path.missing.insert(SUPPORT_CONTRACT_EVIDENCE);
-    Some((path, sources))
+    Some((path, archives))
 }
 
 impl SearchReadAccess<'_> {

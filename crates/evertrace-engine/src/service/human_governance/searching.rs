@@ -258,6 +258,7 @@ struct SearchHitCursor {
     inherited_repository: Option<RepositoryId>,
     blocked_task_shards: Option<BTreeSet<RepositoryId>>,
     relation_archive_budget: RelationArchiveBudget,
+    support_sources: BTreeSet<String>,
     wiki_inputs: std::collections::BTreeMap<String, BTreeSet<String>>,
     after: Option<HumanSearchHit>,
     remaining: Vec<HumanSearchHit>,
@@ -1507,6 +1508,7 @@ impl HumanGovernanceService {
                     checks.insert(hit.access_reference().to_owned());
                 }
             }
+            checks.extend(cursor.support_sources.iter().cloned());
             let physical = repository_operation_read(query.selection, &query.facets, &index);
             if !self
                 .search_checks_readable(
@@ -1519,6 +1521,18 @@ impl HumanGovernanceService {
                     deadline,
                 )
                 .await
+            {
+                return conflict();
+            }
+            if !cursor.support_sources.is_empty()
+                && !self
+                    .retained_relation_archive(
+                        &cursor.support_sources,
+                        &index,
+                        &mut cursor.relation_archive_budget,
+                        deadline,
+                    )
+                    .await
             {
                 return conflict();
             }
@@ -2089,7 +2103,7 @@ impl HumanGovernanceService {
                 )
                 .map_err(|_| HumanGovernanceError::Store)?;
             let mut support_sources = BTreeSet::new();
-            let support = if let Some((mut path, sources)) = support_anchor(
+            let support = if let Some((mut path, archives)) = support_anchor(
                 query.selection,
                 &context.protected_query,
                 &context.query_facets,
@@ -2108,24 +2122,29 @@ impl HumanGovernanceService {
                     deadline,
                 )
             }) {
-                if !sources.is_empty() {
-                    if self
-                        .retained_relation_archive(
-                            &sources,
-                            &index,
-                            &mut relation_archive_budget,
-                            deadline,
-                        )
-                        .await
+                for (reference, sources) in archives {
+                    let pending: BTreeSet<_> =
+                        sources.difference(&support_sources).cloned().collect();
+                    if pending.is_empty()
+                        || self
+                            .retained_relation_archive(
+                                &pending,
+                                &index,
+                                &mut relation_archive_budget,
+                                deadline,
+                            )
+                            .await
                     {
-                        checks.extend(sources.iter().cloned());
-                        support_sources = sources;
+                        support_sources.extend(pending);
                     } else {
-                        path.edges
-                            .retain(|edge| edge.2 != SUPPORT_CONTRACT_EVIDENCE);
+                        path.edges.retain(|(_, target, kind)| {
+                            kind != SUPPORT_CONTRACT_EVIDENCE || target != &reference
+                        });
                         path.missing.insert(SUPPORT_CONTRACT_EVIDENCE);
+                        relation_archive_gap = true;
                     }
                 }
+                checks.extend(support_sources.iter().cloned());
                 Some(std::sync::Arc::new(path))
             } else {
                 None
@@ -2591,6 +2610,7 @@ impl HumanGovernanceService {
                     inherited_repository,
                     blocked_task_shards,
                     relation_archive_budget,
+                    support_sources,
                     wiki_inputs,
                     after: None,
                     remaining,
