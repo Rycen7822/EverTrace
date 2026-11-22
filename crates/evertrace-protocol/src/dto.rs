@@ -176,6 +176,10 @@ pub enum HumanReadRequest {
         review: ProposalConfirmation,
         decision: WebProposalDisposition,
     },
+    WebNegativeReviewEvidence {
+        negative_evidence_id: ProcedureNegativeEvidenceId,
+        expected_frontier: u64,
+    },
     WebSupportActionEligibility {
         expected_validation_revision_id: RevisionId,
         expected_frontier: u64,
@@ -804,6 +808,21 @@ impl ConfigReloadAudit {
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
+pub struct NegativeReviewEvidence {
+    pub review_revision_id: RevisionId,
+    pub status: ProcedureNegativeReviewStatus,
+    pub choices: Vec<NegativeReviewEvidenceChoice>,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct NegativeReviewEvidenceChoice {
+    pub decision: NegativeReviewDecision,
+    pub result_revisions: Vec<RevisionId>,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
 pub struct HumanNegativeReviewMetadata {
     pub negative_evidence_id: ProcedureNegativeEvidenceId,
     pub current_review_revision_id: RevisionId,
@@ -889,6 +908,9 @@ pub enum HumanGovernanceResponse {
     },
     ProposalCreationScope {
         available: bool,
+    },
+    NegativeReviewEvidence {
+        review: Option<Box<NegativeReviewEvidence>>,
     },
     SupportActionEligibility {
         replace: bool,
@@ -1147,6 +1169,9 @@ impl HumanReadRequest {
                 ..
             } => valid_ref(object_ref) && expected_revision_ref.as_deref().is_none_or(valid_ref),
             Self::WebCreationScope {
+                expected_frontier, ..
+            }
+            | Self::WebNegativeReviewEvidence {
                 expected_frontier, ..
             }
             | Self::WebSupportActionEligibility {
@@ -1595,6 +1620,14 @@ impl HumanGovernanceResponse {
                 }
             },
             Self::ProposalCreationScope { .. } => true,
+            Self::NegativeReviewEvidence { review } => review.as_ref().is_none_or(|review| {
+                (review.status == ProcedureNegativeReviewStatus::Pending || review.choices.is_empty())
+                    && review.choices.windows(2).all(|pair| pair[0].decision < pair[1].decision)
+                    && review.choices.iter().all(|choice| {
+                        (1..=64).contains(&choice.result_revisions.len())
+                            && choice.result_revisions.windows(2).all(|pair| pair[0] < pair[1])
+                    })
+            }),
             Self::SupportActionEligibility { replace, deprecate } => !*deprecate || *replace,
             Self::Action { result } => result.validate(),
             Self::Conflict {

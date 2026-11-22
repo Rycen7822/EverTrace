@@ -1160,6 +1160,22 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
                                     )).await.map_err(map_human_error)?;
                                     HumanGovernanceResponse::Action { result: map_human_action(outcome) }
                                 }
+                                HumanReadRequest::WebNegativeReviewEvidence { negative_evidence_id, expected_frontier } => {
+                                    if context.client_kind != ClientKind::Web { return Err(ErrorCode::Untrusted); }
+                                    let review = Box::pin(human_governance.with_session_report(retained_read_report)
+                                        .web_negative_review_evidence(negative_evidence_id, expected_frontier))
+                                        .await.map_err(map_human_error)?;
+                                    HumanGovernanceResponse::NegativeReviewEvidence {
+                                        review: review.map(|value| Box::new(evertrace_protocol::dto::NegativeReviewEvidence {
+                                            review_revision_id: value.review_revision_id, status: value.status,
+                                            choices: value.choices.into_iter().map(|(decision, result_revisions)| {
+                                                evertrace_protocol::dto::NegativeReviewEvidenceChoice {
+                                                    decision: map_negative_decision(decision), result_revisions,
+                                                }
+                                            }).collect(),
+                                        })),
+                                    }
+                                }
                                 HumanReadRequest::WebSupportActionEligibility { expected_frontier, expected_validation_revision_id } => {
                                     if context.client_kind != ClientKind::Web { return Err(ErrorCode::Untrusted); }
                                     let (replace, deprecate) = Box::pin(human_governance.web_support_actions(
@@ -2315,20 +2331,7 @@ fn map_human_item(item: evertrace_engine::HumanSummary) -> HumanSnapshotItem {
                         available_decisions: review
                             .available_decisions
                             .into_iter()
-                            .map(|decision| match decision {
-                                EngineHumanNegativeDecision::ResolveAsIneffective => {
-                                    NegativeReviewDecision::ResolveAsIneffective
-                                }
-                                EngineHumanNegativeDecision::DismissAttribution => {
-                                    NegativeReviewDecision::DismissAttribution
-                                }
-                                EngineHumanNegativeDecision::ConfirmHarm => {
-                                    NegativeReviewDecision::ConfirmHarm
-                                }
-                                EngineHumanNegativeDecision::RequestRevision => {
-                                    NegativeReviewDecision::RequestRevision
-                                }
-                            })
+                            .map(map_negative_decision)
                             .collect(),
                     }),
                 system_detail: item.system_detail.map(|detail| match detail {
@@ -2635,6 +2638,19 @@ fn map_human_item_category(value: EngineHumanItemCategory) -> HumanItemCategory 
         EngineHumanItemCategory::Projection => HumanItemCategory::Projection,
         EngineHumanItemCategory::SessionImport => HumanItemCategory::SessionImport,
         EngineHumanItemCategory::SemanticDerivation => HumanItemCategory::SemanticDerivation,
+    }
+}
+
+fn map_negative_decision(decision: EngineHumanNegativeDecision) -> NegativeReviewDecision {
+    match decision {
+        EngineHumanNegativeDecision::ResolveAsIneffective => {
+            NegativeReviewDecision::ResolveAsIneffective
+        }
+        EngineHumanNegativeDecision::DismissAttribution => {
+            NegativeReviewDecision::DismissAttribution
+        }
+        EngineHumanNegativeDecision::ConfirmHarm => NegativeReviewDecision::ConfirmHarm,
+        EngineHumanNegativeDecision::RequestRevision => NegativeReviewDecision::RequestRevision,
     }
 }
 

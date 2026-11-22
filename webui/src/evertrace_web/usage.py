@@ -176,8 +176,12 @@ async def _read_usage(backend, reference, frontier, revision, object_kind):
             data_identity=identity, selection=before["selection"])
         if reply["kind"] == "conflict" or not _same_page(before, reply["page"]):
             return {"kind":"conflict"}
+        if before is origin:
+            frontier = reply["page"]["state"]["frontier"]
     content["procedure_now"] = context
-    content["current_review"] = item.get("lifecycle") if object_kind == "procedure_negative_evidence" else None
+    if object_kind == "procedure_negative_evidence":
+        content["current_review"] = item.get("lifecycle")
+        content["review_evidence"] = await backend.web_negative_review_evidence(value["negative_evidence_id"], frontier)
     return result
 
 

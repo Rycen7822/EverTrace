@@ -655,6 +655,13 @@ class Backend:
             reply = await self._request(None, confirmation=True, action=action, request_id=request_id)
         return proposal_action_result(reply)
 
+    async def web_negative_review_evidence(self, negative_evidence_id, frontier):
+        result = await self._request({"kind": "web_negative_review_evidence",
+            "negative_evidence_id": negative_evidence_id, "expected_frontier": frontier})
+        if result.get("kind") != "negative_review_evidence":
+            raise BackendError("invalid_read_response")
+        return result["review"]
+
     async def web_support_actions(self, validation, frontier):
         if self.confirmation_channel is None:
             return {}
@@ -843,6 +850,7 @@ class Backend:
                     "compiled_projections",
                     "proposal_creation_scope",
                     "support_action_eligibility",
+                    "negative_review_evidence",
                     "proposal_review",
                     "source_archive",
                     "conflict",

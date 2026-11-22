@@ -332,6 +332,13 @@ pub struct HumanNegativeReviewSummary {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
+pub struct HumanNegativeReviewEvidence {
+    pub review_revision_id: RevisionId,
+    pub status: ProcedureNegativeReviewStatus,
+    pub choices: Vec<(HumanNegativeDecision, Vec<RevisionId>)>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub struct HumanProposalSummary {
     pub proposal_id: RevisionProposalId,
     pub current_revision_id: RevisionId,
@@ -3280,6 +3287,130 @@ impl HumanGovernanceService {
         })
     }
 
+    pub async fn web_negative_review_evidence(
+        &self,
+        id: ProcedureNegativeEvidenceId,
+        expected_frontier: u64,
+    ) -> Result<Option<HumanNegativeReviewEvidence>, HumanGovernanceError> {
+        use crate::procedure::ProcedureNegativeReviewProof as Proof;
+        use evertrace_domain::query::{
+            ExactRecordQuery, ExactRecordRef, HumanContentState, MetadataReadOutcome,
+        };
+        let (Some(runtime), Some(report)) = (&self.runtime_snapshot, &self.session_report) else {
+            return Ok(None);
+        };
+        let deadline = tokio::time::Instant::now() + presentation::READ_DEADLINE;
+        let readable = async |kind: &str, reference: String| {
+            let query = ExactRecordQuery {
+                reference: ExactRecordRef {
+                    stable_key: reference.clone(),
+                    revision_ref: Some(reference.clone()),
+                },
+                field: None,
+                range: None,
+                expected_data_identity: None,
+                expected_selection: None,
+            };
+            let result = tokio::time::timeout_at(
+                deadline,
+                crate::EngineService::read_exact_record(
+                    self.writer.clone(),
+                    Box::new(query),
+                    self.effective_config_hash,
+                    std::sync::Arc::clone(report),
+                    runtime.cas_dir.clone(),
+                ),
+            )
+            .await;
+            matches!(result, Ok(Ok(MetadataReadOutcome::Page(page)))
+                if page.state.frontier == expected_frontier && page.content_state == HumanContentState::Ready
+                    && page.selection.as_ref().is_some_and(|row| row.object_kind == kind && row.revision_ref == reference))
+        };
+        let snapshot = self
+            .writer
+            .project_objects()
+            .await
+            .map_err(|_| HumanGovernanceError::Store)?;
+        if snapshot.frontier != expected_frontier {
+            return Ok(None);
+        }
+        let reference = id.to_string();
+        let negative = snapshot.data_rows().find(|row| {
+            row.object_kind.as_deref() == Some("procedure_negative_evidence")
+                && row.current_revision_id.as_deref() == Some(reference.as_str())
+        });
+        let Some(negative) = negative else {
+            return Ok(None);
+        };
+        if !readable("procedure_negative_evidence", reference).await {
+            return Ok(None);
+        }
+        let view = ProcedureUsageCurrentView::from_snapshot(&snapshot)
+            .map_err(|_| HumanGovernanceError::Store)?;
+        let selection = view
+            .select_negative_review(id)
+            .map_err(|_| HumanGovernanceError::Store)?;
+        let JournalPayload::ProcedureNegativeEvidenceRecorded(fact) = serde_json::from_str(
+            negative
+                .payload_json
+                .as_deref()
+                .ok_or(HumanGovernanceError::Store)?,
+        )
+        .map_err(|_| HumanGovernanceError::Store)?
+        else {
+            return Err(HumanGovernanceError::Store);
+        };
+        let mut choices = Vec::new();
+        for &decision in &selection.available_decisions {
+            let mut refs = match selection
+                .proof(decision)
+                .ok_or(HumanGovernanceError::Store)?
+            {
+                Proof::IneffectiveResolved {
+                    result_revision_ids,
+                }
+                | Proof::ReplayDismissed {
+                    result_revision_ids,
+                }
+                | Proof::ReplayUpheld {
+                    result_revision_ids,
+                } => result_revision_ids,
+                Proof::RequestRevision { .. } => fact
+                    .evidence_refs
+                    .iter()
+                    .map(|reference| reference.parse())
+                    .collect::<Result<Vec<_>, _>>()
+                    .map_err(|_| HumanGovernanceError::Store)?,
+                Proof::SuccessorSuperseded { .. } => return Err(HumanGovernanceError::Store),
+            };
+            refs.sort_unstable();
+            refs.dedup();
+            let mut authorized = true;
+            for id in &refs {
+                if !readable("result_evidence", id.to_string()).await {
+                    authorized = false;
+                    break;
+                }
+            }
+            if authorized {
+                choices.push((human_negative_decision(decision), refs));
+            }
+        }
+        if !readable(
+            "procedure_negative_review",
+            selection.review_revision_id.to_string(),
+        )
+        .await
+        {
+            return Ok(None);
+        }
+        Ok(Some(HumanNegativeReviewEvidence {
+            review_revision_id: selection.review_revision_id,
+            status: selection.review_status,
+            choices,
+        }))
+    }
+
     pub async fn review_negative(
         &self,
         request_id: RequestId,
@@ -4485,19 +4616,21 @@ fn negative_review_summary(
         available_decisions: selection
             .available_decisions
             .into_iter()
-            .map(|decision| match decision {
-                ProcedureNegativeReviewDecision::ResolveAsIneffective => {
-                    HumanNegativeDecision::ResolveAsIneffective
-                }
-                ProcedureNegativeReviewDecision::DismissAttribution => {
-                    HumanNegativeDecision::DismissAttribution
-                }
-                ProcedureNegativeReviewDecision::ConfirmHarm => HumanNegativeDecision::ConfirmHarm,
-                ProcedureNegativeReviewDecision::RequestRevision => {
-                    HumanNegativeDecision::RequestRevision
-                }
-            })
+            .map(human_negative_decision)
             .collect(),
+    }
+}
+
+fn human_negative_decision(decision: ProcedureNegativeReviewDecision) -> HumanNegativeDecision {
+    match decision {
+        ProcedureNegativeReviewDecision::ResolveAsIneffective => {
+            HumanNegativeDecision::ResolveAsIneffective
+        }
+        ProcedureNegativeReviewDecision::DismissAttribution => {
+            HumanNegativeDecision::DismissAttribution
+        }
+        ProcedureNegativeReviewDecision::ConfirmHarm => HumanNegativeDecision::ConfirmHarm,
+        ProcedureNegativeReviewDecision::RequestRevision => HumanNegativeDecision::RequestRevision,
     }
 }
 

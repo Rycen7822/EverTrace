@@ -498,6 +498,7 @@ impl App {
                         | HumanGovernanceResponse::MemoryPage { .. }
                         | HumanGovernanceResponse::CompiledProjections { .. }
                         | HumanGovernanceResponse::ProposalCreationScope { .. }
+                        | HumanGovernanceResponse::NegativeReviewEvidence { .. }
                         | HumanGovernanceResponse::SupportActionEligibility { .. }
                         | HumanGovernanceResponse::ProposalReview { .. }
                         | HumanGovernanceResponse::Export { .. },
@@ -539,6 +540,7 @@ impl App {
                     | HumanGovernanceResponse::Search { .. }
                     | HumanGovernanceResponse::MemoryPage { .. }
                     | HumanGovernanceResponse::ProposalCreationScope { .. }
+                    | HumanGovernanceResponse::NegativeReviewEvidence { .. }
                     | HumanGovernanceResponse::SupportActionEligibility { .. }
                     | HumanGovernanceResponse::ProposalReview { .. }
                     | HumanGovernanceResponse::CompiledProjections { .. } => {

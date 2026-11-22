@@ -37,6 +37,21 @@
   <dt>Task / 原时间</dt><dd>{{ value.task_id }} / {{ value.created_at_us }}</dd>
 </dl>
 {{ text_list('原 confounders', value.confounders) }}
+{% set review = content.get('review_evidence') %}
+<section class="semantic-section" data-negative-review-evidence>
+  <h3>当前复核及证据</h3>
+  {% if review %}
+  <p>原生当前状态：{{ review.status }}。{{ exact_work_link('procedure_negative_review', review.review_revision_id) }}</p>
+  {% set labels = {
+    'resolve_as_ineffective': '判定无效', 'dismiss_attribution': '驳回归因',
+    'confirm_harm': '确认有害', 'request_revision': '请求修订'
+  } %}
+  {% for choice in review.choices %}
+    {{ text_list(labels[choice.decision] ~ ' · 精确结果证据', choice.result_revisions, record_kind='result_evidence', exact_revision=true) }}
+  {% else %}<p>没有当前可读且符合复核条件的决策。</p>{% endfor %}
+  {% else %}<p>当前复核不可读或水位已变化；未用历史状态推定决策。</p>{% endif %}
+  <p>此处只核对原生证据，不提交审核决定。</p>
+</section>
 {% else %}
 <h2>负面复核 · 所选事件</h2>
 <dl>
