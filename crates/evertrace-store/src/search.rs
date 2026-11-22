@@ -395,16 +395,13 @@ impl SearchSnapshot {
             })
             .collect::<Vec<_>>()
             .join(" OR ");
-        let predicate = combine_filter(filter_sql(filter), Some(exact.clone()));
+        let predicate = append_filter(filter_sql(filter), exact.clone());
         let indexed = query_rows(&self.table, predicate, limit, None).await?;
         if self.canonical_sources.is_empty() && supplemental.is_empty() {
             return Ok(indexed);
         }
-        let predicate = combine_filter(
-            filter_sql_dialect(filter, FilterDialect::Sqlite),
-            Some(exact),
-        )
-        .ok_or(StoreError::InvalidInput)?;
+        let predicate = append_filter(filter_sql_dialect(filter, FilterDialect::Sqlite), exact)
+            .ok_or(StoreError::InvalidInput)?;
         let sources = self
             .canonical_sources
             .iter()
@@ -491,13 +488,13 @@ impl SearchSnapshot {
                 .collect::<Vec<_>>()
                 .join(", ")
         );
-        let filter = combine_filter(
+        let filter = append_filter(
             filter_sql(&SearchHardFilter {
                 object_only: true,
                 current_only: true,
                 ..Default::default()
             }),
-            Some(selected),
+            selected,
         );
         query_rows(&self.table, filter, limit, Some(query)).await
     }
@@ -662,7 +659,7 @@ fn filter_sql_dialect(filter: &SearchHardFilter, dialect: FilterDialect) -> Opti
                 .map(|value| sql_literal(value))
                 .collect::<Vec<_>>()
                 .join(", ");
-            clauses.push(format!("(candidate_id IN ({values}) OR (row_variant = 'evidence_surface' AND source_ref IN ({values})))"));
+            clauses.push(format!("(candidate_id IN ({values}) OR row_variant = 'evidence_surface' AND source_ref IN ({values}))"));
         }
     }
     for literal in &filter.condition_literals {
@@ -698,7 +695,7 @@ fn filter_sql_dialect(filter: &SearchHardFilter, dialect: FilterDialect) -> Opti
         )
     };
     clauses.push(format!(
-        "(object_kind IS NULL OR object_kind != 'revision_proposal_revision' OR ({methods}))"
+        "(object_kind IS NULL OR object_kind != 'revision_proposal_revision' OR {methods})"
     ));
     if let Some(revisions) = &filter.procedure_revisions {
         let allowed = if revisions.is_empty() {
@@ -714,7 +711,7 @@ fn filter_sql_dialect(filter: &SearchHardFilter, dialect: FilterDialect) -> Opti
             )
         };
         clauses.push(format!(
-            "(object_kind IS NULL OR object_kind != 'procedure_revision' OR ({allowed}))"
+            "(object_kind IS NULL OR object_kind != 'procedure_revision' OR {allowed})"
         ));
     }
     if let Some(kind) = &filter.object_kind {
@@ -770,8 +767,8 @@ fn filter_sql_dialect(filter: &SearchHardFilter, dialect: FilterDialect) -> Opti
                 .collect::<Vec<_>>()
                 .join(", ");
             scope.push(format!(
-                "(object_kind = 'atom_revision' AND currentness = 'current' AND task_id IS NULL \
-                 AND repository_id IS NULL AND worktree_id IS NULL AND candidate_id IN ({refs}))"
+                "object_kind = 'atom_revision' AND currentness = 'current' AND task_id IS NULL \
+                 AND repository_id IS NULL AND worktree_id IS NULL AND candidate_id IN ({refs})"
             ));
         }
         clauses.push(format!("({})", scope.join(" OR ")));
@@ -832,12 +829,13 @@ fn filter_sql_dialect(filter: &SearchHardFilter, dialect: FilterDialect) -> Opti
     Some(clauses.join(" AND "))
 }
 
-fn combine_filter(left: Option<String>, right: Option<String>) -> Option<String> {
-    match (left, right) {
-        (Some(left), Some(right)) => Some(format!("({left}) AND ({right})")),
-        (Some(value), None) | (None, Some(value)) => Some(value),
-        (None, None) => None,
-    }
+// The hard filter is already a conjunction of complete predicates. Wrapping it
+// would add a parser recursion level to every predicate without changing precedence.
+fn append_filter(hard: Option<String>, selector: String) -> Option<String> {
+    Some(match hard {
+        Some(hard) => format!("{hard} AND ({selector})"),
+        None => selector,
+    })
 }
 
 fn sql_literal(value: &str) -> String {
