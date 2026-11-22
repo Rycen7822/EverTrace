@@ -1331,28 +1331,37 @@ pub(crate) async fn check_source_access(
     rows: &[&ObjectRow],
     deadline: Instant,
 ) -> Result<(), ErrorCode> {
-    check_source_access_split(writer, authority, all_rows, rows, rows, deadline).await
+    check_source_access_split(writer, authority, all_rows, rows, rows, None, deadline).await
 }
 
 /// `source_rows` may omit already admitted source leaves from the same request, never object scopes.
+/// A search index locates row facts only; repository authority is always read fresh.
 pub(crate) async fn check_source_access_split(
     writer: &WriterHandle,
     authority: &RepositoryReadAuthority<'_>,
     all_rows: &[ObjectRow],
     rows: &[&ObjectRow],
     source_rows: &[&ObjectRow],
+    index: Option<&BTreeMap<&str, Vec<&ObjectRow>>>,
     deadline: Instant,
 ) -> Result<(), ErrorCode> {
+    let empty_lookup = BTreeMap::new();
     for chunk in source_rows.chunks(usize::from(evertrace_domain::query::METADATA_READ_LIMIT)) {
         if Instant::now() >= deadline {
             return Err(ErrorCode::ResourceExhausted);
         }
+        // Only evidence surfaces join another observation row here. Receipt and
+        // digest assessment still receive their unchanged canonical inputs.
+        let lookup = (!chunk
+            .iter()
+            .any(|row| row.object_kind.as_deref() == Some("evidence_surface")))
+        .then_some(&empty_lookup);
         if !crate::session_import::source_rows_read_assessment(
             writer,
             authority,
             all_rows,
             chunk,
-            None,
+            lookup,
             Some(deadline),
         )
         .await
@@ -1363,8 +1372,26 @@ pub(crate) async fn check_source_access_split(
             return Err(ErrorCode::Untrusted);
         }
     }
-    let scopes = crate::repository::row_repository_contexts_from_scopes(all_rows.iter(), rows)
-        .map_err(|_| ErrorCode::StoreCorrupt)?;
+    use crate::repository::row_repository_contexts_from_scopes;
+    let scopes = if let Some(index) = index {
+        let requested = rows
+            .iter()
+            .flat_map(|row| [row.task_id.as_deref(), row.worktree_id.as_deref()])
+            .flatten()
+            .collect::<BTreeSet<_>>();
+        let scope_rows = requested.into_iter().flat_map(|reference| {
+            index
+                .get(reference)
+                .into_iter()
+                .flatten()
+                .copied()
+                .filter(move |row| row.object_id.as_deref() == Some(reference))
+        });
+        row_repository_contexts_from_scopes(scope_rows, rows)
+    } else {
+        row_repository_contexts_from_scopes(all_rows.iter(), rows)
+    }
+    .map_err(|_| ErrorCode::StoreCorrupt)?;
     if !crate::repository::repository_read_assessment(
         writer,
         scopes.values().flatten().copied().collect(),

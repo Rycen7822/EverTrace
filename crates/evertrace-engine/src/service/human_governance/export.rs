@@ -144,7 +144,7 @@ impl HumanGovernanceService {
         result.frontier = snapshot.frontier;
         let selection = select(&snapshot, &selections, deadline)?;
         result.object_count = selection.rows.len() as u16;
-        self.selected_access(&snapshot, &selection, None, deadline)
+        self.selected_access(&snapshot, &selection, None, None, deadline)
             .await?;
         let rows = selection.rows.clone();
         let frontier = snapshot.frontier;
@@ -160,7 +160,7 @@ impl HumanGovernanceService {
         if selection.rows != reselected.rows || selection.dependencies != reselected.dependencies {
             return Err(Failure::Conflict);
         }
-        self.selected_access(&current, &reselected, None, deadline)
+        self.selected_access(&current, &reselected, None, None, deadline)
             .await?;
         check_deadline(deadline)?;
         let publication = tokio::task::spawn_blocking(move || stage.publish(deadline))
@@ -181,6 +181,7 @@ impl HumanGovernanceService {
         snapshot: &ProjectionSnapshot,
         selection: &Selection,
         sources: Option<&BTreeMap<&str, bool>>,
+        index: Option<&BTreeMap<&str, Vec<&ObjectRow>>>,
         deadline: Instant,
     ) -> ExportResult<()> {
         let mut rows = selection.rows.iter().collect::<Vec<_>>();
@@ -200,7 +201,7 @@ impl HumanGovernanceService {
         } else {
             rows.as_slice()
         };
-        self.source_repository_access(&snapshot.rows, &rows, source_rows, deadline)
+        self.source_repository_access(&snapshot.rows, &rows, source_rows, index, deadline)
             .await?;
         let observations = source_rows
             .iter()
@@ -225,6 +226,7 @@ impl HumanGovernanceService {
         all_rows: &[ObjectRow],
         rows: &[&ObjectRow],
         source_rows: &[&ObjectRow],
+        index: Option<&BTreeMap<&str, Vec<&ObjectRow>>>,
         deadline: Instant,
     ) -> ExportResult<()> {
         let report = match &self.session_report {
@@ -237,6 +239,7 @@ impl HumanGovernanceService {
             all_rows,
             rows,
             source_rows,
+            index,
             deadline,
         )
         .await
@@ -384,6 +387,7 @@ impl HumanGovernanceService {
                 dependencies,
             },
             sources,
+            for_search.then_some(index),
             deadline,
         )
         .await
