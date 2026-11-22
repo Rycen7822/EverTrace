@@ -655,6 +655,25 @@ class Backend:
             reply = await self._request(None, confirmation=True, action=action, request_id=request_id)
         return proposal_action_result(reply)
 
+    async def web_support_deprecate_available(self, validation, frontier):
+        if self.confirmation_channel is None:
+            return False
+        result = await self._request({"kind": "web_support_deprecation_eligibility",
+            "expected_validation_revision_id": validation, "expected_frontier": frontier})
+        if result.get("kind") != "support_deprecation_eligibility" or type(result.get("available")) is not bool:
+            raise BackendError("invalid_read_response")
+        return result["available"]
+
+    async def web_support_deprecate(self, request_id, validation, frontier, *, reason=None):
+        if reason is None:
+            reply = await self._request({"kind": "web_support_deprecation_outcome", "request_id": request_id,
+                "expected_frontier": frontier, "expected_validation_revision_id": validation})
+        else:
+            action = {"operation": "act", "expected_frontier": frontier, "action": {
+                "kind": "web_support_deprecate", "expected_validation_revision_id": validation, "reason": reason}}
+            reply = await self._request(None, confirmation=True, action=action, request_id=request_id)
+        return proposal_action_result(reply)
+
     async def web_proposal_action(
         self, request_id, proposal, revision, frontier, digest, *, lookup, decision, edit=None, reauthorize=False,
     ):
@@ -797,7 +816,7 @@ class Backend:
                 response = await call({"human_governance": {"operation": "read", "request": read}})
                 result = response["human_governance"]
                 if read["kind"] in ("web_acceptance_outcome", "web_proposal_disposition_outcome",
-                                    "web_correction_outcome", "web_creation_outcome"):
+                                    "web_correction_outcome", "web_creation_outcome", "web_support_deprecation_outcome"):
                     return result
                 if result.get("kind") not in (
                     "state",
@@ -811,6 +830,7 @@ class Backend:
                     "memory_page",
                     "compiled_projections",
                     "proposal_creation_scope",
+                    "support_deprecation_eligibility",
                     "proposal_review",
                     "source_archive",
                     "conflict",

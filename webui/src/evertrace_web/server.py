@@ -213,6 +213,8 @@ class App:
             "/api/proposal-acceptance-result": "POST",
             "/api/proposal-disposition": "POST",
             "/api/proposal-disposition-result": "POST",
+            "/api/proposal-support-deprecate": "POST",
+            "/api/proposal-support-deprecate-result": "POST",
             "/api/proposal-correction": "POST",
             "/api/proposal-correction-result": "POST",
             "/api/proposal-creation": "POST",
@@ -305,6 +307,24 @@ class App:
                     raise BackendError("invalid_input")
                 try:
                     data = await self.backend.web_atom_authoring(payload["request_id"], target, frontier=frontier, content=content, kind=kind)
+                except BackendError:
+                    data = {"status": "unknown"}
+            elif path in ("/api/proposal-support-deprecate", "/api/proposal-support-deprecate-result"):
+                fields = {"request_id", "validation_revision", "frontier"}
+                submit = path == "/api/proposal-support-deprecate"
+                if submit:
+                    fields.add("reason")
+                if set(payload) != fields or not _uuid7(payload["request_id"]) or not _uuid7(payload["validation_revision"]):
+                    raise BackendError("invalid_input")
+                frontier = parse_frontier(payload["frontier"])
+                reason = payload.get("reason")
+                if not frontier or submit and (not isinstance(reason, str) or not reason.strip()
+                                              or len(reason.encode("utf-8")) > 2048 or "\0" in reason):
+                    raise BackendError("invalid_input")
+                try:
+                    data = await self.backend.web_support_deprecate(
+                        payload["request_id"], payload["validation_revision"], frontier, reason=reason,
+                    )
                 except BackendError:
                     data = {"status": "unknown"}
             elif path in ("/api/proposal-accept", "/api/proposal-acceptance-result",
@@ -758,6 +778,15 @@ class App:
                         reader = read_support_detail
                     result = await reader(self.backend, payload["reference"], frontier,
                         payload["revision"], payload["object_kind"])
+                    if payload["object_kind"] == "global_support_validation" and result.get("items"):
+                        detail = result["items"][0]["semantic_detail"]
+                        content = detail.get("content") if detail["state"] == "ready" else None
+                        event = content.get("contract_now") if content else None
+                        if event and event["state"] == "ready" and event["value"] == content["value"]:
+                            validation = content["value"]["validation_revision_id"]
+                            result["support_deprecate_available"] = await self.backend.web_support_deprecate_available(
+                                validation, result["frontier"],
+                            )
                     if surface == "explorer" and payload["object_kind"] == "atom_revision" and result.get("items"):
                         item = result["items"][0]
                         atom = (item["semantic_detail"].get("content") or {}).get("value")
@@ -902,7 +931,8 @@ def present_detail(templates, result, surface):
             core_anchor=result.get("core_anchor"), acceptance_request_id=_request_id() if result.get("web_accept_available") else None,
             disposition_request_id=_request_id() if result.get("web_disposition_available") else None,
             web_edit_available=result.get("web_edit_available", False),
-            correction_frontier=correction_frontier, correction_request_id=_request_id() if correction_frontier else None),
+            correction_frontier=correction_frontier, correction_request_id=_request_id() if correction_frontier else None,
+            support_deprecate_request_id=_request_id() if result.get("support_deprecate_available") else None),
         "source_preview": preview,
         "semantic_text": semantic_text,
         "selection": selection,

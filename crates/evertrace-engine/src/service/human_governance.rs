@@ -1535,68 +1535,196 @@ impl HumanGovernanceService {
         }
     }
 
+    pub async fn web_support_deprecate_available(
+        &self,
+        frontier: u64,
+        validation: RevisionId,
+    ) -> Result<bool, HumanGovernanceError> {
+        let snapshot = self
+            .writer
+            .project_objects()
+            .await
+            .map_err(|_| HumanGovernanceError::Store)?;
+        if snapshot.frontier != frontier {
+            return Ok(false);
+        }
+        match select_support_deprecate(&snapshot, validation) {
+            Ok(SupportDeprecateLookup::Available(selection)) => {
+                self.web_support_deprecation_readable(
+                    &snapshot,
+                    validation,
+                    selection.base_revision_id,
+                )
+                .await
+            }
+            Ok(_) | Err(crate::semantic::SemanticServiceError::InvalidInput) => Ok(false),
+            Err(_) => Err(HumanGovernanceError::Store),
+        }
+    }
+
+    pub async fn reviewed_web_support_deprecation_outcome(
+        &self,
+        request_id: RequestId,
+        frontier: u64,
+        validation: RevisionId,
+    ) -> Result<HumanActionOutcome, HumanGovernanceError> {
+        Ok(self
+            .support_deprecation_outcome(request_id, Some(frontier), validation, None)
+            .await?
+            .unwrap_or(HumanActionOutcome::Unknown))
+    }
+
+    async fn support_deprecation_outcome(
+        &self,
+        request_id: RequestId,
+        web_frontier: Option<u64>,
+        validation: RevisionId,
+        reason: Option<&str>,
+    ) -> Result<Option<HumanActionOutcome>, HumanGovernanceError> {
+        let command_id = CommandId::from_uuid(request_id.as_uuid())
+            .map_err(|_| HumanGovernanceError::InvalidInput)?;
+        let Some(committed) = self
+            .writer
+            .committed_command(command_id)
+            .await
+            .map_err(|_| HumanGovernanceError::Store)?
+        else {
+            return Ok(None);
+        };
+        let marker = web_frontier.map(support_deprecation_cause);
+        let matched = match (
+            committed.payloads.as_slice(),
+            committed.event_ids.as_slice(),
+        ) {
+            ([JournalPayload::RevisionProposalRecorded(proposal)], [audit])
+                if committed.first_causation_id == marker
+                    && proposal.parent_proposal_revision_id.is_none()
+                    && proposal.status == ProposalStatus::Pending
+                    && support_deprecation_matches(proposal, &validation.to_string(), reason) =>
+            {
+                Some((proposal, audit))
+            }
+            _ => None,
+        };
+        let Some((proposal, audit)) = matched else {
+            return if web_frontier.is_some() {
+                Ok(Some(HumanActionOutcome::Unknown))
+            } else {
+                Err(HumanGovernanceError::Store)
+            };
+        };
+        if web_frontier.is_some() {
+            let snapshot = self
+                .writer
+                .project_objects()
+                .await
+                .map_err(|_| HumanGovernanceError::Store)?;
+            let base = proposal
+                .base_revision_id
+                .ok_or(HumanGovernanceError::Store)?;
+            if !self
+                .web_support_deprecation_readable(&snapshot, validation, base)
+                .await?
+                || !self.proposal_accessible(&snapshot, proposal).await?
+            {
+                return Ok(Some(HumanActionOutcome::Unknown));
+            }
+        }
+        Ok(Some(HumanActionOutcome::Applied {
+            current_revision_ref: proposal.proposal_revision_id.to_string(),
+            audit_event_ref: audit.clone(),
+        }))
+    }
+
+    async fn web_support_deprecation_readable(
+        &self,
+        snapshot: &ProjectionSnapshot,
+        validation: RevisionId,
+        base: RevisionId,
+    ) -> Result<bool, HumanGovernanceError> {
+        let deadline = std::time::Instant::now() + presentation::READ_DEADLINE;
+        let index = export::presentation_index(snapshot, deadline)
+            .map_err(|_| HumanGovernanceError::Store)?;
+        for (revision, kind) in [
+            (validation, "global_support_validation"),
+            (base, "atom_revision"),
+        ] {
+            let reference = revision.to_string();
+            let Some((row, _)) = super::actions::select_object_row(snapshot, &reference)
+                .map_err(|_| HumanGovernanceError::Store)?
+            else {
+                return Ok(false);
+            };
+            if row.object_kind.as_deref() != Some(kind)
+                || row.current_revision_id.as_deref() != Some(reference.as_str())
+            {
+                return Ok(false);
+            }
+            match self
+                .readable_indexed_row(snapshot, row, &index, deadline)
+                .await
+            {
+                Ok(()) => (),
+                Err(export::Failure::Denied) => return Ok(false),
+                Err(_) => return Err(HumanGovernanceError::Store),
+            }
+        }
+        Ok(true)
+    }
+
+    pub async fn submit_web_support_deprecate(
+        &self,
+        request_id: RequestId,
+        frontier: u64,
+        validation: RevisionId,
+        reason: String,
+    ) -> Result<HumanActionOutcome, HumanGovernanceError> {
+        self.submit_support_deprecation(request_id, frontier, validation, reason, true)
+            .await
+    }
+
     pub async fn submit_support_deprecate(
+        &self,
+        request_id: RequestId,
+        frontier: u64,
+        validation: RevisionId,
+        reason: String,
+    ) -> Result<HumanActionOutcome, HumanGovernanceError> {
+        self.submit_support_deprecation(request_id, frontier, validation, reason, false)
+            .await
+    }
+
+    async fn submit_support_deprecation(
         &self,
         request_id: RequestId,
         expected_frontier: u64,
         expected_validation_revision_id: RevisionId,
         reason: String,
+        web: bool,
     ) -> Result<HumanActionOutcome, HumanGovernanceError> {
-        let command_id = CommandId::from_uuid(request_id.as_uuid())
-            .map_err(|_| HumanGovernanceError::InvalidInput)?;
-        if let Some(committed) = self
-            .writer
-            .committed_command(command_id)
-            .await
-            .map_err(|_| HumanGovernanceError::Store)?
+        if let Some(outcome) = self
+            .support_deprecation_outcome(
+                request_id,
+                web.then_some(expected_frontier),
+                expected_validation_revision_id,
+                Some(&reason),
+            )
+            .await?
         {
-            let validation_ref = expected_validation_revision_id.to_string();
-            let mut matches = committed.payloads.iter().enumerate().filter_map(
-                |(ordinal, payload)| match payload {
-                    JournalPayload::RevisionProposalRecorded(proposal)
-                        if proposal.parent_proposal_revision_id.is_none()
-                            && proposal.status == ProposalStatus::Pending
-                            && proposal.operation == ProposalOperation::Deprecate
-                            && matches!(
-                                &proposal.payload,
-                                ProposalPayload::Atom(payload)
-                                    if matches!(
-                                        payload.as_ref(),
-                                        AtomProposalPayload::Deprecate { reason: value }
-                                            if value == &reason
-                                    )
-                            )
-                            && proposal.evidence_refs == [validation_ref.clone()]
-                            && proposal.source_cohort_refs == proposal.evidence_refs
-                            && proposal.eligibility == ProposalEligibility::ManualRequired
-                            && proposal.created_by == ProposalCreatedBy::User =>
-                    {
-                        Some((ordinal, proposal.proposal_revision_id))
-                    }
-                    _ => None,
-                },
-            );
-            let (ordinal, revision_id) = matches.next().ok_or(HumanGovernanceError::Store)?;
-            if matches.next().is_some() || committed.payloads.len() != 1 {
-                return Err(HumanGovernanceError::Store);
-            }
-            let audit_event_ref = committed
-                .event_ids
-                .get(ordinal)
-                .cloned()
-                .ok_or(HumanGovernanceError::Store)?;
-            return Ok(HumanActionOutcome::Applied {
-                current_revision_ref: revision_id.to_string(),
-                audit_event_ref,
-            });
+            return Ok(outcome);
         }
 
         let snapshot = self
             .writer
-            .project()
+            .project_objects()
             .await
             .map_err(|_| HumanGovernanceError::Store)?;
         if snapshot.frontier != expected_frontier {
+            if web {
+                return Ok(HumanActionOutcome::Conflict {
+                    current_revision_ref: None,
+                });
+            }
             let current_revision_ref =
                 match select_support_deprecate(&snapshot, expected_validation_revision_id) {
                     Ok(SupportDeprecateLookup::Conflict {
@@ -1612,25 +1740,44 @@ impl HumanGovernanceService {
                 current_revision_ref,
             });
         }
-        let selection = match select_support_deprecate(&snapshot, expected_validation_revision_id)
-            .map_err(|error| match error {
-            crate::semantic::SemanticServiceError::InvalidInput => {
-                HumanGovernanceError::InvalidInput
-            }
-            _ => HumanGovernanceError::Store,
-        })? {
-            SupportDeprecateLookup::Available(selection) => selection,
-            SupportDeprecateLookup::Conflict {
+        let selection = match select_support_deprecate(&snapshot, expected_validation_revision_id) {
+            Ok(SupportDeprecateLookup::Available(selection)) => selection,
+            Ok(SupportDeprecateLookup::Conflict {
                 current_revision_id,
-            } => {
+            }) => {
                 return Ok(HumanActionOutcome::Conflict {
-                    current_revision_ref: Some(current_revision_id.to_string()),
+                    current_revision_ref: (!web).then(|| current_revision_id.to_string()),
                 });
             }
-            SupportDeprecateLookup::Unavailable { reason } => {
+            Ok(SupportDeprecateLookup::Unavailable { reason }) if !web => {
                 return Ok(HumanActionOutcome::Unavailable { reason });
             }
+            Ok(SupportDeprecateLookup::Unavailable { .. })
+            | Err(crate::semantic::SemanticServiceError::InvalidInput)
+                if web =>
+            {
+                return Ok(HumanActionOutcome::Unavailable {
+                    reason: "support_deprecation_unavailable",
+                });
+            }
+            Err(crate::semantic::SemanticServiceError::InvalidInput) => {
+                return Err(HumanGovernanceError::InvalidInput);
+            }
+            _ => return Err(HumanGovernanceError::Store),
         };
+        if web
+            && !self
+                .web_support_deprecation_readable(
+                    &snapshot,
+                    expected_validation_revision_id,
+                    selection.base_revision_id,
+                )
+                .await?
+        {
+            return Ok(HumanActionOutcome::Unavailable {
+                reason: "support_deprecation_unavailable",
+            });
+        }
         let view = SemanticCurrentView::from_snapshot(&snapshot)
             .map_err(|_| HumanGovernanceError::Store)?;
         match compose_support_deprecate(
@@ -1647,20 +1794,7 @@ impl HumanGovernanceService {
                     proposal.target_kind == ProposalTargetKind::Atom
                         && proposal.target_id == Some(ProposalTargetId::Atom(selection.atom_id))
                         && proposal.base_revision_id == Some(selection.base_revision_id)
-                        && proposal.operation == ProposalOperation::Deprecate
-                        && matches!(
-                            &proposal.payload,
-                            ProposalPayload::Atom(payload)
-                                if matches!(
-                                    payload.as_ref(),
-                                    AtomProposalPayload::Deprecate { reason: value }
-                                        if value == &reason
-                                )
-                        )
-                        && proposal.evidence_refs == [validation_ref.clone()]
-                        && proposal.source_cohort_refs == proposal.evidence_refs
-                        && proposal.eligibility == ProposalEligibility::ManualRequired
-                        && proposal.created_by == ProposalCreatedBy::User
+                        && support_deprecation_matches(proposal, &validation_ref, Some(&reason))
                 });
                 let proposal = matches.next().ok_or(HumanGovernanceError::Store)?;
                 if matches.next().is_some() {
@@ -1689,12 +1823,31 @@ impl HumanGovernanceService {
                 if audit_ordinals.next().is_some() {
                     return Err(HumanGovernanceError::Store);
                 }
+                let command = if web {
+                    let [event] = command.events() else {
+                        return Err(HumanGovernanceError::Store);
+                    };
+                    let mut event = event.clone();
+                    event.causation_id = Some(support_deprecation_cause(expected_frontier));
+                    JournalCommand::new(command.command_id(), vec![event])
+                        .map_err(|_| HumanGovernanceError::Store)?
+                } else {
+                    command
+                };
                 let outcome = match self
                     .writer
                     .commit_if_frontier(command, now_us()?, snapshot.frontier)
                     .await
                 {
                     Ok(outcome) => outcome,
+                    Err(
+                        crate::WriterActorError::StaleFrontier
+                        | crate::WriterActorError::IdempotencyConflict,
+                    ) if web => {
+                        return Ok(HumanActionOutcome::Conflict {
+                            current_revision_ref: None,
+                        });
+                    }
                     Err(crate::WriterActorError::StaleFrontier) => {
                         let latest = self
                             .writer
@@ -3434,6 +3587,24 @@ fn current_support_revision(
         }
     }
     Ok(current.map(|(_, _, revision)| revision))
+}
+
+fn support_deprecation_cause(frontier: u64) -> String {
+    format!("web-support-deprecate:{frontier}")
+}
+
+fn support_deprecation_matches(
+    proposal: &RevisionProposal,
+    validation: &str,
+    reason: Option<&str>,
+) -> bool {
+    proposal.operation == ProposalOperation::Deprecate
+        && matches!(&proposal.payload, ProposalPayload::Atom(payload)
+            if matches!(payload.as_ref(), AtomProposalPayload::Deprecate { reason: value } if reason.is_none_or(|reason| value == reason)))
+        && proposal.evidence_refs == [validation]
+        && proposal.source_cohort_refs == proposal.evidence_refs
+        && proposal.eligibility == ProposalEligibility::ManualRequired
+        && proposal.created_by == ProposalCreatedBy::User
 }
 
 fn current_support_source(

@@ -391,11 +391,12 @@ function showAcceptanceReceipt() {
     pending: "正在核对审核结果…",
     applied: receipt.authoring === "correction" ? "已提交修正提案；请前往审核。"
       : receipt.authoring === "creation" ? "已提交新建提案；请前往审核。"
+      : receipt.supportDeprecation ? "已提交弃用提案；资产和支持状态未改。"
       : receipt.reauthorize ? "已再授权为新记录，原删除不变。"
       : decision === "defer" ? "已延期。" : decision === "reject" ? "已拒绝。" : "已接受。",
     no_delta: "此请求已处理；没有再次写入。",
-    conflict: "提案或水位有变化；本请求未应用。",
-    unavailable: "当前提案不具备此网页审核操作的条件；本请求未应用。",
+    conflict: "目标或水位有变化；本请求未应用。",
+    unavailable: "当前目标不具备此网页操作的条件；本请求未应用。",
     unknown: "结果未知；不会自动重试。请只查原请求。",
   }[receipt.status] + " 请求：" + receipt.input.request_id
     + (receipt.result?.current_revision_ref ? " 后继修订：" + receipt.result.current_revision_ref : "")
@@ -405,13 +406,15 @@ async function resolveAcceptance(receipt, lookup) {
   receipt.status = "pending";
   showAcceptanceReceipt();
   try {
-    const path = receipt.authoring ? "proposal-" + receipt.authoring + (lookup ? "-result" : "")
+    const path = receipt.supportDeprecation ? (lookup ? "proposal-support-deprecate-result" : "proposal-support-deprecate")
+      : receipt.authoring ? "proposal-" + receipt.authoring + (lookup ? "-result" : "")
       : receipt.input.decision ? (lookup ? "proposal-disposition-result" : "proposal-disposition")
       : (lookup ? "proposal-acceptance-result" : "proposal-accept");
     const input = { ...receipt.input };
     delete receipt.input.atom_edit;
     delete receipt.input.procedure_edit;
     delete receipt.input.reauthorize;
+    delete receipt.input.reason;
     if (receipt.authoring) {
       delete receipt.input.content;
       delete receipt.input.frontier;
@@ -468,6 +471,21 @@ function submitAtomCorrection(button) {
   sendProposalAction({
     authoring: "correction", input: { request_id: requestId, atom_id: atomId, base_revision_id: revision, frontier, content },
   });
+}
+function submitSupportDeprecation(button) {
+  const { validationRevision, frontier, requestId } = button.dataset;
+  if (!state.active || document.hidden || state.selected?.kind !== "global_support_validation"
+      || state.selected.revision !== validationRevision || ["pending", "unknown"].includes(state.acceptance?.status)) return;
+  const fields = button.closest("[data-support-deprecation]");
+  const input = fields.querySelector("[data-support-deprecation-reason]");
+  const reason = input.value;
+  if (!reason.trim() || new TextEncoder().encode(reason).length > 2048) {
+    fields.querySelector("[data-support-deprecation-status]").textContent = "请输入弃用理由（最多 2048 字节）。";
+    input.focus();
+    return;
+  }
+  if (!window.confirm("针对校验修订 " + validationRevision + " 提交弃用提案？不会立即弃用资产或修改支持状态。")) return;
+  sendProposalAction({ supportDeprecation: true, input: { request_id: requestId, validation_revision: validationRevision, frontier, reason } });
 }
 function atomCreationScope() {
   const { kind, task_id, repository_id } = state.query.selection;
@@ -1307,7 +1325,7 @@ $("detail-body").onclick = (event) => {
     [data-revision-key], [data-sources-open], [data-sources-next], [data-link-key], [data-proposal-confirm], [data-proposal-accept],
     [data-proposal-disposition], [data-atom-edit-preview], [data-procedure-edit-preview],
     [data-nav-back], [data-compare-base], [data-compare-key], [data-compare-side],
-    [data-result-base], [data-result-compare], [data-submit-atom-correction],
+    [data-result-base], [data-result-compare], [data-submit-atom-correction], [data-submit-support-deprecate],
     [data-compare-first], [data-compare-next], [data-compiled-first], [data-compiled-next], [data-compiled-refresh]`,
   );
   if (!button || button.disabled) return;
@@ -1376,6 +1394,7 @@ $("detail-body").onclick = (event) => {
   if (button.hasAttribute("data-proposal-confirm")) confirmProposal(button);
   if (button.matches("[data-atom-edit-preview], [data-procedure-edit-preview]")) previewProposalEdit(button);
   if (button.hasAttribute("data-submit-atom-correction")) submitAtomCorrection(button);
+  if (button.hasAttribute("data-submit-support-deprecate")) submitSupportDeprecation(button);
   if (button.matches("[data-proposal-accept], [data-proposal-disposition]")) actOnProposal(button);
   else if (button.hasAttribute("data-result-base")) compareResult(button, true);
   else if (button.hasAttribute("data-result-compare")) compareResult(button, false);

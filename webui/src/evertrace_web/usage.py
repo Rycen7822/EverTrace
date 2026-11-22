@@ -252,4 +252,6 @@ async def _read_support(backend, reference, frontier, revision, object_kind):
         if reply["kind"] == "conflict" or not _same_page(before, reply["page"]):
             return {"kind":"conflict"}
     content.update({"asset_now":current, "contract_now":event})
+    # A later write must compare the frontier that this exact event was read against.
+    result["frontier"] = origin["state"]["frontier"]
     return result

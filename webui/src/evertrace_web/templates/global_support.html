@@ -67,4 +67,15 @@
     data-kind="{{ now.metadata.object_kind }}">读取当前资产</button>
   {% endif %}
 </section>
+{% if content.kind == 'support_validation' and support_deprecate_request_id|default(none) %}
+<details data-support-deprecation>
+  <summary>提出弃用</summary>
+  <p>按所选校验事件 {{ value.validation_revision_id }} 为全局 Atom {{ value.successor_ref }} 提交待审提案。
+    上方列出仍存与失效的支持；提交不会直接弃用资产，也不会改动校验状态。</p>
+  <label>弃用理由 <textarea data-support-deprecation-reason required rows="4" maxlength="2048"></textarea></label>
+  <p class="muted" data-support-deprecation-status aria-live="polite"></p>
+  <button class="button" type="button" data-submit-support-deprecate data-validation-revision="{{ value.validation_revision_id }}"
+    data-frontier="{{ frontier }}" data-request-id="{{ support_deprecate_request_id }}">提交弃用提案</button>
+</details>
+{% endif %}
 <p>valid 可以伴随 provenance degraded；它不等于被删来源仍在。pending、insufficient、invalidated 不等价，本页不代替原生复核或接受命令。</p>

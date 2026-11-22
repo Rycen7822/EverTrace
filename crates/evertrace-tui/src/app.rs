@@ -498,6 +498,7 @@ impl App {
                         | HumanGovernanceResponse::MemoryPage { .. }
                         | HumanGovernanceResponse::CompiledProjections { .. }
                         | HumanGovernanceResponse::ProposalCreationScope { .. }
+                        | HumanGovernanceResponse::SupportDeprecationEligibility { .. }
                         | HumanGovernanceResponse::ProposalReview { .. }
                         | HumanGovernanceResponse::Export { .. },
                     ) => UiCommand::None,
@@ -538,6 +539,7 @@ impl App {
                     | HumanGovernanceResponse::Search { .. }
                     | HumanGovernanceResponse::MemoryPage { .. }
                     | HumanGovernanceResponse::ProposalCreationScope { .. }
+                    | HumanGovernanceResponse::SupportDeprecationEligibility { .. }
                     | HumanGovernanceResponse::ProposalReview { .. }
                     | HumanGovernanceResponse::CompiledProjections { .. } => {
                         return UiCommand::None;
@@ -2587,7 +2589,8 @@ fn human_action_label(action: &evertrace_protocol::dto::HumanActionRequest) -> &
         | HumanActionRequest::WebAccept { .. }
         | HumanActionRequest::WebCreateAtom { .. }
         | HumanActionRequest::WebCorrectAtom { .. }
-        | HumanActionRequest::WebProposalDisposition { .. } => "unavailable action",
+        | HumanActionRequest::WebProposalDisposition { .. }
+        | HumanActionRequest::WebSupportDeprecate { .. } => "unavailable action",
     }
 }
 

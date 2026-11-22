@@ -176,6 +176,15 @@ pub enum HumanReadRequest {
         review: ProposalConfirmation,
         decision: WebProposalDisposition,
     },
+    WebSupportDeprecationEligibility {
+        expected_validation_revision_id: RevisionId,
+        expected_frontier: u64,
+    },
+    WebSupportDeprecationOutcome {
+        request_id: RequestId,
+        expected_frontier: u64,
+        expected_validation_revision_id: RevisionId,
+    },
     Related {
         relation: HumanRelationKind,
         source_stable_key: String,
@@ -261,6 +270,10 @@ pub enum HumanActionRequest {
     WebProposalDisposition {
         review: ProposalConfirmation,
         decision: WebProposalDisposition,
+    },
+    WebSupportDeprecate {
+        expected_validation_revision_id: RevisionId,
+        reason: String,
     },
     Proposal {
         proposal_id: RevisionProposalId,
@@ -867,6 +880,9 @@ pub enum HumanGovernanceResponse {
     ProposalCreationScope {
         available: bool,
     },
+    SupportDeprecationEligibility {
+        available: bool,
+    },
     ProposalReview {
         frontier: u64,
         item: Option<Box<HumanSnapshotItem>>,
@@ -1035,7 +1051,8 @@ impl HumanGovernanceRequest {
                 action: HumanActionRequest::WebAccept { .. }
                     | HumanActionRequest::WebCreateAtom { .. }
                     | HumanActionRequest::WebCorrectAtom { .. }
-                    | HumanActionRequest::WebProposalDisposition { .. },
+                    | HumanActionRequest::WebProposalDisposition { .. }
+                    | HumanActionRequest::WebSupportDeprecate { .. },
                 ..
             }
         )
@@ -1117,6 +1134,12 @@ impl HumanReadRequest {
             } => valid_ref(object_ref) && expected_revision_ref.as_deref().is_none_or(valid_ref),
             Self::WebCreationScope {
                 expected_frontier, ..
+            }
+            | Self::WebSupportDeprecationEligibility {
+                expected_frontier, ..
+            }
+            | Self::WebSupportDeprecationOutcome {
+                expected_frontier, ..
             } => *expected_frontier != 0,
             Self::WebCreationOutcome { .. } | Self::WebCorrectionOutcome { .. } => true,
             Self::WebAcceptanceOutcome {
@@ -1154,6 +1177,14 @@ impl HumanReadRequest {
             }
         }
     }
+}
+
+fn valid_support_deprecation_reason(reason: &str) -> bool {
+    AtomProposalPayload::Deprecate {
+        reason: reason.to_owned(),
+    }
+    .validate()
+    .is_ok()
 }
 
 impl HumanActionRequest {
@@ -1199,11 +1230,9 @@ impl HumanActionRequest {
                         if matches!(payload.as_ref(), ProcedureProposalPayload::Replace { .. })
                 )
             }
-            Self::SupportDeprecate { reason, .. } => AtomProposalPayload::Deprecate {
-                reason: reason.clone(),
+            Self::SupportDeprecate { reason, .. } | Self::WebSupportDeprecate { reason, .. } => {
+                valid_support_deprecation_reason(reason)
             }
-            .validate()
-            .is_ok(),
             Self::ResolveCompetingSelected { .. } | Self::MarkNewAttempt { .. } => true,
             Self::ForgetObject {
                 expected_revision_ids,
@@ -1534,7 +1563,7 @@ impl HumanGovernanceResponse {
                         && !can_edit
                 }
             },
-            Self::ProposalCreationScope { .. } => true,
+            Self::ProposalCreationScope { .. } | Self::SupportDeprecationEligibility { .. } => true,
             Self::Action { result } => result.validate(),
             Self::Conflict {
                 current_revision_ref,
