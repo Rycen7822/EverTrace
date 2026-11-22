@@ -631,10 +631,14 @@ impl Atom {
                     UserAuthorizationMode::TuiAcceptance | UserAuthorizationMode::WebAcceptance => {
                         if user.mode == UserAuthorizationMode::WebAcceptance
                             && (user.authorized_scope_ceiling != self.scope
-                                || !matches!(
-                                    self.scope,
-                                    AtomScope::Task { .. } | AtomScope::Repository { .. }
-                                ))
+                                || match &self.scope {
+                                    AtomScope::Task { .. } | AtomScope::Repository { .. } => false,
+                                    AtomScope::Global => {
+                                        self.parent_revision_id.is_some()
+                                            || self.supports_revision_refs.is_empty()
+                                    }
+                                    _ => true,
+                                })
                         {
                             return Err(SemanticError::InvalidAtom);
                         }
@@ -702,8 +706,10 @@ impl Atom {
                 .user_authorization_provenance
                 .as_ref()
                 .is_some_and(|value| {
-                    value.mode == UserAuthorizationMode::TuiAcceptance
-                        && matches!(value.authorized_scope_ceiling, AtomScope::Global)
+                    matches!(
+                        value.mode,
+                        UserAuthorizationMode::TuiAcceptance | UserAuthorizationMode::WebAcceptance
+                    ) && matches!(value.authorized_scope_ceiling, AtomScope::Global)
                 })
         {
             return Err(SemanticError::InvalidAtom);

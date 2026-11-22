@@ -756,11 +756,15 @@ impl WebAcceptanceIntent {
                 let AtomProposalPayload::Create { draft } = payload.as_ref() else {
                     return None;
                 };
-                matches!(
-                    draft.scope,
-                    AtomScope::Task { .. } | AtomScope::Repository { .. } | AtomScope::Global
-                )
-                .then(|| draft.scope.clone())
+                match &draft.scope {
+                    AtomScope::Task { .. } | AtomScope::Repository { .. } => {
+                        Some(draft.scope.clone())
+                    }
+                    AtomScope::Global if !draft.supports_revision_refs.is_empty() => {
+                        Some(AtomScope::Global)
+                    }
+                    _ => None,
+                }
             }
             (ObjectDeletionTarget::Procedure { .. }, ProposalPayload::Procedure(_))
             | (ObjectDeletionTarget::CoreMembership { .. }, ProposalPayload::CoreMembership(_)) => {
@@ -1566,6 +1570,22 @@ impl ClosedProposalEditIntent {
 }
 
 impl RevisionProposal {
+    pub fn global_atom_creation_draft(&self) -> Option<&AtomDraft> {
+        if self.operation != ProposalOperation::Create
+            || self.target_id.is_some()
+            || self.base_revision_id.is_some()
+        {
+            return None;
+        }
+        let ProposalPayload::Atom(payload) = &self.payload else {
+            return None;
+        };
+        let AtomProposalPayload::Create { draft } = payload.as_ref() else {
+            return None;
+        };
+        (draft.scope == AtomScope::Global).then_some(draft)
+    }
+
     pub fn atom_merge_inputs(&self) -> Option<&[RevisionId]> {
         let ProposalPayload::Atom(payload) = &self.payload else {
             return None;

@@ -209,7 +209,41 @@ impl HumanGovernanceService {
         let admission = ObjectDeletionCandidateAdmissionView::from_snapshot(&snapshot)
             .and_then(|view| view.classify_proposal(proposal))
             .map_err(|_| HumanGovernanceError::Store)?;
-        Ok(admission.permits_web_acceptance(Some(reference)))
+        if !admission.permits_web_acceptance(Some(reference)) {
+            return Ok(false);
+        }
+        if proposal.global_atom_creation_draft().is_none() {
+            return Ok(true);
+        }
+        let view = SemanticCurrentView::from_snapshot(&snapshot)
+            .map_err(|_| HumanGovernanceError::Store)?;
+        Self::web_reauthorization_support_current_at(&snapshot, &view, proposal)
+    }
+
+    pub(crate) fn web_reauthorization_support_current_at(
+        snapshot: &ProjectionSnapshot,
+        view: &SemanticCurrentView,
+        proposal: &RevisionProposal,
+    ) -> Result<bool, HumanGovernanceError> {
+        use evertrace_domain::semantic::AtomLifecycleStatus;
+        let Some(draft) = proposal.global_atom_creation_draft() else {
+            return Ok(true);
+        };
+        let deletions = ObjectDeletionCurrentView::from_snapshot(snapshot)
+            .map_err(|_| HumanGovernanceError::Store)?;
+        Ok(!draft.supports_revision_refs.is_empty()
+            && draft.supports_revision_refs.iter().all(|revision| {
+                view.atom_revisions.get(revision).is_some_and(|atom| {
+                    atom.lifecycle_status == AtomLifecycleStatus::Active
+                        && view
+                            .atoms
+                            .get(&atom.atom_id)
+                            .is_some_and(|current| current.revision_id == *revision)
+                        && !deletions.events.contains_key(&ObjectDeletionTarget::Atom {
+                            atom_id: atom.atom_id,
+                        })
+                })
+            }))
     }
 
     pub async fn web_procedure_edit_coverage(

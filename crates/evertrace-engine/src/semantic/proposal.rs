@@ -855,11 +855,11 @@ impl RevisionProposalService {
         let global_web_reauthorization = matches!(&acceptance_context, AtomAcceptanceContext::Web {
             authorized_scope_ceiling: AtomScope::Global, intent, ..
         } if intent.reauthorization.is_some());
+        let global_manual = global_tui || global_web_reauthorization;
         if !matches!(
             requested_scope,
             AtomScope::Task { .. } | AtomScope::Repository { .. }
-        ) && !(matches!(requested_scope, AtomScope::Global)
-            && (global_tui || global_web_reauthorization))
+        ) && !(matches!(requested_scope, AtomScope::Global) && global_manual)
         {
             return Err(SemanticServiceError::UnsupportedTarget);
         }
@@ -914,7 +914,7 @@ impl RevisionProposalService {
         if !matches!(
             atom.scope,
             AtomScope::Task { .. } | AtomScope::Repository { .. }
-        ) && !(matches!(atom.scope, AtomScope::Global) && global_tui)
+        ) && !(matches!(atom.scope, AtomScope::Global) && global_manual)
         {
             return Err(SemanticServiceError::UnsupportedTarget);
         }

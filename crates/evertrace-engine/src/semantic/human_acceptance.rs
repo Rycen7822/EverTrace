@@ -420,6 +420,10 @@ impl HumanAcceptanceService {
         let service =
             crate::HumanGovernanceService::new(self.writer.clone(), self.effective_config_hash);
         if !service.proposal_accessible(snapshot, reviewed).await?
+            || (intent.reauthorization.is_some()
+                && !crate::HumanGovernanceService::web_reauthorization_support_current_at(
+                    snapshot, view, reviewed,
+                )?)
             || !Box::pin(authored_creation_scope_current(
                 &service, snapshot, reviewed,
             ))
@@ -629,6 +633,10 @@ impl HumanAcceptanceService {
             .await?
             || ((intent.edit().is_some() || intent.reauthorization.is_some())
                 && !service.proposal_accessible(&snapshot, proposal).await?)
+            || (intent.reauthorization.is_some()
+                && !crate::HumanGovernanceService::web_reauthorization_support_current_at(
+                    &snapshot, &view, proposal,
+                )?)
         {
             return Ok(conflict());
         }

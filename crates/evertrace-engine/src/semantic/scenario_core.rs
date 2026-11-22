@@ -12,10 +12,10 @@ use evertrace_domain::{
         AtomLifecycleStatus, AtomProposalPayload, AtomScope, CoreMembership,
         CoreMembershipProposalPayload, CoreScopeIdentity, EpistemicStatus,
         GlobalSuccessorSupportContract, GlobalSupportState, GlobalSupportValidationEvent,
-        ProcedureProposalPayload, ProposalCreatedBy, ProposalEligibility, ProposalOperation,
-        ProposalPayload, ProposalTargetId, ProposalTargetKind, RevisionProposal, Scenario,
-        ScenarioScope, ScenarioStatus, ScenarioWorkstream, SupportThresholdSnapshot,
-        UserAuthorizationMode,
+        ProcedureProposalPayload, ProposalAcceptanceAuthority, ProposalCreatedBy,
+        ProposalEligibility, ProposalOperation, ProposalPayload, ProposalTargetId,
+        ProposalTargetKind, RevisionProposal, Scenario, ScenarioScope, ScenarioStatus,
+        ScenarioWorkstream, SupportThresholdSnapshot, UserAuthorizationMode,
     },
     work::{
         Attempt, AttemptAdoptionStatus, AttemptExecutionStatus, AttemptLifecycleStatus,
@@ -446,8 +446,15 @@ pub(crate) fn global_atom_support_payloads(
             .user_authorization_provenance
             .as_ref()
             .is_none_or(|value| {
-                value.mode != UserAuthorizationMode::TuiAcceptance
-                    || !matches!(value.authorized_scope_ceiling, AtomScope::Global)
+                let authorized = match value.mode {
+                    UserAuthorizationMode::TuiAcceptance => true,
+                    UserAuthorizationMode::WebAcceptance => proposal.acceptance.as_ref().is_some_and(|audit| {
+                        matches!(&audit.authority_basis, ProposalAcceptanceAuthority::WebAcceptance { intent, .. }
+                            if intent.reauthorization.is_some())
+                    }),
+                    _ => false,
+                };
+                !authorized || value.authorized_scope_ceiling != AtomScope::Global
             })
     {
         return Err(SemanticServiceError::InvalidInput);

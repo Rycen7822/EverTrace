@@ -31,7 +31,7 @@ use evertrace_domain::{
     },
     revision::RevisionId,
     semantic::{
-        AcceptedProposalTarget, Atom, AtomProposalPayload, CoreMembership,
+        AcceptedProposalTarget, Atom, AtomLifecycleStatus, AtomProposalPayload, CoreMembership,
         CoreMembershipProposalPayload, EvidenceCompleteness, ParserStatus,
         ProcedureProposalPayload, ProposalAcceptanceAuthority, ProposalOperation, ProposalPayload,
         ProposalStatus, ProposalTargetId, ResultEvidence, ResultScope, RevisionProposal,
@@ -3924,6 +3924,15 @@ pub fn read_dependencies_for(row: &ObjectRow, payload: &JournalPayload) -> BTree
                         .iter()
                         .map(ToString::to_string),
                 );
+            } else if let Some(draft) = value.global_atom_creation_draft() {
+                refs.extend(draft.evidence_refs.iter().cloned());
+                refs.extend(
+                    draft
+                        .source_observation_refs
+                        .iter()
+                        .map(ToString::to_string),
+                );
+                refs.extend(draft.supports_revision_refs.iter().map(ToString::to_string));
             }
         }
         JournalPayload::CoreMembershipRecorded(value) => {
@@ -13857,6 +13866,26 @@ impl JournalAdmissionState {
                 .map(|audit| &audit.authority_basis)
             {
                 if !admission.permits_web_acceptance(intent.reauthorization.as_deref()) {
+                    return Err(error);
+                }
+                if intent.reauthorization.is_some()
+                    && let Some(draft) = proposal.global_atom_creation_draft()
+                    && (draft.supports_revision_refs.is_empty()
+                        || !draft.supports_revision_refs.iter().all(|revision| {
+                            self.atom_revisions.get(revision).is_some_and(|(atom, _)| {
+                                atom.lifecycle_status == AtomLifecycleStatus::Active
+                                    && self.atoms.get(&atom.atom_id).is_some_and(|(current, _)| {
+                                        current.revision_id == *revision
+                                    })
+                                    && self
+                                        .deletions
+                                        .current(ObjectDeletionTarget::Atom {
+                                            atom_id: atom.atom_id,
+                                        })
+                                        .is_none()
+                            })
+                        }))
+                {
                     return Err(error);
                 }
                 continue;
