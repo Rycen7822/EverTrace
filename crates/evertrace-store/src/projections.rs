@@ -3085,6 +3085,7 @@ pub struct StoredFieldsContext {
     pub rows: Vec<ObjectRow>,
     pub source_suppressed: bool,
     pub(crate) analysis_entry: Option<autoresearch::AnalysisEntry>,
+    pub support_contract_ref: Option<RevisionId>,
     pub current_support_validation: Option<RevisionId>,
 }
 
@@ -7385,6 +7386,7 @@ impl JournalAdmissionState {
             rows: Vec::new(),
             source_suppressed: false,
             analysis_entry: None,
+            support_contract_ref: None,
             current_support_validation: None,
         };
         let Some(root) = selected else {
@@ -7416,6 +7418,30 @@ impl JournalAdmissionState {
                     .ok_or(StoreError::StoreCorrupt)?,
             )
             .map_err(|_| StoreError::StoreCorrupt)?;
+            use evertrace_domain::{
+                procedure::ProcedureScope,
+                semantic::{AtomScope, CoreScopeIdentity},
+            };
+            context.support_contract_ref = match &payload {
+                JournalPayload::CoreMembershipRecorded(member)
+                    if member.scope_identity == CoreScopeIdentity::Global =>
+                {
+                    Some(member.support_contract_ref)
+                }
+                JournalPayload::AtomRecorded(atom) if atom.scope == AtomScope::Global => self
+                    .scenario_core
+                    .exact_successor_support_contract(atom.revision_id, cancelled, deadline),
+                JournalPayload::ProcedureRevisionRecorded(procedure)
+                    if procedure.draft.scope == ProcedureScope::Global =>
+                {
+                    self.scenario_core.exact_successor_support_contract(
+                        procedure.revision_id,
+                        cancelled,
+                        deadline,
+                    )
+                }
+                _ => None,
+            };
             let contract = match &payload {
                 JournalPayload::GlobalSupportContractRecorded(value) => {
                     Some(value.support_contract_revision_id)

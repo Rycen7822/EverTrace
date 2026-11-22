@@ -948,9 +948,8 @@ pub(crate) async fn global_support_path(
 ) -> Option<(RelationRead, BTreeMap<String, BTreeSet<String>>)> {
     use evertrace_domain::{
         query::{METADATA_READ_LIMIT, SUCCESSOR_SUPPORT_CONTRACT, SUPPORT_CONTRACT_EVIDENCE},
-        semantic::{AtomScope, CoreScopeIdentity, GlobalSupportState},
+        semantic::GlobalSupportState,
     };
-    use evertrace_store::projections::{READ_DEPENDENCY_BYTES, READ_DEPENDENCY_LIMIT};
     let exact = |id: &str| {
         // A validation uses the contract ID as its stable key, never as its own revision.
         let mut matches = index
@@ -967,60 +966,29 @@ pub(crate) async fn global_support_path(
         payload.validate().ok()?;
         Some(payload)
     };
-    let pinned_contract = match decode(root)? {
-        JournalPayload::AtomRecorded(atom) if atom.scope == AtomScope::Global => None,
-        JournalPayload::ProcedureRevisionRecorded(procedure)
-            if procedure.draft.scope == evertrace_domain::procedure::ProcedureScope::Global =>
-        {
-            None
-        }
-        JournalPayload::CoreMembershipRecorded(member)
-            if member.scope_identity == CoreScopeIdentity::Global =>
-        {
-            Some(member.support_contract_ref)
-        }
-        _ => return None,
-    };
-    let selected = if let Some(id) = pinned_contract {
-        decode(exact(&id.to_string())?)?
-    } else {
-        let prefix = "object:atom:global_support_contract:";
-        let mut bytes_remaining = READ_DEPENDENCY_BYTES;
-        let mut selected = None;
-        for (position, (_, group)) in index
-            .range(prefix..)
-            .take_while(|(key, _)| key.starts_with(prefix))
-            .enumerate()
-        {
-            if position >= READ_DEPENDENCY_LIMIT || Instant::now() >= access.deadline {
-                return None;
-            }
-            let [row] = group.as_slice() else { return None };
-            bytes_remaining =
-                bytes_remaining.checked_sub(row.payload_json.as_ref()?.len() as u64)?;
-            let payload = decode(row)?;
-            let JournalPayload::GlobalSupportContractRecorded(contract) = &payload else {
-                return None;
-            };
-            if contract.successor_revision_or_membership_ref == successor
-                && selected.replace(payload).is_some()
-            {
-                return None;
-            }
-        }
-        selected?
-    };
-    let JournalPayload::GlobalSupportContractRecorded(contract) = selected else {
+    let kind = root.object_kind.as_deref()?;
+    if !matches!(
+        kind,
+        "atom_revision" | "core_membership" | "procedure_revision"
+    ) {
+        return None;
+    }
+    let contract_id = access
+        .check_exact_record(successor, successor, kind)
+        .await
+        .ok()?
+        .support_contract_ref?;
+    let contract_ref = contract_id.to_string();
+    let row = exact(&contract_ref)?;
+    let JournalPayload::GlobalSupportContractRecorded(contract) = decode(row)? else {
         return None;
     };
     if contract.successor_revision_or_membership_ref != successor
-        || pinned_contract.is_some_and(|id| id != contract.support_contract_revision_id)
+        || contract.support_contract_revision_id != contract_id
     {
         return None;
     }
-    let contract_ref = contract.support_contract_revision_id.to_string();
-    let bridge =
-        evertrace_store::query::canonical_support_contract_source(exact(&contract_ref)?).ok()?;
+    let bridge = evertrace_store::query::canonical_support_contract_source(row).ok()?;
     let mut path = RelationRead {
         rows: vec![bridge],
         edges: vec![(

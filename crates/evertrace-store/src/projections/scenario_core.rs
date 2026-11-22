@@ -653,6 +653,31 @@ impl ScenarioCoreState {
         })
     }
 
+    pub(super) fn exact_successor_support_contract(
+        &self,
+        successor: RevisionId,
+        cancelled: &std::sync::atomic::AtomicBool,
+        deadline: std::time::Instant,
+    ) -> Option<RevisionId> {
+        use std::sync::atomic::Ordering;
+        if self.contracts.len() > super::READ_DEPENDENCY_LIMIT {
+            return None;
+        }
+        let successor = successor.to_string();
+        let mut found = None;
+        for (id, (contract, _)) in &self.contracts {
+            if cancelled.load(Ordering::Relaxed) || std::time::Instant::now() >= deadline {
+                return None;
+            }
+            if contract.successor_revision_or_membership_ref == successor
+                && found.replace(*id).is_some()
+            {
+                return None;
+            }
+        }
+        found
+    }
+
     pub(super) fn atom_support_contract_refs(
         &self,
         revision_id: RevisionId,
