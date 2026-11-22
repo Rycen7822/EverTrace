@@ -297,10 +297,30 @@ pub(crate) fn validate_new_atom_supports(
     refs: &[RevisionId],
 ) -> Result<(), SemanticServiceError> {
     validate_current_support_refs(view, refs, base.revision_id)?;
-    if !Atom::independent_support_closure(base, refs, |id| view.atom_revisions.get(&id)) {
+    if !Atom::support_closure_available(Some(base.atom_id), refs, |id| view.atom_revisions.get(&id))
+    {
         return Err(SemanticServiceError::InvalidInput);
     }
     Ok(())
+}
+
+pub(crate) fn procedure_support_repair_ready(
+    snapshot: &ProjectionSnapshot,
+    validation: RevisionId,
+    base: RevisionId,
+) -> Result<bool, SemanticServiceError> {
+    let support = SupportProjectionView::from_snapshot(snapshot)?;
+    let Some(event) = support.validations.get(&validation) else {
+        return Ok(false);
+    };
+    Ok(event.state == GlobalSupportState::Insufficient
+        && event.successor_ref == base.to_string()
+        && support.current_validations.get(&event.support_contract_ref) == Some(event)
+        && {
+            let procedures = ProcedureUsageCurrentView::from_snapshot(snapshot)?;
+            procedures.current_procedure_by_revision(base).is_some()
+                && procedures.procedure_support_repair_ready(base)
+        })
 }
 
 pub(crate) fn support_successor_fanout_payloads(

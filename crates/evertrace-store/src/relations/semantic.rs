@@ -163,7 +163,7 @@ pub fn build_procedure_usage_relation_rows(
     Ok(rows.into_iter().collect())
 }
 
-pub fn build_procedure_relation_rows(
+pub(crate) fn rebuild_procedure_relation_rows(
     procedures: &[ProcedureRevision],
     atoms: &[Atom],
 ) -> Result<Vec<SemanticRelationRow>, StoreError> {
@@ -181,8 +181,10 @@ pub fn build_procedure_relation_rows(
     let mut rows = BTreeSet::new();
     for procedure in procedures {
         procedure.validate().map_err(|_| StoreError::InvalidInput)?;
-        if let Some(parent) = procedure.parent_revision_id {
-            require_target(&procedure_revisions, parent)?;
+        if let Some(parent) = procedure
+            .parent_revision_id
+            .filter(|parent| procedure_revisions.contains(parent))
+        {
             insert(
                 &mut rows,
                 SemanticRelationKind::ProcedureRevisionSuccessor,
@@ -190,8 +192,12 @@ pub fn build_procedure_relation_rows(
                 parent,
             );
         }
-        for support in &procedure.draft.support_revision_refs {
-            require_target(&atom_revisions, *support)?;
+        for support in procedure
+            .draft
+            .support_revision_refs
+            .iter()
+            .filter(|id| atom_revisions.contains(id))
+        {
             insert(
                 &mut rows,
                 SemanticRelationKind::ProcedureSupportsRevision,

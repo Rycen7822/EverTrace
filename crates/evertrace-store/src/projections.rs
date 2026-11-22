@@ -32,7 +32,7 @@ use evertrace_domain::{
     revision::RevisionId,
     semantic::{
         AcceptedProposalTarget, Atom, AtomLifecycleStatus, AtomProposalPayload, CoreMembership,
-        CoreMembershipProposalPayload, EvidenceCompleteness, ParserStatus,
+        CoreMembershipProposalPayload, EvidenceCompleteness, GlobalSupportState, ParserStatus,
         ProcedureProposalPayload, ProposalAcceptanceAuthority, ProposalOperation, ProposalPayload,
         ProposalStatus, ProposalTargetId, ResultEvidence, ResultScope, RevisionProposal,
         TUI_ACCEPTANCE_EVENT_MANIFEST_REF, UserAuthorizationMode, VerifierStatus,
@@ -13769,7 +13769,7 @@ impl JournalAdmissionState {
         )
     }
 
-    fn validate_changed_atom_supports(
+    fn validate_changed_supports(
         &self,
         proposal: &RevisionProposal,
         payloads: &[&JournalPayload],
@@ -13781,17 +13781,49 @@ impl JournalAdmissionState {
         {
             return Ok(());
         }
-        let Some((validation, draft)) = proposal.atom_support_replacement() else {
-            return Ok(());
-        };
-        let (base, _) = self
-            .atom_revisions
-            .get(&proposal.base_revision_id.ok_or(error)?)
-            .ok_or(error)?;
-        let refs = &draft.supports_revision_refs;
-        if *refs == base.supports_revision_refs {
-            return Ok(());
-        }
+        let (validation, refs, exclude) =
+            if let Some((validation, draft)) = proposal.atom_support_replacement() {
+                let (base, _) = self
+                    .atom_revisions
+                    .get(&proposal.base_revision_id.ok_or(error)?)
+                    .ok_or(error)?;
+                if draft.supports_revision_refs == base.supports_revision_refs {
+                    return Ok(());
+                }
+                (
+                    validation,
+                    &draft.supports_revision_refs,
+                    Some(base.atom_id),
+                )
+            } else if let Some((validation, draft)) = proposal.procedure_support_replacement()
+                && let Some(event) = self.scenario_core.validation(validation)
+            {
+                let base = self
+                    .procedure
+                    .revision(proposal.base_revision_id.ok_or(error)?)
+                    .ok_or(error)?;
+                if draft.support_revision_refs == base.draft.support_revision_refs {
+                    return if proposal.status == ProposalStatus::Accepted {
+                        Err(error)
+                    } else {
+                        Ok(())
+                    };
+                }
+                if !self
+                    .procedure
+                    .procedure_support_repair_ready(base.revision_id)
+                    || event.state != GlobalSupportState::Insufficient
+                    || payloads.iter().any(|payload| {
+                        matches!(payload, JournalPayload::ProcedureNegativeEvidenceRecorded(value)
+                    if value.procedure_revision_id == base.revision_id)
+                    })
+                {
+                    return Err(error);
+                }
+                (validation, &draft.support_revision_refs, None)
+            } else {
+                return Ok(());
+            };
         let eligible = |revision| {
             let (atom, _) = self.atom_revisions.get(&revision)?;
             let current = self.atoms.get(&atom.atom_id)?;
@@ -13811,7 +13843,7 @@ impl JournalAdmissionState {
                 .then_some(atom)
         };
         if self.scenario_core.validation(validation).is_none()
-            || !Atom::independent_support_closure(base, refs, eligible)
+            || !Atom::support_closure_available(exclude, refs, eligible)
         {
             return Err(error);
         }
@@ -13911,7 +13943,7 @@ impl JournalAdmissionState {
             JournalPayload::RevisionProposalRecorded(value) => Some(value.as_ref()),
             _ => None,
         }) {
-            self.validate_changed_atom_supports(proposal, payloads, error)?;
+            self.validate_changed_supports(proposal, payloads, error)?;
             let admission = self.classify_deletion_proposal(proposal)?;
             if let Some(ProposalAcceptanceAuthority::WebAcceptance { intent, .. }) = proposal
                 .acceptance

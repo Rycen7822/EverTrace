@@ -34,8 +34,8 @@ pub use scenario_core::{
 pub(crate) use scenario_core::{
     SupportAtomAcceptance, SupportDeprecateLookup, SupportReplacementLookup,
     compose_support_deprecate, compose_support_replacement, global_support_payloads,
-    select_support_atom_acceptance, select_support_deprecate, select_support_replacement,
-    validate_current_support_refs, validate_new_atom_supports,
+    procedure_support_repair_ready, select_support_atom_acceptance, select_support_deprecate,
+    select_support_replacement, validate_current_support_refs, validate_new_atom_supports,
 };
 
 #[derive(Debug, Error)]

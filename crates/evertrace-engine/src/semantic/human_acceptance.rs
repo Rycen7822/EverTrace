@@ -40,7 +40,7 @@ use crate::{
     ingest::capture_event_drafts,
     procedure::{
         EditedProcedureAcceptance, ProcedureAcceptanceContext, ProcedureAcceptanceResolution,
-        accept_procedure, accept_procedure_edited,
+        accept_procedure, accept_procedure_edited, accept_procedure_support_repair,
     },
     semantic::{
         AtomAcceptanceContext, CoreMembershipAcceptanceContext, ProposalCommandContext,
@@ -350,7 +350,7 @@ impl HumanAcceptanceService {
             }
             if inactive_unchanged_procedure(&snapshot, proposal)?
                 || !self
-                    .atom_replacement_supports_accessible(&snapshot, &view, proposal)
+                    .replacement_supports_accessible(&snapshot, &view, proposal)
                     .await?
             {
                 spool
@@ -1160,11 +1160,17 @@ impl HumanAcceptanceService {
                 reason: "atomic_tui_acceptance_source_unavailable",
             });
         };
-        if let Some((_, draft)) = original.atom_support_replacement()
-            && original
-                .base_revision_id
-                .and_then(|id| view.atom_revisions.get(&id))
-                .is_some_and(|base| base.supports_revision_refs != draft.supports_revision_refs)
+        if original.procedure_support_replacement().is_some()
+            || original
+                .atom_support_replacement()
+                .is_some_and(|(_, draft)| {
+                    original
+                        .base_revision_id
+                        .and_then(|id| view.atom_revisions.get(&id))
+                        .is_some_and(|base| {
+                            base.supports_revision_refs != draft.supports_revision_refs
+                        })
+                })
         {
             return Ok(HumanActionOutcome::Unavailable {
                 reason: "support_replacement_requires_exact_acceptance",
@@ -1582,12 +1588,34 @@ impl HumanAcceptanceService {
         })
     }
 
-    async fn atom_replacement_supports_accessible(
+    async fn replacement_supports_accessible(
         &self,
         snapshot: &ProjectionSnapshot,
         view: &SemanticCurrentView,
         proposal: &RevisionProposal,
     ) -> Result<bool, HumanGovernanceError> {
+        if let Some((validation, draft)) = proposal.procedure_support_replacement() {
+            let base = match current_procedure(snapshot, proposal) {
+                Ok((Some(base), _)) => base,
+                Ok(_) | Err(HumanGovernanceError::InvalidInput) => return Ok(false),
+                Err(error) => return Err(error),
+            };
+            let service =
+                crate::HumanGovernanceService::new(self.writer.clone(), self.effective_config_hash);
+            return Ok(
+                draft.support_revision_refs != base.draft.support_revision_refs
+                    && service
+                        .new_procedure_supports_accessible(
+                            snapshot,
+                            view,
+                            validation,
+                            base.revision_id,
+                            &draft.support_revision_refs,
+                        )
+                        .await?
+                    && service.proposal_accessible(snapshot, proposal).await?,
+            );
+        }
         let Some((validation, draft)) = proposal.atom_support_replacement() else {
             return Ok(true);
         };
@@ -1640,7 +1668,7 @@ impl HumanAcceptanceService {
             });
         }
         if !self
-            .atom_replacement_supports_accessible(snapshot, view, proposal)
+            .replacement_supports_accessible(snapshot, view, proposal)
             .await?
         {
             return Ok(HumanActionOutcome::Unavailable {
@@ -1738,15 +1766,26 @@ impl HumanAcceptanceService {
             }
             ProposalPayload::Procedure(_) => {
                 let (current, publication) = current_procedure(snapshot, proposal)?;
-                let result = accept_procedure(
-                    view,
-                    command_context,
-                    proposal.proposal_id,
-                    ProcedureAcceptanceContext::Manual(context),
-                    current.as_ref(),
-                    publication,
-                    &self.global_promotion,
-                )
+                let result = if proposal.procedure_support_replacement().is_some() {
+                    accept_procedure_support_repair(
+                        view,
+                        command_context,
+                        proposal.proposal_id,
+                        context,
+                        current.as_ref().ok_or(HumanGovernanceError::InvalidInput)?,
+                        &self.global_promotion,
+                    )
+                } else {
+                    accept_procedure(
+                        view,
+                        command_context,
+                        proposal.proposal_id,
+                        ProcedureAcceptanceContext::Manual(context),
+                        current.as_ref(),
+                        publication,
+                        &self.global_promotion,
+                    )
+                }
                 .map_err(|_| HumanGovernanceError::InvalidInput)?;
                 match result {
                     ProcedureAcceptanceResolution::Command {

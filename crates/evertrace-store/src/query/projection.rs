@@ -21,11 +21,11 @@ use crate::{
         RelationProjectionRow, build_attempt_relation_rows, build_autoresearch_relation_rows,
         build_capture_relation_rows, build_core_support_relation_rows, build_episode_relation_rows,
         build_operation_burst_relation_rows, build_physical_relation_rows,
-        build_procedure_relation_rows, build_procedure_usage_relation_rows,
-        build_recovery_application_relation_rows, build_recovery_relation_rows,
-        build_repository_relation_rows, build_segmentation_correction_relation_rows,
-        build_semantic_digest_relation_rows, build_wiki_relation_rows,
-        build_work_binding_relation_rows, build_work_identity_relation_rows,
+        build_procedure_usage_relation_rows, build_recovery_application_relation_rows,
+        build_recovery_relation_rows, build_repository_relation_rows,
+        build_segmentation_correction_relation_rows, build_semantic_digest_relation_rows,
+        build_wiki_relation_rows, build_work_binding_relation_rows,
+        build_work_identity_relation_rows, rebuild_procedure_relation_rows,
         rebuild_semantic_relation_rows,
     },
     search::{
@@ -1079,23 +1079,8 @@ fn derive_l0002_projection_rows(
             super::derive::closed_episode_search_row(row, &episode, &digests, is_current)?;
         exact_rows.insert(candidate.row_id.clone(), candidate);
     }
-    let available_atom_revisions = atoms.keys().copied().collect::<BTreeSet<_>>();
-    let available_procedure_revisions = procedures.keys().copied().collect::<BTreeSet<_>>();
-    // Omit missing relation endpoints, not facts inside an immutable Atom.
+    // The relation builders omit missing endpoints without rewriting immutable facts.
     let relation_atoms = all_values(&atoms);
-    let relation_procedures = all_values(&procedures)
-        .into_iter()
-        .map(|mut procedure| {
-            procedure.parent_revision_id = procedure
-                .parent_revision_id
-                .filter(|revision| available_procedure_revisions.contains(revision));
-            procedure
-                .draft
-                .support_revision_refs
-                .retain(|revision| available_atom_revisions.contains(revision));
-            procedure
-        })
-        .collect::<Vec<_>>();
     let mut relations = BTreeSet::new();
     add_physical(
         &mut relations,
@@ -1195,7 +1180,7 @@ fn derive_l0002_projection_rows(
     );
     add_semantic(
         &mut relations,
-        build_procedure_relation_rows(&relation_procedures, &relation_atoms)?,
+        rebuild_procedure_relation_rows(&all_values(&procedures), &relation_atoms)?,
         &endpoint_seqs,
     );
     add_semantic(

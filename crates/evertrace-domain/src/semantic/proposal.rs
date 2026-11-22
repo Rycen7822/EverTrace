@@ -697,7 +697,10 @@ impl WebAcceptanceIntent {
             {
                 payload.creation().map(|(_, scope)| scope.atom_scope())
             }
-            ProposalPayload::Procedure(payload) if proposal.operation == payload.operation() => {
+            ProposalPayload::Procedure(payload)
+                if proposal.operation == payload.operation()
+                    && proposal.procedure_support_replacement().is_none() =>
+            {
                 Some(payload.draft().scope.into())
             }
             _ => None,
@@ -1326,10 +1329,38 @@ impl ProposalPayload {
         (draft.scope == AtomScope::Global).then_some(draft)
     }
 
+    pub fn procedure_support_replacement(&self) -> Option<&ProcedureDraft> {
+        let Self::Procedure(payload) = self else {
+            return None;
+        };
+        let ProcedureProposalPayload::Replace { draft } = payload.as_ref() else {
+            return None;
+        };
+        (draft.scope == ProcedureScope::Global).then_some(draft)
+    }
+
     /// A changed cohort may change only support edges. Ordinary body edits retain the existing rules.
     pub fn validate_support_replacement(&self, edited: &Self) -> Result<(), SemanticError> {
         if self.validate_closed_edit(edited).is_ok() {
             return Ok(());
+        }
+        if let (Some(base), Some(next)) = (
+            self.procedure_support_replacement(),
+            edited.procedure_support_replacement(),
+        ) {
+            next.validate()?;
+            let mut same_cohort = next.clone();
+            same_cohort
+                .support_revision_refs
+                .clone_from(&base.support_revision_refs);
+            return if !next.support_revision_refs.is_empty()
+                && next.support_revision_refs != base.support_revision_refs
+                && same_cohort == *base
+            {
+                Ok(())
+            } else {
+                Err(SemanticError::InvalidProposal)
+            };
         }
         let (Some(base), Some(next)) = (
             self.atom_support_replacement(),
@@ -1622,10 +1653,31 @@ impl RevisionProposal {
         ))
     }
 
+    pub fn procedure_support_replacement(&self) -> Option<(RevisionId, &ProcedureDraft)> {
+        if self.operation != ProposalOperation::Replace
+            || self.target_kind != ProposalTargetKind::Procedure
+            || !matches!(self.target_id, Some(ProposalTargetId::Procedure(_)))
+        {
+            return None;
+        }
+        let validation = self.support_validation_reference()?;
+        let draft = self.payload.procedure_support_replacement()?;
+        // Direct evidence may itself be an Atom revision. A repair instead
+        // anchors the review outside the unchanged direct evidence set.
+        (!draft.evidence_refs.contains(&self.evidence_refs[0])).then_some((validation, draft))
+    }
+
     fn atom_support_validation_reference(&self) -> Option<RevisionId> {
         if self.target_kind != ProposalTargetKind::Atom
             || !matches!(self.target_id, Some(ProposalTargetId::Atom(_)))
-            || self.base_revision_id.is_none()
+        {
+            return None;
+        }
+        self.support_validation_reference()
+    }
+
+    fn support_validation_reference(&self) -> Option<RevisionId> {
+        if self.base_revision_id.is_none()
             || self.eligibility != ProposalEligibility::ManualRequired
             || self.created_by != ProposalCreatedBy::User
             || self.evidence_refs != self.source_cohort_refs

@@ -348,6 +348,11 @@ impl ProcedureStateEvent {
         Ok(())
     }
 
+    pub fn is_support_review_hold(&self) -> bool {
+        self.to_state == ProcedurePublicationState::ReviewHold
+            && self.reason == ProcedureStateReason::SupportPending
+    }
+
     fn transition_allowed(&self) -> bool {
         use ProcedurePublicationState as S;
         if self.from_state.is_none() {

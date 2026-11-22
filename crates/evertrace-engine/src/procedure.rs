@@ -708,6 +708,7 @@ pub(crate) struct EditedProcedureAcceptance<'a> {
 
 enum ProcedureAcceptanceInput<'a> {
     Standard(ProcedureAcceptanceContext),
+    SupportRepair(AtomAcceptanceContext),
     Edited(EditedProcedureAcceptance<'a>),
 }
 
@@ -747,6 +748,25 @@ pub fn accept_procedure(
     )
 }
 
+pub(crate) fn accept_procedure_support_repair(
+    view: &SemanticCurrentView,
+    context: ProposalCommandContext,
+    proposal_id: evertrace_domain::ids::RevisionProposalId,
+    source: AtomAcceptanceContext,
+    current: &ProcedureRevision,
+    global_config: &GlobalPromotionConfig,
+) -> Result<ProcedureAcceptanceResolution, SemanticServiceError> {
+    accept_procedure_inner(
+        view,
+        context,
+        proposal_id,
+        Some(current),
+        Some(ProcedurePublicationState::ReviewHold),
+        global_config,
+        ProcedureAcceptanceInput::SupportRepair(source),
+    )
+}
+
 pub(crate) fn accept_procedure_edited(
     view: &SemanticCurrentView,
     context: ProposalCommandContext,
@@ -776,8 +796,12 @@ fn accept_procedure_inner(
     global_config: &GlobalPromotionConfig,
     acceptance: ProcedureAcceptanceInput<'_>,
 ) -> Result<ProcedureAcceptanceResolution, SemanticServiceError> {
+    let support_repair = matches!(acceptance, ProcedureAcceptanceInput::SupportRepair(_));
     let (acceptance_context, edit_original) = match acceptance {
         ProcedureAcceptanceInput::Standard(context) => (context, None),
+        ProcedureAcceptanceInput::SupportRepair(source) => {
+            (ProcedureAcceptanceContext::Manual(source), None)
+        }
         ProcedureAcceptanceInput::Edited(edited) => (
             ProcedureAcceptanceContext::Manual(edited.source),
             Some(edited.original),
@@ -800,7 +824,19 @@ fn accept_procedure_inner(
     draft
         .validate()
         .map_err(|_| SemanticServiceError::InvalidInput)?;
-    if draft.evidence_refs.iter().any(|reference| {
+    if support_repair {
+        let base = current.ok_or(SemanticServiceError::BaseConflict)?;
+        if proposal.procedure_support_replacement().is_none()
+            || draft.support_revision_refs == base.draft.support_revision_refs
+            || ProposalPayload::Procedure(Box::new(ProcedureProposalPayload::Replace {
+                draft: base.draft.clone(),
+            }))
+            .validate_support_replacement(&proposal.payload)
+            .is_err()
+        {
+            return Err(SemanticServiceError::InvalidInput);
+        }
+    } else if draft.evidence_refs.iter().any(|reference| {
         // Store validates both source sets. Synthesis proposals cite the
         // digest as evidence and retain its verified direct sources here.
         !proposal.evidence_refs.contains(reference)

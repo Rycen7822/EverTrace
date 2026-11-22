@@ -14,12 +14,12 @@ use evertrace_domain::{
     repository::{RepositoryInstance, WorktreeInstance},
     revision::RevisionId,
     semantic::{
-        Atom, AtomAuthority, AtomDraft, AtomLifecycleStatus, AtomProposalPayload, AtomScope,
-        CoreMembershipProposalPayload, EpistemicStatus, GlobalSupportState,
-        HUMAN_CREATION_MANIFEST, HumanAtomAuthoring, HumanAuthoringTarget, HumanCreationScope,
-        ProcedureProposalPayload, ProposalAcceptanceAuthority, ProposalCreatedBy,
-        ProposalEligibility, ProposalOperation, ProposalPayload, ProposalStatus, ProposalTargetId,
-        ProposalTargetKind, RevisionProposal, TUI_ACCEPTANCE_EVENT_MANIFEST_REF,
+        AcceptedProposalTarget, Atom, AtomAuthority, AtomDraft, AtomLifecycleStatus,
+        AtomProposalPayload, AtomScope, CoreMembershipProposalPayload, EpistemicStatus,
+        GlobalSupportState, HUMAN_CREATION_MANIFEST, HumanAtomAuthoring, HumanAuthoringTarget,
+        HumanCreationScope, ProcedureProposalPayload, ProposalAcceptanceAuthority,
+        ProposalCreatedBy, ProposalEligibility, ProposalOperation, ProposalPayload, ProposalStatus,
+        ProposalTargetId, ProposalTargetKind, RevisionProposal, TUI_ACCEPTANCE_EVENT_MANIFEST_REF,
         UserAuthorizationMode, VerifierStatus, WEB_ACCEPTANCE_EVENT_MANIFEST_REF,
         WebAcceptanceIntent, is_human_authoring_manifest, tui_acceptance_capture_matches,
         tui_acceptance_event_payload,
@@ -437,6 +437,33 @@ pub(crate) fn validate_command_boundary<'a>(
                 return Err(error);
             }
             accepted_edits.insert(accepted.proposal_id);
+        }
+        if let Some((validation, draft)) = accepted.procedure_support_replacement() {
+            if support_validation_ref(accepted, current_support, error)? != Some(validation) {
+                return Err(error);
+            }
+            let base = accepted.base_revision_id.ok_or(error)?;
+            let AcceptedProposalTarget::Procedure {
+                procedure_id,
+                procedure_revision_id,
+                auto_full_audit: None,
+            } = acceptance.accepted_target
+            else {
+                return Err(error);
+            };
+            let Some((_, occurred_at_us, config_hash)) = events.iter().find(|(payload, _, _)| {
+                matches!(payload, JournalPayload::ProcedureRevisionRecorded(revision)
+                    if revision.revision_id == procedure_revision_id && revision.procedure_id == procedure_id
+                        && revision.parent_revision_id == Some(base) && revision.draft == *draft)
+            }) else { return Err(error) };
+            current_support.validate_successor_fanout(
+                base,
+                Some(procedure_revision_id),
+                *occurred_at_us,
+                *config_hash,
+                &payloads,
+                error,
+            )?;
         }
         let Some((accepted_atom_id, accepted_atom_revision_id, _)) = acceptance.accepted_atom()
         else {

@@ -583,6 +583,24 @@ impl ProcedureUsageCurrentView {
             .then_some(procedure)
     }
 
+    pub(crate) fn procedure_support_repair_ready(&self, revision: RevisionId) -> bool {
+        self.publications
+            .get(&revision)
+            .is_some_and(|(event, _)| event.is_support_review_hold())
+            && !self.has_active_harm(revision)
+    }
+
+    fn has_active_harm(&self, revision: RevisionId) -> bool {
+        self.negatives.values().any(|negative| {
+            negative.procedure_revision_id == revision
+                && negative.level != evertrace_domain::procedure::ProcedureNegativeLevel::Ineffective
+                && self.negative_reviews.get(&negative.negative_evidence_id).is_some_and(|review| {
+                    matches!(review.status, evertrace_domain::procedure::ProcedureNegativeReviewStatus::Pending
+                        | evertrace_domain::procedure::ProcedureNegativeReviewStatus::Upheld)
+                })
+        })
+    }
+
     pub(crate) fn coverage_procedures(
         &self,
         scope: evertrace_domain::procedure::ProcedureScope,
@@ -3809,24 +3827,24 @@ impl ProcedureUsageCurrentView {
     }
 
     fn promotion_allowed(&self, revision_id: RevisionId, occurred_at_us: i64) -> bool {
-        self.current_procedure_by_revision(revision_id).is_some_and(|procedure| {
-            (!matches!(procedure.draft.scope, ProcedureScope::Global)
-                || self.procedure_support.get(&revision_id).and_then(|value| value.as_deref()) == Some("valid"))
-                && self.publications.get(&revision_id).is_some_and(|(event, _)| {
-                    event.to_state == ProcedurePublicationState::ActiveProbationary
-                        && event.created_at_us <= occurred_at_us
-                })
-                && !self.has_local_quarantine(revision_id)
-                && !self.negatives.values().any(|negative| {
-                    negative.procedure_revision_id == revision_id
-                        && negative.level != evertrace_domain::procedure::ProcedureNegativeLevel::Ineffective
-                        && self.negative_reviews.get(&negative.negative_evidence_id).is_some_and(|review| {
-                            matches!(review.status,
-                                evertrace_domain::procedure::ProcedureNegativeReviewStatus::Pending
-                                    | evertrace_domain::procedure::ProcedureNegativeReviewStatus::Upheld)
+        self.current_procedure_by_revision(revision_id)
+            .is_some_and(|procedure| {
+                (!matches!(procedure.draft.scope, ProcedureScope::Global)
+                    || self
+                        .procedure_support
+                        .get(&revision_id)
+                        .and_then(|value| value.as_deref())
+                        == Some("valid"))
+                    && self
+                        .publications
+                        .get(&revision_id)
+                        .is_some_and(|(event, _)| {
+                            event.to_state == ProcedurePublicationState::ActiveProbationary
+                                && event.created_at_us <= occurred_at_us
                         })
-                })
-        })
+                    && !self.has_local_quarantine(revision_id)
+                    && !self.has_active_harm(revision_id)
+            })
     }
 }
 

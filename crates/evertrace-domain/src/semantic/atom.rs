@@ -807,9 +807,9 @@ impl Atom {
         Ok(())
     }
 
-    /// Reject self-support through any retained dependency rather than treating a new ID as independence.
-    pub fn independent_support_closure<'a>(
-        base: &Self,
+    /// Resolve the bounded closure, rejecting missing support and optional self-support.
+    pub fn support_closure_available<'a>(
+        exclude: Option<AtomId>,
         refs: &[RevisionId],
         lookup: impl Fn(RevisionId) -> Option<&'a Self>,
     ) -> bool {
@@ -823,7 +823,7 @@ impl Atom {
             let Some(atom) = lookup(reference) else {
                 return false;
             };
-            if atom.atom_id == base.atom_id || seen.len() > MAX_CHECKED_SUPPORTS {
+            if Some(atom.atom_id) == exclude || seen.len() > MAX_CHECKED_SUPPORTS {
                 return false;
             }
             pending.extend(

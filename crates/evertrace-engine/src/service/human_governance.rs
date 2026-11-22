@@ -1463,6 +1463,24 @@ impl HumanGovernanceService {
                 });
             }
         }
+        if let (Some(base), Some(next)) = (
+            selection.initial_payload.procedure_support_replacement(),
+            edited_payload.procedure_support_replacement(),
+        ) && base.support_revision_refs != next.support_revision_refs
+            && !self
+                .new_procedure_supports_accessible(
+                    &snapshot,
+                    &view,
+                    expected_validation_revision_id,
+                    selection.base_revision_id,
+                    &next.support_revision_refs,
+                )
+                .await?
+        {
+            return Ok(HumanActionOutcome::Unavailable {
+                reason: "replacement_support_unavailable",
+            });
+        }
         let edited_for_retry = edited_payload.clone();
         match compose_support_replacement(
             &view,
@@ -1743,7 +1761,7 @@ impl HumanGovernanceService {
                 self.support_revisions_readable(
                     &snapshot,
                     validation,
-                    selection.base_revision_id,
+                    ("atom_revision", selection.base_revision_id),
                     &[],
                 )
                 .await
@@ -1889,7 +1907,7 @@ impl HumanGovernanceService {
                 .base_revision_id
                 .ok_or(HumanGovernanceError::Store)?;
             if !self
-                .support_revisions_readable(&snapshot, validation, base, &[])
+                .support_revisions_readable(&snapshot, validation, ("atom_revision", base), &[])
                 .await?
                 || !self.proposal_accessible(&snapshot, proposal).await?
             {
@@ -1924,7 +1942,35 @@ impl HumanGovernanceService {
         }) {
             return Ok(false);
         }
-        self.support_revisions_readable(snapshot, validation, base.revision_id, refs)
+        self.support_revisions_readable(
+            snapshot,
+            validation,
+            ("atom_revision", base.revision_id),
+            refs,
+        )
+        .await
+    }
+
+    pub(crate) async fn new_procedure_supports_accessible(
+        &self,
+        snapshot: &ProjectionSnapshot,
+        view: &SemanticCurrentView,
+        validation: RevisionId,
+        base: RevisionId,
+        refs: &[RevisionId],
+    ) -> Result<bool, HumanGovernanceError> {
+        if !crate::semantic::procedure_support_repair_ready(snapshot, validation, base)
+            .map_err(|_| HumanGovernanceError::Store)?
+            || !evertrace_domain::semantic::Atom::support_closure_available(None, refs, |id| {
+                view.atom_revisions.get(&id).filter(|atom| {
+                    atom.lifecycle_status == evertrace_domain::semantic::AtomLifecycleStatus::Active
+                        && view.atoms.get(&atom.atom_id) == Some(*atom)
+                })
+            })
+        {
+            return Ok(false);
+        }
+        self.support_revisions_readable(snapshot, validation, ("procedure_revision", base), refs)
             .await
     }
 
@@ -1932,7 +1978,7 @@ impl HumanGovernanceService {
         &self,
         snapshot: &ProjectionSnapshot,
         validation: RevisionId,
-        base: RevisionId,
+        (base_kind, base): (&str, RevisionId),
         refs: &[RevisionId],
     ) -> Result<bool, HumanGovernanceError> {
         let deadline = std::time::Instant::now() + presentation::READ_DEADLINE;
@@ -1940,7 +1986,7 @@ impl HumanGovernanceService {
             .map_err(|_| HumanGovernanceError::Store)?;
         let roots = [
             (validation, "global_support_validation", false),
-            (base, "atom_revision", false),
+            (base, base_kind, false),
         ];
         let candidates = refs.iter().map(|id| (*id, "atom_revision", true));
         for (revision, kind, support) in roots.into_iter().chain(candidates) {
@@ -2070,7 +2116,7 @@ impl HumanGovernanceService {
                 .support_revisions_readable(
                     &snapshot,
                     expected_validation_revision_id,
-                    selection.base_revision_id,
+                    ("atom_revision", selection.base_revision_id),
                     &[],
                 )
                 .await?

@@ -197,6 +197,13 @@ impl ProcedureState {
             .map(|(value, _)| value.to_state)
     }
 
+    pub(super) fn procedure_support_repair_ready(&self, revision: RevisionId) -> bool {
+        self.current_publication
+            .get(&revision)
+            .is_some_and(|(event, _)| event.is_support_review_hold())
+            && !self.has_active_harm(revision)
+    }
+
     pub(super) fn deletion_procedure_impacts(
         &self,
         revision_ids: &BTreeSet<RevisionId>,
@@ -519,7 +526,8 @@ impl ProcedureState {
                     evertrace_domain::semantic::ProposalAcceptanceAuthority::WebAcceptance { .. }
                 )
             });
-            if web {
+            let support_repair = proposal.procedure_support_replacement().is_some();
+            if web || support_repair {
                 use ProcedurePublicationState as S;
                 use evertrace_domain::procedure::ProcedureStateReason as R;
                 let mut states = payloads
@@ -544,7 +552,7 @@ impl ProcedureState {
                     return Err(StoreError::StoreCorrupt);
                 }
             }
-            if web || accepted_edits.contains(&proposal.proposal_id) {
+            if web || support_repair || accepted_edits.contains(&proposal.proposal_id) {
                 if payloads
                     .iter()
                     .filter(|payload| {
