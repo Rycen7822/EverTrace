@@ -49,7 +49,14 @@ pub struct SearchSnapshot {
 #[derive(Clone, Copy)]
 pub enum RelationDirection {
     Adjacent,
-    Outgoing,
+    AtomPredecessors,
+}
+
+#[derive(Default)]
+pub struct RelationNeighbourhood {
+    pub edges: Vec<crate::RelationProjectionRow>,
+    /// Some declared predecessor edges were removed from the live projection.
+    pub incomplete: bool,
 }
 
 #[derive(Clone, Debug)]
@@ -311,10 +318,12 @@ impl SearchSnapshot {
         kinds: &[String],
         direction: RelationDirection,
         limit: usize,
-    ) -> Result<Option<Vec<crate::RelationProjectionRow>>, StoreError> {
+    ) -> Result<Option<RelationNeighbourhood>, StoreError> {
         if sources.len() > 64
             || kinds.len() > 32
             || !(1..=65).contains(&limit)
+            || (matches!(direction, RelationDirection::AtomPredecessors)
+                && kinds != ["atom_supersedes"])
             || kinds
                 .iter()
                 .any(|kind| !crate::relations::is_persisted_relation_kind(kind))
@@ -322,7 +331,7 @@ impl SearchSnapshot {
             return Err(StoreError::InvalidInput);
         }
         if sources.is_empty() || kinds.is_empty() {
-            return Ok(Some(Vec::new()));
+            return Ok(Some(RelationNeighbourhood::default()));
         }
         let frontier = self.frontier;
         let (sources, kinds) = (sources.to_vec(), kinds.to_vec());

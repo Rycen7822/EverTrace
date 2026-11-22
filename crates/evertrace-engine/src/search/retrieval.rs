@@ -722,7 +722,7 @@ impl NativeRetrieval<'_> {
             && !self.context.query_facets.target_anchors.is_empty()
             && kinds.as_slice() == [super::ATOM_SUPERSEDES];
         let direction = if predecessors {
-            RelationDirection::Outgoing
+            RelationDirection::AtomPredecessors
         } else {
             RelationDirection::Adjacent
         };
@@ -751,7 +751,12 @@ impl NativeRetrieval<'_> {
                 .run(snapshot.adjacent_relations(&sources, &persisted_kinds, direction, 65))
                 .await
             {
-                Ok(Ok(Some(rows))) => rows,
+                Ok(Ok(Some(neighbours))) => {
+                    if neighbours.incomplete {
+                        incomplete.insert(super::ATOM_SUPERSEDES.into());
+                    }
+                    neighbours.edges
+                }
                 Ok(Ok(None)) => return Ok(self.invalidated("canonical_frontier_changed")),
                 Ok(Err(_)) => {
                     self.degraded("relation_channel_unavailable");

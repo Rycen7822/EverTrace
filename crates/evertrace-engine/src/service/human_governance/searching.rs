@@ -158,7 +158,8 @@ async fn research_neighbours(
         )
         .await
         .map_err(unavailable)?
-        .ok_or(HumanGovernanceError::Store)?;
+        .ok_or(HumanGovernanceError::Store)?
+        .edges;
     let truncated = runs.len() >= 32;
     let runs: Vec<_> = runs
         .into_iter()
@@ -179,7 +180,8 @@ async fn research_neighbours(
         )
         .await
         .map_err(unavailable)?
-        .ok_or(HumanGovernanceError::Store)?;
+        .ok_or(HumanGovernanceError::Store)?
+        .edges;
     let truncated = truncated || outcomes.len() > limit;
     keys.extend(
         outcomes

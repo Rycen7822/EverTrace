@@ -541,6 +541,7 @@ pub(crate) async fn operation_binding_references(
             )
             .await
             .ok()??
+            .edges
     };
     if neighbours.len() > 64 {
         return None;

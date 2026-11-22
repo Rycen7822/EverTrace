@@ -14470,9 +14470,10 @@ impl JournalAdmissionState {
                 seq,
                 StoreError::StoreCorrupt,
             )?,
-            JournalPayload::AtomRecorded(value) => semantic::record_atom(
+            JournalPayload::AtomRecorded(value) => semantic::record_atom_event(
                 &mut self.atoms,
                 &mut self.atom_revisions,
+                &self.deletions,
                 *value,
                 seq,
                 StoreError::StoreCorrupt,
@@ -15530,9 +15531,10 @@ fn apply_event(
             row.seq,
             StoreError::StoreCorrupt,
         )?,
-        JournalPayload::AtomRecorded(value) => semantic::record_atom(
+        JournalPayload::AtomRecorded(value) => semantic::record_atom_event(
             &mut state.atoms,
             &mut state.atom_revisions,
+            &state.deletions,
             *value,
             row.seq,
             StoreError::StoreCorrupt,

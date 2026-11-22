@@ -27,6 +27,7 @@ use crate::{
     journal::{JournalRow, validate_journal_rows},
     objects::{OBJECTS_CHECKPOINT_ID, ObjectRow, ObjectRowClass, ObjectRowKind},
     relations::{RELATIONS_CHECKPOINT_ID, RelationProjectionRow},
+    search::{RelationDirection, RelationNeighbourhood},
 };
 
 pub(crate) const SQLITE_FILE_NAME: &str = "evertrace.sqlite";
@@ -2024,9 +2025,9 @@ pub(crate) fn read_relation_neighbours(
     frontier: u64,
     sources: &[String],
     kinds: &[String],
-    direction: crate::search::RelationDirection,
+    direction: RelationDirection,
     limit: usize,
-) -> Result<Option<Vec<RelationProjectionRow>>, StoreError> {
+) -> Result<Option<RelationNeighbourhood>, StoreError> {
     let transaction = connection
         .unchecked_transaction()
         .map_err(|_| StoreError::Io)?;
@@ -2062,10 +2063,10 @@ pub(crate) fn read_relation_neighbours(
         .collect::<Vec<_>>()
         .join(",");
     let matching_end = match direction {
-        crate::search::RelationDirection::Adjacent => {
+        RelationDirection::Adjacent => {
             format!("(source_id IN ({endpoints}) OR target_id IN ({endpoints}))")
         }
-        crate::search::RelationDirection::Outgoing => format!("source_id IN ({endpoints})"),
+        RelationDirection::AtomPredecessors => format!("source_id IN ({endpoints})"),
     };
     let kinds_sql = vec!["?"; kinds.len()].join(",");
     let sql = format!(
@@ -2098,8 +2099,65 @@ pub(crate) fn read_relation_neighbours(
     }
     drop(queried);
     drop(statement);
+    let incomplete =
+        if matches!(direction, RelationDirection::AtomPredecessors) && rows.len() < limit {
+            if read_object_checkpoint(connection)?.is_none_or(|(current, _)| current != frontier) {
+                return Ok(None);
+            }
+            predecessor_edges_missing(connection, sources, &endpoints, &rows)?
+        } else {
+            false // At the lookahead cap, the caller already reports fan-out truncation.
+        };
     drop(transaction);
-    Ok(Some(rows))
+    Ok(Some(RelationNeighbourhood {
+        edges: rows,
+        incomplete,
+    }))
+}
+
+fn predecessor_edges_missing(
+    connection: &Connection,
+    sources: &[String],
+    placeholders: &str,
+    edges: &[RelationProjectionRow],
+) -> Result<bool, StoreError> {
+    // Point-read the already admitted sources, never hydrate missing targets.
+    let sql = format!(
+        "SELECT current_revision_id, payload_json FROM object_rows WHERE row_id IN ({placeholders})"
+    );
+    let mut statement = connection
+        .prepare(&sql)
+        .map_err(|_| StoreError::StoreCorrupt)?;
+    let keys = sources
+        .iter()
+        .map(|source| format!("object:atom:atom_revision:{source}"));
+    let mut rows = statement
+        .query(rusqlite::params_from_iter(keys))
+        .map_err(|_| StoreError::StoreCorrupt)?;
+    while let Some(row) = rows.next().map_err(|_| StoreError::StoreCorrupt)? {
+        let source: String = row.get(0).map_err(|_| StoreError::StoreCorrupt)?;
+        let raw = row
+            .get_ref(1)
+            .map_err(|_| StoreError::StoreCorrupt)?
+            .as_str()
+            .map_err(|_| StoreError::StoreCorrupt)?;
+        let crate::JournalPayload::AtomRecorded(atom) =
+            serde_json::from_str(raw).map_err(|_| StoreError::StoreCorrupt)?
+        else {
+            return Err(StoreError::StoreCorrupt);
+        };
+        if atom.revision_id.to_string() != source {
+            return Err(StoreError::StoreCorrupt);
+        }
+        let live = edges
+            .iter()
+            .filter(|edge| edge.source_id.as_ref() == Some(&source))
+            .count();
+        if live < atom.supersedes_revision_refs.len() {
+            return Ok(true);
+        }
+    }
+    Ok(false)
 }
 
 fn read_relation_rows(connection: &Connection) -> Result<Vec<RelationProjectionRow>, StoreError> {

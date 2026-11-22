@@ -10,7 +10,7 @@ use evertrace_domain::{
         SourceObservationId, SourceReceiptId, TaskId, WorkArtifactId, WorktreeId,
     },
     procedure::{ProcedureRevision, ProcedureScope},
-    purge::ObjectReauthorizationIntent,
+    purge::{ObjectDeletionTarget, ObjectReauthorizationIntent},
     repository::{RepositoryInstance, WorktreeInstance},
     revision::RevisionId,
     semantic::{
@@ -144,7 +144,37 @@ fn require_row_identity(
     Ok(())
 }
 
-pub(crate) fn record_atom(
+fn is_forgotten_atom(deletions: &ObjectDeletionState, revision: &RevisionId) -> bool {
+    deletions.events().any(|event| {
+        matches!(event.target, ObjectDeletionTarget::Atom { .. })
+            && event.exact_revision_ids.binary_search(revision).is_ok()
+    })
+}
+
+pub(crate) fn record_atom_event(
+    current: &mut BTreeMap<AtomId, (Atom, u64)>,
+    revisions: &mut BTreeMap<RevisionId, (Atom, u64)>,
+    deletions: &ObjectDeletionState,
+    value: Atom,
+    seq: u64,
+    error: StoreError,
+) -> Result<(), StoreError> {
+    // A successor can keep an immutable declaration, not introduce a link to a forgotten Atom.
+    let parent = value.parent_revision_id.and_then(|id| revisions.get(&id));
+    for reference in &value.supersedes_revision_refs {
+        if parent.is_none_or(|(atom, _)| {
+            atom.supersedes_revision_refs
+                .binary_search(reference)
+                .is_err()
+        }) && is_forgotten_atom(deletions, reference)
+        {
+            return Err(error);
+        }
+    }
+    record_atom(current, revisions, value, seq, error)
+}
+
+fn record_atom(
     current: &mut BTreeMap<AtomId, (Atom, u64)>,
     revisions: &mut BTreeMap<RevisionId, (Atom, u64)>,
     value: Atom,
@@ -1351,9 +1381,13 @@ fn validate_atom_relations(
         .filter(|_| atom.lifecycle_status == AtomLifecycleStatus::Deprecated)
         .and_then(|id| input.atom_revisions.get(&id))
         .map(|(base, _)| base);
-    for revision in atom
-        .supersedes_revision_refs
-        .iter()
+    // A retained supersession declaration is history, not an active support grant.
+    // A canonical tombstone removes the edge without invalidating the immutable Atom.
+    let predecessors = atom.supersedes_revision_refs.iter().filter(|revision| {
+        input.atom_revisions.contains_key(*revision)
+            || !is_forgotten_atom(input.deletions, revision)
+    });
+    for revision in predecessors
         .chain(&atom.supports_revision_refs)
         .chain(&atom.contradicts_revision_refs)
     {
