@@ -874,7 +874,7 @@ impl ProductionSearch {
                     || source_only
                     || self.exact_object_kind.is_some()
                     || exact_query_reference(&context).is_some()
-                    || identifier_only_comparison(&context)
+                    || identifier_only_temporal_query(&context)
                 {
                     Vec::new() // Explicit operands are not lexical queries.
                 } else {
@@ -1578,7 +1578,7 @@ impl ProductionSearch {
             || self.exact_object_kind.is_some()
             || exact_query_reference(&context).is_some()
             || exact_support
-            || identifier_only_comparison(&context)
+            || identifier_only_temporal_query(&context)
         {
             Ok(Vec::new())
         } else if force_fts_failure {
@@ -1944,11 +1944,18 @@ pub(super) fn exact_query_reference(context: &SearchContext) -> Option<&str> {
     .then_some(reference)
 }
 
-pub(super) fn identifier_only_comparison(context: &SearchContext) -> bool {
+pub(super) fn identifier_only_temporal_query(context: &SearchContext) -> bool {
     let facets = &context.query_facets;
-    // A typed pair with no remaining question text is not a lexical query.
-    facets.answer_shape == Some(AnswerShape::TemporalComparison)
-        && facets.target_anchors.len() == 2
+    // Explicit coordinates, with no remaining question text, are not lexical terms.
+    let exact_operands = match facets.answer_shape {
+        Some(AnswerShape::TemporalComparison) => facets.target_anchors.len() == 2,
+        Some(AnswerShape::Timeline | AnswerShape::Latest) => {
+            requested_ordering(&facets.temporal_qualifiers).is_some()
+                && !facets.target_anchors.is_empty()
+        }
+        _ => false,
+    };
+    exact_operands
         && context.protected_facets.is_empty()
         && facets.condition_literals.is_empty()
         && facets

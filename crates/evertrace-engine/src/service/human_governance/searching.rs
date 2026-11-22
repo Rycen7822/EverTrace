@@ -13,7 +13,7 @@ use crate::search::read_context::{
     repository_operation_read, search_observation_access,
 };
 
-const SEARCH_HIT_ORDER_REVISION: u32 = 13;
+const SEARCH_HIT_ORDER_REVISION: u32 = 14;
 
 fn lineage_anchor(
     selection: MemoryScopeSelection,

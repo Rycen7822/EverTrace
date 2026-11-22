@@ -11,7 +11,7 @@ use super::{
     SearchError,
     production::{
         RelationSources, RequestDeadline, candidate_limit, exact_query_reference,
-        exact_slot_primary, hard_compatible, identifier_only_comparison,
+        exact_slot_primary, hard_compatible, identifier_only_temporal_query,
     },
     read_context::{ATTEMPT_RUN_RELATION, RUN_RESULT_RELATION, SearchReadAccess},
 };
@@ -591,7 +591,7 @@ impl NativeRetrieval<'_> {
         identifiers: &[String],
     ) -> Result<(), SearchError> {
         // B: original EvidenceSurface, not object metadata relabelled as evidence.
-        if identifier_only_comparison(self.context) {
+        if identifier_only_temporal_query(self.context) {
             return self
                 .read_exact_evidence(
                     snapshot,
