@@ -308,6 +308,7 @@ pub(crate) fn procedure_support_repair_ready(
     snapshot: &ProjectionSnapshot,
     validation: RevisionId,
     base: RevisionId,
+    changed_refs: Option<&[RevisionId]>,
 ) -> Result<bool, SemanticServiceError> {
     let support = SupportProjectionView::from_snapshot(snapshot)?;
     let Some(event) = support.validations.get(&validation) else {
@@ -318,7 +319,11 @@ pub(crate) fn procedure_support_repair_ready(
         && support.current_validations.get(&event.support_contract_ref) == Some(event)
         && {
             let procedures = ProcedureUsageCurrentView::from_snapshot(snapshot)?;
-            procedures.current_procedure_by_revision(base).is_some()
+            procedures
+                .current_procedure_by_revision(base)
+                .is_some_and(|procedure| {
+                    changed_refs.is_none_or(|refs| procedure.draft.support_revision_refs != refs)
+                })
                 && procedures.procedure_support_repair_ready(base)
         })
 }

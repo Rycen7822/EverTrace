@@ -35,9 +35,9 @@ use evertrace_domain::{
     revision::RevisionId,
     semantic::{
         AtomProposalPayload, GlobalSuccessorSupportContract, GlobalSupportState,
-        GlobalSupportValidationEvent, ProposalCreatedBy, ProposalEligibility, ProposalOperation,
-        ProposalPayload, ProposalStatus, ProposalTargetId, ProposalTargetKind, RevisionProposal,
-        SupportThresholdSnapshot,
+        GlobalSupportValidationEvent, ProcedureProposalPayload, ProposalCreatedBy,
+        ProposalEligibility, ProposalOperation, ProposalPayload, ProposalStatus, ProposalTargetId,
+        ProposalTargetKind, RevisionProposal, SupportThresholdSnapshot,
     },
     work::{BoundaryStatus, CompetingResolutionStatus},
 };
@@ -516,7 +516,11 @@ impl HumanGovernanceService {
                         runtime,
                         snapshot,
                         payload.draft(),
-                        &review.proposal.source_cohort_refs,
+                        if review.proposal.procedure_support_replacement().is_some() {
+                            &payload.draft().evidence_refs
+                        } else {
+                            &review.proposal.source_cohort_refs
+                        },
                     )
                     .await
                     .map_err(|_| HumanGovernanceError::Store)?
@@ -1605,11 +1609,7 @@ impl HumanGovernanceService {
             return Ok(conflict);
         }
         let selection = match select_support_replacement(&snapshot, validation) {
-            Ok(SupportReplacementLookup::Available(selection))
-                if selection.target_kind == ProposalTargetKind::Atom =>
-            {
-                selection
-            }
+            Ok(SupportReplacementLookup::Available(selection)) => selection,
             Ok(SupportReplacementLookup::Conflict { .. }) => return Ok(conflict),
             Ok(_) | Err(crate::semantic::SemanticServiceError::InvalidInput) => {
                 return Ok(unavailable);
@@ -1618,24 +1618,46 @@ impl HumanGovernanceService {
         };
         let view = SemanticCurrentView::from_snapshot(&snapshot)
             .map_err(|_| HumanGovernanceError::Store)?;
-        let base = view
-            .atom_revisions
-            .get(&selection.base_revision_id)
-            .ok_or(HumanGovernanceError::Store)?;
-        if refs == base.supports_revision_refs
-            || !self
-                .new_atom_supports_accessible(&snapshot, &view, validation, base, &refs)
-                .await?
-        {
-            return Ok(unavailable);
+        let mut payload = selection.initial_payload.clone();
+        match &mut payload {
+            ProposalPayload::Atom(value) => {
+                let AtomProposalPayload::Replace { draft } = value.as_mut() else {
+                    return Err(HumanGovernanceError::Store);
+                };
+                let base = view
+                    .atom_revisions
+                    .get(&selection.base_revision_id)
+                    .ok_or(HumanGovernanceError::Store)?;
+                if refs == draft.supports_revision_refs
+                    || !self
+                        .new_atom_supports_accessible(&snapshot, &view, validation, base, &refs)
+                        .await?
+                {
+                    return Ok(unavailable);
+                }
+                draft.supports_revision_refs.clone_from(&refs);
+            }
+            ProposalPayload::Procedure(value) => {
+                let ProcedureProposalPayload::Replace { draft } = value.as_mut() else {
+                    return Err(HumanGovernanceError::Store);
+                };
+                if refs == draft.support_revision_refs
+                    || !self
+                        .new_procedure_supports_accessible(
+                            &snapshot,
+                            &view,
+                            validation,
+                            selection.base_revision_id,
+                            &refs,
+                        )
+                        .await?
+                {
+                    return Ok(unavailable);
+                }
+                draft.support_revision_refs.clone_from(&refs);
+            }
+            _ => return Err(HumanGovernanceError::Store),
         }
-        let mut draft = selection
-            .initial_payload
-            .atom_support_replacement()
-            .ok_or(HumanGovernanceError::Store)?
-            .clone();
-        draft.supports_revision_refs.clone_from(&refs);
-        let payload = ProposalPayload::Atom(Box::new(AtomProposalPayload::Replace { draft }));
         let resolution = compose_support_replacement(
             &view,
             command_context(request_id, self.effective_config_hash)?,
@@ -1743,35 +1765,55 @@ impl HumanGovernanceService {
         Ok(Some(HumanActionOutcome::Unknown))
     }
 
-    pub async fn web_support_deprecate_available(
+    pub async fn web_support_actions(
         &self,
         frontier: u64,
         validation: RevisionId,
-    ) -> Result<bool, HumanGovernanceError> {
+    ) -> Result<(bool, bool), HumanGovernanceError> {
         let snapshot = self
             .writer
             .project_objects()
             .await
             .map_err(|_| HumanGovernanceError::Store)?;
         if snapshot.frontier != frontier {
-            return Ok(false);
+            return Ok((false, false));
         }
-        match select_support_deprecate(&snapshot, validation) {
-            Ok(SupportDeprecateLookup::Available(selection)) => {
-                self.support_revisions_readable(
-                    &snapshot,
-                    validation,
-                    ("atom_revision", selection.base_revision_id),
-                    &[],
-                )
-                .await
+        let selection = match select_support_replacement(&snapshot, validation) {
+            Ok(SupportReplacementLookup::Available(selection)) => selection,
+            Ok(_) | Err(crate::semantic::SemanticServiceError::InvalidInput) => {
+                return Ok((false, false));
             }
-            Ok(_) | Err(crate::semantic::SemanticServiceError::InvalidInput) => Ok(false),
-            Err(_) => Err(HumanGovernanceError::Store),
+            Err(_) => return Err(HumanGovernanceError::Store),
+        };
+        let atom = selection.target_kind == ProposalTargetKind::Atom;
+        if !atom
+            && !crate::semantic::procedure_support_repair_ready(
+                &snapshot,
+                validation,
+                selection.base_revision_id,
+                None,
+            )
+            .map_err(|_| HumanGovernanceError::Store)?
+        {
+            return Ok((false, false));
         }
+        let kind = if atom {
+            "atom_revision"
+        } else {
+            "procedure_revision"
+        };
+        let readable = self
+            .support_revisions_readable(
+                &snapshot,
+                validation,
+                (kind, selection.base_revision_id),
+                &[],
+            )
+            .await?;
+        Ok((readable, atom && readable))
     }
 
-    pub async fn web_support_atom_current(
+    pub async fn web_support_proposal_current(
         &self,
         proposal: &RevisionProposal,
         frontier: u64,
@@ -1794,11 +1836,11 @@ impl HumanGovernanceService {
         }
         let view = SemanticCurrentView::from_snapshot(&snapshot)
             .map_err(|_| HumanGovernanceError::Store)?;
-        self.web_support_atom_current_at(&snapshot, &view, proposal)
+        self.web_support_proposal_current_at(&snapshot, &view, proposal)
             .await
     }
 
-    pub(crate) async fn web_support_atom_current_at(
+    pub(crate) async fn web_support_proposal_current_at(
         &self,
         snapshot: &ProjectionSnapshot,
         view: &SemanticCurrentView,
@@ -1828,6 +1870,21 @@ impl HumanGovernanceService {
                         &draft.supports_revision_refs,
                     )
                     .await?
+                && self.proposal_accessible(snapshot, proposal).await?);
+        }
+        if let Some((validation, draft)) = proposal.procedure_support_replacement() {
+            let Some(base) = proposal.base_revision_id else {
+                return Ok(false);
+            };
+            return Ok(self
+                .new_procedure_supports_accessible(
+                    snapshot,
+                    view,
+                    validation,
+                    base,
+                    &draft.support_revision_refs,
+                )
+                .await?
                 && self.proposal_accessible(snapshot, proposal).await?);
         }
         let Some(validation) = proposal.support_deprecation_validation() else {
@@ -1959,7 +2016,7 @@ impl HumanGovernanceService {
         base: RevisionId,
         refs: &[RevisionId],
     ) -> Result<bool, HumanGovernanceError> {
-        if !crate::semantic::procedure_support_repair_ready(snapshot, validation, base)
+        if !crate::semantic::procedure_support_repair_ready(snapshot, validation, base, Some(refs))
             .map_err(|_| HumanGovernanceError::Store)?
             || !evertrace_domain::semantic::Atom::support_closure_available(None, refs, |id| {
                 view.atom_revisions.get(&id).filter(|atom| {
@@ -3950,6 +4007,11 @@ fn support_replacement_matches(
         .is_some_and(|(revision, draft)| {
             revision == validation && draft.supports_revision_refs == refs
         })
+        || proposal
+            .procedure_support_replacement()
+            .is_some_and(|(revision, draft)| {
+                revision == validation && draft.support_revision_refs == refs
+            })
 }
 
 fn support_deprecation_cause(frontier: u64) -> String {

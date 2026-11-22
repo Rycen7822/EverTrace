@@ -1160,12 +1160,12 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
                                     )).await.map_err(map_human_error)?;
                                     HumanGovernanceResponse::Action { result: map_human_action(outcome) }
                                 }
-                                HumanReadRequest::WebSupportDeprecationEligibility { expected_frontier, expected_validation_revision_id } => {
+                                HumanReadRequest::WebSupportActionEligibility { expected_frontier, expected_validation_revision_id } => {
                                     if context.client_kind != ClientKind::Web { return Err(ErrorCode::Untrusted); }
-                                    let available = Box::pin(human_governance.web_support_deprecate_available(
+                                    let (replace, deprecate) = Box::pin(human_governance.web_support_actions(
                                         expected_frontier, expected_validation_revision_id,
                                     )).await.map_err(map_human_error)?;
-                                    HumanGovernanceResponse::SupportDeprecationEligibility { available }
+                                    HumanGovernanceResponse::SupportActionEligibility { replace, deprecate }
                                 }
                                 HumanReadRequest::WebSupportReplacementOutcome {
                                     request_id: reviewed_id, expected_frontier, expected_validation_revision_id, support_revisions,
@@ -1924,13 +1924,25 @@ async fn read_proposal_review(
                 reference,
             ))
             .await?;
-        } else if review.proposal.support_atom_validation().is_some() {
+        } else if review.proposal.support_atom_validation().is_some()
+            || review.proposal.procedure_support_replacement().is_some()
+        {
             web_accept_available =
-                Box::pin(service.web_support_atom_current(&review.proposal, page.frontier)).await?;
+                Box::pin(service.web_support_proposal_current(&review.proposal, page.frontier))
+                    .await?;
         }
     }
+    let web_support_repair = web_accept_available
+        && item
+            .as_ref()
+            .and_then(|item| item.proposal_review.as_ref())
+            .is_some_and(|review| {
+                review.proposal.atom_support_replacement().is_some()
+                    || review.proposal.procedure_support_replacement().is_some()
+            });
     Ok(HumanGovernanceResponse::ProposalReview {
         frontier: page.frontier,
+        web_support_repair,
         web_disposition_available: edit.is_none()
             && item
                 .as_ref()

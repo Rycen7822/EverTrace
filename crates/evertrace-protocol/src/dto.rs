@@ -176,7 +176,7 @@ pub enum HumanReadRequest {
         review: ProposalConfirmation,
         decision: WebProposalDisposition,
     },
-    WebSupportDeprecationEligibility {
+    WebSupportActionEligibility {
         expected_validation_revision_id: RevisionId,
         expected_frontier: u64,
     },
@@ -890,8 +890,9 @@ pub enum HumanGovernanceResponse {
     ProposalCreationScope {
         available: bool,
     },
-    SupportDeprecationEligibility {
-        available: bool,
+    SupportActionEligibility {
+        replace: bool,
+        deprecate: bool,
     },
     ProposalReview {
         frontier: u64,
@@ -899,6 +900,8 @@ pub enum HumanGovernanceResponse {
         confirmation_digest: Option<String>,
         #[serde(default, skip_serializing_if = "std::ops::Not::not")]
         web_accept_available: bool,
+        #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+        web_support_repair: bool,
         #[serde(default, skip_serializing_if = "std::ops::Not::not")]
         web_disposition_available: bool,
         #[serde(default, skip_serializing_if = "std::ops::Not::not")]
@@ -1146,7 +1149,7 @@ impl HumanReadRequest {
             Self::WebCreationScope {
                 expected_frontier, ..
             }
-            | Self::WebSupportDeprecationEligibility {
+            | Self::WebSupportActionEligibility {
                 expected_frontier, ..
             }
             | Self::WebSupportDeprecationOutcome {
@@ -1520,6 +1523,7 @@ impl HumanGovernanceResponse {
                 item,
                 confirmation_digest,
                 web_accept_available: available,
+                web_support_repair: support_repair,
                 web_disposition_available: can_dispose,
                 web_edit_available: can_edit,
                 atom_edit_preview,
@@ -1531,6 +1535,9 @@ impl HumanGovernanceResponse {
                     item.validate()
                         && item.proposal.is_some()
                         && (!can_dispose || web_disposition_available(item))
+                        && (!support_repair || *available && !can_edit && item.proposal_review.as_ref().is_some_and(|review| {
+                            review.proposal.atom_support_replacement().is_some() || review.proposal.procedure_support_replacement().is_some()
+                        }))
                         && (!can_edit || item.proposal_review.as_ref().is_some_and(|review| {
                             review.plain_accept_eligible && review.reauthorization.is_none()
                                 && (WebAtomEdit::available(&review.proposal) || WebProcedureEdit::draft(&review.proposal).is_some())
@@ -1582,11 +1589,13 @@ impl HumanGovernanceResponse {
                         && atom_edit_preview.is_none()
                         && procedure_edit_preview.is_none()
                         && !available
+                        && !support_repair
                         && !can_dispose
                         && !can_edit
                 }
             },
-            Self::ProposalCreationScope { .. } | Self::SupportDeprecationEligibility { .. } => true,
+            Self::ProposalCreationScope { .. } => true,
+            Self::SupportActionEligibility { replace, deprecate } => !*deprecate || *replace,
             Self::Action { result } => result.validate(),
             Self::Conflict {
                 current_revision_ref,

@@ -165,6 +165,9 @@ pub struct WebProcedureEdit {
 
 impl WebProcedureEdit {
     pub fn draft(proposal: &RevisionProposal) -> Option<&ProcedureDraft> {
+        if proposal.procedure_support_replacement().is_some() {
+            return None;
+        }
         WebAcceptanceIntent::scope(proposal)?;
         let ProposalPayload::Procedure(payload) = &proposal.payload else {
             return None;
@@ -697,10 +700,7 @@ impl WebAcceptanceIntent {
             {
                 payload.creation().map(|(_, scope)| scope.atom_scope())
             }
-            ProposalPayload::Procedure(payload)
-                if proposal.operation == payload.operation()
-                    && proposal.procedure_support_replacement().is_none() =>
-            {
+            ProposalPayload::Procedure(payload) if proposal.operation == payload.operation() => {
                 Some(payload.draft().scope.into())
             }
             _ => None,

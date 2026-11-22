@@ -424,10 +424,11 @@ impl HumanAcceptanceService {
         let service =
             crate::HumanGovernanceService::new(self.writer.clone(), self.effective_config_hash);
         let accessible = if reviewed.support_atom_validation().is_some()
+            || reviewed.procedure_support_replacement().is_some()
             || reviewed.operation == ProposalOperation::Deprecate
         {
             service
-                .web_support_atom_current_at(snapshot, view, reviewed)
+                .web_support_proposal_current_at(snapshot, view, reviewed)
                 .await?
         } else {
             service.proposal_accessible(snapshot, reviewed).await?
@@ -570,16 +571,27 @@ impl HumanAcceptanceService {
             .map(|accepted| accepted.command)
         } else if matches!(reviewed.payload, ProposalPayload::Procedure(_)) {
             let (current, publication) = current_procedure(snapshot, reviewed)?;
-            accept_procedure(
-                view,
-                context,
-                reviewed.proposal_id,
-                ProcedureAcceptanceContext::Manual(authority),
-                current.as_ref(),
-                publication,
-                &self.global_promotion,
-            )
-            .and_then(|result| match result {
+            let resolution = if reviewed.procedure_support_replacement().is_some() {
+                accept_procedure_support_repair(
+                    view,
+                    context,
+                    reviewed.proposal_id,
+                    authority,
+                    current.as_ref().ok_or(HumanGovernanceError::InvalidInput)?,
+                    &self.global_promotion,
+                )
+            } else {
+                accept_procedure(
+                    view,
+                    context,
+                    reviewed.proposal_id,
+                    ProcedureAcceptanceContext::Manual(authority),
+                    current.as_ref(),
+                    publication,
+                    &self.global_promotion,
+                )
+            };
+            resolution.and_then(|result| match result {
                 ProcedureAcceptanceResolution::Command { command, .. }
                 | ProcedureAcceptanceResolution::AcceptedExisting { command, .. } => Ok(command),
                 ProcedureAcceptanceResolution::NoDelta => {
@@ -645,9 +657,10 @@ impl HumanAcceptanceService {
             return Ok(conflict());
         };
         if ((proposal.support_atom_validation().is_some()
+            || proposal.procedure_support_replacement().is_some()
             || proposal.operation == ProposalOperation::Deprecate)
             && !service
-                .web_support_atom_current_at(&snapshot, &view, proposal)
+                .web_support_proposal_current_at(&snapshot, &view, proposal)
                 .await?)
             || ((proposal.operation == ProposalOperation::Replace || intent.edit().is_some())
                 && !service.web_base_accessible(&snapshot, proposal).await?)

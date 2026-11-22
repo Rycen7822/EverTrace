@@ -799,9 +799,7 @@ class App:
                         event = content.get("contract_now") if content else None
                         if event and event["state"] == "ready" and event["value"] == content["value"]:
                             validation = content["value"]["validation_revision_id"]
-                            result["support_deprecate_available"] = await self.backend.web_support_deprecate_available(
-                                validation, result["frontier"],
-                            )
+                            result["support_actions"] = await self.backend.web_support_actions(validation, result["frontier"])
                     if surface == "explorer" and payload["object_kind"] == "atom_revision" and result.get("items"):
                         item = result["items"][0]
                         atom = (item["semantic_detail"].get("content") or {}).get("value")
@@ -945,10 +943,10 @@ def present_detail(templates, result, surface):
             frontier=result.get("frontier"), confirmation_digest=result.get("confirmation_digest"),
             core_anchor=result.get("core_anchor"), acceptance_request_id=_request_id() if result.get("web_accept_available") else None,
             disposition_request_id=_request_id() if result.get("web_disposition_available") else None,
-            web_edit_available=result.get("web_edit_available", False),
+            web_edit_available=result.get("web_edit_available", False), web_support_repair=result.get("web_support_repair", False),
             correction_frontier=correction_frontier, correction_request_id=_request_id() if correction_frontier else None,
-            support_replace_request_id=_request_id() if result.get("support_deprecate_available") else None,
-            support_deprecate_request_id=_request_id() if result.get("support_deprecate_available") else None),
+            support_replace_request_id=_request_id() if result.get("support_actions", {}).get("replace") else None,
+            support_deprecate_request_id=_request_id() if result.get("support_actions", {}).get("deprecate") else None),
         "source_preview": preview,
         "semantic_text": semantic_text,
         "selection": selection,

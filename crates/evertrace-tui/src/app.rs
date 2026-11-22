@@ -498,7 +498,7 @@ impl App {
                         | HumanGovernanceResponse::MemoryPage { .. }
                         | HumanGovernanceResponse::CompiledProjections { .. }
                         | HumanGovernanceResponse::ProposalCreationScope { .. }
-                        | HumanGovernanceResponse::SupportDeprecationEligibility { .. }
+                        | HumanGovernanceResponse::SupportActionEligibility { .. }
                         | HumanGovernanceResponse::ProposalReview { .. }
                         | HumanGovernanceResponse::Export { .. },
                     ) => UiCommand::None,
@@ -539,7 +539,7 @@ impl App {
                     | HumanGovernanceResponse::Search { .. }
                     | HumanGovernanceResponse::MemoryPage { .. }
                     | HumanGovernanceResponse::ProposalCreationScope { .. }
-                    | HumanGovernanceResponse::SupportDeprecationEligibility { .. }
+                    | HumanGovernanceResponse::SupportActionEligibility { .. }
                     | HumanGovernanceResponse::ProposalReview { .. }
                     | HumanGovernanceResponse::CompiledProjections { .. } => {
                         return UiCommand::None;

@@ -124,7 +124,7 @@ async fn send_human(
             | HumanReadRequest::WebCreationOutcome { .. }
             | HumanReadRequest::WebCorrectionOutcome { .. }
             | HumanReadRequest::WebProposalDispositionOutcome { .. }
-            | HumanReadRequest::WebSupportDeprecationEligibility { .. }
+            | HumanReadRequest::WebSupportActionEligibility { .. }
             | HumanReadRequest::WebSupportReplacementOutcome { .. }
             | HumanReadRequest::WebSupportDeprecationOutcome { .. }
             | HumanReadRequest::BrowseMemories { .. } => {
