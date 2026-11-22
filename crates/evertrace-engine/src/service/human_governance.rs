@@ -1439,6 +1439,30 @@ impl HumanGovernanceService {
         };
         let view = SemanticCurrentView::from_snapshot(&snapshot)
             .map_err(|_| HumanGovernanceError::Store)?;
+        if let Some(draft) = edited_payload.atom_support_replacement() {
+            draft
+                .validate_unprivileged()
+                .map_err(|_| HumanGovernanceError::InvalidInput)?;
+            let base = view
+                .atom_revisions
+                .get(&selection.base_revision_id)
+                .ok_or(HumanGovernanceError::Store)?;
+            if draft.supports_revision_refs != base.supports_revision_refs
+                && !self
+                    .new_atom_supports_accessible(
+                        &snapshot,
+                        &view,
+                        expected_validation_revision_id,
+                        base,
+                        &draft.supports_revision_refs,
+                    )
+                    .await?
+            {
+                return Ok(HumanActionOutcome::Unavailable {
+                    reason: "replacement_support_unavailable",
+                });
+            }
+        }
         let edited_for_retry = edited_payload.clone();
         match compose_support_replacement(
             &view,
@@ -1550,10 +1574,11 @@ impl HumanGovernanceService {
         }
         match select_support_deprecate(&snapshot, validation) {
             Ok(SupportDeprecateLookup::Available(selection)) => {
-                self.web_support_deprecation_readable(
+                self.support_revisions_readable(
                     &snapshot,
                     validation,
                     selection.base_revision_id,
+                    &[],
                 )
                 .await
             }
@@ -1669,7 +1694,7 @@ impl HumanGovernanceService {
                 .base_revision_id
                 .ok_or(HumanGovernanceError::Store)?;
             if !self
-                .web_support_deprecation_readable(&snapshot, validation, base)
+                .support_revisions_readable(&snapshot, validation, base, &[])
                 .await?
                 || !self.proposal_accessible(&snapshot, proposal).await?
             {
@@ -1682,19 +1707,48 @@ impl HumanGovernanceService {
         }))
     }
 
-    async fn web_support_deprecation_readable(
+    pub(crate) async fn new_atom_supports_accessible(
+        &self,
+        snapshot: &ProjectionSnapshot,
+        view: &SemanticCurrentView,
+        validation: RevisionId,
+        base: &evertrace_domain::semantic::Atom,
+        refs: &[RevisionId],
+    ) -> Result<bool, HumanGovernanceError> {
+        if crate::semantic::validate_new_atom_supports(view, base, refs).is_err() {
+            return Ok(false);
+        }
+        let deletions = ObjectDeletionCurrentView::from_snapshot(snapshot)
+            .map_err(|_| HumanGovernanceError::Store)?;
+        if refs.iter().any(|id| {
+            view.atom_revisions.get(id).is_some_and(|atom| {
+                deletions.events.contains_key(&ObjectDeletionTarget::Atom {
+                    atom_id: atom.atom_id,
+                })
+            })
+        }) {
+            return Ok(false);
+        }
+        self.support_revisions_readable(snapshot, validation, base.revision_id, refs)
+            .await
+    }
+
+    async fn support_revisions_readable(
         &self,
         snapshot: &ProjectionSnapshot,
         validation: RevisionId,
         base: RevisionId,
+        refs: &[RevisionId],
     ) -> Result<bool, HumanGovernanceError> {
         let deadline = std::time::Instant::now() + presentation::READ_DEADLINE;
         let index = export::presentation_index(snapshot, deadline)
             .map_err(|_| HumanGovernanceError::Store)?;
-        for (revision, kind) in [
-            (validation, "global_support_validation"),
-            (base, "atom_revision"),
-        ] {
+        let roots = [
+            (validation, "global_support_validation", false),
+            (base, "atom_revision", false),
+        ];
+        let candidates = refs.iter().map(|id| (*id, "atom_revision", true));
+        for (revision, kind, support) in roots.into_iter().chain(candidates) {
             let reference = revision.to_string();
             let Some((row, _)) = super::actions::select_object_row(snapshot, &reference)
                 .map_err(|_| HumanGovernanceError::Store)?
@@ -1703,6 +1757,11 @@ impl HumanGovernanceService {
             };
             if row.object_kind.as_deref() != Some(kind)
                 || row.current_revision_id.as_deref() != Some(reference.as_str())
+                || support
+                    && row
+                        .support_state
+                        .as_deref()
+                        .is_some_and(|state| state != "valid")
             {
                 return Ok(false);
             }
@@ -1813,10 +1872,11 @@ impl HumanGovernanceService {
         };
         if web
             && !self
-                .web_support_deprecation_readable(
+                .support_revisions_readable(
                     &snapshot,
                     expected_validation_revision_id,
                     selection.base_revision_id,
+                    &[],
                 )
                 .await?
         {

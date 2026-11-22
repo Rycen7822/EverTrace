@@ -348,7 +348,11 @@ impl HumanAcceptanceService {
                     .map_err(|_| HumanGovernanceError::Store)?;
                 continue;
             }
-            if inactive_unchanged_procedure(&snapshot, proposal)? {
+            if inactive_unchanged_procedure(&snapshot, proposal)?
+                || !self
+                    .atom_replacement_supports_accessible(&snapshot, &view, proposal)
+                    .await?
+            {
                 spool
                     .acknowledge_segment(segment, 1)
                     .map_err(|_| HumanGovernanceError::Store)?;
@@ -1153,6 +1157,16 @@ impl HumanAcceptanceService {
                 reason: "atomic_tui_acceptance_source_unavailable",
             });
         };
+        if let Some((_, draft)) = original.atom_support_replacement()
+            && original
+                .base_revision_id
+                .and_then(|id| view.atom_revisions.get(&id))
+                .is_some_and(|base| base.supports_revision_refs != draft.supports_revision_refs)
+        {
+            return Ok(HumanActionOutcome::Unavailable {
+                reason: "support_replacement_requires_exact_acceptance",
+            });
+        }
         let support = match support_atom_acceptance(snapshot, view, original) {
             Ok(value) => value,
             Err(crate::semantic::SemanticServiceError::Store(_)) => {
@@ -1565,6 +1579,46 @@ impl HumanAcceptanceService {
         })
     }
 
+    async fn atom_replacement_supports_accessible(
+        &self,
+        snapshot: &ProjectionSnapshot,
+        view: &SemanticCurrentView,
+        proposal: &RevisionProposal,
+    ) -> Result<bool, HumanGovernanceError> {
+        let Some((validation, draft)) = proposal.atom_support_replacement() else {
+            return Ok(true);
+        };
+        let base = view
+            .atom_revisions
+            .get(
+                &proposal
+                    .base_revision_id
+                    .ok_or(HumanGovernanceError::Store)?,
+            )
+            .ok_or(HumanGovernanceError::Store)?;
+        if draft.supports_revision_refs == base.supports_revision_refs {
+            return Ok(true);
+        }
+        match select_support_atom_acceptance(snapshot, proposal) {
+            Ok(_) => (),
+            Err(crate::semantic::SemanticServiceError::Store(_)) => {
+                return Err(HumanGovernanceError::Store);
+            }
+            Err(_) => return Ok(false),
+        }
+        let service =
+            crate::HumanGovernanceService::new(self.writer.clone(), self.effective_config_hash);
+        service
+            .new_atom_supports_accessible(
+                snapshot,
+                view,
+                validation,
+                base,
+                &draft.supports_revision_refs,
+            )
+            .await
+    }
+
     async fn accept_plain(
         &self,
         request_id: RequestId,
@@ -1580,6 +1634,14 @@ impl HumanAcceptanceService {
         if inactive_unchanged_procedure(snapshot, proposal)? {
             return Ok(HumanActionOutcome::Unavailable {
                 reason: "existing_procedure_not_active",
+            });
+        }
+        if !self
+            .atom_replacement_supports_accessible(snapshot, view, proposal)
+            .await?
+        {
+            return Ok(HumanActionOutcome::Unavailable {
+                reason: "replacement_support_unavailable",
             });
         }
         let support = match support_atom_acceptance(snapshot, view, proposal) {

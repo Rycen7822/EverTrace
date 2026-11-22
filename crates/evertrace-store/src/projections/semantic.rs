@@ -684,7 +684,7 @@ fn validate_support_proposal_target(
     .ok_or(error)?;
     match proposal.operation {
         ProposalOperation::Replace => original
-            .validate_closed_edit(&proposal.payload)
+            .validate_support_replacement(&proposal.payload)
             .map_err(|_| error),
         ProposalOperation::Deprecate => match &proposal.payload {
             ProposalPayload::Atom(payload)
@@ -700,21 +700,7 @@ fn validate_support_proposal_target(
 
 fn atom_replacement_payload(atom: &Atom) -> ProposalPayload {
     ProposalPayload::Atom(Box::new(AtomProposalPayload::Replace {
-        draft: AtomDraft {
-            kind: atom.kind,
-            epistemic_status: atom.epistemic_status,
-            value: atom.value.clone(),
-            scope: atom.scope.clone(),
-            applicability_expr: atom.applicability_expr.clone(),
-            future_cue_lifecycle_exprs: atom.future_cue_lifecycle_exprs.clone(),
-            validity_interval: atom.validity_interval.clone(),
-            provenance: atom.provenance.clone(),
-            source_observation_refs: atom.source_observation_refs.clone(),
-            evidence_refs: atom.evidence_refs.clone(),
-            supersedes_revision_refs: atom.supersedes_revision_refs.clone(),
-            supports_revision_refs: atom.supports_revision_refs.clone(),
-            contradicts_revision_refs: atom.contradicts_revision_refs.clone(),
-        },
+        draft: atom.into(),
     }))
 }
 
@@ -1953,6 +1939,31 @@ fn validate_proposal_relations(
                     || atom.lifecycle_status != AtomLifecycleStatus::Active
                 {
                     return Err(StoreError::StoreCorrupt);
+                }
+                let replacement = proposal.atom_support_replacement();
+                if base.scope == AtomScope::Global
+                    && (atom.supports_revision_refs != base.supports_revision_refs
+                        || replacement.is_some_and(|(_, draft)| {
+                            draft.supports_revision_refs != base.supports_revision_refs
+                        }))
+                {
+                    let (validation, draft) = replacement.ok_or(StoreError::StoreCorrupt)?;
+                    let validation = validation.to_string();
+                    if support_validation_ref.as_deref() != Some(validation.as_str()) {
+                        return Err(StoreError::StoreCorrupt);
+                    }
+                    let mut expected = draft.clone();
+                    expected.evidence_refs.push(validation);
+                    expected.evidence_refs.sort();
+                    expected.evidence_refs.dedup();
+                    expected
+                        .source_observation_refs
+                        .push(acceptance_observation_id);
+                    expected.source_observation_refs.sort();
+                    expected.source_observation_refs.dedup();
+                    if AtomDraft::from(atom) != expected {
+                        return Err(StoreError::StoreCorrupt);
+                    }
                 }
             }
             ProposalOperation::Deprecate => {

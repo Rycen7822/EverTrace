@@ -3924,7 +3924,10 @@ pub fn read_dependencies_for(row: &ObjectRow, payload: &JournalPayload) -> BTree
                         .iter()
                         .map(ToString::to_string),
                 );
-            } else if let Some(draft) = value.global_atom_creation_draft() {
+            } else if let Some(draft) = value
+                .global_atom_creation_draft()
+                .or_else(|| value.atom_support_replacement().map(|(_, draft)| draft))
+            {
                 refs.extend(draft.evidence_refs.iter().cloned());
                 refs.extend(
                     draft
@@ -13766,6 +13769,55 @@ impl JournalAdmissionState {
         )
     }
 
+    fn validate_changed_atom_supports(
+        &self,
+        proposal: &RevisionProposal,
+        payloads: &[&JournalPayload],
+        error: StoreError,
+    ) -> Result<(), StoreError> {
+        if !(proposal.status == ProposalStatus::Accepted
+            || proposal.status == ProposalStatus::Pending
+                && proposal.parent_proposal_revision_id.is_none())
+        {
+            return Ok(());
+        }
+        let Some((validation, draft)) = proposal.atom_support_replacement() else {
+            return Ok(());
+        };
+        let (base, _) = self
+            .atom_revisions
+            .get(&proposal.base_revision_id.ok_or(error)?)
+            .ok_or(error)?;
+        let refs = &draft.supports_revision_refs;
+        if *refs == base.supports_revision_refs {
+            return Ok(());
+        }
+        let eligible = |revision| {
+            let (atom, _) = self.atom_revisions.get(&revision)?;
+            let current = self.atoms.get(&atom.atom_id)?;
+            let target = ObjectDeletionTarget::Atom {
+                atom_id: atom.atom_id,
+            };
+            let changing = payloads.iter().any(|payload| match payload {
+                JournalPayload::AtomRecorded(other) => other.atom_id == atom.atom_id,
+                JournalPayload::ObjectDeletionLedgerRecorded(event) => event.target == target,
+                _ => false,
+            });
+            (atom.lifecycle_status == AtomLifecycleStatus::Active
+                && current.0.revision_id == revision
+                && self.scenario_core.atom_support_eligible(revision)
+                && self.deletions.current(target).is_none()
+                && !changing)
+                .then_some(atom)
+        };
+        if self.scenario_core.validation(validation).is_none()
+            || !Atom::independent_support_closure(base, refs, eligible)
+        {
+            return Err(error);
+        }
+        Ok(())
+    }
+
     fn validate_non_resurrection_command(
         &self,
         payloads: &[&JournalPayload],
@@ -13859,6 +13911,7 @@ impl JournalAdmissionState {
             JournalPayload::RevisionProposalRecorded(value) => Some(value.as_ref()),
             _ => None,
         }) {
+            self.validate_changed_atom_supports(proposal, payloads, error)?;
             let admission = self.classify_deletion_proposal(proposal)?;
             if let Some(ProposalAcceptanceAuthority::WebAcceptance { intent, .. }) = proposal
                 .acceptance

@@ -1,3 +1,5 @@
+use std::collections::BTreeSet;
+
 use serde::{Deserialize, Serialize};
 
 use crate::{
@@ -535,6 +537,26 @@ pub struct Atom {
     pub created_at_us: i64,
 }
 
+impl From<&Atom> for AtomDraft {
+    fn from(atom: &Atom) -> Self {
+        Self {
+            kind: atom.kind,
+            epistemic_status: atom.epistemic_status,
+            value: atom.value.clone(),
+            scope: atom.scope.clone(),
+            applicability_expr: atom.applicability_expr.clone(),
+            future_cue_lifecycle_exprs: atom.future_cue_lifecycle_exprs.clone(),
+            validity_interval: atom.validity_interval.clone(),
+            provenance: atom.provenance.clone(),
+            source_observation_refs: atom.source_observation_refs.clone(),
+            evidence_refs: atom.evidence_refs.clone(),
+            supersedes_revision_refs: atom.supersedes_revision_refs.clone(),
+            supports_revision_refs: atom.supports_revision_refs.clone(),
+            contradicts_revision_refs: atom.contradicts_revision_refs.clone(),
+        }
+    }
+}
+
 impl Atom {
     pub fn validate(&self) -> Result<(), SemanticError> {
         self.value.validate()?;
@@ -763,7 +785,19 @@ impl Atom {
             || !authority_same && !accepted_authority_change
             || !contains_all(&next.source_observation_refs, &self.source_observation_refs)
             || !contains_all(&next.evidence_refs, &self.evidence_refs)
-            || !contains_all(&next.supports_revision_refs, &self.supports_revision_refs)
+            || (!contains_all(&next.supports_revision_refs, &self.supports_revision_refs)
+                && !(self.scope == AtomScope::Global
+                    && next.scope == AtomScope::Global
+                    && next.lifecycle_status == AtomLifecycleStatus::Active
+                    && !next.supports_revision_refs.is_empty()
+                    && next.accepted_proposal_id.is_some()
+                    && next
+                        .user_authorization_provenance
+                        .as_ref()
+                        .is_some_and(|value| {
+                            value.mode == UserAuthorizationMode::TuiAcceptance
+                                && value.authorized_scope_ceiling == AtomScope::Global
+                        })))
             || !contains_all(
                 &next.contradicts_revision_refs,
                 &self.contradicts_revision_refs,
@@ -773,6 +807,35 @@ impl Atom {
             return Err(SemanticError::InvalidAtomSuccessor);
         }
         Ok(())
+    }
+
+    /// Reject self-support through any retained dependency rather than treating a new ID as independence.
+    pub fn independent_support_closure<'a>(
+        base: &Self,
+        refs: &[RevisionId],
+        lookup: impl Fn(RevisionId) -> Option<&'a Self>,
+    ) -> bool {
+        const MAX_CHECKED_SUPPORTS: usize = 256;
+        let mut pending: BTreeSet<_> = refs.iter().copied().collect();
+        let mut seen = BTreeSet::new();
+        while let Some(reference) = pending.pop_first() {
+            if !seen.insert(reference) {
+                continue;
+            }
+            let Some(atom) = lookup(reference) else {
+                return false;
+            };
+            if atom.atom_id == base.atom_id || seen.len() > MAX_CHECKED_SUPPORTS {
+                return false;
+            }
+            pending.extend(
+                atom.supports_revision_refs
+                    .iter()
+                    .filter(|id| !seen.contains(id))
+                    .copied(),
+            );
+        }
+        !refs.is_empty()
     }
 
     fn has_semantic_successor_change(&self, next: &Self) -> bool {

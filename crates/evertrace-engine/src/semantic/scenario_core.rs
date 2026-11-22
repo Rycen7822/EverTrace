@@ -8,7 +8,7 @@ use evertrace_domain::{
     procedure::{ProcedureRevision, ProcedureScope},
     revision::RevisionId,
     semantic::{
-        AcceptedProposalTarget, ActiveScenarioLineage, Atom, AtomAuthority, AtomDraft, AtomKind,
+        AcceptedProposalTarget, ActiveScenarioLineage, Atom, AtomAuthority, AtomKind,
         AtomLifecycleStatus, AtomProposalPayload, AtomScope, CoreMembership,
         CoreMembershipProposalPayload, CoreScopeIdentity, EpistemicStatus,
         GlobalSuccessorSupportContract, GlobalSupportState, GlobalSupportValidationEvent,
@@ -255,7 +255,7 @@ pub(crate) fn select_support_atom_acceptance(
     match proposal.operation {
         ProposalOperation::Replace => selection
             .initial_payload
-            .validate_closed_edit(&proposal.payload)
+            .validate_support_replacement(&proposal.payload)
             .map_err(|_| SemanticServiceError::InvalidInput)?,
         ProposalOperation::Deprecate => {
             let ProposalPayload::Atom(payload) = &proposal.payload else {
@@ -291,6 +291,18 @@ pub(crate) fn select_support_atom_acceptance(
     })
 }
 
+pub(crate) fn validate_new_atom_supports(
+    view: &SemanticCurrentView,
+    base: &Atom,
+    refs: &[RevisionId],
+) -> Result<(), SemanticServiceError> {
+    validate_current_support_refs(view, refs, base.revision_id)?;
+    if !Atom::independent_support_closure(base, refs, |id| view.atom_revisions.get(&id)) {
+        return Err(SemanticServiceError::InvalidInput);
+    }
+    Ok(())
+}
+
 pub(crate) fn support_successor_fanout_payloads(
     selection: &SupportAtomAcceptance,
     config_hash: [u8; 32],
@@ -317,7 +329,7 @@ pub(crate) fn compose_support_replacement(
 ) -> Result<ProposalResolution<RevisionProposal>, SemanticServiceError> {
     selection
         .initial_payload
-        .validate_closed_edit(&edited_payload)
+        .validate_support_replacement(&edited_payload)
         .map_err(|_| SemanticServiceError::InvalidInput)?;
     let validation_ref = selection.validation_revision_id.to_string();
     RevisionProposalService.submit(
@@ -339,21 +351,7 @@ pub(crate) fn compose_support_replacement(
 
 fn atom_replacement_payload(atom: &Atom) -> ProposalPayload {
     ProposalPayload::Atom(Box::new(AtomProposalPayload::Replace {
-        draft: AtomDraft {
-            kind: atom.kind,
-            epistemic_status: atom.epistemic_status,
-            value: atom.value.clone(),
-            scope: atom.scope.clone(),
-            applicability_expr: atom.applicability_expr.clone(),
-            future_cue_lifecycle_exprs: atom.future_cue_lifecycle_exprs.clone(),
-            validity_interval: atom.validity_interval.clone(),
-            provenance: atom.provenance.clone(),
-            source_observation_refs: atom.source_observation_refs.clone(),
-            evidence_refs: atom.evidence_refs.clone(),
-            supersedes_revision_refs: atom.supersedes_revision_refs.clone(),
-            supports_revision_refs: atom.supports_revision_refs.clone(),
-            contradicts_revision_refs: atom.contradicts_revision_refs.clone(),
-        },
+        draft: atom.into(),
     }))
 }
 
