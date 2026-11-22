@@ -4,6 +4,7 @@ use evertrace_domain::{
     query::*,
     semantic::{NormativeResolutionState, SemanticResolution},
 };
+use evertrace_store::search::RelationDirection;
 
 use crate::search::read_context::{
     ATTEMPT_RUN_RELATION, LINEAGE_RELATIONS, LineageQuery, OperationRead, RUN_RESULT_RELATION,
@@ -149,7 +150,12 @@ async fn research_neighbours(
         return Ok((keys, true));
     }
     let runs = snapshot
-        .adjacent_relations(&[anchor.to_owned()], &[ATTEMPT_RUN_RELATION.into()], 32)
+        .adjacent_relations(
+            &[anchor.to_owned()],
+            &[ATTEMPT_RUN_RELATION.into()],
+            RelationDirection::Adjacent,
+            32,
+        )
         .await
         .map_err(unavailable)?
         .ok_or(HumanGovernanceError::Store)?;
@@ -165,7 +171,12 @@ async fn research_neighbours(
     }
     let limit = 32 - keys.len();
     let outcomes = snapshot
-        .adjacent_relations(&runs, &[RUN_RESULT_RELATION.into()], limit + 1)
+        .adjacent_relations(
+            &runs,
+            &[RUN_RESULT_RELATION.into()],
+            RelationDirection::Adjacent,
+            limit + 1,
+        )
         .await
         .map_err(unavailable)?
         .ok_or(HumanGovernanceError::Store)?;

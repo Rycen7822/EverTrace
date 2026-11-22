@@ -2024,6 +2024,7 @@ pub(crate) fn read_relation_neighbours(
     frontier: u64,
     sources: &[String],
     kinds: &[String],
+    direction: crate::search::RelationDirection,
     limit: usize,
 ) -> Result<Option<Vec<RelationProjectionRow>>, StoreError> {
     let transaction = connection
@@ -2056,16 +2057,23 @@ pub(crate) fn read_relation_neighbours(
     }
     drop(checkpoint);
     drop(statement);
-    let placeholders = |count| vec!["?"; count].join(",");
+    let endpoints = (1..=sources.len())
+        .map(|i| format!("?{i}"))
+        .collect::<Vec<_>>()
+        .join(",");
+    let matching_end = match direction {
+        crate::search::RelationDirection::Adjacent => {
+            format!("(source_id IN ({endpoints}) OR target_id IN ({endpoints}))")
+        }
+        crate::search::RelationDirection::Outgoing => format!("source_id IN ({endpoints})"),
+    };
+    let kinds_sql = vec!["?"; kinds.len()].join(",");
     let sql = format!(
-        "SELECT row_id, relation_kind, source_id, target_id, source_event_seq, projection_generation FROM relation_rows WHERE (source_id IN ({}) OR target_id IN ({})) AND relation_kind IN ({}) ORDER BY row_id LIMIT ?",
-        placeholders(sources.len()),
-        placeholders(sources.len()),
-        placeholders(kinds.len())
+        "SELECT row_id, relation_kind, source_id, target_id, source_event_seq, projection_generation \
+         FROM relation_rows WHERE {matching_end} AND relation_kind IN ({kinds_sql}) ORDER BY row_id LIMIT ?"
     );
     let mut values = sources
         .iter()
-        .chain(sources)
         .chain(kinds)
         .cloned()
         .map(rusqlite::types::Value::Text)

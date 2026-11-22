@@ -46,6 +46,12 @@ pub struct SearchSnapshot {
     _lease: crate::connection::StoreReadLease,
 }
 
+#[derive(Clone, Copy)]
+pub enum RelationDirection {
+    Adjacent,
+    Outgoing,
+}
+
 #[derive(Clone, Debug)]
 pub struct SearchObjectAccess {
     pub kinds: &'static [&'static str],
@@ -303,6 +309,7 @@ impl SearchSnapshot {
         &self,
         sources: &[String],
         kinds: &[String],
+        direction: RelationDirection,
         limit: usize,
     ) -> Result<Option<Vec<crate::RelationProjectionRow>>, StoreError> {
         if sources.len() > 64
@@ -323,7 +330,7 @@ impl SearchSnapshot {
             .lease_read(&self._lease, move |connection, cancel| {
                 cancel.check()?;
                 crate::sqlite_state::read_relation_neighbours(
-                    connection, frontier, &sources, &kinds, limit,
+                    connection, frontier, &sources, &kinds, direction, limit,
                 )
             })
             .await

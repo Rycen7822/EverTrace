@@ -11,7 +11,9 @@ use evertrace_domain::{
         ExactFieldsQuery, ExactReadQuery, ExactRecordQuery, ExactRecordRef, MetadataReadOutcome,
     },
 };
-use evertrace_store::{JournalPayload, ObjectRow, projections::StoredFieldsContext};
+use evertrace_store::{
+    JournalPayload, ObjectRow, projections::StoredFieldsContext, search::RelationDirection,
+};
 
 use crate::{WriterHandle, repository::RepositoryReadAuthority};
 
@@ -534,6 +536,7 @@ pub(crate) async fn operation_binding_references(
             .adjacent_relations(
                 &[operation.to_owned()],
                 &["operation_to_binding_revision".into()],
+                RelationDirection::Adjacent,
                 65,
             )
             .await

@@ -3,7 +3,9 @@ use std::collections::{BTreeMap, BTreeSet};
 
 use evertrace_domain::error::ErrorCode;
 use evertrace_domain::query::*;
-use evertrace_store::{SearchHardFilter, SearchIndex, SearchProjectionRow, SearchSnapshot};
+use evertrace_store::{
+    SearchHardFilter, SearchIndex, SearchProjectionRow, SearchSnapshot, search::RelationDirection,
+};
 
 use super::{
     SearchError,
@@ -675,7 +677,7 @@ impl NativeRetrieval<'_> {
             // Latest must not ignore an explicit contradiction while choosing an update.
             for (kind, needed) in [
                 (
-                    "atom_supersedes",
+                    super::ATOM_SUPERSEDES,
                     self.context.query_facets.temporal_qualifiers.is_empty()
                         || requested_ordering(&self.context.query_facets.temporal_qualifiers)
                             == Some(TemporalOrdering::Supersession),
@@ -710,10 +712,25 @@ impl NativeRetrieval<'_> {
             })
             .cloned()
             .collect::<Vec<_>>();
+        // A historical predecessor request follows declared updates backwards in time,
+        // not every revision that happens to point to the same operand.
+        let predecessors = self.context.intent == SearchIntent::HistoryLookup
+            && !self.objects.current_only
+            && !self.context.query_facets.target_anchors.is_empty()
+            && kinds.as_slice() == [super::ATOM_SUPERSEDES];
+        let direction = if predecessors {
+            RelationDirection::Outgoing
+        } else {
+            RelationDirection::Adjacent
+        };
         let mut relation_links = BTreeSet::new();
         let mut incomplete = BTreeSet::new();
         let mut visited = BTreeSet::new();
         let mut frontier = self.references();
+        if predecessors {
+            // Independent constraints may be displayed but are not roots of this history.
+            frontier.retain(|id| self.context.query_facets.target_anchors.contains(id));
+        }
         self.result.layer = RetrievalLayer::D;
         for _ in 0..self.result.budget.hops_remaining {
             if kinds.is_empty() || frontier.is_empty() {
@@ -728,7 +745,7 @@ impl NativeRetrieval<'_> {
             visited.extend(sources.iter().cloned());
             let mut edges = match self
                 .deadline
-                .run(snapshot.adjacent_relations(&sources, &persisted_kinds, 65))
+                .run(snapshot.adjacent_relations(&sources, &persisted_kinds, direction, 65))
                 .await
             {
                 Ok(Ok(Some(rows))) => rows,
@@ -760,19 +777,7 @@ impl NativeRetrieval<'_> {
             if edges.len() > 64 {
                 self.degraded("relation_fanout_truncated");
             }
-            let edges: Vec<_> = edges
-                .into_iter()
-                .take(64)
-                .filter(|edge| {
-                    access.is_none()
-                        || self.objects.current_only
-                        || edge.relation_kind.as_deref() != Some(super::ATOM_SUPERSEDES)
-                        || edge
-                            .source_id
-                            .as_ref()
-                            .is_some_and(|id| sources.contains(id))
-                })
-                .collect();
+            let edges: Vec<_> = edges.into_iter().take(64).collect();
             let targets = edges
                 .iter()
                 .filter_map(|edge| {
@@ -851,7 +856,15 @@ impl NativeRetrieval<'_> {
                     }
                 }
             }
-            frontier = refs.difference(&visited).cloned().collect();
+            frontier = if predecessors {
+                edges
+                    .into_iter()
+                    .filter_map(|edge| edge.target_id)
+                    .filter(|target| refs.contains(target) && !visited.contains(target))
+                    .collect()
+            } else {
+                refs.difference(&visited).cloned().collect()
+            };
         }
         if kinds.iter().any(|kind| kind == RUN_RESULT_RELATION) {
             let verified_runs: BTreeSet<_> = relation_links
