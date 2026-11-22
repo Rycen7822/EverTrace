@@ -202,6 +202,16 @@ pub fn scoped_research_source(
     Ok(source)
 }
 
+/// A contract named by an exact successor is a request-local bridge, not a current alias.
+pub fn canonical_support_contract_source(
+    row: &crate::ObjectRow,
+) -> Result<SearchProjectionRow, StoreError> {
+    if row.object_kind.as_deref() != Some("global_support_contract") {
+        return Err(StoreError::StoreCorrupt);
+    }
+    exact_identifier_row(row, row.source_event_seq, true)?.ok_or(StoreError::StoreCorrupt)
+}
+
 /// A frozen lineage operand is exact-only; descriptive metadata does not grant verification authority.
 pub fn canonical_lineage_source(
     row: &crate::ObjectRow,

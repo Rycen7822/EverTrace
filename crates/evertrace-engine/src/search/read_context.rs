@@ -922,13 +922,13 @@ pub(crate) struct LineageQuery {
 }
 
 #[derive(PartialEq)]
-pub(crate) struct LineageRead {
+pub(crate) struct RelationRead {
     pub rows: Vec<evertrace_store::SearchProjectionRow>,
     pub edges: Vec<(String, String, String)>,
-    pub verification_missing: bool,
+    pub missing: BTreeSet<&'static str>,
 }
 
-impl LineageRead {
+impl RelationRead {
     pub(crate) fn covers(&self, reference: &str) -> bool {
         self.rows
             .iter()
@@ -936,9 +936,166 @@ impl LineageRead {
     }
 }
 
+/// Resolve the frozen contract and current validation for one explicitly selected successor.
+/// The caller still checks the archive of every eligible support revision before exposing hop two.
+pub(crate) fn global_support_path(
+    index: &BTreeMap<&str, Vec<&ObjectRow>>,
+    readable: &BTreeSet<String>,
+    successor: &str,
+    include_evidence: bool,
+    candidate_limit: usize,
+    deadline: Instant,
+) -> Option<(RelationRead, BTreeSet<String>)> {
+    use evertrace_domain::{
+        query::{SUCCESSOR_SUPPORT_CONTRACT, SUPPORT_CONTRACT_EVIDENCE},
+        semantic::{AtomScope, CoreScopeIdentity, GlobalSupportState},
+    };
+    use evertrace_store::projections::{READ_DEPENDENCY_BYTES, READ_DEPENDENCY_LIMIT};
+    let exact = |id: &str| {
+        // A validation uses the contract ID as its stable key, never as its own revision.
+        let mut matches = index
+            .get(id)?
+            .iter()
+            .copied()
+            .filter(|row| row.current_revision_id.as_deref() == Some(id));
+        let row = matches.next()?;
+        (matches.next().is_none() && readable.contains(id)).then_some(row)
+    };
+    let root = exact(successor)?;
+    let decode = |row: &ObjectRow| -> Option<JournalPayload> {
+        let payload: JournalPayload = serde_json::from_str(row.payload_json.as_deref()?).ok()?;
+        payload.validate().ok()?;
+        Some(payload)
+    };
+    let pinned_contract = match decode(root)? {
+        JournalPayload::AtomRecorded(atom) if atom.scope == AtomScope::Global => None,
+        JournalPayload::ProcedureRevisionRecorded(procedure)
+            if procedure.draft.scope == evertrace_domain::procedure::ProcedureScope::Global =>
+        {
+            None
+        }
+        JournalPayload::CoreMembershipRecorded(member)
+            if member.scope_identity == CoreScopeIdentity::Global =>
+        {
+            Some(member.support_contract_ref)
+        }
+        _ => return None,
+    };
+    let rows = |prefix: &'static str| {
+        index
+            .range(prefix..)
+            .take_while(move |(key, _)| key.starts_with(prefix))
+    };
+    let mut remaining = READ_DEPENDENCY_BYTES;
+    let mut records = READ_DEPENDENCY_LIMIT;
+    let mut load = |group: &[&ObjectRow]| {
+        records = records.checked_sub(1)?;
+        if Instant::now() >= deadline {
+            return None;
+        }
+        let [row] = group else { return None };
+        remaining = remaining.checked_sub(row.payload_json.as_ref()?.len() as u64)?;
+        decode(row)
+    };
+    let mut selected = None;
+    for (_, group) in rows("object:atom:global_support_contract:") {
+        let JournalPayload::GlobalSupportContractRecorded(contract) = load(group)? else {
+            return None;
+        };
+        if contract.successor_revision_or_membership_ref == successor
+            && selected.replace(contract).is_some()
+        {
+            return None;
+        }
+    }
+    let contract = selected?;
+    if pinned_contract.is_some_and(|id| id != contract.support_contract_revision_id) {
+        return None;
+    }
+    let contract_ref = contract.support_contract_revision_id.to_string();
+    let bridge =
+        evertrace_store::query::canonical_support_contract_source(exact(&contract_ref)?).ok()?;
+    let mut path = RelationRead {
+        rows: vec![bridge],
+        edges: vec![(
+            successor.into(),
+            contract_ref.clone(),
+            SUCCESSOR_SUPPORT_CONTRACT.into(),
+        )],
+        missing: BTreeSet::new(),
+    };
+    let mut sources = BTreeSet::new();
+    if !include_evidence {
+        return Some((path, sources));
+    }
+    let mut head = None;
+    for (_, group) in rows("object:atom:global_support_validation:") {
+        let JournalPayload::GlobalSupportValidationRecorded(validation) = load(group)? else {
+            return None;
+        };
+        let sequence = group[0].source_event_seq;
+        if validation.support_contract_ref == contract.support_contract_revision_id
+            && head
+                .as_ref()
+                .is_none_or(|(previous, _)| sequence > *previous)
+        {
+            head = Some((sequence, validation));
+        }
+    }
+    let valid = head.map(|(_, validation)| validation).filter(|validation| {
+        validation.successor_ref == successor
+            && validation.state == GlobalSupportState::Valid
+            && exact(&validation.validation_revision_id.to_string()).is_some()
+            && validation.surviving_support_refs.len()
+                >= usize::from(
+                    contract
+                        .support_threshold_snapshot
+                        .minimum_surviving_support,
+                )
+    });
+    if let Some(validation) = valid {
+        for id in validation
+            .surviving_support_refs
+            .iter()
+            .take(candidate_limit.saturating_sub(2))
+        {
+            let reference = id.to_string();
+            let atom = exact(&reference).and_then(decode);
+            let Some(JournalPayload::AtomRecorded(atom)) = atom.filter(|_| {
+                contract.support_revision_refs.binary_search(id).is_ok()
+                    && contract
+                        .authorization_revision_refs
+                        .binary_search(id)
+                        .is_err()
+            }) else {
+                continue;
+            };
+            let direct = atom
+                .source_observation_refs
+                .iter()
+                .map(ToString::to_string)
+                .collect::<BTreeSet<_>>();
+            if direct.is_empty() || !direct.is_subset(readable) {
+                continue;
+            }
+            path.edges.push((
+                contract_ref.clone(),
+                reference,
+                SUPPORT_CONTRACT_EVIDENCE.into(),
+            ));
+            sources.extend(direct);
+        }
+        if path.edges.len() - 1 == validation.surviving_support_refs.len() {
+            return Some((path, sources));
+        }
+    }
+    path.missing.insert(SUPPORT_CONTRACT_EVIDENCE);
+    Some((path, sources))
+}
+
 impl SearchReadAccess<'_> {
     /// Read only the nominated Transition and its immutable snapshot coordinates, not Worktree current pointers.
-    pub(crate) async fn lineage(&self, query: &LineageQuery) -> Option<LineageRead> {
+    pub(crate) async fn lineage(&self, query: &LineageQuery) -> Option<RelationRead> {
         use evertrace_domain::repository::{LineageAssessment, SnapshotCaptureStatus};
         let (id, version) = evertrace_domain::query::parse_transition_revision(&query.revision)?;
         let key = id.to_string();
@@ -970,7 +1127,7 @@ impl SearchReadAccess<'_> {
         };
         tree_in_repository(transition.from_worktree_instance_id)?;
         tree_in_repository(transition.to_worktree_instance_id)?;
-        let mut result = LineageRead {
+        let mut result = RelationRead {
             rows: vec![
                 evertrace_store::query::canonical_lineage_source(
                     row,
@@ -980,7 +1137,7 @@ impl SearchReadAccess<'_> {
                 .ok()?,
             ],
             edges: Vec::new(),
-            verification_missing: false,
+            missing: BTreeSet::new(),
         };
         if transition.lineage_assessment != LineageAssessment::Proven {
             return Some(result);
@@ -1045,7 +1202,7 @@ impl SearchReadAccess<'_> {
     pub(crate) async fn verify_lineage(
         &self,
         query: &LineageQuery,
-        lineage: &mut LineageRead,
+        lineage: &mut RelationRead,
         index: &BTreeMap<&str, Vec<&ObjectRow>>,
         cas_dir: &std::path::Path,
         budget: &mut RelationArchiveBudget,
@@ -1073,25 +1230,25 @@ impl SearchReadAccess<'_> {
             if count == evertrace_store::projections::READ_DEPENDENCY_LIMIT
                 || Instant::now() >= self.deadline
             {
-                lineage.verification_missing = true;
+                lineage.missing.insert(SNAPSHOT_VERIFICATION_RESULT);
                 break;
             }
             let [row] = rows.as_slice() else {
-                lineage.verification_missing = true;
+                lineage.missing.insert(SNAPSHOT_VERIFICATION_RESULT);
                 continue;
             };
             let Some(raw) = row.payload_json.as_deref() else {
-                lineage.verification_missing = true;
+                lineage.missing.insert(SNAPSHOT_VERIFICATION_RESULT);
                 continue;
             };
             let Some(remaining) = metadata_bytes.checked_sub(raw.len() as u64) else {
-                lineage.verification_missing = true;
+                lineage.missing.insert(SNAPSHOT_VERIFICATION_RESULT);
                 break;
             };
             metadata_bytes = remaining;
             let Ok(JournalPayload::ResultEvidenceRecorded(result)) = serde_json::from_str(raw)
             else {
-                lineage.verification_missing = true;
+                lineage.missing.insert(SNAPSHOT_VERIFICATION_RESULT);
                 continue;
             };
             let run_revision = result.experiment_run_revision_id.to_string();
@@ -1111,13 +1268,13 @@ impl SearchReadAccess<'_> {
                 continue;
             };
             let Some(remaining) = metadata_bytes.checked_sub(run_json.len() as u64) else {
-                lineage.verification_missing = true;
+                lineage.missing.insert(SNAPSHOT_VERIFICATION_RESULT);
                 break;
             };
             metadata_bytes = remaining;
             let Ok(JournalPayload::ExperimentRunRecorded(run)) = serde_json::from_str(run_json)
             else {
-                lineage.verification_missing = true;
+                lineage.missing.insert(SNAPSHOT_VERIFICATION_RESULT);
                 continue;
             };
             let snapshot = run.code_snapshot_id.to_string();
@@ -1126,7 +1283,7 @@ impl SearchReadAccess<'_> {
             };
             // Denied or incomplete nominees also spend a check; they cannot make the access window unbounded.
             let Some(remaining) = checks_remaining.checked_sub(1) else {
-                lineage.verification_missing = true;
+                lineage.missing.insert(SNAPSHOT_VERIFICATION_RESULT);
                 break;
             };
             checks_remaining = remaining;
@@ -1160,13 +1317,13 @@ impl SearchReadAccess<'_> {
                     .reparse_snapshot_result(result, run, cas_dir, budget)
                     .await
             {
-                lineage.verification_missing = true;
+                lineage.missing.insert(SNAPSHOT_VERIFICATION_RESULT);
                 continue;
             }
             let Ok(mut source) =
                 evertrace_store::query::canonical_lineage_source(row, query.repository, current)
             else {
-                lineage.verification_missing = true;
+                lineage.missing.insert(SNAPSHOT_VERIFICATION_RESULT);
                 continue;
             };
             source.worktree_id = Some(tree.clone());
@@ -1176,7 +1333,9 @@ impl SearchReadAccess<'_> {
                 .edges
                 .push((snapshot, revision, SNAPSHOT_VERIFICATION_RESULT.into()));
         }
-        lineage.verification_missing |= verified.len() != snapshots.len();
+        if verified.len() != snapshots.len() {
+            lineage.missing.insert(SNAPSHOT_VERIFICATION_RESULT);
+        }
     }
 
     async fn reparse_snapshot_result(

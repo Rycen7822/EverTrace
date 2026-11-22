@@ -6,8 +6,8 @@ mod relation_assembly;
 
 pub use derive::{
     DefaultRetrievalSuppressionGeneration, canonical_lineage_source, canonical_physical_source,
-    canonical_work_binding_source, canonical_work_episode_source,
-    default_retrieval_suppression_ref_hash, scoped_research_source,
+    canonical_support_contract_source, canonical_work_binding_source,
+    canonical_work_episode_source, default_retrieval_suppression_ref_hash, scoped_research_source,
 };
 pub use projection::{
     L0002ProjectionSnapshot, L0002ProjectionWorker, derive_l0002_projections,

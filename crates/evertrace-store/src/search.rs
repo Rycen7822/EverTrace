@@ -938,6 +938,7 @@ impl SearchProjectionRow {
                         | "worktree_snapshot"
                         | "experiment_run"
                         | "result_evidence"
+                        | "global_support_contract"
                 )
             )
         {

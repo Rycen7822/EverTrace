@@ -699,6 +699,8 @@ pub enum EvidenceRole {
 pub const TRANSITION_FROM_SNAPSHOT: &str = "worktree_transition_from_snapshot";
 pub const TRANSITION_TO_SNAPSHOT: &str = "worktree_transition_to_snapshot";
 pub const SNAPSHOT_VERIFICATION_RESULT: &str = "snapshot_to_verification_result";
+pub const SUCCESSOR_SUPPORT_CONTRACT: &str = "successor_to_support_contract";
+pub const SUPPORT_CONTRACT_EVIDENCE: &str = "support_contract_supports_revision";
 
 impl EvidenceRole {
     pub fn for_relation(kind: &str) -> Option<Self> {
@@ -725,6 +727,8 @@ impl EvidenceRole {
             | TRANSITION_FROM_SNAPSHOT
             | TRANSITION_TO_SNAPSHOT
             | SNAPSHOT_VERIFICATION_RESULT
+            | SUCCESSOR_SUPPORT_CONTRACT
+            | SUPPORT_CONTRACT_EVIDENCE
             | "binding_to_scope_effect"
             | "binding_to_primary_task"
             | "binding_to_primary_workstream"

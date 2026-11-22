@@ -512,7 +512,7 @@ pub struct ProductionSearch {
     candidate_grants: Option<CandidateGrants>,
     semantics: Option<std::sync::Arc<super::resolution::SemanticSearchResolution>>,
     canonical_sources: Option<(u64, Vec<SearchProjectionRow>)>,
-    lineage: Option<std::sync::Arc<super::read_context::LineageRead>>,
+    relation_read: Option<std::sync::Arc<super::read_context::RelationRead>>,
     recall_sources: BTreeSet<String>,
     matched_sources: BTreeSet<String>,
     matched_contexts: BTreeSet<String>,
@@ -531,7 +531,7 @@ impl ProductionSearch {
             candidate_grants: None,
             semantics: None,
             canonical_sources: None,
-            lineage: None,
+            relation_read: None,
             recall_sources: BTreeSet::new(),
             matched_sources: BTreeSet::new(),
             matched_contexts: BTreeSet::new(),
@@ -592,11 +592,11 @@ impl ProductionSearch {
         self
     }
 
-    pub(crate) fn with_lineage(
+    pub(crate) fn with_relation_read(
         mut self,
-        lineage: Option<std::sync::Arc<super::read_context::LineageRead>>,
+        relation_read: Option<std::sync::Arc<super::read_context::RelationRead>>,
     ) -> Self {
-        self.lineage = lineage;
+        self.relation_read = relation_read;
         self
     }
 
@@ -796,7 +796,7 @@ impl ProductionSearch {
             sequence_scope: self.sequence_scope.as_ref(),
             time_scope,
             relation_sources: Some(relation_sources),
-            lineage: self.lineage.as_deref(),
+            relation_read: self.relation_read.as_deref(),
             include_hit_window: true,
         }
         .run(snapshot)
@@ -1148,7 +1148,7 @@ impl ProductionSearch {
             sequence_scope: None,
             time_scope,
             relation_sources: None,
-            lineage: None,
+            relation_read: None,
             include_hit_window: false,
         };
         if source_count || time_scope.is_some() {
@@ -1271,7 +1271,7 @@ impl ProductionSearch {
             sequence_scope: self.sequence_scope.as_ref(),
             time_scope: None,
             relation_sources: None,
-            lineage: None,
+            relation_read: None,
             include_hit_window: false,
         };
         let has_unread_source = self.candidate_grants.as_ref().is_some_and(|grants| {

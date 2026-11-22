@@ -71,7 +71,7 @@ pub(super) struct NativeRetrieval<'a> {
     pub sequence_scope: Option<&'a super::SourceSequenceScope>,
     pub time_scope: Option<&'a super::TemporalReadScope<'a>>,
     pub relation_sources: Option<RelationSources<'a>>,
-    pub lineage: Option<&'a super::read_context::LineageRead>,
+    pub relation_read: Option<&'a super::read_context::RelationRead>,
     pub include_hit_window: bool,
 }
 
@@ -680,7 +680,12 @@ impl NativeRetrieval<'_> {
             .iter()
             .filter(|kind| {
                 !super::read_context::LINEAGE_RELATIONS.contains(&kind.as_str())
-                    && kind.as_str() != SNAPSHOT_VERIFICATION_RESULT
+                    && !matches!(
+                        kind.as_str(),
+                        SNAPSHOT_VERIFICATION_RESULT
+                            | evertrace_domain::query::SUCCESSOR_SUPPORT_CONTRACT
+                            | evertrace_domain::query::SUPPORT_CONTRACT_EVIDENCE
+                    )
             })
             .cloned()
             .collect::<Vec<_>>();
@@ -716,10 +721,9 @@ impl NativeRetrieval<'_> {
                     break;
                 }
             };
-            if let Some(lineage) = self.lineage {
+            if let Some(read) = self.relation_read {
                 edges.extend(
-                    lineage
-                        .edges
+                    read.edges
                         .iter()
                         .filter(|edge| sources.contains(&edge.0) && kinds.contains(&edge.2))
                         .map(|(source, target, kind)| {
@@ -847,12 +851,19 @@ impl NativeRetrieval<'_> {
         let answer_limit = self.answer_text_limit() * 2;
         let mut relation_bytes = 0usize;
         for (source, target, kind) in relation_links {
+            let exact_support = matches!(
+                kind.as_str(),
+                evertrace_domain::query::SUCCESSOR_SUPPORT_CONTRACT
+                    | evertrace_domain::query::SUPPORT_CONTRACT_EVIDENCE
+            );
             let resolve = |reference: &str| {
-                let mut matches = self
-                    .result
-                    .candidates
-                    .iter()
-                    .filter(|candidate| candidate.matches_reference(reference));
+                let mut matches = self.result.candidates.iter().filter(|candidate| {
+                    if exact_support {
+                        candidate.candidate_id == reference
+                    } else {
+                        candidate.matches_reference(reference)
+                    }
+                });
                 let first = matches.next()?;
                 matches.next().is_none().then(|| first.candidate_id.clone())
             };
@@ -891,8 +902,8 @@ impl NativeRetrieval<'_> {
                 self.degraded("relation_endpoint_omitted_or_ambiguous");
             }
         }
-        if self.lineage.is_some_and(|read| read.verification_missing) {
-            incomplete.insert(SNAPSHOT_VERIFICATION_RESULT.into());
+        if let Some(read) = self.relation_read {
+            incomplete.extend(read.missing.iter().map(|kind| (*kind).to_owned()));
         }
         if incomplete.contains(ATTEMPT_RUN_RELATION)
             && kinds.iter().any(|kind| kind == RUN_RESULT_RELATION)
