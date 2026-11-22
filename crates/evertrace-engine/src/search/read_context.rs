@@ -938,13 +938,13 @@ impl RelationRead {
 
 /// Resolve the frozen contract and current validation for one explicitly selected successor.
 /// The caller still checks the archive of every eligible support revision before exposing hop two.
-pub(crate) fn global_support_path(
+pub(crate) async fn global_support_path(
     index: &BTreeMap<&str, Vec<&ObjectRow>>,
     readable: &BTreeSet<String>,
     successor: &str,
     include_evidence: bool,
     candidate_limit: usize,
-    deadline: Instant,
+    access: &SearchReadAccess<'_>,
 ) -> Option<(RelationRead, BTreeMap<String, BTreeSet<String>>)> {
     use evertrace_domain::{
         query::{METADATA_READ_LIMIT, SUCCESSOR_SUPPORT_CONTRACT, SUPPORT_CONTRACT_EVIDENCE},
@@ -981,35 +981,41 @@ pub(crate) fn global_support_path(
         }
         _ => return None,
     };
-    let rows = |prefix: &'static str| {
-        index
+    let selected = if let Some(id) = pinned_contract {
+        decode(exact(&id.to_string())?)?
+    } else {
+        let prefix = "object:atom:global_support_contract:";
+        let mut bytes_remaining = READ_DEPENDENCY_BYTES;
+        let mut selected = None;
+        for (position, (_, group)) in index
             .range(prefix..)
-            .take_while(move |(key, _)| key.starts_with(prefix))
-    };
-    let mut remaining = READ_DEPENDENCY_BYTES;
-    let mut records = READ_DEPENDENCY_LIMIT;
-    let mut load = |group: &[&ObjectRow]| {
-        records = records.checked_sub(1)?;
-        if Instant::now() >= deadline {
-            return None;
-        }
-        let [row] = group else { return None };
-        remaining = remaining.checked_sub(row.payload_json.as_ref()?.len() as u64)?;
-        decode(row)
-    };
-    let mut selected = None;
-    for (_, group) in rows("object:atom:global_support_contract:") {
-        let JournalPayload::GlobalSupportContractRecorded(contract) = load(group)? else {
-            return None;
-        };
-        if contract.successor_revision_or_membership_ref == successor
-            && selected.replace(contract).is_some()
+            .take_while(|(key, _)| key.starts_with(prefix))
+            .enumerate()
         {
-            return None;
+            if position >= READ_DEPENDENCY_LIMIT || Instant::now() >= access.deadline {
+                return None;
+            }
+            let [row] = group.as_slice() else { return None };
+            bytes_remaining =
+                bytes_remaining.checked_sub(row.payload_json.as_ref()?.len() as u64)?;
+            let payload = decode(row)?;
+            let JournalPayload::GlobalSupportContractRecorded(contract) = &payload else {
+                return None;
+            };
+            if contract.successor_revision_or_membership_ref == successor
+                && selected.replace(payload).is_some()
+            {
+                return None;
+            }
         }
-    }
-    let contract = selected?;
-    if pinned_contract.is_some_and(|id| id != contract.support_contract_revision_id) {
+        selected?
+    };
+    let JournalPayload::GlobalSupportContractRecorded(contract) = selected else {
+        return None;
+    };
+    if contract.successor_revision_or_membership_ref != successor
+        || pinned_contract.is_some_and(|id| id != contract.support_contract_revision_id)
+    {
         return None;
     }
     let contract_ref = contract.support_contract_revision_id.to_string();
@@ -1028,31 +1034,31 @@ pub(crate) fn global_support_path(
     if !include_evidence {
         return Some((path, archives));
     }
-    let mut head = None;
-    for (_, group) in rows("object:atom:global_support_validation:") {
-        let JournalPayload::GlobalSupportValidationRecorded(validation) = load(group)? else {
+    // The current head belongs to the canonical reducer, never to an ordering over historical rows.
+    let valid = async {
+        let context = access
+            .check_exact_record(&contract_ref, &contract_ref, "global_support_contract")
+            .await
+            .ok()?;
+        let head = context.current_support_validation?;
+        let JournalPayload::GlobalSupportValidationRecorded(validation) =
+            decode(exact(&head.to_string())?)?
+        else {
             return None;
         };
-        let sequence = group[0].source_event_seq;
-        if validation.support_contract_ref == contract.support_contract_revision_id
-            && head
-                .as_ref()
-                .is_none_or(|(previous, _)| sequence > *previous)
-        {
-            head = Some((sequence, validation));
-        }
-    }
-    let valid = head.map(|(_, validation)| validation).filter(|validation| {
-        validation.successor_ref == successor
+        (validation.validation_revision_id == head
+            && validation.support_contract_ref == contract.support_contract_revision_id
+            && validation.successor_ref == successor
             && validation.state == GlobalSupportState::Valid
-            && exact(&validation.validation_revision_id.to_string()).is_some()
             && validation.surviving_support_refs.len()
                 >= usize::from(
                     contract
                         .support_threshold_snapshot
                         .minimum_surviving_support,
-                )
-    });
+                ))
+        .then_some(validation)
+    }
+    .await;
     if let Some(validation) = valid {
         let mut archive_refs_remaining = usize::from(METADATA_READ_LIMIT);
         for id in validation

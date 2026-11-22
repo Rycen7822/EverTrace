@@ -2107,8 +2107,14 @@ impl HumanGovernanceService {
                 &context.protected_query,
                 &context.query_facets,
             );
-            let mut support_sources = BTreeSet::new();
-            let support = if let Some((mut path, archives)) = support_request.and_then(|anchor| {
+            let support_read = if let Some(anchor) = support_request {
+                let access = crate::search::read_context::SearchReadAccess {
+                    writer: &self.writer,
+                    authority: RepositoryReadAuthority::retained(report.as_ref()),
+                    frontier: snapshot.frontier,
+                    config_hash: self.effective_config_hash,
+                    deadline,
+                };
                 global_support_path(
                     &index,
                     &refs,
@@ -2119,9 +2125,14 @@ impl HumanGovernanceService {
                         .iter()
                         .any(|kind| kind == SUPPORT_CONTRACT_EVIDENCE),
                     context.budget.candidates_remaining as usize,
-                    deadline,
+                    &access,
                 )
-            }) {
+                .await
+            } else {
+                None
+            };
+            let mut support_sources = BTreeSet::new();
+            let support = if let Some((mut path, archives)) = support_read {
                 for (reference, sources) in archives {
                     let pending: BTreeSet<_> =
                         sources.difference(&support_sources).cloned().collect();
