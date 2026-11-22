@@ -669,10 +669,10 @@ impl WebAcceptanceIntent {
                 AtomProposalPayload::Replace { draft }
                     if proposal.operation == ProposalOperation::Replace
                         && proposal.eligibility == ProposalEligibility::ManualRequired
-                        && matches!(
+                        && (matches!(
                             draft.scope,
                             AtomScope::Task { .. } | AtomScope::Repository { .. }
-                        ) =>
+                        ) || proposal.atom_support_replacement().is_some()) =>
                 {
                     Some(draft.scope.clone())
                 }
@@ -1636,6 +1636,14 @@ impl RevisionProposal {
             return None;
         };
         reference.parse().ok()
+    }
+
+    /// The immutable selector, not evidence of current support or authorization.
+    pub fn support_atom_validation(&self) -> Option<RevisionId> {
+        self.support_deprecation_validation().or_else(|| {
+            self.atom_support_replacement()
+                .map(|(validation, _)| validation)
+        })
     }
 
     /// The immutable selector in a support-deprecation proposal, not proof that it is still current.

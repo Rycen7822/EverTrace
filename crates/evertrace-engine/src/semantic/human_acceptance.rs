@@ -423,9 +423,11 @@ impl HumanAcceptanceService {
         }
         let service =
             crate::HumanGovernanceService::new(self.writer.clone(), self.effective_config_hash);
-        let accessible = if reviewed.operation == ProposalOperation::Deprecate {
+        let accessible = if reviewed.support_atom_validation().is_some()
+            || reviewed.operation == ProposalOperation::Deprecate
+        {
             service
-                .web_support_deprecation_current_at(snapshot, reviewed)
+                .web_support_atom_current_at(snapshot, view, reviewed)
                 .await?
         } else {
             service.proposal_accessible(snapshot, reviewed).await?
@@ -584,7 +586,7 @@ impl HumanAcceptanceService {
                     Err(crate::semantic::SemanticServiceError::BaseConflict)
                 }
             })
-        } else if reviewed.support_deprecation_validation().is_some() {
+        } else if reviewed.support_atom_validation().is_some() {
             select_support_atom_acceptance(snapshot, reviewed).and_then(|support| {
                 RevisionProposalService
                     .accept_support_linked(view, context, reviewed.proposal_id, authority, &support)
@@ -642,9 +644,10 @@ impl HumanAcceptanceService {
         }) else {
             return Ok(conflict());
         };
-        if (proposal.operation == ProposalOperation::Deprecate
+        if ((proposal.support_atom_validation().is_some()
+            || proposal.operation == ProposalOperation::Deprecate)
             && !service
-                .web_support_deprecation_current_at(&snapshot, proposal)
+                .web_support_atom_current_at(&snapshot, &view, proposal)
                 .await?)
             || ((proposal.operation == ProposalOperation::Replace || intent.edit().is_some())
                 && !service.web_base_accessible(&snapshot, proposal).await?)

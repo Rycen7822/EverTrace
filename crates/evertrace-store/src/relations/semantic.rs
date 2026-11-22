@@ -331,6 +331,22 @@ pub fn build_semantic_relation_rows(
     atoms: &[Atom],
     proposals: &[RevisionProposal],
 ) -> Result<Vec<SemanticRelationRow>, StoreError> {
+    semantic_relation_rows(atoms, proposals, false)
+}
+
+/// The object projection has already validated the deletion and repository closures.
+pub(crate) fn rebuild_semantic_relation_rows(
+    atoms: &[Atom],
+    proposals: &[RevisionProposal],
+) -> Result<Vec<SemanticRelationRow>, StoreError> {
+    semantic_relation_rows(atoms, proposals, true)
+}
+
+fn semantic_relation_rows(
+    atoms: &[Atom],
+    proposals: &[RevisionProposal],
+    omit_absent_atom_edges: bool,
+) -> Result<Vec<SemanticRelationRow>, StoreError> {
     let atom_revisions = atoms
         .iter()
         .map(|atom| atom.revision_id)
@@ -349,41 +365,33 @@ pub fn build_semantic_relation_rows(
     let mut rows = BTreeSet::new();
     for atom in atoms {
         atom.validate().map_err(|_| StoreError::InvalidInput)?;
-        if let Some(parent) = atom.parent_revision_id {
-            require_target(&atom_revisions, parent)?;
-            insert(
-                &mut rows,
+        for (kind, refs) in [
+            (
                 SemanticRelationKind::AtomRevisionSuccessor,
-                atom.revision_id,
-                parent,
-            );
-        }
-        for revision in &atom.supersedes_revision_refs {
-            require_target(&atom_revisions, *revision)?;
-            insert(
-                &mut rows,
+                atom.parent_revision_id.as_slice(),
+            ),
+            (
                 SemanticRelationKind::AtomSupersedes,
-                atom.revision_id,
-                *revision,
-            );
-        }
-        for revision in &atom.supports_revision_refs {
-            require_target(&atom_revisions, *revision)?;
-            insert(
-                &mut rows,
+                atom.supersedes_revision_refs.as_slice(),
+            ),
+            (
                 SemanticRelationKind::AtomSupports,
-                atom.revision_id,
-                *revision,
-            );
-        }
-        for revision in &atom.contradicts_revision_refs {
-            require_target(&atom_revisions, *revision)?;
-            insert(
-                &mut rows,
+                atom.supports_revision_refs.as_slice(),
+            ),
+            (
                 SemanticRelationKind::AtomContradicts,
-                atom.revision_id,
-                *revision,
-            );
+                atom.contradicts_revision_refs.as_slice(),
+            ),
+        ] {
+            for &revision in refs {
+                if !atom_revisions.contains(&revision) {
+                    if omit_absent_atom_edges {
+                        continue;
+                    }
+                    return Err(StoreError::InvalidInput);
+                }
+                insert(&mut rows, kind, atom.revision_id, revision);
+            }
         }
         for observation in &atom.source_observation_refs {
             rows.insert(SemanticRelationRow {

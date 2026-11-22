@@ -1924,10 +1924,9 @@ async fn read_proposal_review(
                 reference,
             ))
             .await?;
-        } else if review.proposal.support_deprecation_validation().is_some() {
+        } else if review.proposal.support_atom_validation().is_some() {
             web_accept_available =
-                Box::pin(service.web_support_deprecation_current(&review.proposal, page.frontier))
-                    .await?;
+                Box::pin(service.web_support_atom_current(&review.proposal, page.frontier)).await?;
         }
     }
     Ok(HumanGovernanceResponse::ProposalReview {

@@ -448,7 +448,8 @@ pub(crate) fn global_atom_support_payloads(
                     UserAuthorizationMode::TuiAcceptance => true,
                     UserAuthorizationMode::WebAcceptance => proposal.acceptance.as_ref().is_some_and(|audit| {
                         matches!(&audit.authority_basis, ProposalAcceptanceAuthority::WebAcceptance { intent, .. }
-                            if intent.reauthorization.is_some())
+                            if intent.reauthorization.is_some()
+                                || (intent.edit().is_none() && proposal.atom_support_replacement().is_some()))
                     }),
                     _ => false,
                 };

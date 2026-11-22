@@ -24,9 +24,9 @@ use crate::{
         build_procedure_relation_rows, build_procedure_usage_relation_rows,
         build_recovery_application_relation_rows, build_recovery_relation_rows,
         build_repository_relation_rows, build_segmentation_correction_relation_rows,
-        build_semantic_digest_relation_rows, build_semantic_relation_rows,
-        build_wiki_relation_rows, build_work_binding_relation_rows,
-        build_work_identity_relation_rows,
+        build_semantic_digest_relation_rows, build_wiki_relation_rows,
+        build_work_binding_relation_rows, build_work_identity_relation_rows,
+        rebuild_semantic_relation_rows,
     },
     search::{
         SEARCH_PROJECTION_GENERATION, SearchProjectionRow, read_search_rows,
@@ -1081,21 +1081,8 @@ fn derive_l0002_projection_rows(
     }
     let available_atom_revisions = atoms.keys().copied().collect::<BTreeSet<_>>();
     let available_procedure_revisions = procedures.keys().copied().collect::<BTreeSet<_>>();
-    let relation_atoms = all_values(&atoms)
-        .into_iter()
-        .map(|mut atom| {
-            atom.parent_revision_id = atom
-                .parent_revision_id
-                .filter(|revision| available_atom_revisions.contains(revision));
-            atom.supersedes_revision_refs
-                .retain(|revision| available_atom_revisions.contains(revision));
-            atom.supports_revision_refs
-                .retain(|revision| available_atom_revisions.contains(revision));
-            atom.contradicts_revision_refs
-                .retain(|revision| available_atom_revisions.contains(revision));
-            atom
-        })
-        .collect::<Vec<_>>();
+    // Omit missing relation endpoints, not facts inside an immutable Atom.
+    let relation_atoms = all_values(&atoms);
     let relation_procedures = all_values(&procedures)
         .into_iter()
         .map(|mut procedure| {
@@ -1193,7 +1180,7 @@ fn derive_l0002_projection_rows(
     );
     add_semantic(
         &mut relations,
-        build_semantic_relation_rows(&relation_atoms, &all_values(&proposals))?,
+        rebuild_semantic_relation_rows(&relation_atoms, &all_values(&proposals))?,
         &endpoint_seqs,
     );
     add_semantic(

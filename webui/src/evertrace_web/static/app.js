@@ -440,6 +440,9 @@ function actOnProposal(button) {
   if (action === "deprecate") {
     prompt = "按提案修订 " + revision + " 弃用这份 Atom？原正文与授权保留，依赖将重新校验。";
   }
+  if (action === "support_replace") {
+    prompt = "按提案修订 " + revision + " 替换支持并发布新合同？原正文与历史保留，依赖将重新校验。";
+  }
   if (action === "edit") {
     if (button.dataset.atomEditValue) input.atom_edit = JSON.parse(button.dataset.atomEditValue);
     else input.procedure_edit = JSON.parse(button.dataset.procedureEditValue);

@@ -655,12 +655,7 @@ impl Atom {
                             && (user.authorized_scope_ceiling != self.scope
                                 || match &self.scope {
                                     AtomScope::Task { .. } | AtomScope::Repository { .. } => false,
-                                    AtomScope::Global => {
-                                        (self.parent_revision_id.is_some()
-                                            && self.lifecycle_status
-                                                != AtomLifecycleStatus::Deprecated)
-                                            || self.supports_revision_refs.is_empty()
-                                    }
+                                    AtomScope::Global => self.supports_revision_refs.is_empty(),
                                     _ => true,
                                 })
                         {
@@ -795,8 +790,11 @@ impl Atom {
                         .user_authorization_provenance
                         .as_ref()
                         .is_some_and(|value| {
-                            value.mode == UserAuthorizationMode::TuiAcceptance
-                                && value.authorized_scope_ceiling == AtomScope::Global
+                            matches!(
+                                value.mode,
+                                UserAuthorizationMode::TuiAcceptance
+                                    | UserAuthorizationMode::WebAcceptance
+                            ) && value.authorized_scope_ceiling == AtomScope::Global
                         })))
             || !contains_all(
                 &next.contradicts_revision_refs,

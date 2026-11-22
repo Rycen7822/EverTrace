@@ -19,6 +19,13 @@
     {% set proposal = review.proposal %}
     {% set payload = proposal.payload %}
     {% set change = payload.value %}
+    {% set support_repair = acceptance_request_id and payload.kind == 'atom' and summary.operation == 'replace'
+      and change.draft.scope.kind == 'global' %}
+    {% if support_repair %}
+      <p>按所选校验 {{ exact_work_link('global_support_validation', proposal.evidence_refs[0]) }} 换证。
+        接受会发布同一 Atom 的新修订和新支持合同，保留原正文与历史，并让直接依赖旧修订的合同重新校验。</p>
+      {{ text_list('将采用的精确支持修订', change.draft.supports_revision_refs, record_kind='atom_revision', exact_revision=true) }}
+    {% endif %}
     {% if payload.kind == 'atom' and summary.operation == 'deprecate' %}
       <h4>弃用理由</h4><div class="memory-prose semantic-body">{{ change.reason }}</div>
       {% if acceptance_request_id %}
@@ -82,13 +89,14 @@
         data-review-digest="{{ confirmation_digest }}">复核当前提案</button>
       <p data-proposal-confirmation-result role="status">只核对这份提案；不会提交审核决定。</p>
       {% if acceptance_request_id %}
-        {% set action = 'reauthorize' if review.get('reauthorization') else summary.operation %}
+        {% set action = 'reauthorize' if review.get('reauthorization') else 'support_replace' if support_repair else summary.operation %}
         <button class="button" type="button" data-proposal-accept="{{ action }}" data-proposal-id="{{ summary.proposal_id }}"
           data-request-id="{{ acceptance_request_id }}" data-revision="{{ summary.current_revision_id }}"
           data-frontier="{{ frontier }}" data-review-digest="{{ confirmation_digest }}">
           {% if action == 'reauthorize' %}确认再授权为新记录
           {% elif action == 'merge' %}确认合并并接受
-          {% elif action == 'deprecate' %}确认弃用此 Atom{% else %}确认接受这份提案{% endif %}</button>
+          {% elif action == 'deprecate' %}确认弃用此 Atom
+          {% elif action == 'support_replace' %}确认替换此 Atom 的支持{% else %}确认接受这份提案{% endif %}</button>
       {% endif %}
       {% if web_edit_available and payload.kind == 'atom' %}
         {% set value = change.draft.value %}
@@ -152,7 +160,8 @@
   {% endif %}
   {% set base = item.get('proposal_base') %}
   {% if base and base.state == 'ready' and base.content %}
-    <details{% if acceptance_request_id and summary.operation == 'deprecate' %} open{% endif %}><summary>原基准修订</summary>
+    <details{% if support_repair|default(false) or (acceptance_request_id and summary.operation == 'deprecate') %} open{% endif %}>
+    <summary>原基准修订</summary>
     {% with content=base.content %}{% include 'semantic_content.html' %}{% endwith %}</details>
   {% elif summary.base_revision_id %}
     <p>未返回原基准正文，不以当前目标代替。</p>

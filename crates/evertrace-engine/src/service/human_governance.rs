@@ -1753,7 +1753,7 @@ impl HumanGovernanceService {
         }
     }
 
-    pub async fn web_support_deprecation_current(
+    pub async fn web_support_atom_current(
         &self,
         proposal: &RevisionProposal,
         frontier: u64,
@@ -1774,15 +1774,44 @@ impl HumanGovernanceService {
         {
             return Ok(false);
         }
-        self.web_support_deprecation_current_at(&snapshot, proposal)
+        let view = SemanticCurrentView::from_snapshot(&snapshot)
+            .map_err(|_| HumanGovernanceError::Store)?;
+        self.web_support_atom_current_at(&snapshot, &view, proposal)
             .await
     }
 
-    pub(crate) async fn web_support_deprecation_current_at(
+    pub(crate) async fn web_support_atom_current_at(
         &self,
         snapshot: &ProjectionSnapshot,
+        view: &SemanticCurrentView,
         proposal: &RevisionProposal,
     ) -> Result<bool, HumanGovernanceError> {
+        if let Some((validation, draft)) = proposal.atom_support_replacement() {
+            match crate::semantic::select_support_atom_acceptance(snapshot, proposal) {
+                Ok(_) => (),
+                Err(crate::semantic::SemanticServiceError::Store(_)) => {
+                    return Err(HumanGovernanceError::Store);
+                }
+                Err(_) => return Ok(false),
+            }
+            let Some(base) = proposal
+                .base_revision_id
+                .and_then(|id| view.atom_revisions.get(&id))
+            else {
+                return Ok(false);
+            };
+            return Ok(draft.supports_revision_refs != base.supports_revision_refs
+                && self
+                    .new_atom_supports_accessible(
+                        snapshot,
+                        view,
+                        validation,
+                        base,
+                        &draft.supports_revision_refs,
+                    )
+                    .await?
+                && self.proposal_accessible(snapshot, proposal).await?);
+        }
         let Some(validation) = proposal.support_deprecation_validation() else {
             return Ok(false);
         };

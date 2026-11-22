@@ -855,12 +855,19 @@ impl RevisionProposalService {
         let global_web_reauthorization = matches!(&acceptance_context, AtomAcceptanceContext::Web {
             authorized_scope_ceiling: AtomScope::Global, intent, ..
         } if intent.reauthorization.is_some());
-        let global_web_deprecation = support_linked_global
-            && current.support_deprecation_validation().is_some()
+        let global_web_support_change = support_linked_global
+            && (current.support_deprecation_validation().is_some()
+                || current
+                    .atom_support_replacement()
+                    .is_some_and(|(_, draft)| {
+                        current_atom.is_some_and(|base| {
+                            base.supports_revision_refs != draft.supports_revision_refs
+                        })
+                    }))
             && matches!(&acceptance_context, AtomAcceptanceContext::Web {
                 authorized_scope_ceiling: AtomScope::Global, intent, ..
             } if intent.reauthorization.is_none() && intent.edit().is_none());
-        let global_manual = global_tui || global_web_reauthorization || global_web_deprecation;
+        let global_manual = global_tui || global_web_reauthorization || global_web_support_change;
         if !matches!(
             requested_scope,
             AtomScope::Task { .. } | AtomScope::Repository { .. }
@@ -873,7 +880,7 @@ impl RevisionProposalService {
                 &acceptance_context,
                 AtomAcceptanceContext::RepositoryTui { .. } | AtomAcceptanceContext::TaskTui { .. }
             )
-            && !(global_tui && support_linked_global || global_web_deprecation)
+            && !(global_tui && support_linked_global || global_web_support_change)
         {
             return Err(SemanticServiceError::UnsupportedTarget);
         }

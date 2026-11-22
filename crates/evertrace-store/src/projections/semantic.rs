@@ -1942,6 +1942,17 @@ fn validate_proposal_relations(
                 }
                 let replacement = proposal.atom_support_replacement();
                 if base.scope == AtomScope::Global
+                    && let ProposalAcceptanceAuthority::WebAcceptance { intent, .. } =
+                        &acceptance.authority_basis
+                    && (intent.edit().is_some()
+                        || intent.reauthorization.is_some()
+                        || replacement.is_none_or(|(_, draft)| {
+                            draft.supports_revision_refs == base.supports_revision_refs
+                        }))
+                {
+                    return Err(StoreError::StoreCorrupt);
+                }
+                if base.scope == AtomScope::Global
                     && (atom.supports_revision_refs != base.supports_revision_refs
                         || replacement.is_some_and(|(_, draft)| {
                             draft.supports_revision_refs != base.supports_revision_refs

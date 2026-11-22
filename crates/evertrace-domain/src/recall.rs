@@ -6,7 +6,7 @@ use crate::{
     },
     revision::RevisionId,
     semantic::{
-        ApplicabilityExpr, Atom, AtomAuthority, AtomLifecycleStatus, ConstraintExpr,
+        ApplicabilityExpr, Atom, AtomAuthority, AtomLifecycleStatus, AtomScope, ConstraintExpr,
         ConstraintField, ConstraintState, ConstraintTruth, ConstraintValue, UserAuthorizationMode,
     },
     work::{CheckpointVerifierState, PhaseKind},
@@ -554,18 +554,25 @@ pub fn compile_atom_future_cue(
     if !atom.kind.is_normative() {
         return Err(FutureCueDiagnostic::SourceNotNormative);
     }
+    // For an active Global Web successor, Store admission and replay require
+    // an exact support repair and its protected acceptance cohort.
     match atom.authority {
         AtomAuthority::UserExplicit
             if atom
                 .user_authorization_provenance
                 .as_ref()
-                .is_some_and(|proof| proof.mode == UserAuthorizationMode::TuiAcceptance) => {}
+                .is_some_and(|proof| {
+                    proof.mode == UserAuthorizationMode::TuiAcceptance
+                        || (proof.mode == UserAuthorizationMode::WebAcceptance
+                            && atom.scope == AtomScope::Global
+                            && atom.parent_revision_id.is_some())
+                }) => {}
         AtomAuthority::ProjectPolicy => {
             return Err(FutureCueDiagnostic::ProjectPolicyProofUnavailable);
         }
         _ => return Err(FutureCueDiagnostic::AuthorityUnverified),
     }
-    if matches!(atom.scope, crate::semantic::AtomScope::Global) && !global_support_valid {
+    if atom.scope == AtomScope::Global && !global_support_valid {
         return Err(FutureCueDiagnostic::GlobalSupportUnavailable);
     }
     if atom.validity_interval.valid_until_us.is_some() {
