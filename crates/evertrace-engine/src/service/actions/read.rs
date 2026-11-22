@@ -10,6 +10,11 @@ struct SearchCandidateReview {
     unreadable_methods: BTreeSet<String>,
 }
 
+enum NormalSearchAttempt {
+    Done(McpServiceResult),
+    Retry(NormalSearchScope),
+}
+
 // Both normal Search and the legacy complete-snapshot consumers share the
 // candidate classification, authorization, route accounting, and response
 // presentation path. This is deliberately a request-local argument bundle,
@@ -119,26 +124,41 @@ impl McpActionService {
     pub(super) fn normal_search(
         &self,
         request_id: RequestId,
-        scope: NormalSearchScope,
+        mut scope: NormalSearchScope,
         query: String,
     ) -> Pin<Box<dyn Future<Output = Result<McpServiceResult, McpServiceError>> + Send + '_>> {
-        Box::pin(self.normal_search_inner(request_id, scope, query, false))
+        Box::pin(async move {
+            let mut retried_anchor = false;
+            loop {
+                // Drop the first read future before retrying against the same deadline on the refreshed scope.
+                match Box::pin(self.normal_search_inner(request_id, scope, &query, retried_anchor))
+                    .await?
+                {
+                    NormalSearchAttempt::Done(result) => return Ok(result),
+                    NormalSearchAttempt::Retry(next) => {
+                        scope = next;
+                        retried_anchor = true;
+                    }
+                }
+            }
+        })
     }
 
     async fn normal_search_inner(
         &self,
         request_id: RequestId,
         scope: NormalSearchScope,
-        query: String,
+        query: &str,
         retried_anchor: bool,
-    ) -> Result<McpServiceResult, McpServiceError> {
+    ) -> Result<NormalSearchAttempt, McpServiceError> {
+        let ready = |result| Ok(NormalSearchAttempt::Done(result));
         let label = scope_label_for_binding(&scope.binding);
         let remaining = scope
             .deadline
             .saturating_duration_since(std::time::Instant::now());
         let latency_us = u64::try_from(remaining.as_micros()).unwrap_or(u64::MAX);
         if latency_us == 0 {
-            return Ok(empty_result(
+            return ready(empty_result(
                 request_id,
                 McpServiceStatus::Partial,
                 &label,
@@ -146,9 +166,9 @@ impl McpActionService {
                 ["search_deadline_exhausted"],
             ));
         }
-        let relation = crate::search::explicit_atom_relation(&query, &scope.target_anchors);
+        let relation = crate::search::explicit_atom_relation(query, &scope.target_anchors);
         let atom_relation = relation.is_some();
-        let physical = crate::search::explicit_operation_binding(&query, &scope.target_anchors);
+        let physical = crate::search::explicit_operation_binding(query, &scope.target_anchors);
         let mut relation_requirements: Vec<String> =
             relation.map(|(_, kind)| kind.into()).into_iter().collect();
         if physical.is_some() {
@@ -157,7 +177,7 @@ impl McpActionService {
                 "binding_to_scope_effect".into(),
             ]);
         }
-        let support = crate::search::explicit_global_support(&query, &scope.target_anchors);
+        let support = crate::search::explicit_global_support(query, &scope.target_anchors);
         if support.is_some() {
             use evertrace_domain::query::{SUCCESSOR_SUPPORT_CONTRACT, SUPPORT_CONTRACT_EVIDENCE};
             relation_requirements.extend([
@@ -166,14 +186,14 @@ impl McpActionService {
             ]);
         }
         let explicit_relation = atom_relation || physical.is_some() || support.is_some();
-        let source_shape = crate::search::explicit_source_shape(&query, &scope.target_anchors);
-        let count_unit = crate::search::explicit_count_unit(&query, &scope.target_anchors);
+        let source_shape = crate::search::explicit_source_shape(query, &scope.target_anchors);
+        let count_unit = crate::search::explicit_count_unit(query, &scope.target_anchors);
         let exact_shape = source_shape.is_some() || count_unit.is_some();
-        let entity_list = crate::search::entity_list_topic(&query).is_some();
+        let entity_list = crate::search::entity_list_topic(query).is_some();
         let exact_slots = if entity_list {
             None
         } else {
-            crate::search::explicit_exact_slots(&query, &scope.target_anchors)
+            crate::search::explicit_exact_slots(query, &scope.target_anchors)
         };
         let explicit_exact = exact_slots.is_some();
         let explicit_view = explicit_relation || exact_shape || explicit_exact;
@@ -201,7 +221,7 @@ impl McpActionService {
             } else {
                 SearchIntent::StageAssistance
             },
-            raw_query: query.clone(),
+            raw_query: query.to_owned(),
             protected_query: String::new(),
             protected_facets: BTreeSet::new(),
             execution: scope
@@ -277,7 +297,7 @@ impl McpActionService {
         )
         .unwrap_or(u64::MAX);
         if context.budget.latency_us_remaining == 0 {
-            return Ok(empty_result(
+            return ready(empty_result(
                 request_id,
                 McpServiceStatus::Partial,
                 &label,
@@ -313,11 +333,12 @@ impl McpActionService {
                 search,
                 context,
             ))
-            .await;
+            .await
+            .map(NormalSearchAttempt::Done);
         }
         if episode_history {
             search = search.with_exact_object_kind("work_episode");
-        } else if physical.is_none() {
+        } else if physical.is_none() && !atom_relation {
             let include_probationary = self.operation_config.as_ref().map_or_else(
                 || evertrace_domain::config::ProcedureConfig::default().include_probationary,
                 |config| config.config().procedure.include_probationary,
@@ -356,7 +377,7 @@ impl McpActionService {
                 )
                 .await?
             else {
-                return Ok(empty_result(
+                return ready(empty_result(
                     request_id,
                     McpServiceStatus::Partial,
                     &label,
@@ -389,10 +410,13 @@ impl McpActionService {
         let has_procedure = selected_candidates
             .iter()
             .any(|candidate| candidate.object_kind.as_deref() == Some("procedure_revision"));
-        let execution_changed = found
-            .degraded_reasons
-            .contains("execution_context_frontier_changed");
-        let candidate_context = if execution_changed {
+        let changed_frontier = [
+            "execution_context_frontier_changed",
+            "read_access_frontier_changed",
+        ]
+        .into_iter()
+        .find(|reason| found.degraded_reasons.contains(*reason));
+        let candidate_context = if changed_frontier.is_some() {
             Some(
                 self.writer
                     .normal_search_current_context(scope.request.clone())
@@ -438,34 +462,24 @@ impl McpActionService {
                 &scope.binding,
                 &scope.client_cwd,
             );
-            if fresh_anchor.as_ref() != Some(&scope.anchor) || execution_changed {
+            if fresh_anchor.as_ref() != Some(&scope.anchor) || changed_frontier.is_some() {
                 if !retried_anchor && let Some(anchor) = fresh_anchor {
-                    return Box::pin(self.normal_search_inner(
-                        request_id,
-                        NormalSearchScope {
-                            binding: scope.binding,
-                            anchor,
-                            client_cwd: scope.client_cwd,
-                            deadline: scope.deadline,
-                            request: scope.request,
-                            context: candidate_context.expect("checked above"),
-                            target_anchors: scope.target_anchors,
-                        },
-                        query,
-                        true,
-                    ))
-                    .await;
+                    return Ok(NormalSearchAttempt::Retry(NormalSearchScope {
+                        anchor,
+                        context: candidate_context.expect("checked above"),
+                        ..scope
+                    }));
                 }
-                if execution_changed {
-                    return Ok(empty_result(
+                if let Some(reason) = changed_frontier {
+                    return ready(empty_result(
                         request_id,
                         McpServiceStatus::Partial,
                         &label,
                         "partial",
-                        ["execution_context_frontier_changed"],
+                        [reason],
                     ));
                 }
-                return Ok(scope_unresolved(request_id));
+                return ready(scope_unresolved(request_id));
             }
         }
         let stale_current_candidate = candidate_context.as_ref().is_some_and(|fresh| {
@@ -478,21 +492,10 @@ impl McpActionService {
             })
         });
         if stale_current_candidate && !retried_anchor {
-            return Box::pin(self.normal_search_inner(
-                request_id,
-                NormalSearchScope {
-                    binding: scope.binding,
-                    anchor: scope.anchor,
-                    client_cwd: scope.client_cwd,
-                    deadline: scope.deadline,
-                    request: scope.request,
-                    context: candidate_context.expect("checked above"),
-                    target_anchors: scope.target_anchors,
-                },
-                query,
-                true,
-            ))
-            .await;
+            return Ok(NormalSearchAttempt::Retry(NormalSearchScope {
+                context: candidate_context.expect("checked above"),
+                ..scope
+            }));
         }
         let mut blocked_candidates = BTreeSet::new();
         let mut methods = BTreeSet::new();
@@ -783,7 +786,7 @@ impl McpActionService {
             blocked_candidates,
         );
         result.grounded_view = view;
-        Ok(result)
+        ready(result)
     }
 
     async fn global_support_search(

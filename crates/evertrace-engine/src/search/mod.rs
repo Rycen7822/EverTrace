@@ -26,22 +26,27 @@ pub(crate) fn explicit_atom_relation<'a>(
         .strip_suffix('?')
         .unwrap_or(input.trim())
         .trim_end();
-    let operand = if request.eq_ignore_ascii_case("what contradicts") {
-        let [target] = targets else {
-            return None;
-        };
-        target.as_str()
+    let relation = |phrase: &str| {
+        if phrase.eq_ignore_ascii_case("what contradicts") {
+            Some("atom_contradicts")
+        } else if phrase.eq_ignore_ascii_case("trace atom support") {
+            Some("atom_supports")
+        } else {
+            None
+        }
+    };
+    let (operand, kind) = if let Some(kind) = relation(request) {
+        let [target] = targets else { return None };
+        (target.as_str(), kind)
     } else {
         let (verb, operand) = request.rsplit_once(char::is_whitespace)?;
-        if !verb.trim_end().eq_ignore_ascii_case("what contradicts")
-            || targets.iter().any(|target| target != operand)
-        {
+        if targets.iter().any(|target| target != operand) {
             return None;
         }
-        operand
+        (operand, relation(verb.trim_end())?)
     };
     (operand.parse::<AtomId>().is_ok() || operand.parse::<RevisionId>().is_ok())
-        .then_some((operand, "atom_contradicts"))
+        .then_some((operand, kind))
 }
 
 /// Exact phrase with one existing `refs` operand, never inferred from general prose.
