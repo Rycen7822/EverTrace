@@ -1172,8 +1172,9 @@ impl SearchReadAccess<'_> {
         let mut kept = vec![row.clone(), selected.clone()];
         let mut omitted = BTreeSet::new();
         let mut archive_gap = false;
-        for (offset, (reference, sources)) in archives.into_iter().enumerate() {
-            let admitted = if offset >= candidate_limit.saturating_sub(2) {
+        for (reference, sources) in archives {
+            // Only verified endpoints occupy candidate slots. Stop reading archives once those slots are full.
+            let admitted = if kept.len() >= candidate_limit {
                 omitted.insert(reference.clone());
                 false
             } else if check_relation_archive(
