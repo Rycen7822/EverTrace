@@ -2494,6 +2494,18 @@ impl SearchCandidate {
                     || self.currentness == Some(SearchCurrentness::Current)))
     }
 
+    /// Current normative context has no position in an explicitly bounded source timeline.
+    pub fn is_source_timeline_context(&self, qualifiers: &[TemporalQualifier]) -> bool {
+        matches!(qualifiers, [qualifier] if qualifier.source_sequence_ref().is_some())
+            && self.object_kind.as_deref() == Some("atom_revision")
+            && self.row_variant == SearchCandidateVariant::Object
+            && self.currentness == Some(SearchCurrentness::Current)
+            && self.semantic_resolution
+                == Some(SemanticResolution::Normative(
+                    crate::semantic::NormativeResolutionState::Active,
+                ))
+    }
+
     pub fn temporal_match(&self, qualifiers: &[TemporalQualifier]) -> Option<bool> {
         if requested_ordering(qualifiers).is_some() {
             return Some(true);
@@ -2735,16 +2747,21 @@ pub fn timeline_order<'a>(
 ) -> Option<(OrderingBasis, Vec<&'a SearchCandidate>)> {
     let requested = requested_ordering(qualifiers);
     let allows = |basis| requested.is_none_or(|domain| domain.basis() == basis);
-    if candidates.is_empty() {
-        return None;
-    }
-    let mut ordered = candidates.iter().collect::<Vec<_>>();
+    let scoped_source = qualifiers
+        .first()
+        .and_then(TemporalQualifier::source_sequence_ref);
+    let mut ordered = candidates
+        .iter()
+        .filter(|candidate| !candidate.is_source_timeline_context(qualifiers))
+        .collect::<Vec<_>>();
+    let first = *ordered.first()?;
     if allows(OrderingBasis::SourceSequence)
-        && let Some(anchor) = candidates[0]
+        && let Some(anchor) = first
             .source_sequence
             .as_ref()
             .map(|value| value.source_anchor)
-        && candidates.iter().all(|candidate| {
+        && scoped_source.is_none_or(|source| source == anchor)
+        && ordered.iter().all(|candidate| {
             candidate
                 .source_sequence
                 .as_ref()
@@ -2761,6 +2778,9 @@ pub fn timeline_order<'a>(
             )
         });
         return Some((OrderingBasis::SourceSequence, ordered));
+    }
+    if scoped_source.is_some() {
+        return None;
     }
     if allows(OrderingBasis::Supersession)
         && candidates[0].revision_order.is_some()
@@ -4488,6 +4508,17 @@ impl HumanSearchPage {
                 .iter()
                 .position(|candidate| statement.support_refs.contains(&candidate.candidate_id))
             else {
+                if step.role == EvidenceRole::ConstraintSupport
+                    && statement.ordering_basis == OrderingBasis::Unknown
+                    && self.result.candidates.iter().any(|candidate| {
+                        statement.support_refs.contains(&candidate.candidate_id)
+                            && candidate.is_source_timeline_context(
+                                &view.evidence_need.temporal_scope.qualifiers,
+                            )
+                    })
+                {
+                    continue;
+                }
                 return false;
             };
             if statement.ordering_basis != basis || previous.is_some_and(|old| old >= rank) {
@@ -4766,7 +4797,11 @@ impl HumanSearchPage {
                     && positioned
                     && statement.derivation_kind == DerivationKind::Quoted
             } else {
-                !sequence_mode || !positioned || statement.derivation_kind != DerivationKind::Quoted
+                // Timeline checks the basis for every quote against the ordered cohort, not just its own position.
+                !sequence_mode
+                    || view.evidence_need.answer_shape == Some(AnswerShape::Timeline)
+                    || !positioned
+                    || statement.derivation_kind != DerivationKind::Quoted
             }
         })
     }

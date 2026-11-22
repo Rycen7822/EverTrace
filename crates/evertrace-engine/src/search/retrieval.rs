@@ -1185,17 +1185,19 @@ impl NativeRetrieval<'_> {
         let mut active_evidence = Vec::new();
         let mut trace = Vec::new();
         let mut matching_constraints = BTreeSet::new();
-        let mut quoted_candidates = self.result.candidates.iter().collect::<Vec<_>>();
-        let time_order = (self.context.query_facets.answer_shape == Some(AnswerShape::Timeline))
-            .then(|| {
-                timeline_order(
-                    &self.result.candidates,
-                    &self.context.query_facets.temporal_qualifiers,
-                )
-            })
+        let qualifiers = &self.context.query_facets.temporal_qualifiers;
+        let timeline = self.context.query_facets.answer_shape == Some(AnswerShape::Timeline);
+        let time_order = timeline
+            .then(|| timeline_order(&self.result.candidates, qualifiers))
             .flatten();
         let ordering_basis = time_order.as_ref().map(|(basis, _)| *basis);
-        if let Some((_, ordered)) = time_order {
+        let mut quoted_candidates = self.result.candidates.iter().collect::<Vec<_>>();
+        if let Some((_, mut ordered)) = time_order {
+            ordered.extend(
+                quoted_candidates
+                    .into_iter()
+                    .filter(|candidate| candidate.is_source_timeline_context(qualifiers)),
+            );
             quoted_candidates = ordered;
         }
         for candidate in quoted_candidates {
@@ -1248,20 +1250,19 @@ impl NativeRetrieval<'_> {
                 statement: candidate.text.clone(),
                 support_refs: BTreeSet::from([candidate.candidate_id.clone()]),
                 derivation_kind: DerivationKind::Quoted,
-                ordering_basis: ordering_basis.unwrap_or_else(|| {
-                    if self
-                        .context
-                        .query_facets
-                        .temporal_qualifiers
-                        .iter()
-                        .any(|qualifier| qualifier.source_sequence_ref().is_some())
-                        && candidate.source_sequence.is_some()
-                    {
-                        OrderingBasis::SourceSequence
-                    } else {
-                        OrderingBasis::Unknown
-                    }
-                }),
+                ordering_basis: if timeline {
+                    ordering_basis
+                        .filter(|_| !candidate.is_source_timeline_context(qualifiers))
+                        .unwrap_or(OrderingBasis::Unknown)
+                } else if qualifiers
+                    .iter()
+                    .any(|qualifier| qualifier.source_sequence_ref().is_some())
+                    && candidate.source_sequence.is_some()
+                {
+                    OrderingBasis::SourceSequence
+                } else {
+                    OrderingBasis::Unknown
+                },
                 content_trust: "untrusted_source_content".into(),
                 instruction_authority: "none".into(),
             });
