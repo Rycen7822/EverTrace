@@ -1847,6 +1847,18 @@ impl HumanGovernanceService {
                                 || kind == SNAPSHOT_VERIFICATION_RESULT
                         })
                 });
+            let atom_history =
+                closed_exact_anchor(&protected.text, &protected.facets).filter(|anchor| {
+                    protected.protected_facets.is_empty()
+                        && protected.facets.temporal_mode == TemporalMode::Any
+                        && protected.facets.polarity == Polarity::Positive
+                        && protected.facets.relation_requirements.as_slice()
+                            == [crate::search::ATOM_SUPERSEDES]
+                        && anchor
+                            .parse::<evertrace_domain::revision::RevisionId>()
+                            .is_ok()
+                });
+            let exact_atom_history = atom_history.is_some();
             let mut refs = BTreeSet::new();
             let mut proposals = BTreeSet::new();
             let mut unavailable = research
@@ -1854,7 +1866,8 @@ impl HumanGovernanceService {
                 .is_some_and(|(_, _, truncated)| *truncated);
             let mut relation_archive_budget = RelationArchiveBudget::default();
             let mut relation_archive_gap = false;
-            let observation_access = if research.is_none() && !exact_lineage {
+            let observation_access = if research.is_none() && !exact_lineage && !exact_atom_history
+            {
                 Box::pin(search_observation_access(
                     &self.writer,
                     &RepositoryReadAuthority::retained(report.as_ref()),
@@ -1866,14 +1879,27 @@ impl HumanGovernanceService {
             } else {
                 Default::default()
             };
-            let rows: Box<dyn Iterator<Item = &ObjectRow> + Send> =
-                if let Some((_, keys, _)) = &research {
-                    Box::new(keys.iter().filter_map(|key| research_head(&index, key)))
-                } else if exact_lineage {
-                    Box::new(std::iter::empty())
-                } else {
-                    Box::new(snapshot.data_rows())
-                };
+            let rows: Box<dyn Iterator<Item = &ObjectRow> + Send> = if let Some(root) = atom_history
+            {
+                // The shared relation stage authorizes each newly found predecessor.
+                Box::new(
+                    index
+                        .get(root)
+                        .into_iter()
+                        .flatten()
+                        .copied()
+                        .filter(move |row| {
+                            row.object_kind.as_deref() == Some("atom_revision")
+                                && row.current_revision_id.as_deref() == Some(root)
+                        }),
+                )
+            } else if let Some((_, keys, _)) = &research {
+                Box::new(keys.iter().filter_map(|key| research_head(&index, key)))
+            } else if exact_lineage {
+                Box::new(std::iter::empty())
+            } else {
+                Box::new(snapshot.data_rows())
+            };
             for row in rows {
                 let kind = row.object_kind.as_deref().unwrap_or_default();
                 if kind == "wiki_projection"
@@ -2211,14 +2237,20 @@ impl HumanGovernanceService {
                     checks.extend(scope.positions.keys().cloned());
                 }
             }
-            let (recall_sources, recall_checks, recall_incomplete) = self
-                .recall_source_refs(&snapshot, &index, &refs, deadline)
-                .await?;
-            checks.extend(recall_checks);
-            let matched = self
-                .matched_cue_sources(&snapshot, &index, &refs, &context, deadline)
-                .await?;
-            checks.extend(matched.checks.iter().cloned());
+            let (recall_sources, recall_incomplete, matched) = if exact_atom_history {
+                // An explicitly nominated immutable predecessor path does not ask for live Recall or cue matches.
+                Default::default()
+            } else {
+                let (sources, recall_checks, incomplete) = self
+                    .recall_source_refs(&snapshot, &index, &refs, deadline)
+                    .await?;
+                let matched = self
+                    .matched_cue_sources(&snapshot, &index, &refs, &context, deadline)
+                    .await?;
+                checks.extend(recall_checks);
+                checks.extend(matched.checks.iter().cloned());
+                (sources, incomplete, matched)
+            };
             let mut source_references = context.query_facets.target_anchors.clone();
             source_references.extend(context.query_facets.exact_identifiers.iter().cloned());
             if index.contains_key(context.protected_query.as_str()) {
@@ -2403,25 +2435,36 @@ impl HumanGovernanceService {
                     .collect::<BTreeSet<_>>();
                 refs.retain(|reference| operands.contains(reference.as_str()));
             }
-            let (mut page, projection_version) =
-                crate::search::ProductionSearch::new(search.clone())
-                    .with_canonical_sources(snapshot.frontier, canonical_sources)
-                    .with_relation_read(lineage.clone().or(support))
-                    .with_recall_sources(recall_sources)
-                    .with_matched_sources(matched.references, matched.contexts)
-                    .with_sequence_scope(sequence_scope)
-                    .with_semantic_resolution(std::sync::Arc::clone(&semantics))
-                    .with_validated_frontier(snapshot.frontier)
-                    .with_method_proposals(proposals)
-                    .with_readable_refs(snapshot.frontier, refs)
-                    .retrieve(
-                        context,
-                        query.selection == MemoryScopeSelection::Global,
-                        time_scope.as_ref(),
-                        &relation_sources,
-                    )
-                    .await
-                    .map_err(|_| HumanGovernanceError::Store)?;
+            let atom_access =
+                exact_atom_history.then(|| crate::search::read_context::SearchReadAccess {
+                    writer: &self.writer,
+                    authority: RepositoryReadAuthority::retained(report.as_ref()),
+                    frontier: snapshot.frontier,
+                    config_hash: self.effective_config_hash,
+                    deadline,
+                });
+            let mut production = crate::search::ProductionSearch::new(search.clone())
+                .with_canonical_sources(snapshot.frontier, canonical_sources)
+                .with_relation_read(lineage.clone().or(support))
+                .with_recall_sources(recall_sources)
+                .with_matched_sources(matched.references, matched.contexts)
+                .with_sequence_scope(sequence_scope)
+                .with_semantic_resolution(std::sync::Arc::clone(&semantics))
+                .with_validated_frontier(snapshot.frontier)
+                .with_method_proposals(proposals)
+                .with_readable_refs(snapshot.frontier, refs);
+            if exact_atom_history {
+                production = production.with_exact_object_kind("atom_revision");
+            }
+            let (mut page, projection_version) = Box::pin(production.retrieve(
+                context,
+                query.selection == MemoryScopeSelection::Global,
+                time_scope.as_ref(),
+                &relation_sources,
+                atom_access.as_ref(),
+            ))
+            .await
+            .map_err(|_| HumanGovernanceError::Store)?;
             if matched.unknown {
                 page.result
                     .degraded_reasons

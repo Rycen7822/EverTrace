@@ -731,6 +731,7 @@ impl ProductionSearch {
         global_only: bool,
         time_scope: Option<&TemporalReadScope<'_>>,
         relation_sources: RelationSources<'_>,
+        atom_access: Option<&super::read_context::SearchReadAccess<'_>>,
     ) -> Result<(HumanSearchPage, Option<u64>), SearchError> {
         context.validate()?;
         if self.readable_refs.is_none() {
@@ -785,6 +786,12 @@ impl ProductionSearch {
         ))
         .await?;
         let version = snapshot.version();
+        let access = atom_access.map(|access| ScopedCandidateRead {
+            index: &self.index,
+            access,
+            checks_remaining: (context.budget.candidates_remaining as usize)
+                .saturating_sub(result.candidates.len()),
+        });
         let retrieval = super::retrieval::NativeRetrieval {
             context: &context,
             result,
@@ -798,7 +805,7 @@ impl ProductionSearch {
             relation_read: self.relation_read.as_deref(),
             include_hit_window: true,
         };
-        let page = Box::pin(retrieval.run(snapshot)).await?;
+        let page = Box::pin(retrieval.run(snapshot, access)).await?;
         Ok((page, Some(version)))
     }
 

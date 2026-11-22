@@ -324,7 +324,9 @@ impl NativeRetrieval<'_> {
         }
         let mut filter = self.objects.clone();
         filter.object_kind = Some("atom_revision".into());
-        filter.object_access = None; // The exact neighbors below need their own live grant.
+        // These exact neighbours need their own live grant, not the admitted root set.
+        filter.object_access = None;
+        filter.readable_refs = None;
         let cap = access.checks_remaining;
         let rows = match self
             .deadline
@@ -623,6 +625,7 @@ impl NativeRetrieval<'_> {
     pub(super) async fn run(
         mut self,
         snapshot: SearchSnapshot,
+        access: Option<ScopedCandidateRead<'_>>,
     ) -> Result<HumanSearchPage, SearchError> {
         if self.result.completeness == RetrievalCompleteness::Unknown {
             return Ok(HumanSearchPage {
@@ -643,7 +646,7 @@ impl NativeRetrieval<'_> {
             )
             .await?;
         }
-        self.finish(snapshot, None).await
+        self.finish(snapshot, access).await
     }
 
     pub(super) async fn finish(

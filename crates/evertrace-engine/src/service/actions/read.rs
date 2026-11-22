@@ -865,9 +865,10 @@ impl McpActionService {
             .with_readable_refs(access.frontier, refs)
             .with_canonical_sources(access.frontier, trace.path.rows.clone())
             .with_relation_read(Some(std::sync::Arc::new(trace.path.clone())));
-        let (page, _) = Box::pin(search.retrieve(context, false, None, &|_, _| Ok(Vec::new())))
-            .await
-            .map_err(|_| McpServiceError::Store)?;
+        let (page, _) =
+            Box::pin(search.retrieve(context, false, None, &|_, _| Ok(Vec::new()), None))
+                .await
+                .map_err(|_| McpServiceError::Store)?;
         if page.result.projection_frontier != access.frontier
             || page.result.authoritative_frontier != access.frontier
             || Box::pin(access.scoped_support_trace(
@@ -982,7 +983,7 @@ impl McpActionService {
             let (mut page, _) = search
                 .with_readable_refs(access.frontier, refs)
                 .with_canonical_sources(access.frontier, operands)
-                .retrieve(context, false, None, &sources)
+                .retrieve(context, false, None, &sources, None)
                 .await
                 .map_err(|_| McpServiceError::Store)?;
             if binding.is_none() {
