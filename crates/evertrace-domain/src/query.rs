@@ -1408,22 +1408,17 @@ impl GroundedEvidenceView {
         if self.evidence_need.answer_shape != Some(AnswerShape::Latest) {
             return None;
         }
+        let qualifiers = &self.evidence_need.temporal_scope.qualifiers;
         let (indices, operands): (Vec<_>, Vec<_>) = self
             .quoted_operands(candidates, matching_constraints)?
             .into_iter()
+            .filter(|(_, candidate)| !candidate.is_source_order_context(qualifiers))
             .unzip();
         let relations = self.relation_clauses();
         let order = self
             .conflicts
             .is_empty()
-            .then(|| {
-                latest_order(
-                    &operands,
-                    candidates,
-                    &self.evidence_need.temporal_scope.qualifiers,
-                    &relations,
-                )
-            })
+            .then(|| latest_order(&operands, candidates, qualifiers, &relations))
             .flatten();
         Some(GroundedLatest {
             operator_revision: 1,
@@ -2494,8 +2489,8 @@ impl SearchCandidate {
                     || self.currentness == Some(SearchCurrentness::Current)))
     }
 
-    /// Current normative context has no position in an explicitly bounded source timeline.
-    pub fn is_source_timeline_context(&self, qualifiers: &[TemporalQualifier]) -> bool {
+    /// Current normative context is not a record in an explicitly bounded source sequence.
+    pub fn is_source_order_context(&self, qualifiers: &[TemporalQualifier]) -> bool {
         matches!(qualifiers, [qualifier] if qualifier.source_sequence_ref().is_some())
             && self.object_kind.as_deref() == Some("atom_revision")
             && self.row_variant == SearchCandidateVariant::Object
@@ -2752,7 +2747,7 @@ pub fn timeline_order<'a>(
         .and_then(TemporalQualifier::source_sequence_ref);
     let mut ordered = candidates
         .iter()
-        .filter(|candidate| !candidate.is_source_timeline_context(qualifiers))
+        .filter(|candidate| !candidate.is_source_order_context(qualifiers))
         .collect::<Vec<_>>();
     let first = *ordered.first()?;
     if allows(OrderingBasis::SourceSequence)
@@ -4512,7 +4507,7 @@ impl HumanSearchPage {
                     && statement.ordering_basis == OrderingBasis::Unknown
                     && self.result.candidates.iter().any(|candidate| {
                         statement.support_refs.contains(&candidate.candidate_id)
-                            && candidate.is_source_timeline_context(
+                            && candidate.is_source_order_context(
                                 &view.evidence_need.temporal_scope.qualifiers,
                             )
                     })

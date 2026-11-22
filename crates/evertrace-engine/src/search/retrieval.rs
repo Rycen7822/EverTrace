@@ -1196,7 +1196,7 @@ impl NativeRetrieval<'_> {
             ordered.extend(
                 quoted_candidates
                     .into_iter()
-                    .filter(|candidate| candidate.is_source_timeline_context(qualifiers)),
+                    .filter(|candidate| candidate.is_source_order_context(qualifiers)),
             );
             quoted_candidates = ordered;
         }
@@ -1252,7 +1252,7 @@ impl NativeRetrieval<'_> {
                 derivation_kind: DerivationKind::Quoted,
                 ordering_basis: if timeline {
                     ordering_basis
-                        .filter(|_| !candidate.is_source_timeline_context(qualifiers))
+                        .filter(|_| !candidate.is_source_order_context(qualifiers))
                         .unwrap_or(OrderingBasis::Unknown)
                 } else if qualifiers
                     .iter()
