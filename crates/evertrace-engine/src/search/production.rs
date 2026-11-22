@@ -827,6 +827,7 @@ impl ProductionSearch {
         let source_only =
             source_order.is_some() || count_unit == Some(CountUnit::SourceObservation);
         let atoms_only = atom_relation || count_unit == Some(CountUnit::ObjectRevision);
+        let current_only = requires_current_objects(&context);
         let discover = async {
             let snapshot = self
                 .index
@@ -944,11 +945,14 @@ impl ProductionSearch {
                     revision,
                     key,
                     kind,
-                } => (
-                    access.check_current(&key, &revision, &kind).await,
-                    revision,
-                    &mut grants.object_revisions,
-                ),
+                } => {
+                    let verified = if !current_only && kind == "atom_revision" {
+                        access.check_revision(&revision).await
+                    } else {
+                        access.check_current(&key, &revision, &kind).await
+                    };
+                    (verified, revision, &mut grants.object_revisions)
+                }
                 OfferedRead::Evidence(source) => {
                     let verified = if source_order.is_some() {
                         access.checked_source_receipt(&source).await.map(|receipt| {

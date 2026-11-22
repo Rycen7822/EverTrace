@@ -14,6 +14,8 @@ pub(crate) use resolution::SemanticSearchResolution;
 pub use diagnostic::{DiagnosticRetrieval, DiagnosticSession};
 pub use production::{DiagnosticFtsFailure, ProductionSearch, SearchError};
 
+pub(crate) const ATOM_SUPERSEDES: &str = "atom_supersedes";
+
 /// The whole request must name the relation and one stable operand. Other prose stays lexical.
 pub(crate) fn explicit_atom_relation<'a>(
     input: &'a str,
@@ -31,6 +33,8 @@ pub(crate) fn explicit_atom_relation<'a>(
             Some("atom_contradicts")
         } else if phrase.eq_ignore_ascii_case("trace atom support") {
             Some("atom_supports")
+        } else if phrase.eq_ignore_ascii_case("trace atom predecessors") {
+            Some(ATOM_SUPERSEDES)
         } else {
             None
         }
@@ -45,8 +49,9 @@ pub(crate) fn explicit_atom_relation<'a>(
         }
         (operand, relation(verb.trim_end())?)
     };
-    (operand.parse::<AtomId>().is_ok() || operand.parse::<RevisionId>().is_ok())
-        .then_some((operand, kind))
+    (operand.parse::<RevisionId>().is_ok()
+        || (kind != ATOM_SUPERSEDES && operand.parse::<AtomId>().is_ok()))
+    .then_some((operand, kind))
 }
 
 /// Exact phrase with one existing `refs` operand, never inferred from general prose.

@@ -168,6 +168,7 @@ impl McpActionService {
         }
         let relation = crate::search::explicit_atom_relation(query, &scope.target_anchors);
         let atom_relation = relation.is_some();
+        let atom_history = relation.is_some_and(|(_, kind)| kind == crate::search::ATOM_SUPERSEDES);
         let physical = crate::search::explicit_operation_binding(query, &scope.target_anchors);
         let mut relation_requirements: Vec<String> =
             relation.map(|(_, kind)| kind.into()).into_iter().collect();
@@ -216,7 +217,7 @@ impl McpActionService {
         }
         let mut context = SearchContext {
             query_anchor: scope.anchor.search_anchor(),
-            intent: if episode_history {
+            intent: if episode_history || atom_history {
                 SearchIntent::HistoryLookup
             } else {
                 SearchIntent::StageAssistance
@@ -249,7 +250,11 @@ impl McpActionService {
                 relation_requirements,
                 polarity: Polarity::Positive,
                 explicit_exclusions: Vec::new(),
-                temporal_mode: TemporalMode::Current,
+                temporal_mode: if atom_history {
+                    TemporalMode::Any
+                } else {
+                    TemporalMode::Current
+                },
                 temporal_qualifiers: source_shape
                     .map(
                         |(_, domain)| evertrace_domain::query::TemporalQualifier::OrderBy {
@@ -270,7 +275,9 @@ impl McpActionService {
                 } else {
                     explicit_relation.then_some(evertrace_domain::query::AnswerShape::SourceSnippet)
                 },
-                lifecycle_boundary: if episode_history {
+                lifecycle_boundary: if atom_history {
+                    LifecycleBoundary::Any
+                } else if episode_history {
                     LifecycleBoundary::Terminal
                 } else {
                     LifecycleBoundary::Active
@@ -482,16 +489,26 @@ impl McpActionService {
                 return ready(scope_unresolved(request_id));
             }
         }
-        let stale_current_candidate = candidate_context.as_ref().is_some_and(|fresh| {
-            found.candidates.iter().take(3).any(|candidate| {
+        let unavailable =
+            |rows: &[ObjectRow], candidate: &evertrace_domain::query::SearchCandidate| {
                 candidate.row_variant == evertrace_domain::query::SearchCandidateVariant::Object
-                    && !matches!(
-                        select_object_row_rows(&fresh.rows, &candidate.candidate_id),
-                        Ok(Some((_, true)))
-                    )
-            })
+                    && !select_object_row_rows(rows, &candidate.candidate_id)
+                        .ok()
+                        .flatten()
+                        .is_some_and(|(row, current)| {
+                            current
+                                || (atom_history
+                                    && row.object_kind.as_deref() == Some("atom_revision"))
+                        })
+            };
+        let stale_candidate = candidate_context.as_ref().is_some_and(|fresh| {
+            found
+                .candidates
+                .iter()
+                .take(3)
+                .any(|candidate| unavailable(&fresh.rows, candidate))
         });
-        if stale_current_candidate && !retried_anchor {
+        if stale_candidate && !retried_anchor {
             return Ok(NormalSearchAttempt::Retry(NormalSearchScope {
                 context: candidate_context.expect("checked above"),
                 ..scope
@@ -575,9 +592,13 @@ impl McpActionService {
                         }) else {
                             continue;
                         };
-                        fresh_access
-                            .check_current(&candidate.source_ref, &candidate.candidate_id, kind)
-                            .await
+                        if atom_history && kind == "atom_revision" {
+                            fresh_access.check_revision(&candidate.candidate_id).await
+                        } else {
+                            fresh_access
+                                .check_current(&candidate.source_ref, &candidate.candidate_id, kind)
+                                .await
+                        }
                     }
                 };
                 if proof.is_err() {
@@ -636,17 +657,7 @@ impl McpActionService {
                     .candidates
                     .iter()
                     .take(3)
-                    .filter(|candidate| {
-                        candidate.row_variant
-                            == evertrace_domain::query::SearchCandidateVariant::Object
-                            && !matches!(
-                                select_object_row_rows(
-                                    &candidate_context.rows,
-                                    &candidate.candidate_id,
-                                ),
-                                Ok(Some((_, true)))
-                            )
-                    })
+                    .filter(|candidate| unavailable(&candidate_context.rows, candidate))
                     .map(|candidate| candidate.candidate_id.clone()),
             );
         }
@@ -1165,7 +1176,17 @@ impl McpActionService {
                 continue;
             }
             match classify_search_candidate_rows(rows, label, candidate, now) {
-                Some(item) => items.push(item),
+                Some(mut item) => {
+                    // An explicit predecessor trace quotes revisions; even its current root is not guidance.
+                    if item.kind == "atom_revision"
+                        && context.intent == SearchIntent::HistoryLookup
+                        && context.query_facets.relation_requirements.as_slice()
+                            == [crate::search::ATOM_SUPERSEDES]
+                    {
+                        item.partition = McpItemPartition::Evidence;
+                    }
+                    items.push(item);
+                }
                 None => {
                     omitted.insert(candidate.candidate_id.clone());
                 }

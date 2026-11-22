@@ -376,10 +376,14 @@ impl NativeRetrieval<'_> {
                 access.access.check_evidence(source).await
             } else if row.object_kind.as_deref() == Some("atom_revision") {
                 let revision = row.candidate_id.as_deref().ok_or(SearchError::Corrupt)?;
-                access
-                    .access
-                    .check_current(source, revision, "atom_revision")
-                    .await
+                if self.objects.current_only {
+                    access
+                        .access
+                        .check_current(source, revision, "atom_revision")
+                        .await
+                } else {
+                    access.access.check_revision(revision).await
+                }
             } else {
                 return Err(SearchError::Corrupt);
             };
@@ -756,7 +760,19 @@ impl NativeRetrieval<'_> {
             if edges.len() > 64 {
                 self.degraded("relation_fanout_truncated");
             }
-            let edges: Vec<_> = edges.into_iter().take(64).collect();
+            let edges: Vec<_> = edges
+                .into_iter()
+                .take(64)
+                .filter(|edge| {
+                    access.is_none()
+                        || self.objects.current_only
+                        || edge.relation_kind.as_deref() != Some(super::ATOM_SUPERSEDES)
+                        || edge
+                            .source_id
+                            .as_ref()
+                            .is_some_and(|id| sources.contains(id))
+                })
+                .collect();
             let targets = edges
                 .iter()
                 .filter_map(|edge| {
