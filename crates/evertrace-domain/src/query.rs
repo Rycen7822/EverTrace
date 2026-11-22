@@ -1188,9 +1188,11 @@ impl GroundedEvidenceView {
         {
             return self.evidence_need.target.iter().cloned().collect();
         }
+        let qualifiers = &self.evidence_need.temporal_scope.qualifiers;
         if self.evidence_need.answer_shape == Some(AnswerShape::Timeline)
-            && requested_ordering(&self.evidence_need.temporal_scope.qualifiers).is_some()
-            && timeline_order(candidates, &self.evidence_need.temporal_scope.qualifiers)
+            && (requested_ordering(qualifiers).is_some()
+                || matches!(qualifiers.as_slice(), [qualifier] if qualifier.is_event_time()))
+            && timeline_order(candidates, qualifiers)
                 .is_none_or(|(basis, _)| basis == OrderingBasis::RecordedAtFallback)
         {
             return candidates
